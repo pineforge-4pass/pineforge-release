@@ -119,7 +119,7 @@ jobs:
     steps:
       - name: Mint App token (scoped to one target)
         id: app
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.PINEFORGE_APP_ID }}
           private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
