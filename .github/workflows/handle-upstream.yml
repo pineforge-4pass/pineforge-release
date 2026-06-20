@@ -1,0 +1,155 @@
+name: handle-upstream
+
+# Inbound hub handler. Fired by an upstream release:
+#   pineforge-engine      release.yml -> event_type=engine-release  {version: vX.Y.Z, run_id}
+#   pineforge-codegen-oss release.yml -> event_type=codegen-release {version: X.Y.Z, run_id}
+#
+# Bumps the matching pin in docker/Dockerfile, patch-bumps THIS repo's VERSION,
+# commits + tags with the org GitHub App token. The App-token-pushed tag fires
+# publish.yml (build the combined image -> fan out to the MCPs). A GITHUB_TOKEN-
+# pushed tag would NOT re-trigger publish.yml; the App token (a non-default
+# credential) does. Idempotent, with half-failed-release recovery, a downgrade
+# guard, and serialized concurrency.
+
+on:
+  repository_dispatch:
+    types: [engine-release, codegen-release]
+
+concurrency:
+  group: handle-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: read   # GITHUB_TOKEN stays read-only; the App token does the push.
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint org App token
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.PINEFORGE_APP_ID }}
+          private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
+
+      - name: Checkout main (App token bypasses the ruleset + re-fires publish.yml)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Validate payload + select pin
+        id: in
+        env:
+          EVENT: ${{ github.event.action }}
+          RAW_VERSION: ${{ github.event.client_payload.version }}
+          RUN_ID: ${{ github.event.client_payload.run_id }}
+        run: |
+          set -euo pipefail
+          # client_payload is ATTACKER-CONTROLLABLE -> strict allowlist before it
+          # touches a Dockerfile ARG / pip pin / image ref.
+          case "$EVENT" in
+            engine-release)  ARG=ENGINE_VERSION ;;
+            codegen-release) ARG=CODEGEN_VERSION ;;
+            *) echo "::error::unexpected event '$EVENT'"; exit 1 ;;
+          esac
+          if ! printf '%s' "${RAW_VERSION:-}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'; then
+            echo "::error::rejected untrusted version '${RAW_VERSION:-}'"; exit 1
+          fi
+          if [ -n "${RUN_ID:-}" ] && ! printf '%s' "$RUN_ID" | grep -Eq '^[0-9]+$'; then
+            echo "::error::bad run_id '${RUN_ID}'"; exit 1
+          fi
+          VER="${RAW_VERSION#v}"   # bare semver for both the ARG pin and the pip spec
+          {
+            echo "arg=$ARG"
+            echo "version=$VER"
+          } >> "$GITHUB_OUTPUT"
+          echo "selected ${ARG}=${VER} (event ${EVENT}, upstream run ${RUN_ID:-n/a})"
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Log in to GHCR (read, for the image-exists probe)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide action (idempotent + recover half-failed release + downgrade guard)
+        id: decide
+        env:
+          ARG: ${{ steps.in.outputs.arg }}
+          NEW: ${{ steps.in.outputs.version }}
+          FORCE: ${{ github.event.client_payload.force }}
+        run: |
+          set -euo pipefail
+          cur="$(grep -m1 "^ARG ${ARG}=" docker/Dockerfile | sed -E "s/^ARG ${ARG}=//" | tr -d '[:space:]')"
+          ver="$(tr -d '[:space:]' < VERSION)"
+          img="ghcr.io/pineforge-4pass/pineforge-release:${ver}"
+          img_exists() { docker manifest inspect "$img" >/dev/null 2>&1; }
+          # Monotonicity (downgrade) guard: refuse an older pin unless forced.
+          is_older() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]; }
+          if [ "$cur" != "$NEW" ] && is_older "$NEW" "$cur" && [ "${FORCE:-}" != "true" ]; then
+            echo "::error::refusing downgrade ${ARG} ${cur} -> ${NEW} (set client_payload.force=true to override)"; exit 1
+          fi
+          if [ "$cur" = "$NEW" ]; then
+            if img_exists; then mode=noop; else mode=republish; fi
+          else
+            mode=bump
+          fi
+          {
+            echo "mode=$mode"
+            echo "cur_ver=$ver"
+          } >> "$GITHUB_OUTPUT"
+          echo "mode=$mode (pin ${cur} -> ${NEW}; current VERSION ${ver})"
+
+      - name: No-op
+        if: steps.decide.outputs.mode == 'noop'
+        run: echo "pin already ${{ steps.in.outputs.version }} and image exists — nothing to do."
+
+      - name: Re-publish (recover a half-failed prior release)
+        if: steps.decide.outputs.mode == 'republish'
+        env:
+          TAG: v${{ steps.decide.outputs.cur_ver }}
+        run: |
+          set -euo pipefail
+          echo "pin set but image missing — re-pushing ${TAG} to re-fire publish.yml"
+          git push origin "refs/tags/${TAG}" --force
+
+      - name: Bump pin + VERSION, commit, tag (fires publish.yml)
+        if: steps.decide.outputs.mode == 'bump'
+        env:
+          ARG: ${{ steps.in.outputs.arg }}
+          NEW: ${{ steps.in.outputs.version }}
+          EVENT: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          # Bump ONLY the top-level pre-FROM ARG default (first match).
+          sed -i -E "0,/^ARG ${ARG}=.*/s//ARG ${ARG}=${NEW}/" docker/Dockerfile
+          grep -q "^ARG ${ARG}=${NEW}$" docker/Dockerfile || { echo "::error::ARG ${ARG} not updated"; exit 1; }
+          # codegen pin must never carry a leading v (pip install ==vX is invalid).
+          if [ "$ARG" = "CODEGEN_VERSION" ]; then
+            grep -q '^ARG CODEGEN_VERSION=[0-9]' docker/Dockerfile || { echo "::error::CODEGEN_VERSION malformed"; exit 1; }
+          fi
+          # Patch-bump this repo's own version; skip any pre-existing tag.
+          cur="$(tr -d '[:space:]' < VERSION)"
+          [[ "$cur" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || { echo "::error::VERSION malformed '$cur'"; exit 1; }
+          maj="${BASH_REMATCH[1]}"; min="${BASH_REMATCH[2]}"; pat="${BASH_REMATCH[3]}"
+          git fetch --tags --quiet
+          next="${maj}.${min}.$((pat + 1))"
+          while git rev-parse -q --verify "refs/tags/v${next}" >/dev/null; do
+            pat=$((pat + 1)); next="${maj}.${min}.$((pat + 1))"
+          done
+          printf '%s\n' "$next" > VERSION
+          git add docker/Dockerfile VERSION
+          git diff --cached --quiet && { echo "::error::nothing staged — refusing empty release"; exit 1; }
+          git commit -m "chore(release): v${next} — ${EVENT} ${ARG}=${NEW}"
+          git tag -a "v${next}" -m "pineforge-release v${next} (${ARG}=${NEW})"
+          git push origin HEAD:main
+          git push origin "v${next}"
+          echo "pushed v${next}; publish.yml will build + fan out."
