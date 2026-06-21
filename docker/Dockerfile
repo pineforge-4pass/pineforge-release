@@ -9,18 +9,22 @@
 # the entrypoint/run_json harness on top, and IS the standalone `.pine -> trades`
 # tool. Downstream (the MCP servers, end users) consume THIS image.
 #
-# Pins (handle-upstream.yml bumps them; publish.yml passes RELEASE_*):
-#   ENGINE_VERSION   pineforge-engine release to fetch the static-lib tarball for
-#   CODEGEN_VERSION  pineforge-codegen PyPI version to bake in
+# Versions are NOT pinned in this file. CI resolves them and supplies them as
+# build-args; the (engine, codegen) pair is recorded in the release tag message
+# (read back by publish.yml) + the io.pineforge.* image labels below. Building
+# without the build-args is an error (guards below), never a silent empty value:
+#   ENGINE_VERSION   pineforge-engine release whose static-lib tarball is fetched
+#   CODEGEN_VERSION  pineforge-codegen PyPI version baked in
 #
 # Published as ghcr.io/pineforge-4pass/pineforge-release:<own-semver>.
 
-ARG ENGINE_VERSION=0.10.10
-ARG CODEGEN_VERSION=0.7.5
+ARG ENGINE_VERSION
+ARG CODEGEN_VERSION
 
 # --- Stage 1: stage the pure-Python transpiler (final image carries no pip) ---
 FROM debian:bookworm-slim AS codegen
 ARG CODEGEN_VERSION
+RUN test -n "${CODEGEN_VERSION}" || { echo "ERROR: CODEGEN_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -31,6 +35,7 @@ RUN pip3 install --break-system-packages --no-cache-dir -U \
 FROM debian:bookworm-slim AS engine
 ARG ENGINE_VERSION
 ARG TARGETARCH
+RUN test -n "${ENGINE_VERSION}" || { echo "ERROR: ENGINE_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -58,6 +63,7 @@ ARG CODEGEN_VERSION
 ARG RELEASE_VERSION=unknown
 ARG RELEASE_GIT_SHA=unknown
 ARG RELEASE_BUILD_DATE=unknown
+RUN test -n "${ENGINE_VERSION}" && test -n "${CODEGEN_VERSION}" || { echo "ERROR: ENGINE_VERSION + CODEGEN_VERSION build-args are required (CI resolves them)" >&2; exit 1; }
 
 LABEL org.opencontainers.image.title="pineforge-release" \
       org.opencontainers.image.description="Full PineScript v6 -> deterministic backtest (engine static lib + bundled codegen transpiler)" \
