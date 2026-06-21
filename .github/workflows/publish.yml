@@ -71,7 +71,7 @@ jobs:
           [ -n "$ok" ] || { echo "::error::engine ${E} tarballs or codegen ${C} not available after wait"; exit 1; }
 
       - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Image metadata
         id: meta
