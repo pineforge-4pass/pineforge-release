@@ -50,10 +50,18 @@ LABEL org.opencontainers.image.title="pineforge-release" \
 # still-bundled base it overwrites /opt/pineforge/pycodegen with the same tree.
 USER root
 COPY --from=codegen /opt/codegen /opt/pineforge/pycodegen
+# Own the Pine->backtest harness HERE rather than inheriting it from the engine
+# base — Phase 2 turns the engine into a pure base (no entrypoint/run_json), so
+# this image must carry the harness itself. (On a still-bundled engine base these
+# overwrite the inherited copies with identical content.)
+COPY docker/run_json.py   /opt/pineforge/bin/run_json.py
+COPY docker/entrypoint.sh /opt/pineforge/bin/entrypoint.sh
+RUN chmod +x /opt/pineforge/bin/entrypoint.sh /opt/pineforge/bin/run_json.py
 ENV PYTHONPATH=/opt/pineforge/pycodegen \
     PINEFORGE_ENGINE_VERSION=${ENGINE_VERSION} \
     PINEFORGE_CODEGEN_VERSION=${CODEGEN_VERSION} \
     PINEFORGE_RELEASE_VERSION=${RELEASE_VERSION}
 USER 10001
 
-# ENTRYPOINT inherited from the pineforge-engine base image.
+# This image OWNS the entrypoint (the engine base may shed it in Phase 2).
+ENTRYPOINT ["/opt/pineforge/bin/entrypoint.sh"]
