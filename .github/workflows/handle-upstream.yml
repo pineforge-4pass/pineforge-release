@@ -34,7 +34,7 @@ jobs:
           private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
 
       - name: Checkout main (App token bypasses the ruleset + re-fires publish.yml)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
