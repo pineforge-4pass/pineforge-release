@@ -22,10 +22,15 @@ place they are composed: it pins each one independently and owns its **own
 semver**. Downstream consumers — the MCP servers and end users — depend on this
 combined image, never on the bare engine.
 
-| Pin | Where | Meaning |
-|-----|-------|---------|
-| `ENGINE_VERSION` | `docker/Dockerfile` | `pineforge-engine` release whose static-lib tarball (libpineforge.a + headers) is fetched |
-| `CODEGEN_VERSION` | `docker/Dockerfile` | `pineforge-codegen` PyPI version baked in |
+No upstream version is pinned in source. CI resolves them at release time and
+records the pair in the **release tag message** (`engine=` / `codegen=`, read
+back by `publish.yml`) and the image labels below; `docker/Dockerfile` takes them
+as build-args with no defaults.
+
+| Version | Where | Meaning |
+|---------|-------|---------|
+| `ENGINE_VERSION` | resolved by CI; recorded in the release tag message + `io.pineforge.engine.version` label | `pineforge-engine` release whose static-lib tarball (libpineforge.a + headers) is fetched |
+| `CODEGEN_VERSION` | resolved by CI; recorded in the release tag message + `io.pineforge.codegen.version` label | `pineforge-codegen` PyPI version baked in |
 | `VERSION` | repo root | this image's own semver |
 
 The combined image also carries `io.pineforge.engine.version` /

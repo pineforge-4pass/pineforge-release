@@ -40,7 +40,7 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app.outputs.token }}
 
-      - name: Validate payload + select pin
+      - name: Validate payload
         id: in
         env:
           EVENT: ${{ github.event.action }}
@@ -49,10 +49,10 @@ jobs:
         run: |
           set -euo pipefail
           # client_payload is ATTACKER-CONTROLLABLE -> strict allowlist before it
-          # touches a Dockerfile ARG / pip pin / image ref.
+          # reaches a build-arg / pip pin / image ref / tag message.
           case "$EVENT" in
-            engine-release)  ARG=ENGINE_VERSION ;;
-            codegen-release) ARG=CODEGEN_VERSION ;;
+            engine-release)  component=engine ;;
+            codegen-release) component=codegen ;;
             *) echo "::error::unexpected event '$EVENT'"; exit 1 ;;
           esac
           if ! printf '%s' "${RAW_VERSION:-}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'; then
@@ -61,12 +61,9 @@ jobs:
           if [ -n "${RUN_ID:-}" ] && ! printf '%s' "$RUN_ID" | grep -Eq '^[0-9]+$'; then
             echo "::error::bad run_id '${RUN_ID}'"; exit 1
           fi
-          VER="${RAW_VERSION#v}"   # bare semver for both the ARG pin and the pip spec
-          {
-            echo "arg=$ARG"
-            echo "version=$VER"
-          } >> "$GITHUB_OUTPUT"
-          echo "selected ${ARG}=${VER} (event ${EVENT}, upstream run ${RUN_ID:-n/a})"
+          VER="${RAW_VERSION#v}"   # bare semver
+          { echo "component=$component"; echo "version=$VER"; } >> "$GITHUB_OUTPUT"
+          echo "dispatched ${component}=${VER} (event ${EVENT}, upstream run ${RUN_ID:-n/a})"
 
       - name: Configure git identity
         run: |
@@ -80,37 +77,64 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # COUPLED-BUMP: the dispatched component = the payload version; the OTHER
+      # component is FROZEN at whatever the last release shipped. The pins live in
+      # the latest tag's annotated message (engine=/codegen=); for the one-time
+      # bootstrap off a pre-redesign tag (no such lines) we read the frozen value
+      # from that tag's committed docker/Dockerfile ARG. No source pin is written.
+      - name: Resolve full (engine, codegen) pin pair
+        id: pins
+        env:
+          COMPONENT: ${{ steps.in.outputs.component }}
+          VER:       ${{ steps.in.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --quiet
+          LATEST="$(git tag -l 'v*' --sort=-v:refname | head -1)"
+          msg() { [ -n "$LATEST" ] && git for-each-ref --format='%(contents:body)' "refs/tags/$LATEST" | sed -n "s/^$1=//p" | head -1 || true; }
+          # bootstrap: pre-redesign tags still carry the committed ARG pin.
+          oldpin() { [ -n "$LATEST" ] && git show "$LATEST:docker/Dockerfile" 2>/dev/null | sed -n -E "s/^ARG $1=([0-9][^[:space:]]*)$/\1/p" | head -1 || true; }
+          Eprev="$(msg engine)";  [ -n "$Eprev" ] || Eprev="$(oldpin ENGINE_VERSION)"
+          Cprev="$(msg codegen)"; [ -n "$Cprev" ] || Cprev="$(oldpin CODEGEN_VERSION)"
+          if [ "$COMPONENT" = engine ]; then E="$VER"; C="$Cprev"; else C="$VER"; E="$Eprev"; fi
+          [ -n "$E" ] && [ -n "$C" ] || { echo "::error::could not resolve frozen component (engine='$E' codegen='$C'); LATEST='$LATEST'"; exit 1; }
+          for v in "$E" "$C"; do
+            printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$' || { echo "::error::resolved bad version '$v'"; exit 1; }
+          done
+          { echo "engine=$E"; echo "codegen=$C"; echo "eprev=$Eprev"; echo "cprev=$Cprev"; } >> "$GITHUB_OUTPUT"
+          echo "pins: engine ${Eprev:-∅}->${E}, codegen ${Cprev:-∅}->${C}"
+
       - name: Decide action (idempotent + recover half-failed release + downgrade guard)
         id: decide
         env:
-          ARG: ${{ steps.in.outputs.arg }}
-          NEW: ${{ steps.in.outputs.version }}
-          FORCE: ${{ github.event.client_payload.force }}
+          COMPONENT: ${{ steps.in.outputs.component }}
+          E:      ${{ steps.pins.outputs.engine }}
+          C:      ${{ steps.pins.outputs.codegen }}
+          EPREV:  ${{ steps.pins.outputs.eprev }}
+          CPREV:  ${{ steps.pins.outputs.cprev }}
+          FORCE:  ${{ github.event.client_payload.force }}
         run: |
           set -euo pipefail
-          cur="$(grep -m1 "^ARG ${ARG}=" docker/Dockerfile | sed -E "s/^ARG ${ARG}=//" | tr -d '[:space:]')"
           ver="$(tr -d '[:space:]' < VERSION)"
           img="ghcr.io/pineforge-4pass/pineforge-release:${ver}"
           img_exists() { docker manifest inspect "$img" >/dev/null 2>&1; }
-          # Monotonicity (downgrade) guard: refuse an older pin unless forced.
-          is_older() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]; }
-          if [ "$cur" != "$NEW" ] && is_older "$NEW" "$cur" && [ "${FORCE:-}" != "true" ]; then
-            echo "::error::refusing downgrade ${ARG} ${cur} -> ${NEW} (set client_payload.force=true to override)"; exit 1
+          # Monotonicity (downgrade) guard on the DISPATCHED component only.
+          is_older() { [ -n "$2" ] && [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]; }
+          if [ "$COMPONENT" = engine ]; then dnew="$E"; dprev="$EPREV"; else dnew="$C"; dprev="$CPREV"; fi
+          if is_older "$dnew" "$dprev" && [ "${FORCE:-}" != "true" ]; then
+            echo "::error::refusing downgrade ${COMPONENT} ${dprev} -> ${dnew} (set client_payload.force=true to override)"; exit 1
           fi
-          if [ "$cur" = "$NEW" ]; then
+          if [ "$E" = "$EPREV" ] && [ "$C" = "$CPREV" ]; then
             if img_exists; then mode=noop; else mode=republish; fi
           else
             mode=bump
           fi
-          {
-            echo "mode=$mode"
-            echo "cur_ver=$ver"
-          } >> "$GITHUB_OUTPUT"
-          echo "mode=$mode (pin ${cur} -> ${NEW}; current VERSION ${ver})"
+          { echo "mode=$mode"; echo "cur_ver=$ver"; } >> "$GITHUB_OUTPUT"
+          echo "mode=$mode (engine ${EPREV:-∅}->${E}, codegen ${CPREV:-∅}->${C}; VERSION ${ver})"
 
       - name: No-op
         if: steps.decide.outputs.mode == 'noop'
-        run: echo "pin already ${{ steps.in.outputs.version }} and image exists — nothing to do."
+        run: echo "engine+codegen unchanged and image exists — nothing to do."
 
       - name: Re-publish (recover a half-failed prior release)
         if: steps.decide.outputs.mode == 'republish'
@@ -118,24 +142,16 @@ jobs:
           TAG: v${{ steps.decide.outputs.cur_ver }}
         run: |
           set -euo pipefail
-          echo "pin set but image missing — re-pushing ${TAG} to re-fire publish.yml"
+          echo "versions unchanged but image missing — re-pushing ${TAG} to re-fire publish.yml"
           git push origin "refs/tags/${TAG}" --force
 
-      - name: Bump pin + VERSION, commit, tag (fires publish.yml)
+      - name: Bump VERSION, commit, tag (fires publish.yml)
         if: steps.decide.outputs.mode == 'bump'
         env:
-          ARG: ${{ steps.in.outputs.arg }}
-          NEW: ${{ steps.in.outputs.version }}
-          EVENT: ${{ github.event.action }}
+          E:     ${{ steps.pins.outputs.engine }}
+          C:     ${{ steps.pins.outputs.codegen }}
         run: |
           set -euo pipefail
-          # Bump ONLY the top-level pre-FROM ARG default (first match).
-          sed -i -E "0,/^ARG ${ARG}=.*/s//ARG ${ARG}=${NEW}/" docker/Dockerfile
-          grep -q "^ARG ${ARG}=${NEW}$" docker/Dockerfile || { echo "::error::ARG ${ARG} not updated"; exit 1; }
-          # codegen pin must never carry a leading v (pip install ==vX is invalid).
-          if [ "$ARG" = "CODEGEN_VERSION" ]; then
-            grep -q '^ARG CODEGEN_VERSION=[0-9]' docker/Dockerfile || { echo "::error::CODEGEN_VERSION malformed"; exit 1; }
-          fi
           # Patch-bump this repo's own version; skip any pre-existing tag.
           cur="$(tr -d '[:space:]' < VERSION)"
           [[ "$cur" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || { echo "::error::VERSION malformed '$cur'"; exit 1; }
@@ -146,10 +162,12 @@ jobs:
             pat=$((pat + 1)); next="${maj}.${min}.$((pat + 1))"
           done
           printf '%s\n' "$next" > VERSION
-          git add docker/Dockerfile VERSION
+          # No source pin is written — the (engine, codegen) pair is recorded in the
+          # IMMUTABLE annotated tag message (read back by publish.yml) + image labels.
+          git add VERSION
           git diff --cached --quiet && { echo "::error::nothing staged — refusing empty release"; exit 1; }
-          git commit -m "chore(release): v${next} — ${EVENT} ${ARG}=${NEW}"
-          git tag -a "v${next}" -m "pineforge-release v${next} (${ARG}=${NEW})"
+          git commit -m "chore(release): v${next} — engine ${E} + codegen ${C}"
+          git tag -a "v${next}" -m "$(printf 'pineforge-release v%s\n\nengine=%s\ncodegen=%s\n' "$next" "$E" "$C")"
           git push origin HEAD:main
           git push origin "v${next}"
-          echo "pushed v${next}; publish.yml will build + fan out."
+          echo "pushed v${next} (engine ${E} + codegen ${C}); publish.yml will build + fan out."
