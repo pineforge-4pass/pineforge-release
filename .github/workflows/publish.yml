@@ -40,6 +40,10 @@ jobs:
         run: |
           set -euo pipefail
           semver() { printf '%s' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'; }
+          # actions/checkout@v4 re-points refs/tags/<tag> at the COMMIT it peels to,
+          # so cat-file would see 'commit' and we'd never read the annotated message.
+          # Re-fetch tags (forced) to restore the annotated tag objects.
+          git fetch --force --tags origin >/dev/null 2>&1 || true
           e=""; c=""
           # Trust the tag message ONLY if REF is an ANNOTATED tag — a lightweight
           # tag's %(contents:body) leaks the target commit body, not our keys.
