@@ -48,22 +48,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Wait for upstream artifacts (engine image + codegen on PyPI)
+      - name: Wait for upstream artifacts (engine tarballs + codegen on PyPI)
         env:
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
         run: |
           set -euo pipefail
+          # The Dockerfile builds FROM the engine static-lib tarball (per arch),
+          # not a Docker image. Confirm both arch tarballs + the codegen version
+          # are published before building (the build fetch fails loud anyway).
+          base="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${E}"
           ok=
           for i in $(seq 1 20); do
-            if docker manifest inspect "ghcr.io/pineforge-4pass/pineforge-engine:${E}" >/dev/null 2>&1 \
+            if curl -fsIL "${base}/pineforge-v${E}-linux-x86_64.tar.gz"  >/dev/null 2>&1 \
+               && curl -fsIL "${base}/pineforge-v${E}-linux-aarch64.tar.gz" >/dev/null 2>&1 \
                && pip index versions pineforge-codegen 2>/dev/null | grep -qF "${C}"; then
               ok=1; break
             fi
-            echo "waiting for engine:${E} + codegen ${C} ... (${i})"
+            echo "waiting for engine ${E} tarballs + codegen ${C} ... (${i})"
             sleep 15
           done
-          [ -n "$ok" ] || { echo "::error::engine image ${E} or codegen ${C} not available after wait"; exit 1; }
+          [ -n "$ok" ] || { echo "::error::engine ${E} tarballs or codegen ${C} not available after wait"; exit 1; }
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
