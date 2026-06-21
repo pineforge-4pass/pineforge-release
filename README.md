@@ -24,7 +24,7 @@ combined image, never on the bare engine.
 
 | Pin | Where | Meaning |
 |-----|-------|---------|
-| `ENGINE_VERSION` | `docker/Dockerfile` | ghcr `pineforge-engine` tag built on |
+| `ENGINE_VERSION` | `docker/Dockerfile` | `pineforge-engine` release whose static-lib tarball (libpineforge.a + headers) is fetched |
 | `CODEGEN_VERSION` | `docker/Dockerfile` | `pineforge-codegen` PyPI version baked in |
 | `VERSION` | repo root | this image's own semver |
 
