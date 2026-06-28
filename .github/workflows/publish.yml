@@ -83,7 +83,7 @@ jobs:
           for i in $(seq 1 20); do
             if curl -fsIL "${base}/pineforge-v${E}-linux-x86_64.tar.gz"  >/dev/null 2>&1 \
                && curl -fsIL "${base}/pineforge-v${E}-linux-aarch64.tar.gz" >/dev/null 2>&1 \
-               && pip index versions pineforge-codegen 2>/dev/null | grep -qF "${C}"; then
+               && curl -fsSL "https://pypi.org/pypi/pineforge-codegen/${C}/json" >/dev/null 2>&1; then
               ok=1; break
             fi
             echo "waiting for engine ${E} tarballs + codegen ${C} ... (${i})"
