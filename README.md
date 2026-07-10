@@ -47,7 +47,7 @@ pineforge-engine release ───────(engine-release)─┘    bump pin
                                                       → tag (App) → publish.yml
                                                           build+push image
                                                           → dispatch (pineforge-release)
-                                                            → pineforge-codegen-mcp
+                                                            → pineforge-backtest-mcp
                                                             → pineforge-mcp-public
 ```
 

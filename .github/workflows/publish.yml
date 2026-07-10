@@ -141,7 +141,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        repo: [pineforge-codegen-mcp, pineforge-mcp-public]
+        repo: [pineforge-backtest-mcp, pineforge-mcp-public]
     steps:
       - name: Mint App token (scoped to one target)
         id: app
