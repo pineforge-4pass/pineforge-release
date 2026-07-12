@@ -133,7 +133,15 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC2016  # backticks here are literal markdown, not command substitution
           notes="$(printf 'Combined PineScript -> backtest image.\n\nengine %s + codegen %s\n\n```\ndocker pull ghcr.io/pineforge-4pass/pineforge-release:%s\n```\n' "$E" "$C" "${TAG#v}")"
-          gh release create "$TAG" --title "$TAG" --verify-tag --notes "$notes"
+          # Semver-aware "Latest": two near-simultaneous upstream releases run
+          # handle-upstream serially, but their publish jobs can CREATE the
+          # GitHub Releases out of version order, and GitHub's default Latest
+          # is creation-ordered (observed 2026-07-12: v0.1.13 created 9s after
+          # v0.1.14 stole Latest and downstream resolvers deployed the stale
+          # bundle). Mark Latest explicitly iff TAG is the semver max.
+          max_tag="$(printf '%s\n' "$TAG" $(gh release list --limit 100 --json tagName -q '.[].tagName') | sort -uV | tail -1)"
+          if [ "$max_tag" = "$TAG" ]; then latest_flag=true; else latest_flag=false; fi
+          gh release create "$TAG" --title "$TAG" --verify-tag --notes "$notes" --latest=$latest_flag
 
   notify-mcps:
     needs: publish
