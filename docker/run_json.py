@@ -41,7 +41,9 @@ Schema:
           "max_drawdown": float,
           "commission":      float,   # ABI v2
           "entry_bar_index": int,     # ABI v2: script-bar index of entry fill
-          "exit_bar_index":  int      # ABI v2: script-bar index of exit fill
+          "exit_bar_index":  int,     # ABI v2: script-bar index of exit fill
+          "entry_incarnation": int    # run-scoped physical-entry provenance;
+                                        # 0 when the strategy lacks the accessor
         },
         ...
       ],
@@ -56,10 +58,11 @@ Schema:
         ...
       ],
       "fingerprint": {                 # decode-able backtest provenance
-        "token":  "<base64(canonical provenance JSON)>",  # b64decode -> JSON
-        "digest": "sha256:<hex>",      # stable run id over canonical JSON
+        "token":  "<base64(canonical provenance JSON)>",  # b64decode -> authoritative UTF-8 bytes
+        "digest": "sha256:<hex of those bytes>",  # hash token bytes; do not assume json.loads round-trip
         "provenance": {
           "engine":   { version_string, major, minor, patch, commit_sha },
+          "feed":     { canonicalization, source_values_sha256 },
           "codegen":  { version, generated_cpp_sha256, transpiled_from_pine },
           "strategy": { ...all strategy() params, effective... },
           "inputs":   { "<title>": { type, default, value }, ... },
@@ -83,6 +86,7 @@ import hashlib
 import json
 import math
 import re
+import struct
 import sys
 import time
 from datetime import datetime, timezone
@@ -134,6 +138,23 @@ _STRAT_FIELD_KEY = {
 
 _INPUT_RE = re.compile(
     r'get_input_(\w+)\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*((?:[^();]|\([^()]*\))*?)\s*\)')
+
+# Canonical primary-feed identity. Hash the numeric BarC values in source-row
+# order, before any validation-only start/end slicing. The domain prefix makes
+# the byte contract versioned and prevents cross-domain hash reuse.
+SOURCE_FEED_CANONICALIZATION = "pf-ohlcv-barc-le-v1"
+_SOURCE_FEED_HASH_PREFIX = b"pineforge:ohlcv:barc-le:v1\0"
+_SOURCE_FEED_RECORD = struct.Struct("<5dq")
+
+
+def _new_source_feed_hasher():
+    h = hashlib.sha256()
+    h.update(_SOURCE_FEED_HASH_PREFIX)
+    return h
+
+
+def _update_source_feed_hash(h, row) -> None:
+    h.update(_SOURCE_FEED_RECORD.pack(*row))
 
 
 def _ctor_body(cpp_text: str) -> str:
@@ -264,7 +285,10 @@ def _codegen_version() -> str:
 
 def build_provenance(engine: dict, cpp_path, transpiled: bool,
                      inputs_applied: dict, overrides_applied: dict,
-                     runtime: dict | None) -> dict:
+                     runtime: dict | None, *, source_feed_sha256: str) -> dict:
+    if not isinstance(source_feed_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", source_feed_sha256):
+        raise ValueError("source_feed_sha256 must be a lowercase SHA-256 hex digest")
     cpp_text = ""
     cpp_sha = None
     if cpp_path:
@@ -276,6 +300,10 @@ def build_provenance(engine: dict, cpp_path, transpiled: bool,
             cpp_text = ""
     return {
         "engine": engine,
+        "feed": {
+            "canonicalization": SOURCE_FEED_CANONICALIZATION,
+            "source_values_sha256": source_feed_sha256,
+        },
         "codegen": {
             "version": _codegen_version(),
             "generated_cpp_sha256": cpp_sha,
@@ -291,8 +319,225 @@ def build_provenance(engine: dict, cpp_path, transpiled: bool,
     }
 
 
+# Product accepted-type domain for exact Python integers: JavaScript
+# Number.MAX/MIN_SAFE_INTEGER (= ±(2**53 - 1)). Rejecting larger exact ints
+# guarantees unique lossless integer identity across generic ECMAScript
+# consumers. This is not a claim that every such magnitude must round as
+# binary64 — e.g. float(2**53) is exactly representable and remains legal
+# on the float path, while exact int(2**53) is deliberately outside the
+# product integer domain. Out-of-domain provenance yields no fingerprint
+# under existing callers (exception → fingerprint None / skipped).
+# Booleans are handled separately (bool subclasses int).
+_JS_MAX_SAFE_INTEGER = 9007199254740991
+_JS_MIN_SAFE_INTEGER = -9007199254740991
+
+
+def _canonical_json_number(num: float) -> str:
+    """Serialize a finite IEEE-754 float via ECMAScript NumberToString.
+
+    Matches ECMAScript NumberToString (RFC 8785 / JCS numeric form):
+    integral values have no trailing ``.0``, ``±0`` is ``0``, and
+    scientific notation uses ES exponent thresholds (``e`` when the
+    exponent is < -6 or >= 21). Non-finite values raise ValueError.
+    Float subclasses are normalized via base ``float.__float__`` first so
+    hooks such as ``__float__``/``__abs__``/comparisons/``__repr__`` cannot
+    alter the underlying binary64 value used for math and emission.
+    """
+    # Plain built-in float: ignore subclass __float__/__abs__/__lt__/...
+    num = float.__float__(num)
+    if not math.isfinite(num):
+        raise ValueError(
+            "non-finite numbers are not permitted in fingerprint JSON")
+    if num == 0.0:
+        return "0"
+    negative = num < 0
+    r = repr(abs(num))
+    if "e" in r or "E" in r:
+        mant, exp_s = r.lower().split("e")
+        exp = int(exp_s)
+        if "." in mant:
+            whole, frac = mant.split(".")
+            digits_raw = whole + frac
+            n = exp + len(whole)
+        else:
+            digits_raw = mant
+            n = exp + len(digits_raw)
+    else:
+        if "." in r:
+            whole, frac = r.split(".")
+            digits_raw = whole + frac
+            n = len(whole)
+        else:
+            digits_raw = r
+            n = len(digits_raw)
+    # Leading-zero strip adjusts n so value = int(digits)*10^(n-k) holds.
+    lead = len(digits_raw) - len(digits_raw.lstrip("0"))
+    digits = digits_raw.lstrip("0") or "0"
+    if digits != "0":
+        n -= lead
+    while len(digits) > 1 and digits[-1] == "0":
+        digits = digits[:-1]
+    k = len(digits)
+    sign = "-" if negative else ""
+    if 0 < n <= 21:
+        if k <= n:
+            return sign + digits + ("0" * (n - k))
+        return sign + digits[:n] + "." + digits[n:]
+    if -6 < n <= 0:
+        return sign + "0." + ("0" * (-n)) + digits
+    exp = n - 1
+    exp_s = f"+{exp}" if exp >= 0 else str(exp)
+    if k == 1:
+        return sign + digits + "e" + exp_s
+    return sign + digits[0] + "." + digits[1:] + "e" + exp_s
+
+
+def _reject_unpaired_surrogates(s: str, *, what: str) -> None:
+    """Fail closed on unpaired UTF-16 surrogates (invalid I-JSON / UTF-8)."""
+    for ch in s:
+        cp = ord(ch)
+        if 0xD800 <= cp <= 0xDFFF:
+            raise ValueError(
+                f"unpaired UTF-16 surrogate in fingerprint JSON {what}")
+
+
+def _canonical_json_string(s: str) -> str:
+    """Serialize a string in RFC 8785 / JCS string form.
+
+    JSON control characters, quotes, and backslashes are escaped; valid
+    Unicode (including non-ASCII, emoji, and U+2028/U+2029) is emitted as
+    raw code points (not ``ensure_ascii`` ``\\uXXXX`` escapes). Unpaired
+    surrogates raise ValueError rather than producing invalid I-JSON.
+    Str subclasses are normalized via base ``str.__str__`` first so
+    ``__str__``/``__iter__`` hooks cannot redirect iteration or emission.
+    """
+    # Plain built-in str: ignore subclass __str__/__iter__/...
+    s = str.__str__(s)
+    _reject_unpaired_surrogates(s, what="string")
+    return json.dumps(s, ensure_ascii=False)
+
+
+def _utf16_code_unit_key(s: str) -> bytes:
+    """Object-key sort key matching JCS / ECMAScript UTF-16 code unit order.
+
+    Str subclasses are normalized via base ``str.__str__`` first so
+    ``__str__``/``__iter__``/``encode`` hooks cannot corrupt key order or
+    hide unpaired surrogates.
+    """
+    # Plain built-in str: ignore subclass __str__/__iter__/encode hooks.
+    s = str.__str__(s)
+    _reject_unpaired_surrogates(s, what="object key")
+    return s.encode("utf-16-be")
+
+
+def _canonical_fingerprint_json(value) -> str:
+    """Canonical JSON text for fingerprint token/digest bytes.
+
+    Direct RFC 8785 / JCS-style canonical writer over the accepted Python
+    value tree. The resulting UTF-8 token bytes are authoritative for
+    ``digest``; verifiers should hash those bytes rather than assuming plain
+    ``JSON.stringify`` is itself JCS (it does not sort keys or implement
+    full JCS). Over values parsed under a JavaScript / IEEE-754 binary64
+    number model, this matches a JCS direct encoder for the accepted types:
+    - objects: each key is normalized once via base ``str.__str__`` to a
+      plain built-in str; keys sorted by UTF-16 code unit order on those
+      normalized names; no whitespace. Duplicate normalized names raise
+      ValueError (fail closed — distinct str-subclass keys can override
+      ``__eq__``/``__hash__`` so both coexist in a Python dict while
+      ``str.__str__`` yields the same text; emitting both would produce
+      duplicate JSON names that JS silently drops). Non-str keys raise
+      TypeError. The retained original key is used only for value lookup.
+    - arrays: element order preserved; no whitespace
+    - numbers (float): ECMAScript NumberToString for every finite IEEE-754
+      value after base ``float.__float__`` normalization (subclass hooks
+      ignored); non-finite numbers raise ValueError
+    - numbers (int): decimal digits only for exact integers inside the
+      product safe-integer domain [-(2**53-1), 2**53-1]. This is a strict
+      accepted-type policy guaranteeing unique lossless integer identity
+      across generic ECMAScript consumers — not a claim that every larger
+      individual value is unrepresentable as binary64. Exact integers
+      outside the domain raise ValueError (e.g. int 2**53); isolated
+      binary64 floats such as float(2**53) remain legal via the float path.
+      Int subclasses (e.g. IntEnum) are normalized via base ``int.__index__``
+      to a plain built-in int before domain checks and digit emission, so
+      ``__index__``/``__int__``/comparison/``__str__``/``__repr__``/
+      ``__format__`` hooks cannot change the value or bypass rejection.
+      Booleans are not integers.
+    - strings: JCS form — control/quote/backslash escapes, raw valid
+      Unicode; unpaired surrogates raise ValueError. Str subclasses are
+      normalized via base ``str.__str__`` so ``__str__``/``__iter__``/
+      ``encode`` hooks cannot change emission, key order, or bypass
+      surrogate rejection.
+    - bools/null: ``true`` / ``false`` / ``null``
+    """
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        return _canonical_json_string(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        # Plain built-in int via base slot: subclass __index__/__int__/
+        # comparison hooks must not bypass domain checks or alter digits
+        # (Python 3.9 IntEnum str was "Enum.NAME").
+        value = int.__index__(value)
+        if value < _JS_MIN_SAFE_INTEGER or value > _JS_MAX_SAFE_INTEGER:
+            raise ValueError(
+                "integers outside the JavaScript safe-integer range "
+                f"[{_JS_MIN_SAFE_INTEGER}, {_JS_MAX_SAFE_INTEGER}] "
+                "are not permitted in fingerprint JSON")
+        return int.__repr__(value)
+    if isinstance(value, float):
+        return _canonical_json_number(value)
+    if isinstance(value, list):
+        return "[" + ",".join(
+            _canonical_fingerprint_json(v) for v in value) + "]"
+    if isinstance(value, dict):
+        # Normalize each original key exactly once to a plain built-in str.
+        # Distinct str subclasses can override __eq__/__hash__ so two keys
+        # coexist while str.__str__ yields the same text; emit the
+        # normalized name, look up values via the retained original key,
+        # and fail closed on duplicate normalized names.
+        items = []  # (normalized_key, original_key)
+        seen_normalized = set()
+        for k in value.keys():
+            if not isinstance(k, str):
+                raise TypeError(
+                    "fingerprint JSON object keys must be str, "
+                    f"got {type(k).__name__}")
+            nk = str.__str__(k)
+            if nk in seen_normalized:
+                raise ValueError(
+                    "duplicate fingerprint JSON object key after "
+                    f"str normalization: {nk!r}")
+            seen_normalized.add(nk)
+            items.append((nk, k))
+        parts = []
+        for nk, orig in sorted(items, key=lambda ik: _utf16_code_unit_key(ik[0])):
+            parts.append(
+                _canonical_json_string(nk) + ":"
+                + _canonical_fingerprint_json(value[orig]))
+        return "{" + ",".join(parts) + "}"
+    raise TypeError(
+        f"fingerprint JSON cannot encode {type(value).__name__}")
+
+
 def build_fingerprint(provenance: dict) -> dict:
-    canonical = json.dumps(provenance, sort_keys=True, separators=(",", ":"))
+    """Build ``{token, digest, provenance}`` for a provenance dict.
+
+    ``token`` is base64 of the canonical UTF-8 JSON bytes; ``digest`` is
+    ``sha256:`` + hex of those same bytes. Verifiers should treat the decoded
+    token bytes as authoritative and hash them directly. Re-canonicalizing a
+    decoded value tree requires an RFC 8785/JCS direct encoder with an
+    IEEE-754 binary64 number model — default Python ``json.loads`` may yield
+    ints outside the product integer domain for tokens such as ``1e20``
+    (``100000000000000000000``). Project tests that rebuild from token text
+    use ``json.loads(text, parse_int=float)``. Out-of-domain inputs raise
+    here; existing callers yield no fingerprint (``None`` / skip).
+    """
+    canonical = _canonical_fingerprint_json(provenance)
     raw = canonical.encode("utf-8")
     return {
         "token": base64.b64encode(raw).decode("ascii"),
@@ -475,19 +720,23 @@ def check_abi(lib: ctypes.CDLL) -> None:
 
 # --- helpers ----------------------------------------------------------
 
-def load_bars(csv_path: Path) -> tuple[ctypes.Array, int]:
+def load_bars(csv_path: Path) -> tuple[ctypes.Array, int, str]:
+    """Load the source tape once and return bars, count, and canonical hash."""
     rows: list[tuple[float, float, float, float, float, int]] = []
+    feed_hasher = _new_source_feed_hasher()
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            rows.append((
+            parsed = (
                 float(row["open"]),
                 float(row["high"]),
                 float(row["low"]),
                 float(row["close"]),
                 float(row["volume"]),
                 int(row["timestamp"]),
-            ))
+            )
+            _update_source_feed_hash(feed_hasher, parsed)
+            rows.append(parsed)
     n = len(rows)
     bars = (BarC * n)()
     for i, (o, h, l, c, v, ts) in enumerate(rows):
@@ -497,7 +746,7 @@ def load_bars(csv_path: Path) -> tuple[ctypes.Array, int]:
         bars[i].close     = c
         bars[i].volume    = v
         bars[i].timestamp = ts
-    return bars, n
+    return bars, n, feed_hasher.hexdigest()
 
 
 def load_strategy(so_path: Path) -> ctypes.CDLL:
@@ -522,6 +771,10 @@ def load_strategy(so_path: Path) -> ctypes.CDLL:
     if hasattr(lib, "strategy_get_last_error"):
         lib.strategy_get_last_error.argtypes = [ctypes.c_void_p]
         lib.strategy_get_last_error.restype  = ctypes.c_char_p
+    if hasattr(lib, "strategy_closed_trade_entry_incarnation"):
+        lib.strategy_closed_trade_entry_incarnation.argtypes = [
+            ctypes.c_void_p, ctypes.c_int]
+        lib.strategy_closed_trade_entry_incarnation.restype = ctypes.c_uint64
 
     # syminfo setters — declare argtypes so ctypes does not default the float
     # args to c_int (which would truncate mintick=0.5 to 0). Guarded with
@@ -594,7 +847,8 @@ def build_report_dict(report: ReportC, ohlcv_path: Path,
                       elapsed: float,
                       applied_inputs: dict[str, str],
                       applied_overrides: dict[str, str],
-                      applied_runtime: dict[str, object] | None = None) -> dict:
+                      applied_runtime: dict[str, object] | None = None,
+                      trade_entry_incarnations: list[int] | None = None) -> dict:
     trades = []
     pnls: list[float] = []
     for i in range(report.trades_len):
@@ -615,6 +869,11 @@ def build_report_dict(report: ReportC, ohlcv_path: Path,
             "commission":      float(t.commission),
             "entry_bar_index": int(t.entry_bar_index),
             "exit_bar_index":  int(t.exit_bar_index),
+            "entry_incarnation": (
+                int(trade_entry_incarnations[i])
+                if trade_entry_incarnations is not None
+                and i < len(trade_entry_incarnations) else 0
+            ),
         })
 
     n = len(pnls)
@@ -823,7 +1082,7 @@ def main() -> int:
     magnifier_samples = max(2, int(args.magnifier_samples))
     magnifier_dist = parse_magnifier_dist(args.magnifier_dist)
 
-    bars, n = load_bars(args.ohlcv)
+    bars, n, source_feed_sha256 = load_bars(args.ohlcv)
     first_ts, last_ts = bars[0].timestamp, bars[n - 1].timestamp
 
     lib = load_strategy(args.so)
@@ -916,8 +1175,17 @@ def main() -> int:
             "trade_start_ms":     args.trade_start_ms,
             "chart_tz":           args.chart_tz or "",
         }
-        out = build_report_dict(report, args.ohlcv, n, first_ts, last_ts,
-                                elapsed, inputs, overrides, applied_runtime)
+        incarnation_accessor = getattr(
+            lib, "strategy_closed_trade_entry_incarnation", None)
+        trade_entry_incarnations = (
+            [int(incarnation_accessor(state, i))
+             for i in range(report.trades_len)]
+            if incarnation_accessor is not None else None
+        )
+        out = build_report_dict(
+            report, args.ohlcv, n, first_ts, last_ts,
+            elapsed, inputs, overrides, applied_runtime,
+            trade_entry_incarnations)
         if timing is not None:
             out["diagnostics"]["timing"] = timing
             out["diagnostics"]["throughput"] = _throughput_block(
@@ -931,6 +1199,7 @@ def main() -> int:
                 inputs,
                 overrides,
                 applied_runtime,
+                source_feed_sha256=source_feed_sha256,
             ))
         except Exception:
             out["fingerprint"] = None

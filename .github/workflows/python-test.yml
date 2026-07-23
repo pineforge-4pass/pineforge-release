@@ -1,0 +1,31 @@
+name: python-test
+
+# Minimal PR/push gate for pure-Python regressions (no native engine).
+# Currently runs the focused fingerprint canonicalization contract test.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fingerprint-canonical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Fingerprint canonical regression
+        run: |
+          python3 -m py_compile docker/run_json.py tests/test_fingerprint_canonical.py
+          python3 tests/test_fingerprint_canonical.py
