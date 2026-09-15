@@ -68,3 +68,11 @@ Credentials are a single org GitHub App (`PINEFORGE_APP_ID` /
 ## License
 
 Apache-2.0.
+
+## Harness / engine ABI
+
+`docker/run_json.py` is the engine's harness, vendored from the pinned
+`pineforge-engine` tag (`scripts/sync-harness.sh <engine-version>`; the
+upstream-release workflow runs the same sync when it bumps the engine pin).
+The Dockerfile refuses to build when the harness `EXPECTED_PF_ABI` differs from
+`PF_ABI_VERSION` in the bundled engine headers.

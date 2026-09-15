@@ -90,6 +90,16 @@ COPY --from=codegen /opt/codegen             /opt/pineforge/pycodegen
 COPY docker/run_json.py   /opt/pineforge/bin/run_json.py
 COPY docker/entrypoint.sh /opt/pineforge/bin/entrypoint.sh
 RUN chmod +x /opt/pineforge/bin/entrypoint.sh /opt/pineforge/bin/run_json.py
+# The harness (run_json.py) mirrors the engine's C structs; it must be the copy
+# from the pinned engine tag. Fail the build if its ABI differs from the header
+# in the bundled tarball (0.1.23/0.1.24 shipped an ABI-2 harness on ABI-3 libs).
+RUN set -eu; \
+    want="$(sed -n 's/^#define PF_ABI_VERSION \([0-9][0-9]*\).*/\1/p' /opt/pineforge/include/pineforge/pineforge.h)"; \
+    have="$(sed -n 's/^EXPECTED_PF_ABI = \([0-9][0-9]*\).*/\1/p' /opt/pineforge/bin/run_json.py)"; \
+    if [ -z "$want" ] || [ -z "$have" ] || [ "$want" != "$have" ]; then \
+      echo "ERROR: harness EXPECTED_PF_ABI=${have:-?} != engine PF_ABI_VERSION=${want:-?} for engine ${ENGINE_VERSION}; run scripts/sync-harness.sh ${ENGINE_VERSION}" >&2; exit 1; \
+    fi; \
+    echo "harness ABI ${have} matches engine ${ENGINE_VERSION}"
 
 ENV PINEFORGE_PREFIX=/opt/pineforge \
     PYTHONPATH=/opt/pineforge/pycodegen \

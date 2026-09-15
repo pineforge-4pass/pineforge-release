@@ -164,7 +164,9 @@ jobs:
           printf '%s\n' "$next" > VERSION
           # No source pin is written — the (engine, codegen) pair is recorded in the
           # IMMUTABLE annotated tag message (read back by publish.yml) + image labels.
-          git add VERSION
+          # Keep the harness in step with the pinned engine (its ABI mirrors the engine structs).
+          curl -fsSL "https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/v${E}/docker/run_json.py" -o docker/run_json.py
+          git add VERSION docker/run_json.py
           git diff --cached --quiet && { echo "::error::nothing staged — refusing empty release"; exit 1; }
           git commit -m "chore(release): v${next} — engine ${E} + codegen ${C}"
           git tag -a "v${next}" -m "$(printf 'pineforge-release v%s\n\nengine=%s\ncodegen=%s\n' "$next" "$E" "$C")"
