@@ -143,13 +143,13 @@ jobs:
           if [ "$max_tag" = "$TAG" ]; then latest_flag=true; else latest_flag=false; fi
           gh release create "$TAG" --title "$TAG" --verify-tag --notes "$notes" --latest=$latest_flag
 
-  notify-mcps:
+  notify-consumers:
     needs: publish
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        repo: [pineforge-backtest-mcp, pineforge-mcp-public]
+        repo: [pineforge-backtest-mcp, pineforge-mcp-public, pineforge-app]
     steps:
       - name: Mint App token (scoped to one target)
         id: app
