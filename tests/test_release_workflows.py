@@ -129,7 +129,18 @@ class PublishTest(unittest.TestCase):
 
     def test_github_release_list_failure_is_not_a_latest(self):
         body = _step(self.text, "GitHub Release")
-        self.assertIn('releases="$(gh release list --limit 100 --json tagName -q \'.[].tagName\')"', body)
+        self.assertIn('releases="$(gh release list --exclude-drafts --limit 100 --json tagName -q \'.[].tagName\')"',
+                      body)
+
+    def test_draft_releases_never_hold_latest(self):
+        # GitHub never marks a draft Latest; counting one (say a hand-made
+        # v9.9.9) would keep a new stable release off Latest.
+        body = _step(self.text, "GitHub Release")
+        calls = [ln for ln in body.splitlines()
+                 if "gh release list" in ln and not ln.lstrip().startswith("#")]
+        self.assertTrue(calls)
+        for ln in calls:
+            self.assertIn("--exclude-drafts", ln)
 
     def test_github_release_channel(self):
         body = _step(self.text, "GitHub Release")

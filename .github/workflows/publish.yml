@@ -190,8 +190,9 @@ jobs:
           # v0.1.14 stole Latest and downstream resolvers deployed the stale
           # bundle). Mark Latest explicitly iff TAG is the highest STABLE release
           # by semver precedence (coreutils' version sort ranks v1.0.0-rc.1 above v1.0.0).
+          # Drafts never hold Latest, so a draft (say a hand-made v9.9.9) must not count.
           # A failing `gh release list` fails the step (it must not make TAG the max).
-          releases="$(gh release list --limit 100 --json tagName -q '.[].tagName')"
+          releases="$(gh release list --exclude-drafts --limit 100 --json tagName -q '.[].tagName')"
           max_tag="$(printf '%s\n%s\n' "$TAG" "$releases" | python3 scripts/release_pair.py latest-tag --stable)"
           if [ "$max_tag" = "$TAG" ]; then latest_flag=true; else latest_flag=false; fi
           gh release create "$TAG" --title "$TAG" --verify-tag --notes "$notes" --latest=$latest_flag
