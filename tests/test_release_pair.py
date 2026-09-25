@@ -34,17 +34,18 @@ def outputs(proc: subprocess.CompletedProcess) -> dict:
 
 def decide(component: str, version: str, prev: tuple, *, current: str = "0.1.25",
            flag: str = "", other: str = "false", image: str = "true",
-           force: str = "false") -> subprocess.CompletedProcess:
+           force: str = "false", partner: str = "") -> subprocess.CompletedProcess:
     return run(
         "decide", "--component", component, "--version", version,
         "--prerelease-flag", flag, "--prev-engine", prev[0], "--prev-codegen", prev[1],
         "--current-release", current, "--other-published", other,
-        "--image-exists", image, "--force", force,
+        "--image-exists", image, "--force", force, "--partner-latest", partner,
     )
 
 
-def check(release: str, engine: str, codegen: str) -> subprocess.CompletedProcess:
-    return run("check", "--release", release, "--engine", engine, "--codegen", codegen)
+def check(release: str, engine: str, codegen: str, newest: str = "") -> subprocess.CompletedProcess:
+    return run("check", "--release", release, "--engine", engine, "--codegen", codegen,
+               "--newest-stable", newest)
 
 
 class VersionTest(unittest.TestCase):
@@ -110,6 +111,11 @@ class LatestTagTest(unittest.TestCase):
         proc = run("latest-tag", stdin="junk\nv0.1.9\nv0.1.10\nrelease-2\n\n")
         self.assertEqual(proc.stdout, "v0.1.10\n")
 
+    def test_newest_pypi_release_in_semver_spelling(self):
+        proc = run("latest-pep440", stdin="0.10.4\n1.0.0rc1\n1.0.0rc2\n0.9.0\n1.0.0.post1\nfoo\n1.0.0a3\n")
+        self.assertEqual((proc.returncode, proc.stdout), (0, "1.0.0-rc.2\n"))
+        self.assertEqual(run("latest-pep440", stdin="0.10.4\n1.0.0\n1.0.0rc1\n").stdout, "1.0.0\n")
+
     def test_no_tags_prints_nothing(self):
         proc = run("latest-tag", stdin="")
         self.assertEqual((proc.returncode, proc.stdout), (0, ""))
@@ -149,6 +155,16 @@ class DecideLegacyTest(unittest.TestCase):
         proc = decide("engine", "0.13.2", ("0.13.1", ""))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("could not resolve frozen component", proc.stderr)
+
+    def test_0x_bump_needs_a_0x_hub_version(self):
+        # A half-done first pair leaves VERSION=1.0.0 on main with 0.x pins
+        # landed; a 0.x event must not patch-bump it into v1.0.1.
+        for current in ("1.0.0", "1.0.0-rc.1", "0.1.26-rc.1"):
+            with self.subTest(current=current):
+                proc = decide("codegen", "0.10.5", self.PREV, current=current)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn(f"VERSION {current}", proc.stderr)
+                self.assertEqual(proc.stdout, "")
 
     def test_prerelease_on_the_0x_line_is_refused(self):
         proc = decide("engine", "0.14.0-rc.1", self.PREV, flag="true")
@@ -214,7 +230,8 @@ class DecidePairTest(unittest.TestCase):
     def test_stale_rc_after_the_final_is_refused(self):
         proc = decide("engine", "v1.0.0-rc.1", self.FINAL, current="1.0.0", flag="true")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("refusing downgrade engine 1.0.0 -> 1.0.0-rc.1", proc.stderr)
+        self.assertIn("refusing engine 1.0.0-rc.1 below the landed pair 1.0.0, even forced", proc.stderr)
+        self.assertNotIn("client_payload.force", proc.stderr)  # forcing cannot help here
 
     def test_pair_line_rollback_is_not_a_new_release(self):
         proc = decide("engine", "v1.0.0", ("1.0.1", "1.0.1"), current="1.0.1", other="true",
@@ -231,6 +248,42 @@ class DecidePairTest(unittest.TestCase):
         self.assertEqual(drifted.returncode, 1)
         self.assertIn("VERSION 0.1.25", drifted.stderr)
 
+    def test_partner_at_another_new_version_is_a_mismatch(self):
+        # engine 1.0.1 while codegen already released 1.0.2: never pairable.
+        proc = decide("engine", "v1.0.1", self.FINAL, current="1.0.0", partner="1.0.2")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("engine 1.0.1", proc.stderr)
+        self.assertIn("codegen 1.0.2", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        # an engine that skips the codegen's rc.2 is a mismatch as well
+        skip = decide("engine", "v1.0.0", self.RC1, current="1.0.0-rc.1", partner="1.0.0-rc.2")
+        self.assertEqual(skip.returncode, 1)
+        self.assertIn("codegen 1.0.0-rc.2", skip.stderr)
+
+    def test_partner_not_moved_or_mid_release_still_waits(self):
+        for partner in ("1.0.0", "", "1.0.1"):  # landed, unknown, same version still uploading
+            with self.subTest(partner=partner):
+                got = outputs(decide("engine", "v1.0.1", self.FINAL, current="1.0.0", partner=partner))
+                self.assertEqual(got["mode"], "wait")
+        first = outputs(decide("engine", "v1.0.0-rc.1", self.LEGACY, partner="0.10.4"))
+        self.assertEqual(first["mode"], "wait")
+
+    def test_half_done_pair_is_tagged_not_bumped_again(self):
+        # main got the release commit (VERSION = the pair version) but not the tag.
+        first = decide("codegen", "1.0.0-rc.1", self.LEGACY, current="1.0.0-rc.1", other="true")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        got = outputs(first)
+        self.assertEqual((got["mode"], got["retag"], got["release"]), ("bump", "true", "1.0.0-rc.1"))
+        later = outputs(decide("engine", "v1.0.1", self.FINAL, current="1.0.1", other="true"))
+        self.assertEqual((later["mode"], later["retag"], later["release"]), ("bump", "true", "1.0.1"))
+        normal = outputs(decide("codegen", "1.0.0-rc.1", self.LEGACY, other="true"))
+        self.assertEqual(normal["retag"], "false")
+
+    def test_version_drift_on_the_pair_line_fails(self):
+        proc = decide("engine", "v1.0.1", self.FINAL, current="1.0.3", other="true")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("VERSION 1.0.3", proc.stderr)
+
     def test_prerelease_flag_must_agree_with_the_version(self):
         for version, flag in [("v1.0.0-rc.1", "false"), ("v1.0.0", "true"), ("v1.0.0", "yes")]:
             with self.subTest(version=version, flag=flag):
@@ -246,11 +299,11 @@ class CheckTest(unittest.TestCase):
         proc = check("1.0.0-rc.1", "1.0.0-rc.1", "1.0.0-rc.1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(outputs(proc), {"line": "pair", "prerelease": "true",
-                                         "codegen_pypi": "1.0.0rc1"})
+                                         "codegen_pypi": "1.0.0rc1", "moving": "false"})
 
     def test_final_pair_is_stable(self):
-        self.assertEqual(outputs(check("1.0.0", "1.0.0", "1.0.0")),
-                         {"line": "pair", "prerelease": "false", "codegen_pypi": "1.0.0"})
+        self.assertEqual(outputs(check("1.0.0", "1.0.0", "1.0.0", newest="v1.0.0")),
+                         {"line": "pair", "prerelease": "false", "codegen_pypi": "1.0.0", "moving": "true"})
 
     def test_mismatched_pair_fails_loud_naming_both_versions(self):
         for engine, codegen in [("1.0.0", "1.0.1"), ("1.0.0-rc.1", "1.0.0-rc.2"), ("1.0.0", "0.10.4")]:
@@ -273,8 +326,15 @@ class CheckTest(unittest.TestCase):
         self.assertIn("codegen 0.10.4", proc.stderr)
 
     def test_0x_pair_keeps_independent_versions(self):
-        self.assertEqual(outputs(check("0.1.26", "0.13.1", "0.10.4")),
-                         {"line": "legacy", "prerelease": "false", "codegen_pypi": "0.10.4"})
+        self.assertEqual(outputs(check("0.1.26", "0.13.1", "0.10.4", newest="v0.1.26")),
+                         {"line": "legacy", "prerelease": "false", "codegen_pypi": "0.10.4", "moving": "true"})
+
+    def test_moving_tags_follow_the_newest_stable_release(self):
+        self.assertEqual(outputs(check("1.0.0", "1.0.0", "1.0.0", newest="v1.0.0"))["moving"], "true")
+        self.assertEqual(outputs(check("1.0.0", "1.0.0", "1.0.0", newest="v1.0.1"))["moving"], "false")
+        self.assertEqual(outputs(check("1.0.1-rc.1", "1.0.1-rc.1", "1.0.1-rc.1", newest="v1.0.0"))["moving"],
+                         "false")
+        self.assertEqual(outputs(check("0.1.26", "0.13.1", "0.10.4", newest="v0.1.26"))["moving"], "true")
 
     def test_0x_line_is_stable_only(self):
         self.assertEqual(check("0.1.26", "0.14.0-rc.1", "0.10.4").returncode, 1)

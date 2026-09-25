@@ -11,6 +11,7 @@ Pairing: on the 0.x line engine and codegen keep independent versions (an
 upstream event moves its component, the other stays frozen) and the hub
 patch-bumps its own VERSION. From 1.0.0 on they share one version, prerelease
 included: an event whose partner has not published that version yet waits,
+a partner that has released a different new version is a mismatch that fails,
 and the hub release version is the pair's.
 
 Commands print key=value lines on stdout (for $GITHUB_OUTPUT); notes and
@@ -18,8 +19,9 @@ errors go to stderr, and a broken rule exits 1:
 
   info VERSION                bare, line (legacy | pair), prerelease, pypi
   latest-tag [--stable]       highest version tag of those on stdin
+  latest-pep440               highest PyPI (PEP 440) version on stdin, semver spelling
   decide ...                  handle-upstream's action for one upstream event
-  check --release R --engine E --codegen C
+  check --release R --engine E --codegen C [--newest-stable TAG]
                               publish.yml's rule for the image it builds
 """
 from __future__ import annotations
@@ -35,8 +37,12 @@ _VERSION_RE = re.compile(
     r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-(alpha|beta|rc)\.(0|[1-9][0-9]*))?"
 )
+_PEP440_RE = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:(a|b|rc)(0|[1-9][0-9]*))?"
+)
 _PRE_RANK = {"alpha": 0, "beta": 1, "rc": 2}
 _PEP440_PRE = {"alpha": "a", "beta": "b", "rc": "rc"}
+_FROM_PEP440 = {"a": "alpha", "b": "beta", "rc": "rc"}
 
 
 class RuleError(Exception):
@@ -89,6 +95,27 @@ def parse(text: str) -> Version:
     return Version(int(major), int(minor), int(patch), pre, int(pre_num or 0))
 
 
+def parse_pep440(text: str) -> Version:
+    """A PyPI version in the one PEP 440 spelling parse() maps to (1.0.0rc1)."""
+    m = _PEP440_RE.fullmatch(text) if isinstance(text, str) else None
+    if not m:
+        raise ValueError(f"not a X.Y.Z[a|b|rcN] PyPI version: {text!r}")
+    major, minor, patch, pre, pre_num = m.groups()
+    return Version(int(major), int(minor), int(patch), _FROM_PEP440.get(pre), int(pre_num or 0))
+
+
+def latest_pep440(versions: Iterable[str]) -> Optional[Version]:
+    best = None
+    for raw in versions:
+        try:
+            version = parse_pep440(raw.strip())
+        except ValueError:
+            continue
+        if best is None or version > best:
+            best = version
+    return best
+
+
 def _flag(value: bool) -> str:
     return "true" if value else "false"
 
@@ -110,8 +137,13 @@ def latest_tag(tags: Iterable[str], stable: bool = False) -> Optional[str]:
 
 def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
            prev_codegen: str, current_release: str, other_published: bool,
-           image_exists: bool, force: bool) -> tuple:
-    """Return (outputs, note) for one upstream event; raise RuleError to refuse it."""
+           image_exists: bool, force: bool, partner_latest: str = "") -> tuple:
+    """Return (outputs, note) for one upstream event; raise RuleError to refuse it.
+
+    partner_latest is the other component's newest published version (semver,
+    "" if unknown); it only matters when that component has not published this
+    event's version.
+    """
     v = parse(version)
     if prerelease_flag not in ("", "true", "false"):
         raise RuleError(f"bad client_payload.prerelease {prerelease_flag!r} (expected true or false)")
@@ -121,17 +153,16 @@ def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
         raise RuleError(f"could not resolve frozen component (engine={prev_engine!r} "
                         f"codegen={prev_codegen!r})")
     ep, cp = parse(prev_engine), parse(prev_codegen)
+    cur = parse(current_release)
     landed_pair = ep.line == "pair" or cp.line == "pair"
     if landed_pair and ep != cp:
         raise RuleError(f"landed pins engine {ep} + codegen {cp} break the pairing rule; "
                         "fix the latest release tag before releasing")
-    if landed_pair and parse(current_release) != ep:
-        raise RuleError(f"VERSION {current_release} does not match the landed pair "
-                        f"engine {ep} + codegen {cp}")
 
     other = "codegen" if component == "engine" else "engine"
     moved = (v, cp) if component == "engine" else (ep, v)  # today's coupled bump
     dprev = ep if component == "engine" else cp
+    other_prev = cp if component == "engine" else ep
 
     def same_or_bump(e: Version, c: Version) -> str:
         if (e, c) == (ep, cp):
@@ -139,7 +170,7 @@ def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
         return "bump"
 
     out = {"line": v.line, "eprev": str(ep), "cprev": str(cp), "release": "",
-           "prerelease": "false", "awaiting": ""}
+           "prerelease": "false", "awaiting": "", "retag": "false"}
     if v.line == "legacy":
         if landed_pair:
             raise RuleError(
@@ -148,32 +179,61 @@ def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
         if v.prerelease:
             raise RuleError(f"refusing {component} {v}: the 0.x line is stable-only; "
                             "prereleases start at 1.0.0-rc.1")
-    if v < dprev and not force:
-        raise RuleError(f"refusing downgrade {component} {dprev} -> {v} "
-                        "(set client_payload.force=true to override)")
-
-    if v.line == "legacy":
+        if cur.line != "legacy" or cur.prerelease:
+            raise RuleError(f"refusing {component} {v}: VERSION {cur} is not a stable 0.x hub "
+                            "version (is a 1.0 pair release half-done?); 0.x events patch-bump "
+                            "a 0.x VERSION only")
+        if v < dprev and not force:
+            raise RuleError(f"refusing downgrade {component} {dprev} -> {v} "
+                            "(set client_payload.force=true to override)")
         e, c = moved
         out.update(mode=same_or_bump(e, c), engine=str(e), codegen=str(c))
-        note = f"mode={out['mode']} (engine {ep}->{e}, codegen {cp}->{c}; VERSION {current_release})"
+        note = f"mode={out['mode']} (engine {ep}->{e}, codegen {cp}->{c}; VERSION {cur})"
         return out, note
 
+    # From 1.0.0 on: the release version is the pair's, so a landed pair only
+    # moves forward (a forced event cannot re-release an older pair).
     if landed_pair and v < ep:
         raise RuleError(f"refusing {component} {v} below the landed pair {ep}, even forced: "
                         "from 1.0.0 on the release version is the pair's, so this would move "
                         "the hub backwards; roll back by re-pointing image tags instead")
-    other_prev = cp if component == "engine" else ep
-    if other_prev == v or other_published:
-        out.update(mode=same_or_bump(v, v), engine=str(v), codegen=str(v), release=str(v),
-                   prerelease=_flag(v.prerelease))
+    if not landed_pair and v < dprev and not force:
+        raise RuleError(f"refusing downgrade {component} {dprev} -> {v} "
+                        "(set client_payload.force=true to override)")
+    completes = other_prev == v or other_published
+    # VERSION is the landed release; it may equal this event's version only
+    # when this pair's release commit reached main but its tag did not.
+    retag = cur == v and v != ep and completes
+    if not retag:
+        if landed_pair and cur != ep:
+            raise RuleError(f"VERSION {cur} does not match the landed pair engine {ep} + "
+                            f"codegen {cp}")
+        if not landed_pair and (cur.line != "legacy" or cur.prerelease):
+            raise RuleError(f"VERSION {cur} has no release tag: a pair release is half-done "
+                            f"(main carries its commit, tag v{cur} is missing); send an "
+                            f"event for {cur} again to tag it")
+    if completes:
+        out.update(mode="bump" if retag else same_or_bump(v, v), engine=str(v), codegen=str(v),
+                   release=str(v), prerelease=_flag(v.prerelease), retag=_flag(retag))
         channel = "prerelease" if v.prerelease else "stable"
-        if out["mode"] == "bump":
+        if retag:
+            note = (f"mode=bump (retag): main already carries release v{v} (engine {v} + "
+                    f"codegen {v}) without its tag; tagging it")
+        elif out["mode"] == "bump":
             note = (f"mode=bump: pair engine {v} + codegen {v} -> release v{v} ({channel}); "
                     f"landed pair was engine {ep} + codegen {cp}")
         else:
             image = "image exists" if image_exists else "image missing"
             note = f"mode={out['mode']}: pair engine {v} + codegen {v} already released as v{v} ({image})"
         return out, note
+    if partner_latest:
+        partner = parse(partner_latest)
+        if partner > other_prev and partner != v:
+            pair = f"engine {v} + codegen {partner}" if component == "engine" else \
+                f"engine {partner} + codegen {v}"
+            raise RuleError(f"mismatched pair: {pair} are both newer than the landed pair "
+                            f"(engine {ep} + codegen {cp}); from 1.0.0 on engine and codegen "
+                            "must release the same version, prerelease included")
     e, c = moved
     out.update(mode="wait", engine=str(e), codegen=str(c), prerelease=_flag(v.prerelease),
                awaiting=other)
@@ -183,7 +243,9 @@ def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
     return out, note
 
 
-def check(release: str, engine: str, codegen: str) -> dict:
+def check(release: str, engine: str, codegen: str, newest_stable: str = "") -> dict:
+    """The pair rule for the image publish.yml builds. `moving` is true only for
+    the newest stable release (by semver): `latest` and X.Y never go backwards."""
     r, e, c = parse(release), parse(engine), parse(codegen)
     if "pair" in (r.line, e.line, c.line):
         if e != c:
@@ -198,7 +260,9 @@ def check(release: str, engine: str, codegen: str) -> dict:
             raise RuleError(f"refusing to publish release {r} (engine {e} + codegen {c}): "
                             "the 0.x line is stable-only")
         line = "legacy"
-    return {"line": line, "prerelease": _flag(r.prerelease), "codegen_pypi": c.pep440}
+    moving = not r.prerelease and bool(newest_stable) and parse(newest_stable) == r
+    return {"line": line, "prerelease": _flag(r.prerelease), "codegen_pypi": c.pep440,
+            "moving": _flag(moving)}
 
 
 def _emit(pairs: dict) -> None:
@@ -213,6 +277,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_info.add_argument("version")
     p_latest = sub.add_parser("latest-tag")
     p_latest.add_argument("--stable", action="store_true", help="skip prereleases")
+    sub.add_parser("latest-pep440")
     p_decide = sub.add_parser("decide")
     p_decide.add_argument("--component", required=True, choices=["engine", "codegen"])
     p_decide.add_argument("--version", required=True)
@@ -223,10 +288,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_decide.add_argument("--other-published", choices=["true", "false"], default="false")
     p_decide.add_argument("--image-exists", choices=["true", "false"], default="false")
     p_decide.add_argument("--force", default="false", help="only the literal 'true' forces")
+    p_decide.add_argument("--partner-latest", default="",
+                          help="the other component's newest published version, if known")
     p_check = sub.add_parser("check")
     p_check.add_argument("--release", required=True)
     p_check.add_argument("--engine", required=True)
     p_check.add_argument("--codegen", required=True)
+    p_check.add_argument("--newest-stable", default="", help="the newest stable release tag")
     args = parser.parse_args(argv)
 
     try:
@@ -238,15 +306,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             tag = latest_tag(sys.stdin, stable=args.stable)
             if tag:
                 print(tag)
+        elif args.cmd == "latest-pep440":
+            best = latest_pep440(sys.stdin)
+            if best:
+                print(best)
         elif args.cmd == "decide":
             out, note = decide(args.component, args.version, args.prerelease_flag,
                                args.prev_engine, args.prev_codegen, args.current_release,
                                args.other_published == "true", args.image_exists == "true",
-                               args.force == "true")
+                               args.force == "true", args.partner_latest)
             _emit(out)
             print(note, file=sys.stderr)
         else:
-            _emit(check(args.release, args.engine, args.codegen))
+            _emit(check(args.release, args.engine, args.codegen, args.newest_stable))
     except (RuleError, ValueError) as err:
         print(f"::error::{err}", file=sys.stderr)
         return 1
