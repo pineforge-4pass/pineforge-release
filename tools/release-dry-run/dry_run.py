@@ -257,17 +257,23 @@ class World:
     def refused(self, res, step, message):
         return not res.ok and res.failed_step.startswith(step) and message in res.job.text()
 
+    def unchanged(self, tags, main, why=False):
+        """No tag added and main where it was (with why=True: what changed, for the report)."""
+        if why:
+            return {"new tags": sorted(self.tags() - tags), "main moved": self.rev("main") != main}
+        return self.tags() == tags and self.rev("main") == main
+
 
 # ------------------------------------------------------------------ worlds
 def pair(w):
     """1.0 line, engine first: rc.1 waits, pairs, ships as a prerelease; 1.0.0 promotes; refusals."""
-    before = w.tags()
+    before, main = w.tags(), w.rev("main")
     w.engine_published("1.0.0-rc.1")
     r = w.upstream("engine-release", {"version": "v1.0.0-rc.1", "prerelease": True, "run_id": 101})
     d = r.step("decide")
     w.check("engine rc.1 first: green run, mode=wait, awaiting codegen",
             r.ok and d.get("mode") == "wait" and d.get("awaiting") == "codegen", (r.failed_step, d))
-    w.check("engine rc.1 first: no tag, nothing pushed", w.tags() == before, sorted(w.tags() - before))
+    w.check("engine rc.1 first: no tag, main unchanged", w.unchanged(before, main), w.unchanged(before, main, why=True))
     w.check("engine rc.1 first: the run says the pair is pending",
             "pair pending: engine 1.0.0-rc.1 recorded, waiting for codegen 1.0.0-rc.1" in r.text())
 
@@ -309,9 +315,11 @@ def pair(w):
             r.ok and r.step("decide").get("mode") == "noop" and w.tags() == before, (r.failed_step, r.step("decide")))
 
     w.engine_published("1.0.0")
+    before, main = w.tags(), w.rev("main")
     r = w.upstream("engine-release", {"version": "v1.0.0", "prerelease": False, "run_id": 104})
-    w.check("engine 1.0.0 first: mode=wait", r.ok and r.step("decide").get("mode") == "wait",
-            (r.failed_step, r.step("decide")))
+    w.check("engine 1.0.0 first: mode=wait; no tag, main unchanged",
+            r.ok and r.step("decide").get("mode") == "wait" and w.unchanged(before, main),
+            (r.failed_step, r.step("decide"), w.unchanged(before, main, why=True)))
     w.codegen_published("1.0.0")
     r = w.upstream("codegen-release", {"version": "1.0.0", "prerelease": False, "run_id": 105})
     d = r.step("decide")
@@ -335,7 +343,7 @@ def pair(w):
     w.check("publish v1.0.0: every consumer gets release_version=1.0.0 prerelease=false",
             w.dispatched(p) == {c: ("1.0.0", "false") for c in CONSUMERS}, w.dispatched(p))
 
-    before = w.tags()
+    before, main = w.tags(), w.rev("main")
     r = w.upstream("engine-release", {"version": "v1.0.0-rc.1", "prerelease": True, "run_id": 106})
     w.check("a late rc.1 event after 1.0.0 is refused",
             w.refused(r, "Decide action", "refusing engine 1.0.0-rc.1 below the landed pair 1.0.0"), r.failed_step)
@@ -360,31 +368,51 @@ def pair(w):
     w.check("a partner probe answered 503 fails the run instead of waiting",
             w.refused(r, "Probe the partner release", "could not tell whether engine v1.0.3 tarballs is published"),
             r.failed_step)
-    w.check("no refused event tagged anything", w.tags() == before, sorted(w.tags() - before))
+    w.check("no refused or waiting event tagged or pushed anything", w.unchanged(before, main),
+            w.unchanged(before, main, why=True))
 
 
 def reverse(w):
-    """1.0 line, codegen first: the engine's event completes the pair."""
+    """1.0 line, codegen first: the engine's event completes rc.1, then 1.0.0."""
+    before, main = w.tags(), w.rev("main")
     w.codegen_published("1.0.0rc1")
     r = w.upstream("codegen-release", {"version": "1.0.0-rc.1", "prerelease": True, "run_id": 201})
     d = r.step("decide")
-    w.check("codegen rc.1 first: mode=wait, awaiting engine",
-            r.ok and d.get("mode") == "wait" and d.get("awaiting") == "engine", (r.failed_step, d))
+    w.check("codegen rc.1 first: mode=wait, awaiting engine; no tag, main unchanged",
+            r.ok and d.get("mode") == "wait" and d.get("awaiting") == "engine" and w.unchanged(before, main),
+            (r.failed_step, d, w.unchanged(before, main, why=True)))
     w.engine_published("1.0.0-rc.1")
     r = w.upstream("engine-release", {"version": "v1.0.0-rc.1", "prerelease": True, "run_id": 202})
     w.check("engine rc.1 second: mode=bump, tag v1.0.0-rc.1 pairs 1.0.0-rc.1 + 1.0.0-rc.1",
             r.ok and r.step("decide").get("mode") == "bump" and w.pins("v1.0.0-rc.1") == ("1.0.0-rc.1", "1.0.0-rc.1"),
             (r.failed_step, r.step("decide")))
 
+    w.image(f"{IMAGE}:1.0.0-rc.1")   # its publish run pushed the image (the pair world runs publish.yml)
+    before, main = w.tags(), w.rev("main")
+    w.codegen_published("1.0.0")
+    r = w.upstream("codegen-release", {"version": "1.0.0", "prerelease": False, "run_id": 203})
+    d = r.step("decide")
+    w.check("codegen 1.0.0 first: mode=wait, awaiting engine; no tag, main unchanged",
+            r.ok and d.get("mode") == "wait" and d.get("awaiting") == "engine" and w.unchanged(before, main),
+            (r.failed_step, d, w.unchanged(before, main, why=True)))
+    w.engine_published("1.0.0")
+    r = w.upstream("engine-release", {"version": "v1.0.0", "prerelease": False, "run_id": 204})
+    d = r.step("decide")
+    w.check("engine 1.0.0 second: mode=bump release=1.0.0 prerelease=false; tag v1.0.0 pairs 1.0.0 + 1.0.0",
+            r.ok and (d.get("mode"), d.get("release"), d.get("prerelease")) == ("bump", "1.0.0", "false")
+            and w.pins("v1.0.0") == ("1.0.0", "1.0.0"), (r.failed_step, d))
+
 
 def lost_partner(w):
     """The partner's dispatch never arrives: re-running the waiting run completes the pair."""
     event = {"version": "v1.0.0-rc.1", "prerelease": True, "run_id": 301}
+    before, main = w.tags(), w.rev("main")
     w.engine_published("1.0.0-rc.1")
     r = w.upstream("engine-release", event)
     w.check("engine rc.1: mode=wait", r.ok and r.step("decide").get("mode") == "wait", (r.failed_step, r.step("decide")))
     w.codegen_published("1.0.0rc1")   # codegen ships, but its dispatch is lost: no run
-    w.check("codegen on PyPI with no event: still no tag", "v1.0.0-rc.1" not in w.tags())
+    w.check("codegen on PyPI with no event: still no tag, main unchanged", w.unchanged(before, main),
+            w.unchanged(before, main, why=True))
     r = w.upstream("engine-release", event)   # "Re-run all jobs" on the waiting run: same event, same main
     w.check("re-running the waiting run: mode=bump, tag v1.0.0-rc.1",
             r.ok and r.step("decide").get("mode") == "bump" and w.pins("v1.0.0-rc.1") == ("1.0.0-rc.1", "1.0.0-rc.1"),
@@ -474,6 +502,8 @@ def main():
     unknown = set(opts.only) - set(WORLDS)
     if unknown:
         ap.error(f"unknown world(s): {', '.join(sorted(unknown))}")
+    if opts.out and Path(opts.out).is_dir() and any(Path(opts.out).iterdir()):
+        ap.error(f"--out {opts.out} is not empty; give a new or empty directory")
     for tool in ("git", "jq", "node", "python3"):
         if not shutil.which(tool):
             sys.exit(f"dry_run: {tool} is not on PATH")

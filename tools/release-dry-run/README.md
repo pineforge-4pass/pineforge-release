@@ -38,14 +38,15 @@ The first run clones `docker/metadata-action` at the major version
 
 Each check prints `PASS` or `FAIL`. The exit status is 0 only when every check
 passes. Transcripts and state go to a new temporary directory (`--out DIR` to
-choose). `-k WORLD` runs one world and `-v` prints every run as it happens.
+choose a new or empty one). `-k WORLD` runs one world and `-v` prints every run
+as it happens.
 
 ## Worlds
 
 | world | what it proves |
 |---|---|
 | `pair` | Engine rc.1 first waits; codegen rc.1 completes the pair (tag `v1.0.0-rc.1`, pins in the tag message). The rc image gets only its fixed tags (no `latest`, no `1.0`), a GitHub prerelease with `--latest=false`, and `prerelease=true` to all three consumers. A duplicate event is a no-op. 1.0.0 then pairs the same way and takes `1.0`, `latest` and GitHub Latest, even with a draft `v9.9.9` present. Refused: a late rc, a 0.x event after 1.0, a contradicting prerelease flag, a mismatched pair (named), and a probe answered 503. |
-| `reverse` | Codegen rc.1 first, engine rc.1 second: same pair. |
+| `reverse` | Codegen first, engine second, for rc.1 and then 1.0.0: the same pairs. |
 | `lost-partner` | The partner's dispatch never arrives. Re-running the waiting run (same event) completes the pair. |
 | `retag` | The release commit reached `main` but its tag push failed. The next event tags that commit. |
 | `legacy` | 0.x as before: a patch bump, `latest` and GitHub Latest. A failing `gh release list` fails the step instead of creating the release. A hand-made tag with a mismatched 1.0 pair fails before any build. |
