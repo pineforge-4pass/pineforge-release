@@ -1,7 +1,8 @@
 name: python-test
 
-# Minimal PR/push gate for pure-Python regressions (no native engine).
-# Currently runs the focused fingerprint canonicalization contract test.
+# Minimal PR/push gate for pure-Python regressions (no native engine): the
+# focused fingerprint canonicalization contract test and the release-rule
+# tests (scripts/release_pair.py and its wiring into the release workflows).
 
 on:
   push:
@@ -29,3 +30,8 @@ jobs:
         run: |
           python3 -m py_compile docker/run_json.py tests/test_fingerprint_canonical.py
           python3 tests/test_fingerprint_canonical.py
+
+      - name: Release rules (version order, prerelease channel, 1.0 pairing)
+        run: |
+          python3 -m py_compile scripts/release_pair.py
+          python3 -m unittest discover -s tests -p 'test_release_*.py' -v
