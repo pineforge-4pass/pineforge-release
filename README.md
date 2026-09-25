@@ -71,25 +71,33 @@ The rules live in `scripts/release_pair.py` (unit-tested in `tests/`).
 - **0.x** — an upstream event moves its own component's pin; the other stays at
   the last release, and `VERSION` gets a patch bump. The 0.x line is stable-only.
 - **From 1.0.0 on** — engine and codegen must be the same `X.Y.Z`, prerelease
-  included. The first event of a pair waits: its run logs the pending pin and
-  builds nothing. The partner's event finds the first one's published artifacts
-  (engine tarballs, codegen on PyPI) and completes the pair, whichever comes
-  first; `VERSION` becomes the pair version. A mismatched pair fails naming both
-  versions, and a 0.x event is refused once a 1.0 pair has landed.
+  included, and `VERSION` becomes that pair version. Upstreams dispatch after
+  their artifacts are published, so in either order the first event of a pair
+  waits (its run logs the pending pin and builds nothing) and the partner's
+  event finds the first one's artifacts (engine tarballs, codegen on PyPI) and
+  completes the pair. It fails naming both versions when the partner has
+  released a different new version (the pair can never form), when a tag records
+  a mismatched pair, and when a 0.x event arrives after a 1.0 pair has landed.
+  A probe that cannot reach GitHub or PyPI fails the run instead of waiting; re-run
+  it. If a pair's tag push failed after its release commit reached `main`, the next
+  event for that pair tags that commit.
 - **Prereleases** (`X.Y.Z-alpha.N`, `-beta.N`, `-rc.N`; PyPI spells the codegen
-  `X.Y.ZrcN`) publish the exact-version image tags only, a GitHub prerelease that
-  is never Latest, and `prerelease: true` downstream. `latest` and `X.Y` never
-  move to a prerelease.
+  `X.Y.ZaN`, `X.Y.ZbN`, `X.Y.ZrcN`) are published as a GitHub prerelease that is
+  never Latest, with `prerelease: true` downstream.
+- `client_payload.force: true` lets a 0.x event move its component backwards. On
+  the 1.0 line a release older than the landed pair is refused even forced: the
+  release version is the pair's, so roll back by re-pointing image tags.
 
 Credentials are a single org GitHub App (`PINEFORGE_APP_ID` /
 `PINEFORGE_APP_PRIVATE_KEY`); no personal access tokens.
 
 ## Image tags
 
-`X.Y.Z` · `X.Y` · `latest` · `engine<E>-codegen<C>` · `<short-sha>`
+`X.Y.Z` · `X.Y` · `latest` · `engine<E>-codegen<C>` · `sha-<short>`
 
-A prerelease (for example `1.0.0-rc.1`) gets `X.Y.Z-rc.N` ·
-`engine<E>-codegen<C>` · `<short-sha>` only.
+`latest` and `X.Y` move only for the newest stable release. A prerelease (for
+example `1.0.0-rc.1`) gets `X.Y.Z-rc.N` · `engine<E>-codegen<C>` · `sha-<short>`
+only.
 
 ## License
 
