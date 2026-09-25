@@ -167,8 +167,12 @@ def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
         out.update(mode=same_or_bump(v, v), engine=str(v), codegen=str(v), release=str(v),
                    prerelease=_flag(v.prerelease))
         channel = "prerelease" if v.prerelease else "stable"
-        note = (f"mode={out['mode']}: pair engine {v} + codegen {v} -> release v{v} ({channel}); "
-                f"landed pair engine {ep} + codegen {cp}")
+        if out["mode"] == "bump":
+            note = (f"mode=bump: pair engine {v} + codegen {v} -> release v{v} ({channel}); "
+                    f"landed pair was engine {ep} + codegen {cp}")
+        else:
+            image = "image exists" if image_exists else "image missing"
+            note = f"mode={out['mode']}: pair engine {v} + codegen {v} already released as v{v} ({image})"
         return out, note
     e, c = moved
     out.update(mode="wait", engine=str(e), codegen=str(c), prerelease=_flag(v.prerelease),

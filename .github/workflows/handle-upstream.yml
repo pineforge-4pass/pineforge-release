@@ -1,15 +1,20 @@
 name: handle-upstream
 
 # Inbound hub handler. Fired by an upstream release:
-#   pineforge-engine      release.yml -> event_type=engine-release  {version: vX.Y.Z, run_id}
-#   pineforge-codegen-oss release.yml -> event_type=codegen-release {version: X.Y.Z, run_id}
+#   pineforge-engine      release.yml -> event_type=engine-release  {version: vX.Y.Z, prerelease, run_id}
+#   pineforge-codegen-oss release.yml -> event_type=codegen-release {version: X.Y.Z, prerelease, run_id}
+# `prerelease` (true|false) is optional and must agree with the version.
 #
-# Bumps the matching pin in docker/Dockerfile, patch-bumps THIS repo's VERSION,
-# commits + tags with the org GitHub App token. The App-token-pushed tag fires
-# publish.yml (build the combined image -> fan out to the MCPs). A GITHUB_TOKEN-
-# pushed tag would NOT re-trigger publish.yml; the App token (a non-default
-# credential) does. Idempotent, with half-failed-release recovery, a downgrade
-# guard, and serialized concurrency.
+# 0.x line: moves the dispatched component's pin, freezes the other one,
+# patch-bumps THIS repo's VERSION, commits + tags with the org GitHub App token.
+# From 1.0.0 on (scripts/release_pair.py) engine and codegen share one version,
+# prerelease included: the first event of a pair records its pin in the run
+# log and builds nothing; the partner's event finds the first one's published
+# artifacts, and the release version becomes the pair version.
+# The App-token-pushed tag fires publish.yml (build the combined image -> fan
+# out to the MCPs and the app). A GITHUB_TOKEN-pushed tag would NOT re-trigger
+# publish.yml; the App token (a non-default credential) does. Idempotent, with
+# half-failed-release recovery, a downgrade guard, and serialized concurrency.
 
 on:
   repository_dispatch:
@@ -45,6 +50,7 @@ jobs:
         env:
           EVENT: ${{ github.event.action }}
           RAW_VERSION: ${{ github.event.client_payload.version }}
+          RAW_PRERELEASE: ${{ github.event.client_payload.prerelease }}
           RUN_ID: ${{ github.event.client_payload.run_id }}
         run: |
           set -euo pipefail
@@ -58,12 +64,24 @@ jobs:
           if ! printf '%s' "${RAW_VERSION:-}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'; then
             echo "::error::rejected untrusted version '${RAW_VERSION:-}'"; exit 1
           fi
+          case "${RAW_PRERELEASE:-}" in
+            ''|true|false) ;;
+            *) echo "::error::rejected untrusted prerelease '${RAW_PRERELEASE}'"; exit 1 ;;
+          esac
           if [ -n "${RUN_ID:-}" ] && ! printf '%s' "$RUN_ID" | grep -Eq '^[0-9]+$'; then
             echo "::error::bad run_id '${RUN_ID}'"; exit 1
           fi
-          VER="${RAW_VERSION#v}"   # bare semver
-          { echo "component=$component"; echo "version=$VER"; } >> "$GITHUB_OUTPUT"
-          echo "dispatched ${component}=${VER} (event ${EVENT}, upstream run ${RUN_ID:-n/a})"
+          # The release rules take X.Y.Z or X.Y.Z-{alpha,beta,rc}.N (one PyPI
+          # spelling each); anything else fails here. Emits bare/line/prerelease/pypi.
+          facts="$(python3 scripts/release_pair.py info "$RAW_VERSION")"
+          VER="$(printf '%s\n' "$facts" | sed -n 's/^bare=//p')"
+          {
+            echo "component=$component"
+            echo "version=$VER"
+            echo "payload_prerelease=${RAW_PRERELEASE:-}"
+            printf '%s\n' "$facts"
+          } >> "$GITHUB_OUTPUT"
+          echo "dispatched ${component}=${VER} (event ${EVENT}, prerelease ${RAW_PRERELEASE:-unset}, upstream run ${RUN_ID:-n/a})"
 
       - name: Configure git identity
         run: |
@@ -77,64 +95,96 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # COUPLED-BUMP: the dispatched component = the payload version; the OTHER
-      # component is FROZEN at whatever the last release shipped. The pins live in
-      # the latest tag's annotated message (engine=/codegen=); for the one-time
-      # bootstrap off a pre-redesign tag (no such lines) we read the frozen value
-      # from that tag's committed docker/Dockerfile ARG. No source pin is written.
-      - name: Resolve full (engine, codegen) pin pair
+      # The landed pins live in the latest tag's annotated message (engine=/
+      # codegen=); for the one-time bootstrap off a pre-redesign tag (no such
+      # lines) we read them from that tag's committed docker/Dockerfile ARG. No
+      # source pin is written. "Latest" is semver precedence (v1.0.0 outranks
+      # v1.0.0-rc.1; git's v:refname sort puts the rc first).
+      - name: Resolve the landed (engine, codegen) pin pair
         id: pins
-        env:
-          COMPONENT: ${{ steps.in.outputs.component }}
-          VER:       ${{ steps.in.outputs.version }}
         run: |
           set -euo pipefail
           git fetch --tags --quiet
-          LATEST="$(git tag -l 'v*' --sort=-v:refname | head -1)"
+          LATEST="$(git tag -l 'v*' | python3 scripts/release_pair.py latest-tag)"
           msg() { [ -n "$LATEST" ] && git for-each-ref --format='%(contents:body)' "refs/tags/$LATEST" | sed -n "s/^$1=//p" | head -1 || true; }
           # bootstrap: pre-redesign tags still carry the committed ARG pin.
           oldpin() { [ -n "$LATEST" ] && git show "$LATEST:docker/Dockerfile" 2>/dev/null | sed -n -E "s/^ARG $1=([0-9][^[:space:]]*)$/\1/p" | head -1 || true; }
           Eprev="$(msg engine)";  [ -n "$Eprev" ] || Eprev="$(oldpin ENGINE_VERSION)"
           Cprev="$(msg codegen)"; [ -n "$Cprev" ] || Cprev="$(oldpin CODEGEN_VERSION)"
-          if [ "$COMPONENT" = engine ]; then E="$VER"; C="$Cprev"; else C="$VER"; E="$Eprev"; fi
-          [ -n "$E" ] && [ -n "$C" ] || { echo "::error::could not resolve frozen component (engine='$E' codegen='$C'); LATEST='$LATEST'"; exit 1; }
-          for v in "$E" "$C"; do
-            printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$' || { echo "::error::resolved bad version '$v'"; exit 1; }
-          done
-          { echo "engine=$E"; echo "codegen=$C"; echo "eprev=$Eprev"; echo "cprev=$Cprev"; } >> "$GITHUB_OUTPUT"
-          echo "pins: engine ${Eprev:-∅}->${E}, codegen ${Cprev:-∅}->${C}"
+          { echo "latest=$LATEST"; echo "eprev=$Eprev"; echo "cprev=$Cprev"; } >> "$GITHUB_OUTPUT"
+          echo "landed at ${LATEST:-∅}: engine ${Eprev:-∅}, codegen ${Cprev:-∅}"
 
-      - name: Decide action (idempotent + recover half-failed release + downgrade guard)
+      # From 1.0.0 on a pair completes only once the OTHER component has
+      # published the same version. Each upstream dispatches after its artifacts
+      # are up (engine: release tarballs; codegen: PyPI), so the second event of
+      # a pair always finds the first one's.
+      - name: Probe the partner release (1.0 line)
+        id: partner
+        if: steps.in.outputs.line == 'pair'
+        env:
+          COMPONENT: ${{ steps.in.outputs.component }}
+          VER:       ${{ steps.in.outputs.version }}
+          PYPI:      ${{ steps.in.outputs.pypi }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${VER}"
+          published=false
+          for i in 1 2 3; do
+            if [ "$COMPONENT" = engine ]; then
+              curl -fsSL "https://pypi.org/pypi/pineforge-codegen/${PYPI}/json" >/dev/null 2>&1 && published=true
+            else
+              curl -fsIL "${base}/pineforge-v${VER}-linux-x86_64.tar.gz" >/dev/null 2>&1 \
+                && curl -fsIL "${base}/pineforge-v${VER}-linux-aarch64.tar.gz" >/dev/null 2>&1 \
+                && published=true
+            fi
+            [ "$published" = true ] && break
+            [ "$i" = 3 ] || sleep 10
+          done
+          if [ "$COMPONENT" = engine ]; then partner="codegen ${VER} (PyPI ${PYPI})"; else partner="engine v${VER} tarballs"; fi
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          echo "${partner} published: ${published}"
+
+      - name: Decide action (pairing rule + idempotent + recover half-failed release + downgrade guard)
         id: decide
         env:
           COMPONENT: ${{ steps.in.outputs.component }}
-          E:      ${{ steps.pins.outputs.engine }}
-          C:      ${{ steps.pins.outputs.codegen }}
-          EPREV:  ${{ steps.pins.outputs.eprev }}
-          CPREV:  ${{ steps.pins.outputs.cprev }}
-          FORCE:  ${{ github.event.client_payload.force }}
+          VER:       ${{ steps.in.outputs.version }}
+          PAYLOAD_PRERELEASE: ${{ steps.in.outputs.payload_prerelease }}
+          EPREV:     ${{ steps.pins.outputs.eprev }}
+          CPREV:     ${{ steps.pins.outputs.cprev }}
+          PUBLISHED: ${{ steps.partner.outputs.published }}
+          FORCE:     ${{ github.event.client_payload.force }}
         run: |
           set -euo pipefail
           ver="$(tr -d '[:space:]' < VERSION)"
           img="ghcr.io/pineforge-4pass/pineforge-release:${ver}"
-          img_exists() { docker manifest inspect "$img" >/dev/null 2>&1; }
-          # Monotonicity (downgrade) guard on the DISPATCHED component only.
-          is_older() { [ -n "$2" ] && [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]; }
-          if [ "$COMPONENT" = engine ]; then dnew="$E"; dprev="$EPREV"; else dnew="$C"; dprev="$CPREV"; fi
-          if is_older "$dnew" "$dprev" && [ "${FORCE:-}" != "true" ]; then
-            echo "::error::refusing downgrade ${COMPONENT} ${dprev} -> ${dnew} (set client_payload.force=true to override)"; exit 1
-          fi
-          if [ "$E" = "$EPREV" ] && [ "$C" = "$CPREV" ]; then
-            if img_exists; then mode=noop; else mode=republish; fi
-          else
-            mode=bump
-          fi
-          { echo "mode=$mode"; echo "cur_ver=$ver"; } >> "$GITHUB_OUTPUT"
-          echo "mode=$mode (engine ${EPREV:-∅}->${E}, codegen ${CPREV:-∅}->${C}; VERSION ${ver})"
+          if docker manifest inspect "$img" >/dev/null 2>&1; then image=true; else image=false; fi
+          # Monotonicity (downgrade) guard on the DISPATCHED component, the 1.0
+          # pairing rule, and noop / republish / bump / wait: see the script.
+          echo "cur_ver=$ver" >> "$GITHUB_OUTPUT"
+          python3 scripts/release_pair.py decide \
+            --component="$COMPONENT" --version="$VER" --prerelease-flag="${PAYLOAD_PRERELEASE:-}" \
+            --prev-engine="$EPREV" --prev-codegen="$CPREV" --current-release="$ver" \
+            --other-published="${PUBLISHED:-false}" --image-exists="$image" --force="${FORCE:-}" \
+            | tee -a "$GITHUB_OUTPUT"
 
       - name: No-op
         if: steps.decide.outputs.mode == 'noop'
         run: echo "engine+codegen unchanged and image exists — nothing to do."
+
+      - name: Wait for the partner release (1.0 pair incomplete)
+        if: steps.decide.outputs.mode == 'wait'
+        env:
+          COMPONENT: ${{ steps.in.outputs.component }}
+          VER:       ${{ steps.in.outputs.version }}
+          AWAITING:  ${{ steps.decide.outputs.awaiting }}
+          EPREV:     ${{ steps.pins.outputs.eprev }}
+          CPREV:     ${{ steps.pins.outputs.cprev }}
+        run: |
+          set -euo pipefail
+          line="pair pending: ${COMPONENT} ${VER} recorded, waiting for ${AWAITING} ${VER}; the landed pair stays engine ${EPREV} + codegen ${CPREV} and nothing is built or published"
+          echo "::notice title=pineforge pair pending::${line}"
+          printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Re-publish (recover a half-failed prior release)
         if: steps.decide.outputs.mode == 'republish'
@@ -148,19 +198,30 @@ jobs:
       - name: Bump VERSION, commit, tag (fires publish.yml)
         if: steps.decide.outputs.mode == 'bump'
         env:
-          E:     ${{ steps.pins.outputs.engine }}
-          C:     ${{ steps.pins.outputs.codegen }}
+          E:       ${{ steps.decide.outputs.engine }}
+          C:       ${{ steps.decide.outputs.codegen }}
+          LINE:    ${{ steps.decide.outputs.line }}
+          RELEASE: ${{ steps.decide.outputs.release }}
         run: |
           set -euo pipefail
-          # Patch-bump this repo's own version; skip any pre-existing tag.
-          cur="$(tr -d '[:space:]' < VERSION)"
-          [[ "$cur" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || { echo "::error::VERSION malformed '$cur'"; exit 1; }
-          maj="${BASH_REMATCH[1]}"; min="${BASH_REMATCH[2]}"; pat="${BASH_REMATCH[3]}"
           git fetch --tags --quiet
-          next="${maj}.${min}.$((pat + 1))"
-          while git rev-parse -q --verify "refs/tags/v${next}" >/dev/null; do
-            pat=$((pat + 1)); next="${maj}.${min}.$((pat + 1))"
-          done
+          if [ "$LINE" = pair ]; then
+            # From 1.0.0 on the release version IS the pair version, prerelease included.
+            next="$RELEASE"
+            [ -n "$next" ] || { echo "::error::pair release without a version"; exit 1; }
+            if git rev-parse -q --verify "refs/tags/v${next}" >/dev/null; then
+              echo "::error::tag v${next} already exists without engine=${E} codegen=${C}; refusing to re-tag"; exit 1
+            fi
+          else
+            # 0.x: patch-bump this repo's own version; skip any pre-existing tag.
+            cur="$(tr -d '[:space:]' < VERSION)"
+            [[ "$cur" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || { echo "::error::VERSION malformed '$cur'"; exit 1; }
+            maj="${BASH_REMATCH[1]}"; min="${BASH_REMATCH[2]}"; pat="${BASH_REMATCH[3]}"
+            next="${maj}.${min}.$((pat + 1))"
+            while git rev-parse -q --verify "refs/tags/v${next}" >/dev/null; do
+              pat=$((pat + 1)); next="${maj}.${min}.$((pat + 1))"
+            done
+          fi
           printf '%s\n' "$next" > VERSION
           # No source pin is written — the (engine, codegen) pair is recorded in the
           # IMMUTABLE annotated tag message (read back by publish.yml) + image labels.
