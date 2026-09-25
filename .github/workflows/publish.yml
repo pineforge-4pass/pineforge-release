@@ -178,7 +178,7 @@ jobs:
             # Never GitHub's "Latest": resolvers that read Latest keep the newest
             # stable release, and the image has no `latest` / X.Y tag either.
             # shellcheck disable=SC2016  # literal markdown backticks
-            notes="$(printf '%s\n\nPrerelease: only the exact-version image tag exists; `latest` stays on the newest stable release.\n' "$notes")"
+            notes="$(printf '%s\n\nPrerelease: the image has only its fixed tags (this version, engine+codegen, sha); `latest` and X.Y stay on the newest stable release.\n' "$notes")"
             gh release create "$TAG" --title "$TAG" --verify-tag --notes "$notes" --prerelease --latest=false
             exit 0
           fi
