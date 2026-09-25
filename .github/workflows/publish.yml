@@ -4,9 +4,10 @@ name: publish
 # and the app. Fires on the v* tag that handle-upstream.yml pushes with the App
 # token (or a manual tag). The tag value equals VERSION (asserted below).
 # From 1.0.0 on the image pairs engine and codegen at the release version
-# (scripts/release_pair.py check). A prerelease tag (vX.Y.Z-rc.N) gets the
-# exact-version image tags only, never `latest` or the moving `X.Y`, a GitHub
-# prerelease, and `prerelease: true` in the downstream payload.
+# (scripts/release_pair.py check). A prerelease tag (vX.Y.Z-rc.N) is published
+# as a GitHub prerelease with the fixed tags X.Y.Z-rc.N, engine<E>-codegen<C>
+# and sha-<short> only, and sends `prerelease: true` downstream; `latest` and
+# the moving `X.Y` follow the newest stable release only.
 
 on:
   push:
@@ -38,7 +39,7 @@ jobs:
           file="$(tr -d '[:space:]' < VERSION)"
           [ "${TAG#v}" = "$file" ] || { echo "::error::tag ${TAG} != VERSION ${file}"; exit 1; }
 
-      - name: Read pins (from the annotated tag message; fallback = resolve latest)
+      - name: Read pins (from the annotated tag message; fallback = the pair version, or resolve latest on 0.x)
         id: pins
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -78,7 +79,9 @@ jobs:
       # From 1.0.0 on engine and codegen share one version, prerelease included,
       # and the release version is that version: a mismatched pair fails here
       # naming both, before anything is built. The 0.x line keeps independent
-      # pins and is stable-only. Emits line, prerelease and codegen_pypi.
+      # pins and is stable-only. Emits line, prerelease, codegen_pypi, and
+      # moving (a stable release that is the newest stable tag: `latest` and
+      # X.Y never move backwards, whichever publish run finishes last).
       - name: Pairing rule + release channel
         id: pair
         env:
@@ -87,8 +90,9 @@ jobs:
           C: ${{ steps.pins.outputs.codegen }}
         run: |
           set -euo pipefail
+          newest="$(git tag -l 'v*' | python3 scripts/release_pair.py latest-tag --stable)"
           python3 scripts/release_pair.py check --release="${REF#v}" --engine="$E" --codegen="$C" \
-            | tee -a "$GITHUB_OUTPUT"
+            --newest-stable="$newest" | tee -a "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -130,15 +134,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
-          # A prerelease gets the exact-version tags only: never `latest` or the
-          # moving X.Y. The action's own automatic `latest` is off; the raw one
-          # below is the only source.
+          # `latest` and the moving X.Y only for the newest stable release (never
+          # a prerelease). The action's own automatic `latest` is off; the raw
+          # one below is the only source.
           flavor: |
             latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ github.ref_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }},enable=${{ steps.pair.outputs.prerelease == 'false' }}
-            type=raw,value=latest,enable=${{ steps.pair.outputs.prerelease == 'false' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }},enable=${{ steps.pair.outputs.moving == 'true' }}
+            type=raw,value=latest,enable=${{ steps.pair.outputs.moving == 'true' }}
             type=raw,value=engine${{ steps.pins.outputs.engine }}-codegen${{ steps.pins.outputs.codegen }}
             type=sha,format=short
 
@@ -185,7 +189,9 @@ jobs:
           # v0.1.14 stole Latest and downstream resolvers deployed the stale
           # bundle). Mark Latest explicitly iff TAG is the highest STABLE release
           # by semver precedence (coreutils' version sort ranks v1.0.0-rc.1 above v1.0.0).
-          max_tag="$(printf '%s\n' "$TAG" $(gh release list --limit 100 --json tagName -q '.[].tagName') | python3 scripts/release_pair.py latest-tag --stable)"
+          # A failing `gh release list` fails the step (it must not make TAG the max).
+          releases="$(gh release list --limit 100 --json tagName -q '.[].tagName')"
+          max_tag="$(printf '%s\n%s\n' "$TAG" "$releases" | python3 scripts/release_pair.py latest-tag --stable)"
           if [ "$max_tag" = "$TAG" ]; then latest_flag=true; else latest_flag=false; fi
           gh release create "$TAG" --title "$TAG" --verify-tag --notes "$notes" --latest=$latest_flag
 

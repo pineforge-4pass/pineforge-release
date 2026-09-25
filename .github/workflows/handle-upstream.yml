@@ -68,8 +68,9 @@ jobs:
             ''|true|false) ;;
             *) echo "::error::rejected untrusted prerelease '${RAW_PRERELEASE}'"; exit 1 ;;
           esac
-          if [ -n "${RUN_ID:-}" ] && ! printf '%s' "$RUN_ID" | grep -Eq '^[0-9]+$'; then
-            echo "::error::bad run_id '${RUN_ID}'"; exit 1
+          # Whole-value match: grep would accept a multi-line value line by line.
+          if [ -n "${RUN_ID:-}" ] && ! [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::bad run_id"; exit 1
           fi
           # The release rules take X.Y.Z or X.Y.Z-{alpha,beta,rc}.N (one PyPI
           # spelling each); anything else fails here. Emits bare/line/prerelease/pypi.
@@ -117,7 +118,10 @@ jobs:
       # From 1.0.0 on a pair completes only once the OTHER component has
       # published the same version. Each upstream dispatches after its artifacts
       # are up (engine: release tarballs; codegen: PyPI), so the second event of
-      # a pair always finds the first one's.
+      # a pair always finds the first one's. Only that event can complete the
+      # pair, so a probe that cannot tell (anything but 200 or 404) fails the run
+      # (re-run it) instead of waiting. When the version is missing, the
+      # partner's newest release tells a pending pair from a mismatched one.
       - name: Probe the partner release (1.0 line)
         id: partner
         if: steps.in.outputs.line == 'pair'
@@ -125,24 +129,46 @@ jobs:
           COMPONENT: ${{ steps.in.outputs.component }}
           VER:       ${{ steps.in.outputs.version }}
           PYPI:      ${{ steps.in.outputs.pypi }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          base="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${VER}"
-          published=false
-          for i in 1 2 3; do
-            if [ "$COMPONENT" = engine ]; then
-              curl -fsSL "https://pypi.org/pypi/pineforge-codegen/${PYPI}/json" >/dev/null 2>&1 && published=true
-            else
-              curl -fsIL "${base}/pineforge-v${VER}-linux-x86_64.tar.gz" >/dev/null 2>&1 \
-                && curl -fsIL "${base}/pineforge-v${VER}-linux-aarch64.tar.gz" >/dev/null 2>&1 \
-                && published=true
-            fi
-            [ "$published" = true ] && break
-            [ "$i" = 3 ] || sleep 10
+          http() {  # GET|HEAD URL -> final HTTP status (000 = no answer), transient errors retried
+            local head=(); [ "$1" = HEAD ] && head=(-I)
+            curl -sSL "${head[@]}" -o /dev/null -w '%{http_code}' --max-time 30 \
+              --retry 4 --retry-delay 5 --retry-all-errors "$2" 2>/dev/null || true
+          }
+          if [ "$COMPONENT" = engine ]; then
+            partner="codegen ${VER} (PyPI ${PYPI})"
+            codes="$(http GET "https://pypi.org/pypi/pineforge-codegen/${PYPI}/json")"
+          else
+            partner="engine v${VER} tarballs"
+            base="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${VER}"
+            codes="$(http HEAD "${base}/pineforge-v${VER}-linux-x86_64.tar.gz") $(http HEAD "${base}/pineforge-v${VER}-linux-aarch64.tar.gz")"
+          fi
+          published=true
+          for code in $codes; do
+            case "$code" in
+              200) ;;
+              404) published=false ;;
+              *) echo "::error::could not tell whether ${partner} is published (HTTP ${codes}); re-run this job"; exit 1 ;;
+            esac
           done
-          if [ "$COMPONENT" = engine ]; then partner="codegen ${VER} (PyPI ${PYPI})"; else partner="engine v${VER} tarballs"; fi
-          echo "published=$published" >> "$GITHUB_OUTPUT"
-          echo "${partner} published: ${published}"
+          latest=""
+          if [ "$published" = false ]; then
+            if [ "$COMPONENT" = engine ]; then
+              json="$(curl -fsSL --max-time 30 --retry 4 --retry-delay 5 --retry-all-errors https://pypi.org/pypi/pineforge-codegen/json)" \
+                || { echo "::error::could not read codegen's releases from PyPI; re-run this job"; exit 1; }
+              latest="$(printf '%s' "$json" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["releases"]))' \
+                | python3 scripts/release_pair.py latest-pep440)"
+            else
+              tags="$(gh api 'repos/pineforge-4pass/pineforge-engine/releases?per_page=100' -q '.[] | select(.draft | not) | .tag_name')" \
+                || { echo "::error::could not read the engine's releases; re-run this job"; exit 1; }
+              latest="$(printf '%s\n' "$tags" | python3 scripts/release_pair.py latest-tag)"
+              latest="${latest#v}"
+            fi
+          fi
+          { echo "published=$published"; echo "partner_latest=$latest"; } >> "$GITHUB_OUTPUT"
+          echo "${partner} published: ${published}${latest:+ (its newest release: ${latest})}"
 
       - name: Decide action (pairing rule + idempotent + recover half-failed release + downgrade guard)
         id: decide
@@ -153,6 +179,7 @@ jobs:
           EPREV:     ${{ steps.pins.outputs.eprev }}
           CPREV:     ${{ steps.pins.outputs.cprev }}
           PUBLISHED: ${{ steps.partner.outputs.published }}
+          PARTNER_LATEST: ${{ steps.partner.outputs.partner_latest }}
           FORCE:     ${{ github.event.client_payload.force }}
         run: |
           set -euo pipefail
@@ -166,7 +193,7 @@ jobs:
             --component="$COMPONENT" --version="$VER" --prerelease-flag="${PAYLOAD_PRERELEASE:-}" \
             --prev-engine="$EPREV" --prev-codegen="$CPREV" --current-release="$ver" \
             --other-published="${PUBLISHED:-false}" --image-exists="$image" --force="${FORCE:-}" \
-            | tee -a "$GITHUB_OUTPUT"
+            --partner-latest="${PARTNER_LATEST:-}" | tee -a "$GITHUB_OUTPUT"
 
       - name: No-op
         if: steps.decide.outputs.mode == 'noop'
@@ -202,9 +229,20 @@ jobs:
           C:       ${{ steps.decide.outputs.codegen }}
           LINE:    ${{ steps.decide.outputs.line }}
           RELEASE: ${{ steps.decide.outputs.release }}
+          RETAG:   ${{ steps.decide.outputs.retag }}
         run: |
           set -euo pipefail
           git fetch --tags --quiet
+          if [ "$RETAG" = true ]; then
+            # A pair release whose tag push failed: main already carries its
+            # release commit (VERSION = the pair version). Tag that commit.
+            commit="$(git log HEAD --format=%H -n 1 --fixed-strings --grep="chore(release): v${RELEASE} — engine ${E} + codegen ${C}")"
+            [ -n "$commit" ] || { echo "::error::VERSION is ${RELEASE} but main has no release commit for it; refusing to tag"; exit 1; }
+            git tag -a "v${RELEASE}" "$commit" -m "$(printf 'pineforge-release v%s\n\nengine=%s\ncodegen=%s\n' "$RELEASE" "$E" "$C")"
+            git push origin "v${RELEASE}"
+            echo "tagged v${RELEASE} at ${commit} (engine ${E} + codegen ${C}); publish.yml will build + fan out."
+            exit 0
+          fi
           if [ "$LINE" = pair ]; then
             # From 1.0.0 on the release version IS the pair version, prerelease included.
             next="$RELEASE"
