@@ -83,7 +83,9 @@ it after changing either workflow.
   a mismatched pair, and when a 0.x event arrives after a 1.0 pair has landed.
   A probe that cannot reach GitHub or PyPI fails the run instead of waiting; re-run
   it. If a pair's tag push failed after its release commit reached `main`, the next
-  event for that pair tags that commit.
+  event for that pair tags that commit. If both upstreams released but the hub only
+  shows the first event's wait (the partner's dispatch was lost), re-run that
+  waiting run: it probes again and completes the pair.
 - **Prereleases** (`X.Y.Z-alpha.N`, `-beta.N`, `-rc.N`; PyPI spells the codegen
   `X.Y.ZaN`, `X.Y.ZbN`, `X.Y.ZrcN`) are published as a GitHub prerelease that is
   never Latest, with `prerelease: true` downstream.
