@@ -80,8 +80,9 @@ jobs:
       # and the release version is that version: a mismatched pair fails here
       # naming both, before anything is built. The 0.x line keeps independent
       # pins and is stable-only. Emits line, prerelease, codegen_pypi, and
-      # moving (a stable release that is the newest stable tag: `latest` and
-      # X.Y never move backwards, whichever publish run finishes last).
+      # moving (a stable release that is the newest stable tag when this run
+      # starts: re-running an older release never moves `latest` / X.Y back;
+      # two publish runs that overlap can still finish out of order).
       - name: Pairing rule + release channel
         id: pair
         env:

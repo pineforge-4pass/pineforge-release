@@ -145,6 +145,7 @@ jobs:
             base="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${VER}"
             codes="$(http HEAD "${base}/pineforge-v${VER}-linux-x86_64.tar.gz") $(http HEAD "${base}/pineforge-v${VER}-linux-aarch64.tar.gz")"
           fi
+          [ -n "${codes// /}" ] || { echo "::error::no HTTP status for ${partner}; re-run this job"; exit 1; }
           published=true
           for code in $codes; do
             case "$code" in

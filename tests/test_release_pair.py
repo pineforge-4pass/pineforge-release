@@ -268,6 +268,11 @@ class DecidePairTest(unittest.TestCase):
         first = outputs(decide("engine", "v1.0.0-rc.1", self.LEGACY, partner="0.10.4"))
         self.assertEqual(first["mode"], "wait")
 
+    def test_unrecorded_0x_partner_release_is_not_a_1x_mismatch(self):
+        # codegen 0.10.5 shipped but never reached the hub: it cannot be a 1.0 partner.
+        got = outputs(decide("engine", "v1.0.0-rc.1", self.LEGACY, partner="0.10.5"))
+        self.assertEqual(got["mode"], "wait")
+
     def test_half_done_pair_is_tagged_not_bumped_again(self):
         # main got the release commit (VERSION = the pair version) but not the tag.
         first = decide("codegen", "1.0.0-rc.1", self.LEGACY, current="1.0.0-rc.1", other="true")
@@ -283,6 +288,7 @@ class DecidePairTest(unittest.TestCase):
         proc = decide("engine", "v1.0.1", self.FINAL, current="1.0.3", other="true")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("VERSION 1.0.3", proc.stderr)
+        self.assertIn("send an event for 1.0.3 again", proc.stderr)  # the half-done recovery hint
 
     def test_prerelease_flag_must_agree_with_the_version(self):
         for version, flag in [("v1.0.0-rc.1", "false"), ("v1.0.0", "true"), ("v1.0.0", "yes")]:

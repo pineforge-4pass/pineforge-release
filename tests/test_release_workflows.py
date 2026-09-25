@@ -52,6 +52,7 @@ class HandleUpstreamTest(unittest.TestCase):
         self.assertIn("%{http_code}", body)
         self.assertIn("--max-time", body)
         self.assertIn("could not tell whether", body)
+        self.assertIn('[ -n "${codes// /}" ]', body)  # no status at all is not "published"
 
     def test_probe_reads_the_partners_newest_release(self):
         body = _step(self.text, "Probe the partner")

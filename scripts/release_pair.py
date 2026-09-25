@@ -207,7 +207,8 @@ def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
     if not retag:
         if landed_pair and cur != ep:
             raise RuleError(f"VERSION {cur} does not match the landed pair engine {ep} + "
-                            f"codegen {cp}")
+                            f"codegen {cp}; if main carries a release commit for {cur} without "
+                            f"its tag, send an event for {cur} again to tag it")
         if not landed_pair and (cur.line != "legacy" or cur.prerelease):
             raise RuleError(f"VERSION {cur} has no release tag: a pair release is half-done "
                             f"(main carries its commit, tag v{cur} is missing); send an "
@@ -228,7 +229,8 @@ def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
         return out, note
     if partner_latest:
         partner = parse(partner_latest)
-        if partner > other_prev and partner != v:
+        # A 0.x partner release the hub never recorded is not a 1.0 partner.
+        if partner.line == "pair" and partner > other_prev and partner != v:
             pair = f"engine {v} + codegen {partner}" if component == "engine" else \
                 f"engine {partner} + codegen {v}"
             raise RuleError(f"mismatched pair: {pair} are both newer than the landed pair "
