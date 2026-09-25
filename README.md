@@ -65,6 +65,9 @@ pineforge-engine release ───────(engine-release)─┘    bump pin
   (`{release_version, prerelease, run_id}`) to both MCP repos and the app.
 
 The rules live in `scripts/release_pair.py` (unit-tested in `tests/`).
+`tools/release-dry-run/` replays both workflows offline through the 0.x and 1.0
+lines and checks every tag, image tag, release and dispatch they would make; run
+it after changing either workflow.
 
 ## Pairing and prereleases
 

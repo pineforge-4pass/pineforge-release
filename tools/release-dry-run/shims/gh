@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+# Dry-run shim for `gh` (see shim.py): answers from $HARNESS_STATE, never the network.
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import shim  # noqa: E402
+
+sys.exit(shim.main("gh", sys.argv[1:]))
