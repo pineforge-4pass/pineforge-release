@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Wiring checks: the release workflows run scripts/release_pair.py where its
+rules apply and never fall back to an rc-unsafe version sort. Stdlib only."""
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+WORKFLOWS = Path(__file__).resolve().parent.parent / ".github" / "workflows"
+
+
+def _step(text: str, name: str) -> str:
+    """The body of the workflow step whose `- name:` line starts with name."""
+    start = text.index(f"- name: {name}")
+    nxt = text.find("\n      - ", start + 1)
+    return text[start:] if nxt < 0 else text[start:nxt]
+
+
+class HandleUpstreamTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (WORKFLOWS / "handle-upstream.yml").read_text(encoding="utf-8")
+
+    def test_no_rc_unsafe_version_sort_left(self):
+        self.assertNotIn("sort -V", self.text)
+        self.assertNotIn("--sort=-v:refname", self.text)
+
+    def test_validates_the_prerelease_flag_and_the_version(self):
+        body = _step(self.text, "Validate payload")
+        self.assertIn("RAW_PRERELEASE: ${{ github.event.client_payload.prerelease }}", body)
+        self.assertIn("python3 scripts/release_pair.py info", body)
+
+    def test_run_id_is_matched_whole_not_per_line(self):
+        body = _step(self.text, "Validate payload")
+        self.assertIn('[[ "$RUN_ID" =~ ^[0-9]+$ ]]', body)
+        self.assertNotIn("grep -Eq '^[0-9]+$'", body)
+
+    def test_landed_pins_come_from_the_semver_latest_tag(self):
+        body = _step(self.text, "Resolve the landed")
+        self.assertIn("git tag -l 'v*' | python3 scripts/release_pair.py latest-tag", body)
+
+    def test_partner_is_probed_only_on_the_pair_line(self):
+        body = _step(self.text, "Probe the partner")
+        self.assertIn("if: steps.in.outputs.line == 'pair'", body)
+        self.assertIn("pypi.org/pypi/pineforge-codegen/${PYPI}/json", body)
+        self.assertIn("pineforge-v${VER}-linux-aarch64.tar.gz", body)
+
+    def test_probe_tells_missing_from_unreachable(self):
+        # Only the completing event probes; a flaky "no" would stall the pair
+        # green, so anything but 200/404 fails the run instead.
+        body = _step(self.text, "Probe the partner")
+        self.assertIn("%{http_code}", body)
+        self.assertIn("--max-time", body)
+        self.assertIn("could not tell whether", body)
+        self.assertIn('[ -n "${codes// /}" ]', body)  # no status at all is not "published"
+
+    def test_probe_reads_the_partners_newest_release(self):
+        body = _step(self.text, "Probe the partner")
+        self.assertIn("https://pypi.org/pypi/pineforge-codegen/json", body)
+        self.assertIn("python3 scripts/release_pair.py latest-pep440", body)
+        self.assertIn("repos/pineforge-4pass/pineforge-engine/releases", body)
+        self.assertIn('echo "partner_latest=', body)
+
+    def test_decision_is_the_script(self):
+        body = _step(self.text, "Decide action")
+        self.assertIn("python3 scripts/release_pair.py decide", body)
+        self.assertIn('--other-published="${PUBLISHED:-false}"', body)
+        self.assertIn("PARTNER_LATEST: ${{ steps.partner.outputs.partner_latest }}", body)
+        self.assertIn('--partner-latest="${PARTNER_LATEST:-}"', body)
+
+    def test_first_event_of_a_pair_waits_without_building(self):
+        body = _step(self.text, "Wait for the partner")
+        self.assertIn("if: steps.decide.outputs.mode == 'wait'", body)
+        self.assertNotIn("git push", body)
+
+    def test_pair_release_version_is_the_pair_version(self):
+        body = _step(self.text, "Bump VERSION")
+        self.assertIn("if: steps.decide.outputs.mode == 'bump'", body)
+        self.assertIn('if [ "$LINE" = pair ]; then', body)
+        self.assertIn('next="$RELEASE"', body)
+
+    def test_half_done_pair_release_is_tagged_in_place(self):
+        body = _step(self.text, "Bump VERSION")
+        self.assertIn("RETAG:   ${{ steps.decide.outputs.retag }}", body)
+        self.assertIn('if [ "$RETAG" = true ]; then', body)
+        self.assertLess(body.index('if [ "$RETAG" = true ]; then'), body.index('printf \'%s\\n\' "$next" > VERSION'))
+
+
+class PublishTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (WORKFLOWS / "publish.yml").read_text(encoding="utf-8")
+
+    def test_no_rc_unsafe_version_sort_left(self):
+        self.assertNotIn("sort -V", self.text)
+        self.assertNotIn("sort -uV", self.text)
+
+    def test_pins_fallback_on_the_pair_line_is_the_release_version(self):
+        body = _step(self.text, "Read pins")
+        self.assertIn('python3 scripts/release_pair.py info "$REF"', body)
+        self.assertIn('e="${REF#v}"; c="${REF#v}"', body)
+
+    def test_pair_is_checked_before_anything_is_built(self):
+        body = _step(self.text, "Pairing rule")
+        self.assertIn("id: pair", body)
+        self.assertIn("python3 scripts/release_pair.py check", body)
+        self.assertLess(self.text.index("- name: Pairing rule"),
+                        self.text.index("docker/build-push-action"))
+
+    def test_waits_for_codegen_under_its_pypi_spelling(self):
+        body = _step(self.text, "Wait for upstream artifacts")
+        self.assertIn("CP: ${{ steps.pair.outputs.codegen_pypi }}", body)
+        self.assertIn("pypi.org/pypi/pineforge-codegen/${CP}/json", body)
+
+    def test_prerelease_never_gets_latest_or_the_moving_minor_tag(self):
+        # moving = stable AND the newest stable tag: latest / X.Y never go back.
+        stable = "enable=${{ steps.pair.outputs.moving == 'true' }}"
+        body = _step(self.text, "Image metadata")
+        self.assertIn("latest=false", body)
+        self.assertIn(f"type=raw,value=latest,{stable}", body)
+        self.assertIn("type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }},"
+                      + stable, body)
+        self.assertEqual(body.count("value=latest"), 1)
+
+    def test_moving_tags_need_the_newest_stable_tag(self):
+        body = _step(self.text, "Pairing rule")
+        self.assertIn("git tag -l 'v*' | python3 scripts/release_pair.py latest-tag --stable", body)
+        self.assertIn('--newest-stable="$newest"', body)
+
+    def test_github_release_list_failure_is_not_a_latest(self):
+        body = _step(self.text, "GitHub Release")
+        self.assertIn('releases="$(gh release list --exclude-drafts --limit 100 --json tagName -q \'.[].tagName\')"',
+                      body)
+
+    def test_draft_releases_never_hold_latest(self):
+        # GitHub never marks a draft Latest; counting one (say a hand-made
+        # v9.9.9) would keep a new stable release off Latest.
+        body = _step(self.text, "GitHub Release")
+        calls = [ln for ln in body.splitlines()
+                 if "gh release list" in ln and not ln.lstrip().startswith("#")]
+        self.assertTrue(calls)
+        for ln in calls:
+            self.assertIn("--exclude-drafts", ln)
+
+    def test_github_release_channel(self):
+        body = _step(self.text, "GitHub Release")
+        self.assertIn("PRERELEASE: ${{ steps.pair.outputs.prerelease }}", body)
+        self.assertIn("--prerelease --latest=false", body)
+        self.assertIn("python3 scripts/release_pair.py latest-tag --stable", body)
+
+    def test_prerelease_flag_reaches_every_consumer(self):
+        self.assertIn("prerelease: ${{ steps.pair.outputs.prerelease }}", self.text)
+        body = _step(self.text, "Dispatch pineforge-release")
+        self.assertIn("PRERELEASE: ${{ needs.publish.outputs.prerelease }}", body)
+        self.assertIn('-F "client_payload[prerelease]=${PRERELEASE}"', body)
+        self.assertIn("repo: [pineforge-backtest-mcp, pineforge-mcp-public, pineforge-app]",
+                      self.text)
+
+
+class PythonTestGateTest(unittest.TestCase):
+    def test_release_rules_run_in_their_own_job(self):
+        text = (WORKFLOWS / "python-test.yml").read_text(encoding="utf-8")
+        job = text[text.index("\n  release-rules:\n"):]
+        self.assertIn("python3 -m unittest discover -s tests -p 'test_release_*.py' -v", job)
+        fingerprint = text[text.index("\n  fingerprint-canonical:\n"):text.index("\n  release-rules:\n")]
+        self.assertNotIn("test_release_", fingerprint)
+
+
+if __name__ == "__main__":
+    unittest.main()

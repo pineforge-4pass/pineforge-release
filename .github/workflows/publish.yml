@@ -1,8 +1,13 @@
 name: publish
 
-# Build + push the combined pineforge-release image, then fan out to the MCPs.
-# Fires on the v* tag that handle-upstream.yml pushes with the App token (or a
-# manual tag). The tag value equals VERSION (asserted below).
+# Build + push the combined pineforge-release image, then fan out to the MCPs
+# and the app. Fires on the v* tag that handle-upstream.yml pushes with the App
+# token (or a manual tag). The tag value equals VERSION (asserted below).
+# From 1.0.0 on the image pairs engine and codegen at the release version
+# (scripts/release_pair.py check). A prerelease tag (vX.Y.Z-rc.N) is published
+# as a GitHub prerelease with the fixed tags X.Y.Z-rc.N, engine<E>-codegen<C>
+# and sha-<short> only, and sends `prerelease: true` downstream; `latest` and
+# the moving `X.Y` follow the newest stable release only.
 
 on:
   push:
@@ -19,6 +24,8 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.pair.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,7 +39,7 @@ jobs:
           file="$(tr -d '[:space:]' < VERSION)"
           [ "${TAG#v}" = "$file" ] || { echo "::error::tag ${TAG} != VERSION ${file}"; exit 1; }
 
-      - name: Read pins (from the annotated tag message; fallback = resolve latest)
+      - name: Read pins (from the annotated tag message; fallback = the pair version, or resolve latest on 0.x)
         id: pins
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -52,15 +59,41 @@ jobs:
             c="$(git for-each-ref --format='%(contents:body)' "refs/tags/$REF" | sed -n 's/^codegen=//p' | head -1)"
           fi
           if ! semver "$e" || ! semver "$c"; then
-            echo "::warning::tag ${REF} lacks valid engine=/codegen= in its message — resolving latest (manual-tag path)"
-            for i in 1 2 3 4 5; do e="$(gh release view -R pineforge-4pass/pineforge-engine --json tagName -q .tagName 2>/dev/null || true)"; [ -n "$e" ] && break; sleep 5; done
-            e="${e#v}"
-            for i in 1 2 3 4 5; do c="$(curl -fsSL https://pypi.org/pypi/pineforge-codegen/json 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || true)"; [ -n "$c" ] && break; sleep 5; done
+            line="$(python3 scripts/release_pair.py info "$REF" | sed -n 's/^line=//p')"
+            if [ "$line" = pair ]; then
+              # From 1.0.0 on the release version IS the pair version.
+              echo "::warning::tag ${REF} lacks valid engine=/codegen= in its message — using the pair version ${REF#v}"
+              e="${REF#v}"; c="${REF#v}"
+            else
+              echo "::warning::tag ${REF} lacks valid engine=/codegen= in its message — resolving latest (manual-tag path)"
+              for i in 1 2 3 4 5; do e="$(gh release view -R pineforge-4pass/pineforge-engine --json tagName -q .tagName 2>/dev/null || true)"; [ -n "$e" ] && break; sleep 5; done
+              e="${e#v}"
+              for i in 1 2 3 4 5; do c="$(curl -fsSL https://pypi.org/pypi/pineforge-codegen/json 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || true)"; [ -n "$c" ] && break; sleep 5; done
+            fi
           fi
           semver "$e" || { echo "::error::bad engine version '$e'"; exit 1; }
           semver "$c" || { echo "::error::bad codegen version '$c'"; exit 1; }
           { echo "engine=$e"; echo "codegen=$c"; } >> "$GITHUB_OUTPUT"
           echo "pins: engine=$e codegen=$c"
+
+      # From 1.0.0 on engine and codegen share one version, prerelease included,
+      # and the release version is that version: a mismatched pair fails here
+      # naming both, before anything is built. The 0.x line keeps independent
+      # pins and is stable-only. Emits line, prerelease, codegen_pypi, and
+      # moving (a stable release that is the newest stable tag when this run
+      # starts: re-running an older release never moves `latest` / X.Y back;
+      # two publish runs that overlap can still finish out of order).
+      - name: Pairing rule + release channel
+        id: pair
+        env:
+          REF: ${{ github.ref_name }}
+          E: ${{ steps.pins.outputs.engine }}
+          C: ${{ steps.pins.outputs.codegen }}
+        run: |
+          set -euo pipefail
+          newest="$(git tag -l 'v*' | python3 scripts/release_pair.py latest-tag --stable)"
+          python3 scripts/release_pair.py check --release="${REF#v}" --engine="$E" --codegen="$C" \
+            --newest-stable="$newest" | tee -a "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -73,20 +106,23 @@ jobs:
         env:
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
+          CP: ${{ steps.pair.outputs.codegen_pypi }}
         run: |
           set -euo pipefail
           # The Dockerfile builds FROM the engine static-lib tarball (per arch),
           # not a Docker image. Confirm both arch tarballs + the codegen version
           # are published before building (the build fetch fails loud anyway).
+          # PyPI spells a codegen prerelease the PEP 440 way (1.0.0rc1); pip
+          # reads the Dockerfile's ==1.0.0-rc.1 pin as that same version.
           base="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${E}"
           ok=
           for i in $(seq 1 20); do
             if curl -fsIL "${base}/pineforge-v${E}-linux-x86_64.tar.gz"  >/dev/null 2>&1 \
                && curl -fsIL "${base}/pineforge-v${E}-linux-aarch64.tar.gz" >/dev/null 2>&1 \
-               && curl -fsSL "https://pypi.org/pypi/pineforge-codegen/${C}/json" >/dev/null 2>&1; then
+               && curl -fsSL "https://pypi.org/pypi/pineforge-codegen/${CP}/json" >/dev/null 2>&1; then
               ok=1; break
             fi
-            echo "waiting for engine ${E} tarballs + codegen ${C} ... (${i})"
+            echo "waiting for engine ${E} tarballs + codegen ${C} (PyPI ${CP}) ... (${i})"
             sleep 15
           done
           [ -n "$ok" ] || { echo "::error::engine ${E} tarballs or codegen ${C} not available after wait"; exit 1; }
@@ -99,10 +135,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          # `latest` and the moving X.Y only for the newest stable release (never
+          # a prerelease). The action's own automatic `latest` is off; the raw
+          # one below is the only source.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ github.ref_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }}
-            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }},enable=${{ steps.pair.outputs.moving == 'true' }}
+            type=raw,value=latest,enable=${{ steps.pair.outputs.moving == 'true' }}
             type=raw,value=engine${{ steps.pins.outputs.engine }}-codegen${{ steps.pins.outputs.codegen }}
             type=sha,format=short
 
@@ -129,17 +170,30 @@ jobs:
           TAG: ${{ github.ref_name }}
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
+          PRERELEASE: ${{ steps.pair.outputs.prerelease }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2016  # backticks here are literal markdown, not command substitution
           notes="$(printf 'Combined PineScript -> backtest image.\n\nengine %s + codegen %s\n\n```\ndocker pull ghcr.io/pineforge-4pass/pineforge-release:%s\n```\n' "$E" "$C" "${TAG#v}")"
+          if [ "$PRERELEASE" = true ]; then
+            # Never GitHub's "Latest": resolvers that read Latest keep the newest
+            # stable release, and the image has no `latest` / X.Y tag either.
+            # shellcheck disable=SC2016  # literal markdown backticks
+            notes="$(printf '%s\n\nPrerelease: the image has only its fixed tags (this version, engine+codegen, sha); `latest` and X.Y stay on the newest stable release.\n' "$notes")"
+            gh release create "$TAG" --title "$TAG" --verify-tag --notes "$notes" --prerelease --latest=false
+            exit 0
+          fi
           # Semver-aware "Latest": two near-simultaneous upstream releases run
           # handle-upstream serially, but their publish jobs can CREATE the
           # GitHub Releases out of version order, and GitHub's default Latest
           # is creation-ordered (observed 2026-07-12: v0.1.13 created 9s after
           # v0.1.14 stole Latest and downstream resolvers deployed the stale
-          # bundle). Mark Latest explicitly iff TAG is the semver max.
-          max_tag="$(printf '%s\n' "$TAG" $(gh release list --limit 100 --json tagName -q '.[].tagName') | sort -uV | tail -1)"
+          # bundle). Mark Latest explicitly iff TAG is the highest STABLE release
+          # by semver precedence (coreutils' version sort ranks v1.0.0-rc.1 above v1.0.0).
+          # Drafts never hold Latest, so a draft (say a hand-made v9.9.9) must not count.
+          # A failing `gh release list` fails the step (it must not make TAG the max).
+          releases="$(gh release list --exclude-drafts --limit 100 --json tagName -q '.[].tagName')"
+          max_tag="$(printf '%s\n%s\n' "$TAG" "$releases" | python3 scripts/release_pair.py latest-tag --stable)"
           if [ "$max_tag" = "$TAG" ]; then latest_flag=true; else latest_flag=false; fi
           gh release create "$TAG" --title "$TAG" --verify-tag --notes "$notes" --latest=$latest_flag
 
@@ -165,11 +219,18 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ matrix.repo }}
           TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.publish.outputs.prerelease }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+          # Consumers keep a prerelease off their production / latest channels.
+          case "$PRERELEASE" in
+            true|false) ;;
+            *) echo "::error::publish job gave no prerelease flag ('${PRERELEASE}')"; exit 1 ;;
+          esac
           gh api repos/pineforge-4pass/"${REPO}"/dispatches \
             -f event_type=pineforge-release \
             -F "client_payload[release_version]=${TAG#v}" \
+            -F "client_payload[prerelease]=${PRERELEASE}" \
             -F "client_payload[run_id]=${RUN_ID}"
-          echo "dispatched pineforge-release -> ${REPO} (${TAG#v})"
+          echo "dispatched pineforge-release -> ${REPO} (${TAG#v}, prerelease=${PRERELEASE})"
