@@ -57,5 +57,55 @@ class HandleUpstreamTest(unittest.TestCase):
         self.assertIn('next="$RELEASE"', body)
 
 
+class PublishTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (WORKFLOWS / "publish.yml").read_text(encoding="utf-8")
+
+    def test_no_rc_unsafe_version_sort_left(self):
+        self.assertNotIn("sort -V", self.text)
+        self.assertNotIn("sort -uV", self.text)
+
+    def test_pins_fallback_on_the_pair_line_is_the_release_version(self):
+        body = _step(self.text, "Read pins")
+        self.assertIn('python3 scripts/release_pair.py info "$REF"', body)
+        self.assertIn('e="${REF#v}"; c="${REF#v}"', body)
+
+    def test_pair_is_checked_before_anything_is_built(self):
+        body = _step(self.text, "Pairing rule")
+        self.assertIn("id: pair", body)
+        self.assertIn("python3 scripts/release_pair.py check", body)
+        self.assertLess(self.text.index("- name: Pairing rule"),
+                        self.text.index("docker/build-push-action"))
+
+    def test_waits_for_codegen_under_its_pypi_spelling(self):
+        body = _step(self.text, "Wait for upstream artifacts")
+        self.assertIn("CP: ${{ steps.pair.outputs.codegen_pypi }}", body)
+        self.assertIn("pypi.org/pypi/pineforge-codegen/${CP}/json", body)
+
+    def test_prerelease_never_gets_latest_or_the_moving_minor_tag(self):
+        stable = "enable=${{ steps.pair.outputs.prerelease == 'false' }}"
+        body = _step(self.text, "Image metadata")
+        self.assertIn("latest=false", body)
+        self.assertIn(f"type=raw,value=latest,{stable}", body)
+        self.assertIn("type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }},"
+                      + stable, body)
+        self.assertEqual(body.count("value=latest"), 1)
+
+    def test_github_release_channel(self):
+        body = _step(self.text, "GitHub Release")
+        self.assertIn("PRERELEASE: ${{ steps.pair.outputs.prerelease }}", body)
+        self.assertIn("--prerelease --latest=false", body)
+        self.assertIn("python3 scripts/release_pair.py latest-tag --stable", body)
+
+    def test_prerelease_flag_reaches_every_consumer(self):
+        self.assertIn("prerelease: ${{ steps.pair.outputs.prerelease }}", self.text)
+        body = _step(self.text, "Dispatch pineforge-release")
+        self.assertIn("PRERELEASE: ${{ needs.publish.outputs.prerelease }}", body)
+        self.assertIn('-F "client_payload[prerelease]=${PRERELEASE}"', body)
+        self.assertIn("repo: [pineforge-backtest-mcp, pineforge-mcp-public, pineforge-app]",
+                      self.text)
+
+
 if __name__ == "__main__":
     unittest.main()
