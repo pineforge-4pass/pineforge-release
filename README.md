@@ -14,6 +14,64 @@ docker run --rm \
   ghcr.io/pineforge-4pass/pineforge-release > report.json
 ```
 
+- **`strategy.pine`** — a PineScript v6 strategy (`//@version=6`; any other
+  version is rejected with exit code 5).
+- **`ohlcv.csv`** — a header row `timestamp,open,high,low,close,volume`, then one
+  bar per row; `timestamp` is UNIX milliseconds (UTC).
+- **stdout** is the JSON report (`summary`, `trades`, `metrics`, `equity_curve`,
+  `fingerprint`, ...); progress lines go to stderr, so the redirect above stays clean.
+
+A minimal strategy to try it with (any hourly or daily OHLCV file works):
+
+```pine
+//@version=6
+strategy("EMA cross", overlay=true)
+fast = ta.ema(close, 9)
+slow = ta.ema(close, 21)
+if ta.crossover(fast, slow)
+    strategy.entry("L", strategy.long)
+if ta.crossunder(fast, slow)
+    strategy.close("L")
+```
+
+```
+jq '.summary' report.json      # total_trades, wins, losses, net_pnl, max_drawdown, ...
+```
+
+`latest` is the newest stable release; pin one with `:X.Y.Z` (see
+[Image tags](#image-tags)). The image is multi-arch (`linux/amd64`, `linux/arm64`).
+
+### Knobs, modes and exit codes
+
+The entrypoint (`docker/entrypoint.sh`) is configured by mounts and `-e` variables:
+
+| Input | Effect |
+|-------|--------|
+| `/in/strategy.pine` | PineScript v6 source, transpiled in the container (preferred). |
+| `/in/strategy.cpp` | A pre-transpiled translation unit, used when there is no `.pine`. Provide exactly one of the two. |
+| `-e PINEFORGE_TRANSPILE_ONLY=1` | Transpile `/in/strategy.pine` and print the C++ on stdout; no compile, no backtest, no OHLCV needed. |
+| `-e PINEFORGE_INPUTS='{"Fast Length": "8"}'` | `input.*()` name → value overrides. |
+| `-e PINEFORGE_OVERRIDES='{"default_qty_value": "5"}'` | `strategy()` header overrides (`initial_capital`, `commission_value`, `pyramiding`, ...). |
+| `-e PINEFORGE_INPUT_TF`, `PINEFORGE_SCRIPT_TF` | Chart and strategy timeframe (`1`, `5`, `15`, `60`, `D`, ...). Unset input timeframe = detected from the bar timestamps; the script timeframe must be coarser than or equal to it. |
+| `-e PINEFORGE_BAR_MAGNIFIER`, `PINEFORGE_MAGNIFIER_SAMPLES`, `PINEFORGE_MAGNIFIER_DIST` | Bar magnifier switch (`true`/`false`, default `false`), sub-bar sample count (≥ 2, default 4) and distribution (`uniform`, `cosine`, `triangle`, `endpoints` (default), `front_loaded`, `back_loaded`). |
+| `-e PINEFORGE_TRADE_START_MS`, `PINEFORGE_CHART_TZ`, `PINEFORGE_MAGNIFIER_VOLUME_WEIGHTED`, `PINEFORGE_SYMINFO`, `PINEFORGE_BENCH` (+ `_WARMUP`, `_REPEATS`) | Optional run knobs; the comments in `docker/entrypoint.sh` say what each does. |
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Success (JSON report on stdout, or C++ in transpile-only mode). |
+| `2` | A required input mount is missing. |
+| `3` | The generated C++ failed to compile. |
+| `4` | The backtest failed; a structured `{"engine":"pineforge","error":"..."}` is printed on stdout (for example when `PINEFORGE_SCRIPT_TF` is finer than `PINEFORGE_INPUT_TF`). |
+| `5` | The transpile failed (unsupported construct, syntax error or a script that is not PineScript v6). |
+
+To see what a given image contains, read its labels (or the `PINEFORGE_*`
+variables listed under [Why this repo exists](#why-this-repo-exists)):
+
+```
+docker inspect --format '{{ index .Config.Labels "io.pineforge.engine.version" }} {{ index .Config.Labels "io.pineforge.codegen.version" }}' \
+  ghcr.io/pineforge-4pass/pineforge-release:latest      # e.g. "0.13.1 0.10.4"
+```
+
 ## Why this repo exists
 
 The engine (the C++ runtime) and the transpiler (`pineforge-codegen`) are
@@ -39,7 +97,8 @@ as build-args with no defaults.
 The combined image also carries `io.pineforge.engine.version` /
 `io.pineforge.codegen.version` labels and the
 `PINEFORGE_ENGINE_VERSION` / `PINEFORGE_CODEGEN_VERSION` / `PINEFORGE_RELEASE_VERSION`
-env vars so consumers can read exactly what is inside.
+env vars so consumers can read exactly what is inside (`PINEFORGE_RELEASE_VERSION`
+is the release tag, with its `v`: `v0.1.25`).
 
 ## Automated release flow
 
@@ -51,8 +110,8 @@ pineforge-engine release ───────(engine-release)─┘    bump pin
                                                           build+push image
                                                           → dispatch (pineforge-release)
                                                             → pineforge-backtest-mcp
-                                                            → pineforge-mcp-public
-                                                            → pineforge-app
+                                                            → pineforge-mcp-public (private)
+                                                            → pineforge-app (private)
 ```
 
 - `handle-upstream.yml` — receives `repository_dispatch` from engine / codegen-oss
@@ -67,9 +126,19 @@ pineforge-engine release ───────(engine-release)─┘    bump pin
 The rules live in `scripts/release_pair.py` (unit-tested in `tests/`).
 `tools/release-dry-run/` replays both workflows offline through the 0.x and 1.0
 lines and checks every tag, image tag, release and dispatch they would make; run
-it after changing either workflow.
+it after changing either workflow:
+
+```
+python3 -m unittest discover -s tests -p 'test_release_*.py'   # the release rules
+python3 tools/release-dry-run/dry_run.py                       # needs bash >= 4.4, jq, node, PyYAML: see its README
+```
 
 ## Pairing and prereleases
+
+> **Status.** The 1.0 pairing rules below are on `main` and pass the offline
+> dry run, but no 1.0.0 (or prerelease) pair has been released yet: every
+> release published so far, up to `v0.1.25`, is on the 0.x line. Read the
+> Releases page for the newest pair.
 
 - **0.x** — an upstream event moves its own component's pin; the other stays at
   the last release, and `VERSION` gets a patch bump. The 0.x line is stable-only.
@@ -106,12 +175,25 @@ only.
 
 ## License
 
-Apache-2.0.
+The files in this repository (Dockerfile, entrypoint, scripts, workflows, tests)
+are Apache-2.0: see [LICENSE](LICENSE). The image bundles software under its own
+terms, so that licence does not cover the whole image:
+
+- **`pineforge-engine`** (`libpineforge.a` and headers): Apache-2.0, with Eigen
+  under MPL-2.0 — see the engine's
+  [`LEGAL.md`](https://github.com/pineforge-4pass/pineforge-engine/blob/main/LEGAL.md).
+- **`pineforge-codegen`** (the transpiler): source-available under the PolyForm
+  Noncommercial License 1.0.0 with a Personal Trading exception. Companies,
+  funds, embedding in a product and hosted or public-facing services need a
+  commercial licence — see its
+  [`LICENSE`](https://github.com/pineforge-4pass/pineforge-codegen-oss/blob/main/LICENSE)
+  and [`LEGAL.md`](https://github.com/pineforge-4pass/pineforge-codegen-oss/blob/main/LEGAL.md).
+- **Debian base image, g++, Eigen and Python**: their upstream licences.
 
 ## Harness / engine ABI
 
 `docker/run_json.py` is the engine's harness, vendored from the pinned
-`pineforge-engine` tag (`scripts/sync-harness.sh <engine-version>`; the
-upstream-release workflow runs the same sync when it bumps the engine pin).
+`pineforge-engine` tag (`scripts/sync-harness.sh <engine-version>`; `handle-upstream.yml`
+fetches the same file for the engine version it releases).
 The Dockerfile refuses to build when the harness `EXPECTED_PF_ABI` differs from
 `PF_ABI_VERSION` in the bundled engine headers.
