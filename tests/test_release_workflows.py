@@ -142,6 +142,17 @@ class PublishTest(unittest.TestCase):
         for ln in calls:
             self.assertIn("--exclude-drafts", ln)
 
+    def test_licences_label_covers_the_bundled_transpiler(self):
+        # docker/metadata-action's labels override the Dockerfile's, and it
+        # derives org.opencontainers.image.licenses from the repository's
+        # Apache-2.0, so publish.yml must set the label itself.
+        expr = "Apache-2.0 AND LicenseRef-PolyForm-Noncommercial-1.0.0-Personal-Trading"
+        body = _step(self.text, "Image metadata")
+        self.assertIn(f"org.opencontainers.image.licenses={expr}\n", body)
+        self.assertIn("labels: ${{ steps.meta.outputs.labels }}", self.text)
+        dockerfile = (WORKFLOWS.parent.parent / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(f'org.opencontainers.image.licenses="{expr}"', dockerfile)
+
     def test_github_release_channel(self):
         body = _step(self.text, "GitHub Release")
         self.assertIn("PRERELEASE: ${{ steps.pair.outputs.prerelease }}", body)
