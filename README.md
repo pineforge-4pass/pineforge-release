@@ -189,8 +189,8 @@ terms, so that licence does not cover the whole image:
   and [`LEGAL.md`](https://github.com/pineforge-4pass/pineforge-codegen-oss/blob/main/LEGAL.md).
 - **Debian base image, g++, Eigen and Python**: their upstream licences.
 
-The image's `org.opencontainers.image.licenses` label names the PineForge
-components:
+The image's `org.opencontainers.image.licenses` label names the licences of the
+PineForge components:
 `Apache-2.0 AND LicenseRef-PolyForm-Noncommercial-1.0.0-Personal-Trading`,
 Apache-2.0 for the engine and this repository's files, and a `LicenseRef` for
 the transpiler's LICENSE, which is the PolyForm Noncommercial License 1.0.0 as
