@@ -103,12 +103,13 @@ try:
 except ImportError:  # pragma: no cover
     _ilmd = None
 
-# Canonical strategy() defaults. Mirrors the engine base-class defaults in
-# include/pineforge/engine.hpp (initial_capital_, process_orders_on_close_,
-# default_qty_type_, default_qty_value_, pyramiding_, commission_type_,
-# commission_value_, slippage_, close_entries_rule_any_). The codegen ctor
-# emits only a subset (it omits process_orders_on_close + close_entries_rule),
-# so this seed supplies the rest. KEEP IN SYNC with engine.hpp.
+# Canonical strategy() defaults: the member defaults of
+# source::PineStrategyConfig (include/pineforge/source/pine_adapter.hpp),
+# which a generated constructor fills and hands to configure_pine_strategy.
+# The constructor declares only what the script (or, for Pine v6, TradingView's
+# default) sets -- a script that omits process_orders_on_close or
+# close_entries_rule leaves them to the struct -- so this seed supplies the
+# rest. KEEP IN SYNC with PineStrategyConfig.
 STRATEGY_SEED = {
     "initial_capital": 1000000.0,
     "process_orders_on_close": False,
@@ -125,10 +126,27 @@ _QTY_TYPE = {"FIXED": "fixed", "PERCENT_OF_EQUITY": "percent_of_equity", "CASH":
 _COMM_TYPE = {"PERCENT": "percent", "CASH_PER_ORDER": "cash_per_order",
               "CASH_PER_CONTRACT": "cash_per_contract"}
 
-# generated.cpp ctor field name -> provenance key.
+# PineStrategyConfig member -> provenance key: the generated constructor's
+# `cfg.<member> = <value>;` lines (pineforge-codegen since R4-C).
+_CFG_FIELD_KEY = {
+    "initial_capital": "initial_capital",
+    "process_orders_on_close": "process_orders_on_close",
+    "default_qty_type": "default_qty_type",
+    "default_qty_value": "default_qty_value",
+    "pyramiding": "pyramiding",
+    "commission_type": "commission_type",
+    "commission_value": "commission_value",
+    "slippage": "slippage",
+    "close_entries_rule_any": "close_entries_rule",
+}
+_QTY_TYPE_INDEX = {0: "fixed", 1: "percent_of_equity", 2: "cash"}
+_COMM_TYPE_INDEX = {0: "percent", 1: "cash_per_order", 2: "cash_per_contract"}
+_CFG_DECL_RE = re.compile(r"\bPineStrategyConfig\s+(\w+)\s*(?:\{\s*\}|\(\s*\))?\s*;")
+
+# Pre-R4-C generated.cpp ctor member write -> provenance key.
 _STRAT_FIELD_KEY = {
     "initial_capital_": "initial_capital",
-    "process_orders_on_close_": "process_orders_on_close",
+    "process" + "_orders_on_close_": "process_orders_on_close",
     "default_qty_type_": "default_qty_type",
     "default_qty_value_": "default_qty_value",
     "pyramiding_": "pyramiding",
@@ -202,23 +220,43 @@ def _unwrap_std_string(expr: str) -> str:
     return m.group(1).strip() if m else expr
 
 
+def _strategy_value(key: str, rhs: str):
+    """One declared strategy() value as the provenance spells it. The generated
+    constructor stores PineStrategyConfig's enum members as int
+    (`static_cast<int>(QtyType::FIXED)`); a pre-R4-C one assigned the enum."""
+    rhs = rhs.strip()
+    cast = re.fullmatch(r"static_cast<\s*\w+\s*>\((.*)\)", rhs, re.DOTALL)
+    if cast:
+        rhs = cast.group(1).strip()
+    if key in ("default_qty_type", "commission_type"):
+        names, index = ((_QTY_TYPE, _QTY_TYPE_INDEX) if key == "default_qty_type"
+                        else (_COMM_TYPE, _COMM_TYPE_INDEX))
+        value = _coerce_scalar(rhs)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return index.get(value, rhs)
+        return names.get(rhs.split("::")[-1], rhs)
+    if key == "close_entries_rule":
+        return "ANY" if _coerce_scalar(rhs) is True else "FIFO"
+    return _coerce_scalar(rhs)
+
+
 def parse_strategy_params(cpp_text: str) -> dict:
-    """Parse strategy() header defaults from the constructor body only."""
+    """Parse strategy() header defaults from the constructor body only: the
+    PineStrategyConfig the generated constructor fills (`cfg.<member> = ...;`),
+    or a pre-R4-C constructor's member writes (`<member>_ = ...;`)."""
     out: dict = {}
     body = _ctor_body(cpp_text)
+    decl = _CFG_DECL_RE.search(body)
+    if decl:
+        field = re.compile(r"\b" + re.escape(decl.group(1)) + r"\.(\w+)\s*=\s*([^;]+);")
+        for fld, rhs in field.findall(body):
+            key = _CFG_FIELD_KEY.get(fld)
+            if key:
+                out[key] = _strategy_value(key, rhs)
     for fld, rhs in re.findall(r"(\w+_)\s*=\s*([^;]+);", body):
         key = _STRAT_FIELD_KEY.get(fld)
-        if not key:
-            continue
-        rhs = rhs.strip()
-        if fld == "default_qty_type_":
-            out[key] = _QTY_TYPE.get(rhs.split("::")[-1], rhs)
-        elif fld == "commission_type_":
-            out[key] = _COMM_TYPE.get(rhs.split("::")[-1], rhs)
-        elif fld == "close_entries_rule_any_":
-            out[key] = "ANY" if _coerce_scalar(rhs) is True else "FIFO"
-        else:
-            out[key] = _coerce_scalar(rhs)
+        if key:
+            out[key] = _strategy_value(key, rhs)
     return out
 
 
@@ -611,7 +649,10 @@ class EquityStatsC(ctypes.Structure):
         ("max_equity_drawdown", ctypes.c_double), ("max_equity_drawdown_pct", ctypes.c_double),
         ("max_equity_runup", ctypes.c_double), ("max_equity_runup_pct", ctypes.c_double),
         ("buy_hold_return", ctypes.c_double), ("buy_hold_return_pct", ctypes.c_double),
-        ("sharpe_tv", ctypes.c_double), ("sortino_tv", ctypes.c_double),
+        # The C field names. _stats_dict writes these two under their JSON
+        # report keys sharpe_tv / sortino_tv (ADR-0001, "Deprecated public
+        # spellings"), so the report schema does not change.
+        ("sharpe_monthly", ctypes.c_double), ("sortino_monthly", ctypes.c_double),
         ("sharpe_bar", ctypes.c_double), ("sortino_bar", ctypes.c_double),
         ("cagr", ctypes.c_double), ("calmar", ctypes.c_double),
         ("recovery_factor", ctypes.c_double), ("time_in_market_pct", ctypes.c_double),
@@ -676,6 +717,8 @@ class ReportC(ctypes.Structure):
         ("metrics",                      MetricsC),
         ("equity_curve",                 ctypes.POINTER(EquityPointC)),
         ("equity_curve_len",             ctypes.c_int64),  # int64, NOT c_int
+        ("broker_state_hash",            ctypes.POINTER(ctypes.c_uint64)),
+        ("broker_state_hash_len",        ctypes.c_int64),
     ]
 
 
@@ -704,7 +747,10 @@ def engine_version(lib: ctypes.CDLL) -> dict:
 
 # pf_report_t is CALLER-allocated: a .so built against a different ABI
 # writes past (or short of) our ReportC buffer. Assert version up front.
-EXPECTED_PF_ABI = 3
+# v4 appended the live-runtime accessors and grew pf_report_t with the
+# broker_state_hash array after equity_curve_len (ReportC above already
+# carries both fields).
+EXPECTED_PF_ABI = 4
 
 
 def check_abi(lib: ctypes.CDLL) -> None:
@@ -834,14 +880,23 @@ def _num(x):
     return f if math.isfinite(f) else None
 
 
+# The JSON report keys of pf_equity_stats_t's two monthly ratios. They are
+# report-schema names: the C fields are sharpe_monthly / sortino_monthly (their
+# pre-1.0 spellings were removed for 1.0), the keys did not change (ADR-0001,
+# "Deprecated public spellings").
+EQUITY_REPORT_KEYS = {"sharpe_monthly": "sharpe_tv", "sortino_monthly": "sortino_tv"}
+
+
 def _stats_dict(s) -> dict:
     """Serialize a pf_trade_stats_t / pf_equity_stats_t ctypes struct to a dict,
     keying off each field's ctype: integer counters stay ints, every double is
-    sanitized through _num. Driven by _fields_ so it tracks the struct verbatim."""
+    sanitized through _num. Driven by _fields_ so it tracks the struct verbatim;
+    an equity struct's two monthly ratios take their EQUITY_REPORT_KEYS."""
+    keys = EQUITY_REPORT_KEYS if isinstance(s, EquityStatsC) else {}
     out = {}
     for name, ctype in s._fields_:
         v = getattr(s, name)
-        out[name] = _num(v) if ctype is ctypes.c_double else int(v)
+        out[keys.get(name, name)] = _num(v) if ctype is ctypes.c_double else int(v)
     return out
 
 
