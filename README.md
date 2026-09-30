@@ -69,7 +69,7 @@ variables listed under [Why this repo exists](#why-this-repo-exists)):
 
 ```
 docker inspect --format '{{ index .Config.Labels "io.pineforge.engine.version" }} {{ index .Config.Labels "io.pineforge.codegen.version" }}' \
-  ghcr.io/pineforge-4pass/pineforge-release:latest      # e.g. "0.13.1 0.10.4"
+  ghcr.io/pineforge-4pass/pineforge-release:latest      # e.g. "1.0.0 1.0.0"
 ```
 
 ## Why this repo exists
@@ -98,7 +98,7 @@ The combined image also carries `io.pineforge.engine.version` /
 `io.pineforge.codegen.version` labels and the
 `PINEFORGE_ENGINE_VERSION` / `PINEFORGE_CODEGEN_VERSION` / `PINEFORGE_RELEASE_VERSION`
 env vars so consumers can read exactly what is inside (`PINEFORGE_RELEASE_VERSION`
-is the release tag, with its `v`: `v0.1.25`).
+is the release tag, with its `v`: `v1.0.0`).
 
 ## Automated release flow
 
@@ -135,10 +135,9 @@ python3 tools/release-dry-run/dry_run.py                       # needs bash >= 4
 
 ## Pairing and prereleases
 
-> **Status.** The 1.0 pairing rules below are on `main` and pass the offline
-> dry run, but no 1.0.0 (or prerelease) pair has been released yet: every
-> release published so far, up to `v0.1.25`, is on the 0.x line. Read the
-> Releases page for the newest pair.
+> **Status.** The 1.0 line started on 2026-09-30: prerelease `v1.0.0-rc.1`,
+> then `v1.0.0` (engine 1.0.0 + codegen 1.0.0). The 0.x line ended at
+> `v0.1.25`. Read the Releases page for the newest pair.
 
 - **0.x** — an upstream event moves its own component's pin; the other stays at
   the last release, and `VERSION` gets a patch bump. The 0.x line is stable-only.
