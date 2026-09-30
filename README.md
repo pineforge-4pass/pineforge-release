@@ -189,6 +189,14 @@ terms, so that licence does not cover the whole image:
   and [`LEGAL.md`](https://github.com/pineforge-4pass/pineforge-codegen-oss/blob/main/LEGAL.md).
 - **Debian base image, g++, Eigen and Python**: their upstream licences.
 
+The image's `org.opencontainers.image.licenses` label is
+`Apache-2.0 AND LicenseRef-PolyForm-Noncommercial-1.0.0-Personal-Trading`:
+Apache-2.0 for the engine and this repository's files, and a `LicenseRef` for
+the transpiler's LICENSE, which is the PolyForm Noncommercial License 1.0.0 as
+modified by its Personal Trading and Commercial Use sections (so not the SPDX
+`PolyForm-Noncommercial-1.0.0` text). Images up to 1.0.0 carry `Apache-2.0` in
+that label.
+
 ## Harness / engine ABI
 
 `docker/run_json.py` is the engine's harness, vendored from the pinned

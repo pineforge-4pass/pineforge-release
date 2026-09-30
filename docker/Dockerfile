@@ -71,7 +71,7 @@ LABEL org.opencontainers.image.title="pineforge-release" \
       org.opencontainers.image.revision="${RELEASE_GIT_SHA}" \
       org.opencontainers.image.created="${RELEASE_BUILD_DATE}" \
       org.opencontainers.image.source="https://github.com/pineforge-4pass/pineforge-release" \
-      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-PolyForm-Noncommercial-1.0.0-Personal-Trading" \
       io.pineforge.engine.version="${ENGINE_VERSION}" \
       io.pineforge.codegen.version="${CODEGEN_VERSION}"
 

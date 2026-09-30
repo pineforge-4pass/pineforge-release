@@ -146,6 +146,12 @@ jobs:
             type=raw,value=latest,enable=${{ steps.pair.outputs.moving == 'true' }}
             type=raw,value=engine${{ steps.pins.outputs.engine }}-codegen${{ steps.pins.outputs.codegen }}
             type=sha,format=short
+          # The action derives the licences label from this repository's
+          # Apache-2.0, and its labels override the Dockerfile's. The image also
+          # bundles the transpiler, whose LICENSE is PolyForm Noncommercial
+          # 1.0.0 as modified by its own sections (see README, License).
+          labels: |
+            org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-PolyForm-Noncommercial-1.0.0-Personal-Trading
 
       - name: Build + push (multi-arch)
         uses: docker/build-push-action@v6
