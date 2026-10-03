@@ -32,6 +32,38 @@
       "minimal": 0,
       "no-trades": 0
     },
+    "scopes": {
+      "corpus": {
+        "graded": 309,
+        "excellent": 309,
+        "strong": 0,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 309,
+          "strong": 0,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        }
+      },
+      "closed": {
+        "graded": 7680,
+        "excellent": 7637,
+        "strong": 43,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7637,
+          "strong": 43,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        }
+      }
+    },
     "excellentPct": 99.46,
     "strongPct": 0.54,
     "excellentOrStrongPct": 100,
@@ -386,6 +418,38 @@
           "weak": 0,
           "minimal": 0,
           "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7596,
+            "strong": 84,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7596,
+              "strong": 84,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
         },
         "excellentPct": 98.95,
         "strongPct": 1.05,
