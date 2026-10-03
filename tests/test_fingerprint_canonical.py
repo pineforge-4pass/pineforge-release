@@ -82,6 +82,247 @@ def _load_runtime():
     return mod
 
 
+SYMINFO_SETTERS = (
+    "strategy_set_syminfo_metadata",
+    "strategy_set_syminfo_mintick",
+    "strategy_set_syminfo_pointvalue",
+    "strategy_set_syminfo_timezone",
+    "strategy_set_syminfo_session",
+)
+
+
+class _FakeLib:
+    """A strategy library stand-in: each named symbol is a function that
+    records (name, *args); absent names fail hasattr like a missing export."""
+
+    def __init__(self, names, returns=None):
+        self.calls = []
+        for name in names:
+            setattr(self, name, self._fn(name, (returns or {}).get(name)))
+
+    def _fn(self, name, result):
+        def call(*args):
+            self.calls.append((name,) + args)
+            return result
+        return call
+
+
+def _run_main(runtime, lib, argv):
+    """runtime.main() against a fake library; returns (exit status, stdout)."""
+    import contextlib
+    import io
+    saved_cdll, saved_argv = ctypes.CDLL, sys.argv
+    ctypes.CDLL = lambda path: lib
+    sys.argv = ["run_json.py"] + argv
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            status = runtime.main()
+    finally:
+        ctypes.CDLL, sys.argv = saved_cdll, saved_argv
+    return status, out.getvalue()
+
+
+def _syminfo_checks(check, runtime, td: Path) -> None:
+    def write(name, doc):
+        p = td / name
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        return p
+
+    four = {"mintick": 0.5, "pointvalue": 2, "timezone": "UTC", "session": "24x7"}
+    st = 7
+    rest = [("strategy_set_syminfo_mintick", st, 0.5),
+            ("strategy_set_syminfo_pointvalue", st, 2.0),
+            ("strategy_set_syminfo_timezone", st, b"UTC"),
+            ("strategy_set_syminfo_session", st, b"24x7")]
+
+    syminfo_error = getattr(runtime, "SyminfoError", None)
+    check("SyminfoError is a ValueError",
+          isinstance(syminfo_error, type) and issubclass(syminfo_error, ValueError))
+    syminfo_error = syminfo_error or ()
+
+    for label, doc, lot in (
+            ("flat", dict(four, mincontract=0.25), 0.25),
+            ("wrapped", {"syminfo": dict(four, mincontract=1e-05)}, 1e-05),
+            ("integer", dict(four, mincontract=1), 1.0)):
+        lib = _FakeLib(SYMINFO_SETTERS)
+        got = runtime.apply_syminfo(lib, st, write(f"grid-{label}.json", doc))
+        check(f"mincontract ({label}) sets qty_step then mincontract, before the other four",
+              lib.calls == [("strategy_set_syminfo_metadata", st, b"qty_step", lot),
+                            ("strategy_set_syminfo_metadata", st, b"mincontract", lot)]
+              + rest)
+        check(f"mincontract ({label}) passes doubles",
+              all(len(c) > 3 and type(c[3]) is float for c in lib.calls[:2]))
+        check(f"mincontract ({label}) returns the applied grid",
+              got == {"qty_step": lot, "mincontract": lot})
+
+    for label, doc in (("absent", dict(four)), ("null", dict(four, mincontract=None)),
+                       ("wrapped null", {"syminfo": dict(four, mincontract=None)})):
+        lib = _FakeLib(SYMINFO_SETTERS)
+        got = runtime.apply_syminfo(lib, st, write("nogrid.json", doc))
+        check(f"mincontract {label}: no metadata call, the four setters as before",
+              lib.calls == rest and got == {})
+
+    # Raw JSON text of a rejected mincontract -> the value as the message shows
+    # it: its JSON text, cut to 80 characters.
+    huge_int = "1" + "0" * 400
+    long_str = '"' + "x" * 1000 + '"'
+    bad_values = (("0", "0", "0"), ("-1", "-1", "-1"), ("-0.0", "-0.0", "-0.0"),
+                  ("1e-400", "0.0", "1e-400 (parses to 0.0)"),
+                  ('"0.001"', '"0.001"', '"0.001"'), ("true", "true", "true"),
+                  ("false", "false", "false"), ("NaN", "NaN", "NaN"),
+                  ("Infinity", "Infinity", "Infinity"),
+                  ("-Infinity", "-Infinity", "-Infinity"), ("[]", "[]", "[]"),
+                  ("{}", "{}", "{}"), (huge_int, huge_int[:80], "an int beyond binary64"),
+                  (long_str, long_str[:80], "a 1000-character string"))
+    for raw, shown, label in bad_values:
+        bad = td / "bad.json"
+        bad.write_text(json.dumps(four)[:-1] + ', "mincontract": ' + raw + "}",
+                       encoding="utf-8")
+        lib = _FakeLib(SYMINFO_SETTERS)
+        try:
+            runtime.apply_syminfo(lib, st, bad)
+            raised = None
+        except syminfo_error as e:
+            raised = str(e)
+        check(f"mincontract {label} raises SyminfoError, no setter called",
+              raised == "syminfo.mincontract must be a positive finite number, got " + shown
+              and lib.calls == [])
+
+    no_meta = tuple(n for n in SYMINFO_SETTERS if n != "strategy_set_syminfo_metadata")
+    lib = _FakeLib(no_meta)
+    try:
+        runtime.apply_syminfo(lib, st, write("grid.json", dict(four, mincontract=0.25)))
+        raised = None
+    except syminfo_error as e:
+        raised = str(e)
+    check("valid mincontract without the metadata setter raises, no setter called",
+          raised is not None and "strategy_set_syminfo_metadata" in raised
+          and lib.calls == [])
+    for label, doc in (("absent", dict(four)), ("null", dict(four, mincontract=None))):
+        lib = _FakeLib(no_meta)
+        got = runtime.apply_syminfo(lib, st, write("nogrid.json", doc))
+        check(f"mincontract {label} without the metadata setter still succeeds",
+              lib.calls == rest and got == {})
+
+    # The grid apply_syminfo returns, recorded as main() does, is in the token bytes.
+    grid = runtime.apply_syminfo(_FakeLib(SYMINFO_SETTERS), st,
+                                 write("g.json", dict(four, mincontract=0.25)))
+    sha = "b" * 64
+    base_rt = {"input_tf": "", "chart_tz": "", "trade_start_ms": None}
+    gridded_rt = dict(base_rt)
+    if isinstance(grid, dict) and grid:
+        gridded_rt["syminfo"] = grid
+    plain = runtime.build_fingerprint(runtime.build_provenance(
+        {}, None, False, {}, {}, dict(base_rt), source_feed_sha256=sha))
+    gridded = runtime.build_fingerprint(runtime.build_provenance(
+        {}, None, False, {}, {}, gridded_rt, source_feed_sha256=sha))
+    check("an applied grid changes the fingerprint digest",
+          plain["digest"] != gridded["digest"]
+          and b"syminfo" not in base64.b64decode(plain["token"])
+          and b'"syminfo":{"mincontract":0.25,"qty_step":0.25}'
+          in base64.b64decode(gridded["token"]))
+
+    # load_strategy declares the metadata setter's C signature.
+    abi = {"pf_abi_version": runtime.EXPECTED_PF_ABI}
+    core = ("pf_abi_version", "strategy_create", "strategy_set_input",
+            "strategy_set_override", "run_backtest_full", "strategy_free",
+            "report_free")
+    saved = ctypes.CDLL
+    ctypes.CDLL = lambda path: _FakeLib(core + SYMINFO_SETTERS, abi)
+    try:
+        lib = runtime.load_strategy(Path("fake.so"))
+    finally:
+        ctypes.CDLL = saved
+    meta = lib.strategy_set_syminfo_metadata
+    check("load_strategy declares strategy_set_syminfo_metadata(void*, char*, double) -> void",
+          getattr(meta, "argtypes", None)
+          == [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double]
+          and getattr(meta, "restype", "unset") is None)
+
+    # main(): the grid reaches applied_runtime and the fingerprint; a gridless
+    # run is unchanged; a rejected mincontract is the structured failure.
+    tape = td / "tape.csv"
+    tape.write_text("open,high,low,close,volume,timestamp\n"
+                    "1,2,0.5,1.5,10,1000\n1.5,3,1,2.5,20,2000\n", encoding="utf-8")
+    base = ["--so", "fake.so", "--ohlcv", str(tape)]
+    grid_rt = {"qty_step": 0.25, "mincontract": 0.25}
+
+    def fake():
+        return _FakeLib(core + SYMINFO_SETTERS, abi)
+
+    def report_of(text):
+        rep = json.loads(text)
+        rep["elapsed_seconds"] = 0
+        return rep
+
+    def states(lib):
+        names = [c[0] for c in lib.calls]
+        return names.count("strategy_create"), names.count("strategy_free")
+
+    status, none_out = _run_main(runtime, fake(), base)
+    no_syminfo = report_of(none_out)
+    for label, doc in (("absent", dict(four)), ("null", dict(four, mincontract=None))):
+        status, out = _run_main(runtime, fake(), base + ["--syminfo", str(write("s.json", doc))])
+        check(f"main with mincontract {label}: the whole report as without syminfo",
+              status == 0 and report_of(out) == no_syminfo)
+
+    status, out = _run_main(runtime, fake(), base + [
+        "--syminfo", str(write("s.json", dict(four, mincontract=0.25)))])
+    rep = report_of(out)
+    prov = json.loads(base64.b64decode(rep["fingerprint"]["token"]))
+    check("main with a grid records applied_runtime.syminfo in the report and fingerprint",
+          status == 0
+          and rep["applied_runtime"].get("syminfo") == grid_rt
+          and prov["runtime"].get("syminfo") == grid_rt
+          and rep["fingerprint"]["digest"] != no_syminfo["fingerprint"]["digest"])
+
+    lib = fake()
+    status, out = _run_main(runtime, lib, base + [
+        "--bench", "--warmup", "2", "--repeats", "3",
+        "--syminfo", str(write("s.json", dict(four, mincontract=0.25)))])
+    rep = report_of(out) if status == 0 else {}
+    created, freed = states(lib)
+    meta_keys = [c[2] for c in lib.calls if c[0] == "strategy_set_syminfo_metadata"]
+    check("main --bench with a grid: recorded, every state freed, metadata set twice per state",
+          status == 0
+          and rep.get("applied_runtime", {}).get("syminfo") == grid_rt
+          and created == freed == 2 + 3 + 1
+          and meta_keys == [b"qty_step", b"mincontract"] * created)
+
+    for label, extra in (("body run", []),
+                         ("bench warmup", ["--bench", "--warmup", "1", "--repeats", "1"]),
+                         ("bench repeats", ["--bench", "--warmup", "0", "--repeats", "1"])):
+        lib = fake()
+        status, out = _run_main(runtime, lib, base + extra + [
+            "--syminfo", str(write("s.json", dict(four, mincontract=-1)))])
+        created, freed = states(lib)
+        check(f"main rejects mincontract -1 ({label}): one structured line, exit 1",
+              status == 1
+              and out == '{"engine":"pineforge","error":'
+              '"syminfo.mincontract must be a positive finite number, got -1"}\n'
+              and not any(c[0] == "run_backtest_full" for c in lib.calls)
+              and created == freed == 1)
+
+    lib = _FakeLib(core + no_meta, abi)
+    status, out = _run_main(runtime, lib, base + [
+        "--syminfo", str(write("s.json", dict(four, mincontract=0.25)))])
+    check("main with a grid and no metadata setter fails, exit 1",
+          status == 1 and json.loads(out).get("error", "").startswith(
+              "the strategy library has no strategy_set_syminfo_metadata"))
+
+    # A replacement apply_syminfo returning a non-dict leaves the report as without syminfo.
+    for label, value in (("None", None), ("True", True)):
+        original = runtime.apply_syminfo
+        runtime.apply_syminfo = lambda lib, strat, path, value=value: value
+        try:
+            status, out = _run_main(runtime, fake(), base + [
+                "--syminfo", str(write("s.json", dict(four, mincontract=0.25)))])
+        finally:
+            runtime.apply_syminfo = original
+        check(f"main: a replacement apply_syminfo returning {label} leaves the report as without syminfo",
+              status == 0 and report_of(out) == no_syminfo)
+
 def main() -> int:
     m = _load_helpers()
     runtime = _load_runtime()
@@ -193,6 +434,10 @@ def main() -> int:
     check("entry incarnation aligns by trade with guarded fallback",
           rendered["trades"][0]["entry_incarnation"] == 41
           and rendered["trades"][1]["entry_incarnation"] == 0)
+
+    # --- syminfo.mincontract -> the engine's lot grid --------------------
+    with tempfile.TemporaryDirectory() as td:
+        _syminfo_checks(check, runtime, Path(td))
 
     # --- UTF-16 object-key order + raw Unicode --------------------------
     chinese = m._canonical_fingerprint_json({"中文键": "中文值"})
