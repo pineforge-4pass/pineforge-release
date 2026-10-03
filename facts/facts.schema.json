@@ -1,0 +1,401 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/pineforge-4pass/pineforge-release/main/facts/facts.schema.json",
+  "title": "PineForge public facts tokens",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "scoreboard",
+    "releases"
+  ],
+  "properties": {
+    "schema": {
+      "const": "pineforge/facts/v1"
+    },
+    "scoreboard": {
+      "$ref": "#/$defs/scoreboard"
+    },
+    "inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "sourceCommit",
+        "populationSha256",
+        "corpusScripts",
+        "communityScripts",
+        "probeScripts",
+        "closedProbes",
+        "closedScripts",
+        "communityProbes",
+        "probeScriptProbes",
+        "tvTrades"
+      ],
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "sourceCommit": {
+          "$ref": "#/$defs/commit"
+        },
+        "populationSha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "corpusScripts": {
+          "$ref": "#/$defs/count"
+        },
+        "communityScripts": {
+          "$ref": "#/$defs/count"
+        },
+        "probeScripts": {
+          "$ref": "#/$defs/count"
+        },
+        "closedProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "closedScripts": {
+          "$ref": "#/$defs/count"
+        },
+        "communityProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "probeScriptProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "tvTrades": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "releases": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9.-]+)?$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "scoreboard"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "pattern": "^https://github\\.com/pineforge-4pass/"
+          },
+          "scoreboard": {
+            "$ref": "#/$defs/scoreboard"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "tiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "excellent",
+        "strong",
+        "moderate",
+        "weak",
+        "minimal",
+        "no-trades"
+      ],
+      "properties": {
+        "excellent": {
+          "$ref": "#/$defs/count"
+        },
+        "strong": {
+          "$ref": "#/$defs/count"
+        },
+        "moderate": {
+          "$ref": "#/$defs/count"
+        },
+        "weak": {
+          "$ref": "#/$defs/count"
+        },
+        "minimal": {
+          "$ref": "#/$defs/count"
+        },
+        "no-trades": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "symbol",
+        "timeframe",
+        "graded",
+        "excellent",
+        "strong",
+        "belowStrong",
+        "engineErrors",
+        "tiers"
+      ],
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "pattern": "^[A-Z0-9_:!.]+$"
+        },
+        "timeframe": {
+          "type": "string",
+          "pattern": "^[0-9]+[DSWM]?$"
+        },
+        "graded": {
+          "$ref": "#/$defs/count"
+        },
+        "excellent": {
+          "$ref": "#/$defs/count"
+        },
+        "strong": {
+          "$ref": "#/$defs/count"
+        },
+        "belowStrong": {
+          "$ref": "#/$defs/count"
+        },
+        "engineErrors": {
+          "$ref": "#/$defs/count"
+        },
+        "tiers": {
+          "$ref": "#/$defs/tiers"
+        }
+      }
+    },
+    "scoreboard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "provenance",
+        "id",
+        "date",
+        "engineCommit",
+        "codegenCommit",
+        "snapshotSha256",
+        "populationSha256",
+        "population",
+        "anomaliesExcluded",
+        "graded",
+        "excellent",
+        "strong",
+        "belowStrong",
+        "engineErrors",
+        "tiers",
+        "excellentPct",
+        "strongPct",
+        "excellentOrStrongPct",
+        "markets",
+        "timeframes",
+        "lanes",
+        "corpusProbes",
+        "closedProbes",
+        "scriptSlugs",
+        "tvTradeRows",
+        "inventoryNote",
+        "pairs",
+        "scopes"
+      ],
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "baselineId",
+            "snapshotSha256",
+            "populationSha256",
+            "engineCommit",
+            "codegenCommit",
+            "promotionDate",
+            "privateEvidenceSha256"
+          ],
+          "properties": {
+            "baselineId": {
+              "type": "string",
+              "pattern": "^pineforge-parity-baseline-[a-z0-9-]+$"
+            },
+            "snapshotSha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "populationSha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "engineCommit": {
+              "$ref": "#/$defs/commit"
+            },
+            "codegenCommit": {
+              "$ref": "#/$defs/commit"
+            },
+            "promotionDate": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "privateEvidenceSha256": {
+              "$ref": "#/$defs/digest"
+            }
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string",
+          "format": "date"
+        },
+        "engineCommit": {
+          "$ref": "#/$defs/commit"
+        },
+        "codegenCommit": {
+          "$ref": "#/$defs/commit"
+        },
+        "snapshotSha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "populationSha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "population": {
+          "$ref": "#/$defs/count"
+        },
+        "anomaliesExcluded": {
+          "$ref": "#/$defs/count"
+        },
+        "graded": {
+          "$ref": "#/$defs/count"
+        },
+        "excellent": {
+          "$ref": "#/$defs/count"
+        },
+        "strong": {
+          "$ref": "#/$defs/count"
+        },
+        "belowStrong": {
+          "$ref": "#/$defs/count"
+        },
+        "engineErrors": {
+          "$ref": "#/$defs/count"
+        },
+        "tiers": {
+          "$ref": "#/$defs/tiers"
+        },
+        "excellentPct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "strongPct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "excellentOrStrongPct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "markets": {
+          "$ref": "#/$defs/count"
+        },
+        "timeframes": {
+          "$ref": "#/$defs/count"
+        },
+        "lanes": {
+          "$ref": "#/$defs/count"
+        },
+        "corpusProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "closedProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "scriptSlugs": {
+          "$ref": "#/$defs/count"
+        },
+        "tvTradeRows": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "inventoryNote": {
+          "type": "string"
+        },
+        "pairs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pair"
+          }
+        },
+        "scopes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "corpus",
+            "closed"
+          ],
+          "properties": {
+            "corpus": {
+              "$ref": "#/$defs/scope"
+            },
+            "closed": {
+              "$ref": "#/$defs/scope"
+            }
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "graded",
+        "excellent",
+        "strong",
+        "belowStrong",
+        "engineErrors",
+        "tiers"
+      ],
+      "properties": {
+        "graded": {
+          "$ref": "#/$defs/count"
+        },
+        "excellent": {
+          "$ref": "#/$defs/count"
+        },
+        "strong": {
+          "$ref": "#/$defs/count"
+        },
+        "belowStrong": {
+          "$ref": "#/$defs/count"
+        },
+        "engineErrors": {
+          "$ref": "#/$defs/count"
+        },
+        "tiers": {
+          "$ref": "#/$defs/tiers"
+        }
+      }
+    }
+  }
+}
