@@ -1,21 +1,21 @@
 {
   "schema": "pineforge/facts/v1",
   "scoreboard": {
-    "source": "Registry baseline pineforge-parity-baseline-20261003-engine-8d47fa2d; digest-verified snapshot 88718b4168a2ec06910f5018bcbe3d809af3f655ee8b57aafbc6dce707f2dc01; private evidence sha256:d7d47273c6d9b6f9ee445239eaa13ef6af270baef62232d2e4b617b4d2467ec3.",
+    "source": "Registry baseline pineforge-parity-baseline-20261003-engine-700c5d24; digest-verified snapshot 3ee846c545adf29e29fa72cb38dd9bc9fed9b5811c7dbed95af854b23989b78f; private evidence sha256:60f77ff210165dedeb87ccd03b45779d4a0940290e694d35ec59fe4c3fbb5177.",
     "provenance": {
-      "baselineId": "pineforge-parity-baseline-20261003-engine-8d47fa2d",
-      "snapshotSha256": "88718b4168a2ec06910f5018bcbe3d809af3f655ee8b57aafbc6dce707f2dc01",
+      "baselineId": "pineforge-parity-baseline-20261003-engine-700c5d24",
+      "snapshotSha256": "3ee846c545adf29e29fa72cb38dd9bc9fed9b5811c7dbed95af854b23989b78f",
       "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
-      "engineCommit": "8d47fa2dd5d2b01549e8e93375c5d4c1e2c08624",
-      "codegenCommit": "8b42cd4a307de0c9e2a8cc64a3efa7678d6e5d70",
-      "promotionDate": "2026-10-03T16:25:00.000Z",
-      "privateEvidenceSha256": "d7d47273c6d9b6f9ee445239eaa13ef6af270baef62232d2e4b617b4d2467ec3"
+      "engineCommit": "700c5d2451f65249f1b23ca28d770fc93e867321",
+      "codegenCommit": "13b9ccfd37b5785a7a345dd493e5cb6916fcba9a",
+      "promotionDate": "2026-10-03T17:39:14.000Z",
+      "privateEvidenceSha256": "60f77ff210165dedeb87ccd03b45779d4a0940290e694d35ec59fe4c3fbb5177"
     },
-    "id": "pineforge-parity-baseline-20261003-engine-8d47fa2d",
+    "id": "pineforge-parity-baseline-20261003-engine-700c5d24",
     "date": "2026-10-03",
-    "engineCommit": "8d47fa2dd5d2b01549e8e93375c5d4c1e2c08624",
-    "codegenCommit": "8b42cd4a307de0c9e2a8cc64a3efa7678d6e5d70",
-    "snapshotSha256": "88718b4168a2ec06910f5018bcbe3d809af3f655ee8b57aafbc6dce707f2dc01",
+    "engineCommit": "700c5d2451f65249f1b23ca28d770fc93e867321",
+    "codegenCommit": "13b9ccfd37b5785a7a345dd493e5cb6916fcba9a",
+    "snapshotSha256": "3ee846c545adf29e29fa72cb38dd9bc9fed9b5811c7dbed95af854b23989b78f",
     "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
     "population": 8006,
     "anomaliesExcluded": 17,
@@ -72,13 +72,53 @@
     "lanes": 18,
     "corpusProbes": 309,
     "closedProbes": 7680,
-    "scriptSlugs": 1092,
-    "tvTradeRows": 5518862,
-    "inventoryNote": "TV trade rows and distinct source/slug identifiers are registry counts, not deduplicated closed trades or independently authored scripts. The historical README script and closed-trade inventories are not derivable from this population document.",
+    "hardLane": {
+      "symbol": "BINANCE:ETHUSDT.P",
+      "timeframe": "15",
+      "hardProbes": 1009,
+      "corpusProbes": 309,
+      "closedProbes": 700,
+      "graded": 1009,
+      "excellent": 1000,
+      "strong": 9,
+      "belowStrong": 0,
+      "engineErrors": 0,
+      "tiers": {
+        "excellent": 1000,
+        "strong": 9,
+        "moderate": 0,
+        "weak": 0,
+        "minimal": 0,
+        "no-trades": 0
+      }
+    },
     "pairs": [
+      {
+        "symbol": "BINANCE:ETHUSDT.P",
+        "timeframe": "15",
+        "hardProbes": 1009,
+        "corpusProbes": 309,
+        "closedProbes": 700,
+        "graded": 1009,
+        "excellent": 1000,
+        "strong": 9,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 1000,
+          "strong": 9,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        }
+      },
       {
         "symbol": "BINANCE:BTCUSDT",
         "timeframe": "15",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 668,
         "graded": 668,
         "excellent": 664,
         "strong": 4,
@@ -96,6 +136,9 @@
       {
         "symbol": "BINANCE:BTCUSDT",
         "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 516,
         "graded": 516,
         "excellent": 516,
         "strong": 0,
@@ -112,24 +155,10 @@
       },
       {
         "symbol": "BINANCE:ETHUSDT.P",
-        "timeframe": "15",
-        "graded": 1009,
-        "excellent": 1000,
-        "strong": 9,
-        "belowStrong": 0,
-        "engineErrors": 0,
-        "tiers": {
-          "excellent": 1000,
-          "strong": 9,
-          "moderate": 0,
-          "weak": 0,
-          "minimal": 0,
-          "no-trades": 0
-        }
-      },
-      {
-        "symbol": "BINANCE:ETHUSDT.P",
         "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 540,
         "graded": 540,
         "excellent": 539,
         "strong": 1,
@@ -147,6 +176,9 @@
       {
         "symbol": "CME_MINI:ES1!",
         "timeframe": "15",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 76,
         "graded": 76,
         "excellent": 76,
         "strong": 0,
@@ -164,6 +196,9 @@
       {
         "symbol": "CME_MINI:ES1!",
         "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 35,
         "graded": 35,
         "excellent": 35,
         "strong": 0,
@@ -181,6 +216,9 @@
       {
         "symbol": "CME_MINI:NQ1!",
         "timeframe": "15",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 74,
         "graded": 74,
         "excellent": 73,
         "strong": 1,
@@ -198,6 +236,9 @@
       {
         "symbol": "CME_MINI:NQ1!",
         "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 37,
         "graded": 37,
         "excellent": 37,
         "strong": 0,
@@ -215,6 +256,9 @@
       {
         "symbol": "NASDAQ:AAPL",
         "timeframe": "15",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 632,
         "graded": 632,
         "excellent": 631,
         "strong": 1,
@@ -232,6 +276,9 @@
       {
         "symbol": "NASDAQ:AAPL",
         "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 464,
         "graded": 464,
         "excellent": 464,
         "strong": 0,
@@ -249,6 +296,9 @@
       {
         "symbol": "NSE:NIFTY",
         "timeframe": "15",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 314,
         "graded": 314,
         "excellent": 313,
         "strong": 1,
@@ -266,6 +316,9 @@
       {
         "symbol": "NSE:NIFTY",
         "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 225,
         "graded": 225,
         "excellent": 225,
         "strong": 0,
@@ -283,6 +336,9 @@
       {
         "symbol": "NYSE:F",
         "timeframe": "15",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 637,
         "graded": 637,
         "excellent": 625,
         "strong": 12,
@@ -300,6 +356,9 @@
       {
         "symbol": "NYSE:F",
         "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 505,
         "graded": 505,
         "excellent": 502,
         "strong": 3,
@@ -317,6 +376,9 @@
       {
         "symbol": "OANDA:EURUSD",
         "timeframe": "15",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 653,
         "graded": 653,
         "excellent": 648,
         "strong": 5,
@@ -334,6 +396,9 @@
       {
         "symbol": "OANDA:EURUSD",
         "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 453,
         "graded": 453,
         "excellent": 453,
         "strong": 0,
@@ -351,6 +416,9 @@
       {
         "symbol": "OANDA:XAUUSD",
         "timeframe": "15",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 695,
         "graded": 695,
         "excellent": 692,
         "strong": 3,
@@ -368,6 +436,9 @@
       {
         "symbol": "OANDA:XAUUSD",
         "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 456,
         "graded": 456,
         "excellent": 456,
         "strong": 0,
@@ -388,7 +459,7 @@
     "1.0.1": {
       "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.0.1/README.md#validation-scoreboard",
       "scoreboard": {
-        "source": "Registry baseline pineforge-parity-baseline-20261001-codegen-67892cda; digest-verified snapshot a61bef614d50edd2795cb28852ce0946aa5036267e935d9866f15876c046fa1e; private evidence sha256:15ae10c4113b2a735c0503585d04b224bf97306b4eff4ca115f4f5649bed2176.",
+        "source": "Registry baseline pineforge-parity-baseline-20261001-codegen-67892cda; digest-verified snapshot a61bef614d50edd2795cb28852ce0946aa5036267e935d9866f15876c046fa1e; private evidence sha256:b380a4807d52d286d8becc01a5d1ba4f0f2966cf2320321368848b2f0f39e9e4.",
         "provenance": {
           "baselineId": "pineforge-parity-baseline-20261001-codegen-67892cda",
           "snapshotSha256": "a61bef614d50edd2795cb28852ce0946aa5036267e935d9866f15876c046fa1e",
@@ -396,7 +467,7 @@
           "engineCommit": "b2a578ce776b75b85c24f46ccdcbb3dcbe227a64",
           "codegenCommit": "67892cdab13c892b05539cbb7aae104ee01f8022",
           "promotionDate": "2026-10-01T16:56:07.000Z",
-          "privateEvidenceSha256": "15ae10c4113b2a735c0503585d04b224bf97306b4eff4ca115f4f5649bed2176"
+          "privateEvidenceSha256": "b380a4807d52d286d8becc01a5d1ba4f0f2966cf2320321368848b2f0f39e9e4"
         },
         "id": "pineforge-parity-baseline-20261001-codegen-67892cda",
         "date": "2026-10-01",
@@ -459,13 +530,53 @@
         "lanes": 18,
         "corpusProbes": 309,
         "closedProbes": 7680,
-        "scriptSlugs": 1092,
-        "tvTradeRows": 5518862,
-        "inventoryNote": "TV trade rows and distinct source/slug identifiers are registry counts, not deduplicated closed trades or independently authored scripts. The historical README script and closed-trade inventories are not derivable from this population document.",
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 995,
+          "strong": 14,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 995,
+            "strong": 14,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
         "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 995,
+            "strong": 14,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 995,
+              "strong": 14,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
           {
             "symbol": "BINANCE:BTCUSDT",
             "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
             "graded": 668,
             "excellent": 660,
             "strong": 8,
@@ -483,6 +594,9 @@
           {
             "symbol": "BINANCE:BTCUSDT",
             "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
             "graded": 516,
             "excellent": 515,
             "strong": 1,
@@ -499,24 +613,10 @@
           },
           {
             "symbol": "BINANCE:ETHUSDT.P",
-            "timeframe": "15",
-            "graded": 1009,
-            "excellent": 995,
-            "strong": 14,
-            "belowStrong": 0,
-            "engineErrors": 0,
-            "tiers": {
-              "excellent": 995,
-              "strong": 14,
-              "moderate": 0,
-              "weak": 0,
-              "minimal": 0,
-              "no-trades": 0
-            }
-          },
-          {
-            "symbol": "BINANCE:ETHUSDT.P",
             "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
             "graded": 540,
             "excellent": 538,
             "strong": 2,
@@ -534,6 +634,9 @@
           {
             "symbol": "CME_MINI:ES1!",
             "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 76,
             "graded": 76,
             "excellent": 73,
             "strong": 3,
@@ -551,6 +654,9 @@
           {
             "symbol": "CME_MINI:ES1!",
             "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 35,
             "graded": 35,
             "excellent": 34,
             "strong": 1,
@@ -568,6 +674,9 @@
           {
             "symbol": "CME_MINI:NQ1!",
             "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 74,
             "graded": 74,
             "excellent": 71,
             "strong": 3,
@@ -585,6 +694,9 @@
           {
             "symbol": "CME_MINI:NQ1!",
             "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 37,
             "graded": 37,
             "excellent": 37,
             "strong": 0,
@@ -602,6 +714,9 @@
           {
             "symbol": "NASDAQ:AAPL",
             "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 632,
             "graded": 632,
             "excellent": 625,
             "strong": 7,
@@ -619,6 +734,9 @@
           {
             "symbol": "NASDAQ:AAPL",
             "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 464,
             "graded": 464,
             "excellent": 463,
             "strong": 1,
@@ -636,6 +754,9 @@
           {
             "symbol": "NSE:NIFTY",
             "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 314,
             "graded": 314,
             "excellent": 308,
             "strong": 6,
@@ -653,6 +774,9 @@
           {
             "symbol": "NSE:NIFTY",
             "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 225,
             "graded": 225,
             "excellent": 224,
             "strong": 1,
@@ -670,6 +794,9 @@
           {
             "symbol": "NYSE:F",
             "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 637,
             "graded": 637,
             "excellent": 622,
             "strong": 15,
@@ -687,6 +814,9 @@
           {
             "symbol": "NYSE:F",
             "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 505,
             "graded": 505,
             "excellent": 501,
             "strong": 4,
@@ -704,6 +834,9 @@
           {
             "symbol": "OANDA:EURUSD",
             "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 653,
             "graded": 653,
             "excellent": 645,
             "strong": 8,
@@ -721,6 +854,9 @@
           {
             "symbol": "OANDA:EURUSD",
             "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 453,
             "graded": 453,
             "excellent": 452,
             "strong": 1,
@@ -738,6 +874,9 @@
           {
             "symbol": "OANDA:XAUUSD",
             "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 695,
             "graded": 695,
             "excellent": 688,
             "strong": 7,
@@ -755,6 +894,9 @@
           {
             "symbol": "OANDA:XAUUSD",
             "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 456,
             "graded": 456,
             "excellent": 454,
             "strong": 2,
@@ -774,7 +916,8 @@
     }
   },
   "inventory": {
-    "source": "https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/d1d188673c526a5a1751e51f4f1aa0c0cdcd7471/README.md#validation-scoreboard; authored-script and closed-trade inventory, not registry row or slug totals; applicable only to the identical pinned population.",
+    "source": "https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/d1d188673c526a5a1751e51f4f1aa0c0cdcd7471/README.md#validation-scoreboard; historical release 1.0.1 authored-script and closed-trade inventory, independent of the active population; not registry row or slug totals.",
+    "sourceRelease": "1.0.1",
     "sourceCommit": "d1d188673c526a5a1751e51f4f1aa0c0cdcd7471",
     "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
     "corpusScripts": 309,

@@ -21,6 +21,7 @@
       "additionalProperties": false,
       "required": [
         "source",
+        "sourceRelease",
         "sourceCommit",
         "populationSha256",
         "corpusScripts",
@@ -65,6 +66,10 @@
         },
         "tvTrades": {
           "$ref": "#/$defs/count"
+        },
+        "sourceRelease": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[A-Za-z0-9.-]+)?$"
         }
       }
     },
@@ -148,7 +153,10 @@
         "strong",
         "belowStrong",
         "engineErrors",
-        "tiers"
+        "tiers",
+        "hardProbes",
+        "corpusProbes",
+        "closedProbes"
       ],
       "properties": {
         "symbol": {
@@ -176,6 +184,15 @@
         },
         "tiers": {
           "$ref": "#/$defs/tiers"
+        },
+        "hardProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "corpusProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "closedProbes": {
+          "$ref": "#/$defs/count"
         }
       }
     },
@@ -207,11 +224,9 @@
         "lanes",
         "corpusProbes",
         "closedProbes",
-        "scriptSlugs",
-        "tvTradeRows",
-        "inventoryNote",
         "pairs",
-        "scopes"
+        "scopes",
+        "hardLane"
       ],
       "properties": {
         "source": {
@@ -328,19 +343,6 @@
         "closedProbes": {
           "$ref": "#/$defs/count"
         },
-        "scriptSlugs": {
-          "$ref": "#/$defs/count"
-        },
-        "tvTradeRows": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "minimum": 0
-        },
-        "inventoryNote": {
-          "type": "string"
-        },
         "pairs": {
           "type": "array",
           "items": {
@@ -362,6 +364,16 @@
               "$ref": "#/$defs/scope"
             }
           }
+        },
+        "hardLane": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/pair"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
