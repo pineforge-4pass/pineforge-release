@@ -55,6 +55,7 @@ The entrypoint (`docker/entrypoint.sh`) is configured by mounts and `-e` variabl
 | `-e PINEFORGE_INPUT_TF`, `PINEFORGE_SCRIPT_TF` | Chart and strategy timeframe (`1`, `5`, `15`, `60`, `D`, ...). Unset input timeframe = detected from the bar timestamps; the script timeframe must be coarser than or equal to it. |
 | `-e PINEFORGE_BAR_MAGNIFIER`, `PINEFORGE_MAGNIFIER_SAMPLES`, `PINEFORGE_MAGNIFIER_DIST` | Bar magnifier switch (`true`/`false`, default `false`), sub-bar sample count (≥ 2, default 4) and distribution (`uniform`, `cosine`, `triangle`, `endpoints` (default), `front_loaded`, `back_loaded`). |
 | `-e PINEFORGE_TRADE_START_MS`, `PINEFORGE_CHART_TZ`, `PINEFORGE_MAGNIFIER_VOLUME_WEIGHTED`, `PINEFORGE_SYMINFO`, `PINEFORGE_BENCH` (+ `_WARMUP`, `_REPEATS`) | Optional run knobs; the comments in `docker/entrypoint.sh` say what each does. |
+| `-e PINEFORGE_SYMBOL_FEEDS=/in/symbols/symbols.json` | Other symbols' bars for `request.security` on another symbol, from 1.1.0; see [Other symbols' bars](#other-symbols-bars-pineforge_symbol_feeds). |
 
 | Exit code | Meaning |
 |-----------|---------|
@@ -71,6 +72,59 @@ variables listed under [Why this repo exists](#why-this-repo-exists)):
 docker inspect --format '{{ index .Config.Labels "io.pineforge.engine.version" }} {{ index .Config.Labels "io.pineforge.codegen.version" }}' \
   ghcr.io/pineforge-4pass/pineforge-release:latest      # e.g. "1.0.0 1.0.0"
 ```
+
+### Other symbols' bars (`PINEFORGE_SYMBOL_FEEDS`)
+
+A script that calls `request.security` on another symbol (`"BINANCE:ETHUSDT"`,
+or an `input.symbol`) reads that symbol's own bars, never the chart's. Without
+them, or when the index lacks the requested symbol string or timeframe, the run
+stops where the request's value is read: exit `4`, with
+`{"engine":"pineforge","error":"request.security(...) at line N: no data is pinned for this request, and its value was read"}`
+on stdout. From 1.1.0 the image installs those bars from the JSON index that
+`PINEFORGE_SYMBOL_FEEDS` names (the harness's `--symbol-feeds`); the published
+images up to 1.0.1 ignore the variable.
+
+```json
+{"symbols": {
+  "BINANCE:ETHUSDT": {
+    "syminfo": {"tickerid": "BINANCE:ETHUSDT", "type": "crypto", "currency": "USDT",
+                "mintick": 0.01, "session": "24x7", "timezone": "UTC"},
+    "feeds": {"240": "ethusdt-240.csv", "1D": "ethusdt-1D.csv"}}}}
+```
+
+```bash
+docker run --rm \
+  -v $(pwd)/strategy.pine:/in/strategy.pine:ro \
+  -v $(pwd)/btcusdt-240.csv:/in/ohlcv.csv:ro \
+  -v $(pwd)/symbols:/in/symbols:ro \
+  -e PINEFORGE_SYMBOL_FEEDS=/in/symbols/symbols.json \
+  ghcr.io/pineforge-4pass/pineforge-release:1.1.0 > report.json
+```
+
+- A key is the exact string the script passes at run time, exchange prefix and
+  suffix included: `BINANCE:ETHUSDT`, `ETHUSDT` and `BINANCE:ETHUSDT.P` are three
+  symbols. For an `input.symbol` it is the input's value (its default, or the
+  `PINEFORGE_INPUTS` override).
+- `feeds` holds one CSV per timeframe the script requests, in the format of
+  `/in/ohlcv.csv`, with paths relative to the index. Timeframes use the engine's
+  spelling: whole minutes as a bare integer (`"240"`, not `"4h"`), else
+  `<n>D|W|M|S`, a bare `D`/`W`/`M`/`S` meaning `1D`/`1W`/`1M`/`1S`. Nothing is
+  aggregated: a `240` feed does not serve a `D` request, and a `1` feed serves
+  only a `1` request.
+- `syminfo` is the symbol's catalog object: its `type`, `timezone`, `session`,
+  `currency` and `mintick` are what `syminfo.*` reads inside the request, where
+  `syminfo.tickerid` is the key itself.
+- The chart must be its own input (`PINEFORGE_SCRIPT_TF` unset or equal to the
+  input timeframe). At most 256 symbols and 256 feeds.
+- An index or feed the harness cannot install fails the run before it starts:
+  exit `4`, one `{"engine":"pineforge","error":"--symbol-feeds: ..."}` line.
+- What was installed is recorded as `applied_runtime.symbol_feeds`, so the
+  fingerprint digest differs from a run without it. Unset, the report is what it
+  was without the variable.
+
+The engine's [`docker/README.md`](https://github.com/pineforge-4pass/pineforge-engine/blob/main/docker/README.md)
+has the full contract: bar close times (`time_close` for a session-bound
+symbol), warm-up history, the merge rule and its refusals.
 
 ## Why this repo exists
 
