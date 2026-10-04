@@ -138,6 +138,7 @@ extra=()
 [[ -n "${PINEFORGE_CHART_TZ:-}" ]]       && extra+=(--chart-tz "${PINEFORGE_CHART_TZ}")
 [[ "${PINEFORGE_MAGNIFIER_VOLUME_WEIGHTED:-}" =~ ^(1|true|yes|on)$ ]] && extra+=(--magnifier-volume-weighted)
 [[ -n "${PINEFORGE_SYMINFO:-}" ]]        && extra+=(--syminfo "${PINEFORGE_SYMINFO}")
+[[ -n "${PINEFORGE_SYMBOL_FEEDS:-}" ]]   && extra+=(--symbol-feeds "${PINEFORGE_SYMBOL_FEEDS}")
 if [[ "${PINEFORGE_BENCH:-}" =~ ^(1|true|yes|on)$ ]]; then
     extra+=(--bench --warmup "${PINEFORGE_WARMUP:-3}" --repeats "${PINEFORGE_REPEATS:-20}")
 fi
