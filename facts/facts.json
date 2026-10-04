@@ -1,21 +1,21 @@
 {
   "schema": "pineforge/facts/v1",
   "scoreboard": {
-    "source": "Registry baseline pineforge-parity-baseline-20261004-engine-7b596622; digest-verified snapshot af86f13e31308927d7694b2ea1c713188ce661db8937cf8b6667905485f3475e; private evidence sha256:b53ab83abad04525ab3bb1be8d1992be616dcf6f8b38a27087f71d74c98c1a6c.",
+    "source": "Registry baseline pineforge-parity-baseline-20261004-engine-39728c09; digest-verified snapshot b4e8a0fd616bb8087b3c4f5db36d598272632c5a1ec2b4037106e7956fef7dce; private evidence sha256:a08ab789d9b552cb3428cd0615e89f2307672fd2d879dc7841846181eedb796c.",
     "provenance": {
-      "baselineId": "pineforge-parity-baseline-20261004-engine-7b596622",
-      "snapshotSha256": "af86f13e31308927d7694b2ea1c713188ce661db8937cf8b6667905485f3475e",
+      "baselineId": "pineforge-parity-baseline-20261004-engine-39728c09",
+      "snapshotSha256": "b4e8a0fd616bb8087b3c4f5db36d598272632c5a1ec2b4037106e7956fef7dce",
       "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
-      "engineCommit": "7b596622a95a8ca63a53247e9528c8051bb626f0",
-      "codegenCommit": "c5d97ee5884fbe62946ca1dd5deedb9e518dc533",
-      "promotionDate": "2026-10-04T04:49:31.000Z",
-      "privateEvidenceSha256": "b53ab83abad04525ab3bb1be8d1992be616dcf6f8b38a27087f71d74c98c1a6c"
+      "engineCommit": "39728c097eea144577e90b86953869178fc63148",
+      "codegenCommit": "bbb126c32b929476811d1754322e83734c4dfeeb",
+      "promotionDate": "2026-10-04T07:28:23.000Z",
+      "privateEvidenceSha256": "a08ab789d9b552cb3428cd0615e89f2307672fd2d879dc7841846181eedb796c"
     },
-    "id": "pineforge-parity-baseline-20261004-engine-7b596622",
+    "id": "pineforge-parity-baseline-20261004-engine-39728c09",
     "date": "2026-10-04",
-    "engineCommit": "7b596622a95a8ca63a53247e9528c8051bb626f0",
-    "codegenCommit": "c5d97ee5884fbe62946ca1dd5deedb9e518dc533",
-    "snapshotSha256": "af86f13e31308927d7694b2ea1c713188ce661db8937cf8b6667905485f3475e",
+    "engineCommit": "39728c097eea144577e90b86953869178fc63148",
+    "codegenCommit": "bbb126c32b929476811d1754322e83734c4dfeeb",
+    "snapshotSha256": "b4e8a0fd616bb8087b3c4f5db36d598272632c5a1ec2b4037106e7956fef7dce",
     "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
     "population": 8006,
     "anomaliesExcluded": 17,
