@@ -74,6 +74,23 @@ Schema:
       }
     }
 
+applied_runtime (and so provenance.runtime) also holds
+"syminfo": {"qty_step": float, "mincontract": float} when --syminfo set a lot
+grid from syminfo.mincontract; without one the key is absent.
+
+applied_runtime also holds "symbol_feeds" when --symbol-feeds installed other
+symbols' bars for request.security (see load_symbol_feeds):
+    {"canonicalization": "pf-symbol-feed-barc-close-le-v1",
+     "symbols": {"<symbol string>": {
+         "facts": {"canonical": str, "type": str, ..., "mintick": float},
+         "feeds": {"<timeframe>": {"bars": int, "first_ts": int, "last_ts": int,
+                                   "source_values_sha256": "<hex>"}}}}}
+Without --symbol-feeds (or with an index naming no symbol) the key is absent.
+
+A run error, a --syminfo the harness rejects (see apply_syminfo) or a
+--symbol-feeds it cannot install (see load_symbol_feeds) prints one line
+{"engine": "pineforge", "error": "<text>"} instead, exit status 1.
+
 NaN convention: any metric with an empty/zero denominator is null (JSON has no
 NaN); a real computed 0 stays 0. See the report-schema + metrics reference docs
 for the per-field meaning of every metrics.* key.
@@ -82,6 +99,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import csv
 import ctypes
 import hashlib
@@ -834,6 +852,22 @@ def load_strategy(so_path: Path) -> ctypes.CDLL:
     for _n in ("strategy_set_syminfo_timezone", "strategy_set_syminfo_session"):
         if hasattr(lib, _n):
             getattr(lib, _n).argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    if hasattr(lib, "strategy_set_syminfo_metadata"):
+        lib.strategy_set_syminfo_metadata.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double]
+        lib.strategy_set_syminfo_metadata.restype = None
+    # Other symbols' data for request.security (engine 1.0.0+, see
+    # load_symbol_feeds). hasattr-guarded: install_symbol_feeds fails by name
+    # on a library without them.
+    if hasattr(lib, "strategy_set_symbol_feed"):
+        lib.strategy_set_symbol_feed.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.POINTER(BarC), ctypes.POINTER(ctypes.c_int64), ctypes.c_int]
+        lib.strategy_set_symbol_feed.restype = ctypes.c_int
+    if hasattr(lib, "strategy_set_symbol_facts"):
+        lib.strategy_set_symbol_facts.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+        lib.strategy_set_symbol_facts.restype = ctypes.c_int
 
     # Validation-parity setters mirrored from scripts/run_strategy.py. All
     # hasattr-guarded: trade_start_time + chart_timezone are runtime PF exports;
@@ -854,16 +888,326 @@ def load_strategy(so_path: Path) -> ctypes.CDLL:
     return lib
 
 
+class SyminfoError(ValueError):
+    """A --syminfo file the harness cannot apply as given. main() reports it as
+    the structured {"engine", "error"} failure (exit 1), never as a traceback."""
+
+
+# This file is vendored: pineforge-release copies it from the pineforge-engine
+# tag at every release. Keep the lot-grid handling (mincontract) identical in
+# both repos, or a sync drops it.
 def apply_syminfo(lib, strat, syminfo_path):
     """Apply syminfo.json (data-worker schema) via strategy_set_syminfo_*.
-    Tolerant: missing keys skipped. Accepts {"syminfo": {...}} or a flat dict."""
+    Tolerant: missing keys skipped. Accepts {"syminfo": {...}} or a flat dict.
+
+    mincontract (TradingView's syminfo.mincontract, the instrument's lot size)
+    is strict: absent or null applies nothing; anything else must be a positive
+    finite JSON number, else SyminfoError before any setter runs. A valid one is
+    set first, as the metadata key qty_step (the engine floors order quantities
+    to that grid) and as mincontract (what syminfo.mincontract reads return).
+    Returns what main() records in applied_runtime["syminfo"]:
+    {"qty_step": v, "mincontract": v}, or {} when no grid was applied."""
     import json
     doc = json.loads(open(syminfo_path).read())
     si = doc.get("syminfo", doc)
+    applied = {}
+    lot = si.get("mincontract")
+    if lot is not None:
+        try:
+            v = (float(lot) if isinstance(lot, (int, float))
+                 and not isinstance(lot, bool) else math.nan)
+        except OverflowError:  # an int beyond binary64
+            v = math.nan
+        if not (math.isfinite(v) and v > 0):
+            raise SyminfoError(
+                "syminfo.mincontract must be a positive finite number, got "
+                + json.dumps(lot)[:80])
+        if not hasattr(lib, "strategy_set_syminfo_metadata"):
+            raise SyminfoError(
+                "the strategy library has no strategy_set_syminfo_metadata, "
+                "so syminfo.mincontract cannot be applied")
+        lib.strategy_set_syminfo_metadata(strat, b"qty_step", v)
+        lib.strategy_set_syminfo_metadata(strat, b"mincontract", v)
+        applied = {"qty_step": v, "mincontract": v}
     if "mintick" in si:    lib.strategy_set_syminfo_mintick(strat, float(si["mintick"]))
     if "pointvalue" in si: lib.strategy_set_syminfo_pointvalue(strat, float(si["pointvalue"]))
     if si.get("timezone"): lib.strategy_set_syminfo_timezone(strat, str(si["timezone"]).encode())
     if si.get("session"):  lib.strategy_set_syminfo_session(strat, str(si["session"]).encode())
+    return applied
+
+
+# --- Other symbols' bars for request.security (--symbol-feeds) --------------
+#
+# request.security on another symbol reads that symbol's own bars, never the
+# chart's (engine and codegen 1.0.0+, C ABI strategy_set_symbol_feed /
+# strategy_set_symbol_facts). The engine keys a feed by the exact symbol string
+# the script passes at run time and by timeframe, and aggregates nothing: a
+# request at "1D" needs a "1D" feed. --symbol-feeds names them in one index:
+#
+#   {"symbols": {"BINANCE:ETHUSDT": {
+#       "syminfo": {<the symbol's catalog syminfo object, flat or wrapped>},
+#       "feeds": {"240": "ethusdt-240.csv", "1D": "ethusdt-1D.csv"}}}}
+
+SYMBOL_FEED_CANONICALIZATION = "pf-symbol-feed-barc-close-le-v1"
+_SYMBOL_FEED_HASH_PREFIX = b"pineforge:symbol-feed:barc-close-le:v1\0"
+_SYMBOL_FEED_RECORD = struct.Struct("<5dqq")
+# The requests manifest's timeframe spelling and caps (scripts/run_strategy.py).
+_SYMBOL_TF_RE = re.compile(r"(?:[1-9][0-9]{0,4}|[1-9][0-9]{0,3}[DWMS])")
+_SYMBOL_FEEDS_MAX = 256
+_SYMBOL_KEY_MAX = 256
+_SYMBOL_STAMP_MAX = 2**53 - 1  # unix ms; the record is fingerprinted as a JSON number
+# Catalog syminfo key -> the strategy_set_symbol_facts field it sets.
+_SYMBOL_FACT_KEYS = (("tickerid", "canonical"), ("type", "type"), ("timezone", "timezone"),
+                     ("session", "session"), ("currency", "currency"), ("mintick", "mintick"))
+_SYMBOL_FEED_SETTERS = ("strategy_set_symbol_facts", "strategy_set_symbol_feed")
+
+
+class SymbolFeedsError(ValueError):
+    """A --symbol-feeds index or feed the harness cannot install as given; main()
+    reports it as the structured {"engine", "error"} failure (exit 1)."""
+
+
+def _shown(value) -> str:
+    return json.dumps(value)[:80]
+
+
+def _symbol_text(value, what: str) -> str:
+    try:
+        if isinstance(value, str):
+            value.encode("utf-8")
+    except UnicodeEncodeError:
+        value = None
+    if (not isinstance(value, str) or not value or len(value) > _SYMBOL_KEY_MAX
+            or any(ord(ch) < 0x20 for ch in value)):
+        raise SymbolFeedsError(
+            f"--symbol-feeds: {what} must be a non-empty string of at most "
+            f"{_SYMBOL_KEY_MAX} characters without control characters, got {_shown(value)}")
+    return value
+
+
+def symbol_timeframe(tf) -> str:
+    """The engine's one feed timeframe spelling: whole minutes as a bare integer
+    ("240", never "4h"), days, weeks, months and seconds as <n>D|W|M|S; Pine's
+    bare D/W/M/S fold to 1D/1W/1M/1S, as the engine folds a request's."""
+    if isinstance(tf, str) and tf in ("D", "W", "M", "S"):
+        tf = "1" + tf
+    if not (isinstance(tf, str) and _SYMBOL_TF_RE.fullmatch(tf)):
+        raise SymbolFeedsError(
+            "--symbol-feeds: a timeframe is whole minutes (\"15\", \"240\") or "
+            f"<n>D|W|M|S (\"1D\", \"1W\"), got {_shown(tf)}")
+    return tf
+
+
+def _bar_close_ms(open_ms: int, tf: str) -> int:
+    """A bar's close when its feed has no time_close column: its open plus the
+    timeframe, n calendar months (UTC) for M. Right for a 24x7 symbol; a
+    session-bound one must carry time_close."""
+    n = int(tf) if tf.isdigit() else int(tf[:-1])
+    unit = "" if tf.isdigit() else tf[-1]
+    if unit != "M":
+        return open_ms + n * {"": 60_000, "S": 1_000, "D": 86_400_000,
+                              "W": 604_800_000}[unit]
+    secs, ms = divmod(open_ms, 1000)
+    try:
+        t = datetime.fromtimestamp(secs, tz=timezone.utc)
+        month = t.month - 1 + n
+        year, month = t.year + month // 12, month % 12 + 1
+        day = min(t.day, calendar.monthrange(year, month)[1])
+        return int(t.replace(year=year, month=month, day=day).timestamp()) * 1000 + ms
+    except (ValueError, OverflowError, OSError):
+        return None  # out of the calendar's range: refused by the caller
+
+
+def _load_symbol_feed(path: Path, symbol: str, tf: str) -> dict:
+    """One feed CSV -> ctypes bars and closes plus its record. Columns:
+    timestamp (open, unix ms), open, high, low, close, optional volume (empty or
+    NaN when the symbol publishes none) and optional time_close (unix ms); other
+    columns are ignored."""
+    where = f"--symbol-feeds: feed {symbol}@{tf} ({path})"
+    rows, lines = [], []
+    try:
+        with path.open(newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            columns = reader.fieldnames or []
+            missing = [c for c in ("timestamp", "open", "high", "low", "close")
+                       if c not in columns]
+            if missing:
+                raise SymbolFeedsError(f"{where}: no column {', '.join(missing)}")
+            for row in reader:
+                line = reader.line_num
+                try:
+                    ts = int(row["timestamp"])
+                    o, h, l, c = (float(row[k]) for k in ("open", "high", "low", "close"))
+                    vol = (row.get("volume") or "").strip()
+                    v = float(vol) if vol else math.nan
+                    cell = (row.get("time_close") or "").strip()
+                    close = int(cell) if cell else None  # empty: open + timeframe
+                except (TypeError, ValueError):
+                    raise SymbolFeedsError(f"{where} line {line}: not a number") from None
+                if not all(math.isfinite(x) for x in (o, h, l, c)) or v < 0 or math.isinf(v):
+                    raise SymbolFeedsError(
+                        f"{where} line {line}: prices must be finite and volume "
+                        "nonnegative or empty")
+                if close is None:
+                    close = _bar_close_ms(ts, tf)
+                if not all(x is not None and abs(x) <= _SYMBOL_STAMP_MAX for x in (ts, close)):
+                    raise SymbolFeedsError(
+                        f"{where} line {line}: a time must be unix milliseconds "
+                        f"within +-{_SYMBOL_STAMP_MAX}")
+                rows.append((o, h, l, c, v, ts, close))
+                lines.append(line)
+    except OSError as e:
+        raise SymbolFeedsError(f"{where}: {e.strerror or e}") from None
+    except (UnicodeDecodeError, csv.Error) as e:
+        raise SymbolFeedsError(f"{where}: not a UTF-8 CSV ({e})") from None
+    n = len(rows)
+    bars = (BarC * n)()
+    closes = (ctypes.c_int64 * n)()
+    hasher = hashlib.sha256(_SYMBOL_FEED_HASH_PREFIX)
+    for i, (o, h, l, c, v, ts, close) in enumerate(rows):
+        next_open = rows[i + 1][5] if i + 1 < n else None
+        if next_open is not None and next_open <= ts:
+            raise SymbolFeedsError(f"{where} line {lines[i + 1]}: timestamps must increase")
+        if close <= ts or (next_open is not None and close > next_open):
+            raise SymbolFeedsError(
+                f"{where} line {lines[i]}: its close {close} is not after its open {ts} "
+                "and at or before the next bar's open (is the timeframe right?)")
+        bars[i].open, bars[i].high, bars[i].low, bars[i].close = o, h, l, c
+        bars[i].volume, bars[i].timestamp = v, ts
+        closes[i] = close
+        hasher.update(_SYMBOL_FEED_RECORD.pack(o, h, l, c, v, ts, close))
+    # A header-only feed is installed as the engine documents it: its requests
+    # read na on every bar (a symbol with no bars in the window).
+    record = {"bars": n, "source_values_sha256": hasher.hexdigest()}
+    if n:
+        record.update(first_ts=rows[0][5], last_ts=rows[-1][5])
+    return {"timeframe": tf, "bars": bars, "close_ms": closes, "n": n, "record": record}
+
+
+def _symbol_facts(doc, symbol: str) -> list:
+    """The strategy_set_symbol_facts (field, value) pairs of a catalog syminfo
+    object: tickerid (as canonical), type, timezone, session, currency, mintick.
+    Absent, null or empty keys set nothing; other keys are ignored."""
+    if doc is None:
+        return []
+    si = doc.get("syminfo", doc) if isinstance(doc, dict) else None
+    if not isinstance(si, dict):
+        raise SymbolFeedsError(f"--symbol-feeds: {symbol}: syminfo must be an object")
+    facts = []
+    for key, field in _SYMBOL_FACT_KEYS:
+        value = si.get(key)
+        if value is None or value == "":
+            continue
+        if field == "mintick":
+            try:
+                ok = (isinstance(value, (int, float)) and not isinstance(value, bool)
+                      and math.isfinite(float(value)) and value > 0)
+            except OverflowError:  # an int beyond binary64
+                ok = False
+            if not ok:
+                raise SymbolFeedsError(
+                    f"--symbol-feeds: {symbol}: syminfo.mintick must be a positive "
+                    f"finite number, got {_shown(value)}")
+            facts.append((field, float(value)))
+        else:
+            facts.append((field, _symbol_text(value, f"{symbol}: syminfo.{key}")))
+    return facts
+
+
+def load_symbol_feeds(index_path: Path) -> list:
+    """Read and check the --symbol-feeds index and every feed it names before
+    any strategy state exists. Each symbol key is the exact string a script's
+    request.security passes (prefix and suffix included: "BINANCE:ETHUSDT",
+    "ETHUSDT" and "BINANCE:ETHUSDT.P" are three symbols). An entry holds "feeds"
+    ({timeframe: CSV path, relative to the index}) and optionally "syminfo".
+    Returns one entry per symbol: {"symbol", "facts", "feeds"}. Any problem is a
+    SymbolFeedsError naming it."""
+    def unique(pairs):
+        out = {}
+        for k, v in pairs:
+            if k in out:
+                raise SymbolFeedsError(f"--symbol-feeds: duplicate key {_shown(k)}")
+            out[k] = v
+        return out
+    try:
+        doc = json.loads(index_path.read_text(encoding="utf-8"), object_pairs_hook=unique)
+    except OSError as e:
+        raise SymbolFeedsError(f"--symbol-feeds: {index_path}: {e.strerror or e}") from None
+    except (ValueError, RecursionError) as e:
+        if isinstance(e, SymbolFeedsError):
+            raise
+        raise SymbolFeedsError(f"--symbol-feeds: {index_path} is not JSON: {e}") from None
+    symbols = doc.get("symbols") if isinstance(doc, dict) else None
+    if not isinstance(symbols, dict):
+        raise SymbolFeedsError('--symbol-feeds: the index must be {"symbols": {...}}')
+    if len(symbols) > _SYMBOL_FEEDS_MAX:
+        raise SymbolFeedsError(f"--symbol-feeds: more than {_SYMBOL_FEEDS_MAX} symbols")
+    out, total = [], 0
+    for symbol, entry in symbols.items():
+        _symbol_text(symbol, "a symbol")
+        if not isinstance(entry, dict) or set(entry) - {"syminfo", "feeds"}:
+            raise SymbolFeedsError(
+                f'--symbol-feeds: {symbol}: an entry is {{"feeds": {{...}}, "syminfo": {{...}}}}')
+        feeds = entry.get("feeds", {})
+        if not isinstance(feeds, dict):
+            raise SymbolFeedsError(f"--symbol-feeds: {symbol}: feeds must be an object")
+        total += len(feeds)
+        if total > _SYMBOL_FEEDS_MAX:
+            raise SymbolFeedsError(f"--symbol-feeds: more than {_SYMBOL_FEEDS_MAX} feeds")
+        named = {}
+        for tf, file in feeds.items():
+            canonical = symbol_timeframe(tf)
+            if canonical in named:
+                raise SymbolFeedsError(
+                    f"--symbol-feeds: {symbol}: two feeds at timeframe {canonical}")
+            if not isinstance(file, str) or not file:
+                raise SymbolFeedsError(
+                    f"--symbol-feeds: {symbol}@{canonical}: the feed must name a CSV file")
+            named[canonical] = index_path.parent / file
+        facts = _symbol_facts(entry.get("syminfo"), symbol)
+        out.append({"symbol": symbol, "facts": facts,
+                    "feeds": [_load_symbol_feed(path, symbol, tf)
+                              for tf, path in named.items()]})
+    return out
+
+
+def install_symbol_feeds(lib, strat, symbols) -> None:
+    """Install what load_symbol_feeds read: each symbol's facts, then its feeds.
+    The engine copies the arrays, so one load serves every state of a run."""
+    missing = [n for n in _SYMBOL_FEED_SETTERS if not hasattr(lib, n)]
+    if missing:
+        raise SymbolFeedsError(
+            f"--symbol-feeds: the strategy library has no {', '.join(missing)}, so "
+            "other symbols' bars cannot be installed (engine 1.0.0 or later)")
+
+    def refused(what):
+        detail = ""
+        if hasattr(lib, "strategy_get_last_error"):
+            err = lib.strategy_get_last_error(strat)
+            detail = err.decode("utf-8", "replace") if err else ""
+        raise SymbolFeedsError(f"--symbol-feeds: the engine refused {what}"
+                               + (f": {detail}" if detail else ""))
+
+    for sym in symbols:
+        key = sym["symbol"].encode()
+        for field, value in sym["facts"]:
+            text = repr(value) if isinstance(value, float) else value
+            if lib.strategy_set_symbol_facts(strat, key, field.encode(), text.encode()) != 0:
+                refused(f"the {field} of {sym['symbol']}")
+        for feed in sym["feeds"]:
+            if lib.strategy_set_symbol_feed(strat, key, feed["timeframe"].encode(),
+                                            feed["bars"], feed["close_ms"], feed["n"]) != 0:
+                refused(f"the feed {sym['symbol']}@{feed['timeframe']}")
+
+
+def symbol_feeds_record(symbols) -> dict:
+    """applied_runtime["symbol_feeds"]: what was installed, so a run with other
+    symbols' bars has its own fingerprint digest."""
+    return {"canonicalization": SYMBOL_FEED_CANONICALIZATION,
+            "symbols": {sym["symbol"]: {
+                "facts": dict(sym["facts"]),
+                "feeds": {feed["timeframe"]: feed["record"] for feed in sym["feeds"]},
+            } for sym in symbols}}
 
 
 def fmt_utc(ms: int) -> str:
@@ -1131,6 +1475,11 @@ def main() -> int:
                          "Raw samples only — no median/ratio is computed in the image.")
     ap.add_argument("--warmup", type=int, default=3, help="Bench warmup runs (default 3).")
     ap.add_argument("--repeats", type=int, default=20, help="Bench timed repeats (default 20).")
+    ap.add_argument("--symbol-feeds", type=Path, default=None,
+                    help="JSON index of other symbols' bars (and syminfo) that "
+                         "request.security reads, keyed by the exact symbol string "
+                         "and timeframe (strategy_set_symbol_feed / _facts); see "
+                         "load_symbol_feeds.")
     args = ap.parse_args()
 
     inputs    = parse_kv_json(args.inputs,    "--inputs")
@@ -1149,17 +1498,37 @@ def main() -> int:
     # Volume-weighted magnifier only meaningful when the magnifier is on.
     vw_on = bool(args.magnifier_volume_weighted) and bar_magnifier == 1
 
+    # The lot grid the last _make_state() applied (the body run's), for
+    # applied_runtime["syminfo"]; {} when none.
+    syminfo_applied: dict = {}
+    # Other symbols' bars, read once before the first state (None without
+    # --symbol-feeds).
+    symbol_feeds = None
+
     def _make_state():
         """Create + fully configure a fresh strategy state — everything EXCEPT the
         timed run_backtest_full call. Mirrors scripts/run_strategy.py's setup so the
         engine behaves identically to the ctypes validation harness."""
+        nonlocal syminfo_applied
         st = lib.strategy_create(b"{}")
         for k, v in inputs.items():
             lib.strategy_set_input(st, k.encode(), v.encode())
         for k, v in overrides.items():
             lib.strategy_set_override(st, k.encode(), v.encode())
         if args.syminfo:
-            apply_syminfo(lib, st, args.syminfo)
+            try:
+                # A replacement apply_syminfo may return None (or another non-dict).
+                r = apply_syminfo(lib, st, args.syminfo)
+                syminfo_applied = r if isinstance(r, dict) else {}
+            except SyminfoError:
+                lib.strategy_free(st)
+                raise
+        if symbol_feeds:
+            try:
+                install_symbol_feeds(lib, st, symbol_feeds)
+            except SymbolFeedsError:
+                lib.strategy_free(st)
+                raise
         if args.trade_start_ms is not None and hasattr(lib, "strategy_set_trade_start_time"):
             lib.strategy_set_trade_start_time(st, int(args.trade_start_ms))
         if args.chart_tz and hasattr(lib, "strategy_set_chart_timezone"):
@@ -1181,31 +1550,41 @@ def main() -> int:
     # isolates the engine hot loop (closest to the GBench harness). dlopen
     # already happened above (load_strategy), outside any loop.
     timing = None
-    if args.bench:
-        warmup = max(0, int(args.warmup))
-        repeats = max(1, int(args.repeats))
-        for _ in range(warmup):
-            st = _make_state(); rep = ReportC()
-            try:
-                _run(st, rep)
-            finally:
-                lib.report_free(ctypes.byref(rep)); lib.strategy_free(st)
-        samples_ns: list[int] = []
-        for _ in range(repeats):
-            st = _make_state(); rep = ReportC()
-            try:
-                t0 = time.perf_counter_ns(); _run(st, rep); t1 = time.perf_counter_ns()
-                samples_ns.append(t1 - t0)
-            finally:
-                lib.report_free(ctypes.byref(rep)); lib.strategy_free(st)
-        timing = _timing_block(
-            samples_ns, warmup=warmup, repeats=repeats,
-            bar_magnifier=bar_magnifier, magnifier_samples=magnifier_samples,
-            magnifier_dist=args.magnifier_dist.strip().lower() or "endpoints",
-            volume_weighted=vw_on)
+    try:
+        if args.symbol_feeds:
+            symbol_feeds = load_symbol_feeds(args.symbol_feeds)
+        if args.bench:
+            warmup = max(0, int(args.warmup))
+            repeats = max(1, int(args.repeats))
+            for _ in range(warmup):
+                st = _make_state(); rep = ReportC()
+                try:
+                    _run(st, rep)
+                finally:
+                    lib.report_free(ctypes.byref(rep)); lib.strategy_free(st)
+            samples_ns: list[int] = []
+            for _ in range(repeats):
+                st = _make_state(); rep = ReportC()
+                try:
+                    t0 = time.perf_counter_ns(); _run(st, rep); t1 = time.perf_counter_ns()
+                    samples_ns.append(t1 - t0)
+                finally:
+                    lib.report_free(ctypes.byref(rep)); lib.strategy_free(st)
+            timing = _timing_block(
+                samples_ns, warmup=warmup, repeats=repeats,
+                bar_magnifier=bar_magnifier, magnifier_samples=magnifier_samples,
+                magnifier_dist=args.magnifier_dist.strip().lower() or "endpoints",
+                volume_weighted=vw_on)
 
-    # --- Body run: one configured run for trades / metrics / diagnostics. ---
-    state = _make_state()
+        # --- Body run: one configured run for trades / metrics / diagnostics. ---
+        state = _make_state()
+    except (SyminfoError, SymbolFeedsError) as e:
+        # A rejected --syminfo or --symbol-feeds: the structured failure, before
+        # any stdout.
+        json.dump({"engine": "pineforge", "error": str(e)},
+                  sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return 1
     report = ReportC()
     started = time.time()
     try:
@@ -1234,6 +1613,10 @@ def main() -> int:
             "trade_start_ms":     args.trade_start_ms,
             "chart_tz":           args.chart_tz or "",
         }
+        if syminfo_applied:
+            applied_runtime["syminfo"] = syminfo_applied
+        if symbol_feeds:
+            applied_runtime["symbol_feeds"] = symbol_feeds_record(symbol_feeds)
         incarnation_accessor = getattr(
             lib, "strategy_closed_trade_entry_incarnation", None)
         trade_entry_incarnations = (
