@@ -98,7 +98,7 @@ docker run --rm \
   -v $(pwd)/btcusdt-240.csv:/in/ohlcv.csv:ro \
   -v $(pwd)/symbols:/in/symbols:ro \
   -e PINEFORGE_SYMBOL_FEEDS=/in/symbols/symbols.json \
-  ghcr.io/pineforge-4pass/pineforge-release:1.1.0 > report.json
+  ghcr.io/pineforge-4pass/pineforge-release:1.2.0 > report.json
 ```
 
 - A key is the exact string the script passes at run time, exchange prefix and
