@@ -148,10 +148,10 @@ jobs:
             type=sha,format=short
           # The action derives the licences label from this repository's
           # Apache-2.0, and its labels override the Dockerfile's. The image also
-          # bundles the transpiler, whose LICENSE from codegen 1.2.0 is the
-          # PineForge Source License 1.1 (see README, License).
+          # bundles the transpiler, whose LICENSE from codegen 1.3.0 is the
+          # PineForge Source License 1.2 (see README, License).
           labels: |
-            org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-PineForge-Source-License-1.1
+            org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2
 
       - name: Build + push (multi-arch)
         uses: docker/build-push-action@v6

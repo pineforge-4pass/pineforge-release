@@ -236,22 +236,27 @@ terms, so that licence does not cover the whole image:
   under MPL-2.0 — see the engine's
   [`LEGAL.md`](https://github.com/pineforge-4pass/pineforge-engine/blob/main/LEGAL.md).
 - **`pineforge-codegen`** (the transpiler): source-available. From codegen
-  1.2.0 (images from 1.2.0 on) it is under the PineForge Source License 1.1;
-  earlier releases, and the images up to 1.1.0 that bundle them, keep the
-  PolyForm Noncommercial License 1.0.0 with a Personal Trading exception that
-  they shipped with. Personal trading is free; investment management, use by
-  or for a company or fund, embedding in a product and hosted or public-facing
-  services need a commercial licence — see its
+  1.3.0 (images from 1.3.0 on) it is under the PineForge Source License 1.2;
+  earlier releases keep the licence they shipped with: codegen 1.2.0 (the
+  1.2.0 image) the PineForge Source License 1.1, and releases up to 1.1.0
+  (the images up to 1.1.0) the PolyForm Noncommercial License 1.0.0 with a
+  Personal Trading exception. Personal trading is free; investment management
+  (from 1.2 of the licence this includes trading a funded-trader challenge,
+  evaluation or simulated account), use by or for a company or fund,
+  embedding in a product and hosted or public-facing services need a
+  commercial licence — see its
   [`LICENSE`](https://github.com/pineforge-4pass/pineforge-codegen-oss/blob/main/LICENSE)
   and [`LEGAL.md`](https://github.com/pineforge-4pass/pineforge-codegen-oss/blob/main/LEGAL.md).
 - **Debian base image, g++, Eigen and Python**: their upstream licences.
 
 The image's `org.opencontainers.image.licenses` label names the licences of the
-PineForge components: `Apache-2.0 AND LicenseRef-PineForge-Source-License-1.1`
-from 1.2.0 on, Apache-2.0 for the engine and this repository's files, and a
-`LicenseRef` for the transpiler's LICENSE, the PineForge Source License 1.1 (no
+PineForge components: `Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2`
+from 1.3.0 on, Apache-2.0 for the engine and this repository's files, and a
+`LicenseRef` for the transpiler's LICENSE, the PineForge Source License 1.2 (no
 SPDX identifier exists for it). The base image's packages, Eigen included, keep
-the upstream licences listed above. Images 1.0.1 to 1.1.0 carry
+the upstream licences listed above. The 1.2.0 image carries
+`Apache-2.0 AND LicenseRef-PineForge-Source-License-1.1`, images 1.0.1 to 1.1.0
+carry
 `Apache-2.0 AND LicenseRef-PolyForm-Noncommercial-1.0.0-Personal-Trading`
 (the transpiler's earlier LICENSE, the PolyForm Noncommercial License 1.0.0 as
 modified by its Personal Trading and Commercial Use sections), and images up

@@ -146,7 +146,7 @@ class PublishTest(unittest.TestCase):
         # docker/metadata-action's labels override the Dockerfile's, and it
         # derives org.opencontainers.image.licenses from the repository's
         # Apache-2.0, so publish.yml must set the label itself.
-        expr = "Apache-2.0 AND LicenseRef-PineForge-Source-License-1.1"
+        expr = "Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2"
         body = _step(self.text, "Image metadata")
         self.assertIn(f"org.opencontainers.image.licenses={expr}\n", body)
         self.assertIn("labels: ${{ steps.meta.outputs.labels }}", self.text)
