@@ -1,0 +1,113 @@
+{
+  "schema": "pineforge/repo-descriptions/v1",
+  "version": 1,
+  "labels": {
+    "apache": "Apache-2.0",
+    "source": "PineForge Source License 1.2"
+  },
+  "licenses": {
+    "engine": {
+      "label": "apache",
+      "repo": "pineforge-4pass/pineforge-engine",
+      "commit": "59082e696f0c7a95c1aa0d3179e1aac23f79fc04",
+      "url": "https://github.com/pineforge-4pass/pineforge-engine/blob/59082e696f0c7a95c1aa0d3179e1aac23f79fc04/LICENSE"
+    },
+    "codegen": {
+      "label": "source",
+      "repo": "pineforge-4pass/pineforge-codegen-oss",
+      "commit": "1e6eb83354b74ede1326fe55e576e91ea81f156b",
+      "url": "https://github.com/pineforge-4pass/pineforge-codegen-oss/blob/1e6eb83354b74ede1326fe55e576e91ea81f156b/LICENSE"
+    },
+    "corpus": {
+      "label": "apache",
+      "repo": "pineforge-4pass/pineforge-corpus",
+      "commit": "262bab123176989464cbab04aa94c72b3d3143be",
+      "url": "https://github.com/pineforge-4pass/pineforge-corpus/blob/262bab123176989464cbab04aa94c72b3d3143be/LICENSE"
+    }
+  },
+  "wording": {
+    "cpp_standard": "C++17",
+    "pine_language": "Pine Script v6",
+    "pine_compact": "PineScript v6"
+  },
+  "repositories": [
+    {
+      "role": "engine",
+      "repo": "pineforge-4pass/pineforge-engine",
+      "public": true,
+      "disposition": "managed",
+      "reason": "Approved published stopgap. Graded probes use the current scoreboard. Parenthesized strategy/script counts are historical inventory bound to inventory.sourceRelease, not the graded-probe denominator.",
+      "source": {
+        "repo": "pineforge-4pass/pineforge-engine",
+        "commit": "59082e696f0c7a95c1aa0d3179e1aac23f79fc04",
+        "url": "https://github.com/pineforge-4pass/pineforge-engine/blob/59082e696f0c7a95c1aa0d3179e1aac23f79fc04/LICENSE"
+      },
+      "template": "Open-source {{word:cpp_standard}} engine for backtesting and forward execution, with a versioned C ABI; {{word:pine_language}} runs through code generation. Against TradingView's own trade lists, all {{facts:scoreboard.graded|grouped}} graded probes ({{facts:inventory.corpusScripts|int}} open-corpus strategies, {{facts:inventory.closedScripts|int}} closed-test scripts) grade excellent or strong: {{facts:scoreboard.excellent|grouped}} excellent, {{facts:scoreboard.strong|int}} strong. {{license:engine}}."
+    },
+    {
+      "role": "codegen-oss",
+      "repo": "pineforge-4pass/pineforge-codegen-oss",
+      "public": true,
+      "disposition": "managed",
+      "reason": "Approved published stopgap; retain the verified current license label and existing product wording without a new licensing decision.",
+      "source": {
+        "repo": "pineforge-4pass/pineforge-codegen-oss",
+        "commit": "1e6eb83354b74ede1326fe55e576e91ea81f156b",
+        "url": "https://github.com/pineforge-4pass/pineforge-codegen-oss/blob/1e6eb83354b74ede1326fe55e576e91ea81f156b/LICENSE"
+      },
+      "template": "{{word:pine_language}} to C++ transpiler for the pineforge-engine runtime. Pure Python; source-available under the {{license:codegen}}: free for noncommercial use and personal trading, commercial use needs a license."
+    },
+    {
+      "role": "corpus",
+      "repo": "pineforge-4pass/pineforge-corpus",
+      "public": true,
+      "disposition": "managed",
+      "reason": "Replace stale untracked quantities. Explicitly distinguish current graded corpus probes from historical authored-script inventory; omit unsupported trade totals.",
+      "source": {
+        "repo": "pineforge-4pass/pineforge-corpus",
+        "commit": "262bab123176989464cbab04aa94c72b3d3143be",
+        "url": "https://github.com/pineforge-4pass/pineforge-corpus/blob/262bab123176989464cbab04aa94c72b3d3143be/LICENSE"
+      },
+      "template": "Open Pine Script reference corpus and TradingView trade traces. Current graded corpus: {{facts:scoreboard.scopes.corpus.excellent|grouped}}/{{facts:scoreboard.scopes.corpus.graded|grouped}} excellent probes. Historical script inventory ({{facts:inventory.sourceRelease|text}}): {{facts:inventory.corpusScripts|grouped}} scripts. {{license:corpus}}."
+    },
+    {
+      "role": "hpo",
+      "repo": "pineforge-4pass/pineforge-hpo",
+      "public": true,
+      "disposition": "HOLD",
+      "reason": "Published description is held/read-only pending authorization. No new license claim, release/catalog change, or setting-change command.",
+      "source": {
+        "repo": "pineforge-4pass/pineforge-hpo",
+        "commit": "d66788a6160b271d78270652acf7f8f82d906343",
+        "url": "https://github.com/pineforge-4pass/pineforge-hpo/blob/d66788a6160b271d78270652acf7f8f82d906343/LICENSE"
+      },
+      "approved_text": "Native C++ hyperparameter optimization for PineForge strategies: grid, seeded random, dlib global search, and TPE (alpha)"
+    },
+    {
+      "role": "release",
+      "repo": "pineforge-4pass/pineforge-release",
+      "public": true,
+      "disposition": "static",
+      "reason": "Preserve verified published product wording; no quantitative parity claim.",
+      "source": {
+        "repo": "pineforge-4pass/pineforge-release",
+        "commit": "f93dfca830b8a4a20d43c682a84d52a62bd942fd",
+        "url": "https://github.com/pineforge-4pass/pineforge-release/blob/f93dfca830b8a4a20d43c682a84d52a62bd942fd/LICENSE"
+      },
+      "template": "Full {{word:pine_compact}} → deterministic backtest: pineforge-engine runtime + bundled codegen transpiler"
+    },
+    {
+      "role": "backtest-mcp",
+      "repo": "pineforge-4pass/pineforge-backtest-mcp",
+      "public": true,
+      "disposition": "static",
+      "reason": "Preserve verified published product wording; no quantitative parity claim.",
+      "source": {
+        "repo": "pineforge-4pass/pineforge-backtest-mcp",
+        "commit": "7ced51880a47af6793e80c65d5de0599c251e25a",
+        "url": "https://github.com/pineforge-4pass/pineforge-backtest-mcp/blob/7ced51880a47af6793e80c65d5de0599c251e25a/LICENSE"
+      },
+      "template": "Offline MCP server: an AI agent transpiles {{word:pine_compact}} → C++ and runs deterministic, TradingView-parity backtests locally (transpile, backtest, parameter grid, Binance OHLCV, Pine coverage lookup). One Docker container, no API key; code & data stay on your machine."
+    }
+  ]
+}
