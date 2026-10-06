@@ -79,6 +79,13 @@ that scope explicitly. Corpus copy names the historical source release separatel
 from current graded probes. Advancing the scoreboard never refills inventory or
 changes a released scoreboard.
 
+The approved engine all-graded claim fails closed unless `scoreboard.belowStrong`
+is zero and `scoreboard.excellent + scoreboard.strong == scoreboard.graded`.
+An unsupported snapshot is refused before output or live API calls, so it cannot
+produce partial command proposals. GitHub owner/repository identities compare
+case-insensitively for source verification, duplicates, live reads, and holds;
+pinned commits and the `LICENSE` source path still match exactly.
+
 At **every promotion**, without delayed batching:
 
 1. Immediately export canonical facts using `lab facts export`, following the

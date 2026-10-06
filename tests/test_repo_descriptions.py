@@ -87,6 +87,59 @@ class DescriptionCLI(unittest.TestCase):
         self.assertNotEqual(self.render(facts=future)["facts_sha256"],
                             self.render()["facts_sha256"])
 
+    def test_consistent_below_strong_snapshot_is_refused_before_output_or_live_reads(self):
+        canonical = json.loads(FACTS.read_text(encoding="utf-8"))
+        facts = copy.deepcopy(canonical)
+        scoreboard = facts["scoreboard"]
+        pair = next(value for value in scoreboard["pairs"]
+                    if value["hardProbes"] == 0 and value["corpusProbes"] == 0
+                    and value["closedProbes"] > 0)
+        for group in (scoreboard, scoreboard["scopes"]["closed"], pair):
+            group["excellent"] -= 1
+            group["belowStrong"] += 1
+            group["tiers"]["excellent"] -= 1
+            group["tiers"]["moderate"] += 1
+        for field, count in (("excellentPct", scoreboard["excellent"]),
+                             ("strongPct", scoreboard["strong"]),
+                             ("excellentOrStrongPct", scoreboard["excellent"] + scoreboard["strong"])):
+            scoreboard[field] = round(count * 100 / scoreboard["graded"], 2)
+        self.assertEqual(facts["inventory"], canonical["inventory"])
+        self.assertEqual(facts["releases"], canonical["releases"])
+        self.assertEqual(scoreboard["hardLane"], canonical["scoreboard"]["hardLane"])
+        self.assertEqual(scoreboard["population"] - scoreboard["anomaliesExcluded"],
+                         scoreboard["graded"])
+        for group in [scoreboard, *scoreboard["scopes"].values(), *scoreboard["pairs"]]:
+            self.assertEqual(sum(group["tiers"].values()), group["graded"])
+            self.assertEqual(group["excellent"] + group["strong"] + group["belowStrong"],
+                             group["graded"])
+            self.assertEqual(group["belowStrong"], sum(value for tier, value in group["tiers"].items()
+                                                     if tier not in {"excellent", "strong"}))
+        for field in ("graded", "excellent", "strong", "belowStrong", "engineErrors"):
+            self.assertEqual(sum(value[field] for value in scoreboard["pairs"]), scoreboard[field])
+            self.assertEqual(sum(value[field] for value in scoreboard["scopes"].values()),
+                             scoreboard[field])
+        future = self.document("future-below-strong.json", facts)
+        executable, env, _ = self.fake_gh()
+        for arguments in [("render",), ("render", "--format", "commands"),
+                          ("check", "--live", "--gh", str(executable))]:
+            with self.subTest(arguments=arguments):
+                result = self.invoke(*arguments, facts=future, env=env)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("all-graded", result.stderr)
+        self.assertFalse((self.root / "api-calls.jsonl").exists())
+
+    def test_all_graded_claim_requires_exact_excellent_and_strong_sum(self):
+        for difference in (-1, 1):
+            with self.subTest(difference=difference):
+                facts = json.loads(FACTS.read_text(encoding="utf-8"))
+                facts["scoreboard"]["excellent"] += difference
+                result = self.invoke("render", "--format", "commands",
+                                     facts=self.document("inconsistent-sum.json", facts))
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("all-graded", result.stderr)
+
     def test_changed_historical_tokens_are_read_not_hardcoded(self):
         facts = json.loads(FACTS.read_text(encoding="utf-8"))
         facts["inventory"].update(corpusScripts=411, closedScripts=855)
@@ -152,16 +205,54 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(self.invoke("render", "--format=json", "--format", "commands").returncode, 2)
 
     def test_hpo_cannot_be_unheld_by_swapping_roles(self):
+        for identity in ("pineforge-4pass/pineforge-hpo", "pineforge-4pass/PineForge-HPO",
+                         "PINEFORGE-4PASS/PINEFORGE-HPO"):
+            with self.subTest(identity=identity):
+                def change(policy):
+                    engine = next(row for row in policy["repositories"] if row["role"] == "engine")
+                    held = next(row for row in policy["repositories"] if row["role"] == "hpo")
+                    engine.update(role="hpo", disposition="HOLD", approved_text="Held engine")
+                    del engine["template"]
+                    held["source"]["url"] = held["source"]["url"].replace(held["repo"], identity)
+                    held["source"]["repo"] = identity
+                    held.update(role="engine", repo=identity, disposition="static",
+                                template="Changed held repository")
+                    del held["approved_text"]
+                result = self.invoke("render", "--format", "commands", policy=self.policy(change))
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+
+    def test_case_only_repository_duplicates_fail_without_partial_output(self):
         def change(policy):
-            engine = next(row for row in policy["repositories"] if row["role"] == "engine")
-            held = next(row for row in policy["repositories"] if row["role"] == "hpo")
-            engine.update(role="hpo", disposition="HOLD", approved_text="Held engine")
-            del engine["template"]
-            held.update(role="engine", disposition="static", template="Changed held repository")
-            del held["approved_text"]
+            original, duplicate = policy["repositories"][:2]
+            identity = original["repo"].swapcase()
+            duplicate["repo"] = identity
+            duplicate["source"] = copy.deepcopy(original["source"])
+            duplicate["source"]["repo"] = identity
+            duplicate["source"]["url"] = duplicate["source"]["url"].replace(original["repo"], identity)
         result = self.invoke("render", "--format", "commands", policy=self.policy(change))
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.returncode, 2, result.stdout)
         self.assertEqual(result.stdout, "")
+        self.assertIn("duplicate", result.stderr)
+
+    def test_mixed_case_source_and_live_identities_are_accepted(self):
+        def change(policy):
+            for row in policy["repositories"]:
+                row["repo"] = row["repo"].swapcase()
+            for license_value in policy["licenses"].values():
+                license_value["repo"] = license_value["repo"].swapcase()
+        policy = self.policy(change)
+        canonical_rows = self.render()["repositories"]
+        rendered_rows = self.render(policy=policy)["repositories"]
+        self.assertEqual([row["expected"] for row in canonical_rows],
+                         [row["expected"] for row in rendered_rows])
+        executable, env, _ = self.fake_gh("case")
+        result = self.invoke("check", "--live", "--gh", str(executable), policy=policy, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(row["status"] == "match" for row in json.loads(result.stdout)["repositories"]))
+        malformed = self.policy(lambda value: value["licenses"]["engine"].update(
+            url=value["licenses"]["engine"]["url"].replace("/LICENSE", "/license")))
+        self.assertEqual(self.invoke("render", policy=malformed).returncode, 2)
 
     def test_policy_refuses_duplicate_repositories_nonpublic_and_unpinned_licenses(self):
         changes = [lambda value: value["repositories"].append(copy.deepcopy(value["repositories"][0])),
@@ -204,6 +295,8 @@ class DescriptionCLI(unittest.TestCase):
         if mode == "identity": state[target]["full_name"] = "other/name"
         if mode == "type": state[target]["description"] = 42
         if mode == "missing": del state[target]["description"]
+        if mode == "case":
+            for response in state.values(): response["full_name"] = response["full_name"].swapcase()
         state_path = self.document("live-state.json", state)
         executable = self.root / "fake third-party gh"
         executable.write_text(
@@ -214,7 +307,7 @@ class DescriptionCLI(unittest.TestCase):
             "with open(os.environ['FAKE_GH_LOG'], 'a') as output: output.write(json.dumps(args) + '\\n')\n"
             "if args[:5] != ['api', '--method', 'GET', '--hostname', 'github.com'] or len(args) != 6:\n"
             "    print('refusing non-read operation', file=sys.stderr); sys.exit(80)\n"
-            "repo = args[5].removeprefix('repos/')\n"
+            "repo = args[5].removeprefix('repos/').casefold()\n"
             "if repo == os.environ['FAKE_GH_TARGET']:\n"
             "    mode = os.environ['FAKE_GH_MODE']\n"
             "    if mode == 'error': print('authentication failed', file=sys.stderr); sys.exit(7)\n"

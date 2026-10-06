@@ -142,14 +142,21 @@ def clean_text(value, *, description=False):
     return value
 
 
+def repository_identity(value):
+    if not isinstance(value, str) or not REPOSITORY.fullmatch(value):
+        raise InputError("invalid public repository identity")
+    return value.casefold()
+
+
 def source(value):
     fields(value, {"repo", "commit", "url"})
-    if not isinstance(value["repo"], str) or not REPOSITORY.fullmatch(value["repo"]):
-        raise InputError("invalid public repository identity")
+    identity = repository_identity(value["repo"])
     if not isinstance(value["commit"], str) or not COMMIT.fullmatch(value["commit"]):
         raise InputError("source must pin a full public commit")
-    expected = f"https://github.com/{value['repo']}/blob/{value['commit']}/LICENSE"
-    if value["url"] != expected:
+    prefix, suffix = "https://github.com/", f"/blob/{value['commit']}/LICENSE"
+    url = value["url"]
+    if (not isinstance(url, str) or not url.startswith(prefix) or not url.endswith(suffix)
+            or repository_identity(url[len(prefix):-len(suffix)]) != identity):
         raise InputError("LICENSE source URL does not match its repository/commit")
 
 
@@ -211,6 +218,10 @@ def render(facts_path, policy_path):
     facts, facts_hash = read_json(facts_path)
     schema, _ = read_json(FACTS_SCHEMA)
     validate_schema(facts, schema, schema)
+    scoreboard = facts["scoreboard"]
+    if (scoreboard["belowStrong"] != 0
+            or scoreboard["excellent"] + scoreboard["strong"] != scoreboard["graded"]):
+        raise InputError("engine all-graded claim requires belowStrong == 0 and excellent + strong == graded")
     policy, policy_hash = read_json(policy_path)
     fields(policy, {"schema", "version", "labels", "licenses", "wording", "repositories"})
     if policy["schema"] != "pineforge/repo-descriptions/v1" or type(policy["version"]) is not int or policy["version"] < 1:
@@ -231,15 +242,16 @@ def render(facts_path, policy_path):
     for row in policy["repositories"]:
         fields(row, {"role", "repo", "public", "disposition", "reason", "source"}, {"template", "approved_text"})
         source(row["source"])
-        if row["repo"] != row["source"]["repo"] or row["public"] is not True:
+        identity = repository_identity(row["repo"])
+        if identity != repository_identity(row["source"]["repo"]) or row["public"] is not True:
             raise InputError("unverified or nonpublic repository")
-        if row["role"] not in ROLES or row["role"] in seen_roles or row["repo"] in seen_repos:
+        if row["role"] not in ROLES or row["role"] in seen_roles or identity in seen_repos:
             raise InputError("unknown or duplicate repository/role")
         seen_roles.add(row["role"])
-        seen_repos.add(row["repo"])
+        seen_repos.add(identity)
         clean_text(row["reason"])
         disposition = row["disposition"]
-        if (row["role"] == "hpo" or row["repo"].split("/")[1] == "pineforge-hpo") and disposition != "HOLD":
+        if (row["role"] == "hpo" or identity.split("/")[1] == "pineforge-hpo") and disposition != "HOLD":
             raise InputError("HPO must remain held; no setting-change command is permitted")
         if disposition == "HOLD":
             if "template" in row or "approved_text" not in row:
@@ -282,7 +294,8 @@ def check_live(document, executable):
             if len(process.stdout) > MAX_INPUT_BYTES:
                 raise InputError("GitHub response exceeds size limit")
             response = decode(process.stdout, "GitHub response")
-            if not isinstance(response, dict) or response.get("private") is not False or response.get("full_name") != row["repo"]:
+            if (not isinstance(response, dict) or response.get("private") is not False
+                    or repository_identity(response.get("full_name")) != repository_identity(row["repo"])):
                 raise InputError("GitHub did not confirm the exact public repository")
             if "description" not in response or not (response["description"] is None or isinstance(response["description"], str)):
                 raise InputError("GitHub description is missing or has the wrong type")
