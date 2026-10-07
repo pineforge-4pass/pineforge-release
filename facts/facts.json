@@ -1,21 +1,21 @@
 {
   "schema": "pineforge/facts/v1",
   "scoreboard": {
-    "source": "Registry baseline pineforge-parity-baseline-20261006-codegen-1e6eb833; digest-verified snapshot 8db963b7f58c9049d1acc9f66ea6ff30efe27a71da585cc87938addfce763457; private evidence sha256:eb530cd3525010a5c2f43e2c2f45150f0ea7e44ba4a773506661b6ca51b83362.",
+    "source": "Registry baseline pineforge-parity-baseline-20261007-engine-49bb2029; digest-verified snapshot 5ff1870dc2338b4086ecf2e50a1ede5b23bef8c67aa9b4a8a61eaf847f1815d7; private evidence sha256:d3639fa35120d8995538c194c72aec452f086b922534d77dd315ed4945db76d3.",
     "provenance": {
-      "baselineId": "pineforge-parity-baseline-20261006-codegen-1e6eb833",
-      "snapshotSha256": "8db963b7f58c9049d1acc9f66ea6ff30efe27a71da585cc87938addfce763457",
+      "baselineId": "pineforge-parity-baseline-20261007-engine-49bb2029",
+      "snapshotSha256": "5ff1870dc2338b4086ecf2e50a1ede5b23bef8c67aa9b4a8a61eaf847f1815d7",
       "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
-      "engineCommit": "59082e696f0c7a95c1aa0d3179e1aac23f79fc04",
+      "engineCommit": "49bb202944c54c9bffdb918e24a7f4fb1a7d838d",
       "codegenCommit": "1e6eb83354b74ede1326fe55e576e91ea81f156b",
-      "promotionDate": "2026-10-06T18:41:16.000Z",
-      "privateEvidenceSha256": "eb530cd3525010a5c2f43e2c2f45150f0ea7e44ba4a773506661b6ca51b83362"
+      "promotionDate": "2026-10-07T05:17:24.000Z",
+      "privateEvidenceSha256": "d3639fa35120d8995538c194c72aec452f086b922534d77dd315ed4945db76d3"
     },
-    "id": "pineforge-parity-baseline-20261006-codegen-1e6eb833",
-    "date": "2026-10-06",
-    "engineCommit": "59082e696f0c7a95c1aa0d3179e1aac23f79fc04",
+    "id": "pineforge-parity-baseline-20261007-engine-49bb2029",
+    "date": "2026-10-07",
+    "engineCommit": "49bb202944c54c9bffdb918e24a7f4fb1a7d838d",
     "codegenCommit": "1e6eb83354b74ede1326fe55e576e91ea81f156b",
-    "snapshotSha256": "8db963b7f58c9049d1acc9f66ea6ff30efe27a71da585cc87938addfce763457",
+    "snapshotSha256": "5ff1870dc2338b4086ecf2e50a1ede5b23bef8c67aa9b4a8a61eaf847f1815d7",
     "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
     "population": 8006,
     "anomaliesExcluded": 17,
