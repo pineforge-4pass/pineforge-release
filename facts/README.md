@@ -356,14 +356,220 @@ receipt has `alert=true` even while rollout is deliberately off. All receipts
 keep `installed=false`. Missing receipts and failed uploads are missing telemetry,
 never a successful consumer health check.
 
-TOP's bounded, read-only workflow heartbeat is the following command from the
-reviewed checkout, with the approved GitHub wrapper on `PATH`:
+TOP's read-only workflow heartbeat uses the approved `ghq` wrapper on `PATH` and
+requires an explicit path to the reviewed checkout. It bounds the GitHub query
+to 45 seconds and 2 MiB of stdout, and the status parser to 10 seconds and 32
+KiB of stdout. A timeout or output-limit breach terminates only that child
+process group: it sends `SIGTERM`, waits at most three seconds, sends `SIGKILL`
+if the group remains, then waits at most two more seconds. Stderr is discarded;
+failures produce a neutral receipt rather than command output.
 
 ```sh
-set -o pipefail
-ghq api --method GET --hostname github.com \
-  'repos/pineforge-4pass/pineforge-release/actions/workflows/facts-fanout.yml/runs?branch=main&per_page=20' \
-  | python3 scripts/facts_fanout.py status
+python3 - /path/to/reviewed/pineforge-release <<'PY'
+import json
+import os
+from pathlib import Path
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+RUNS = (
+    "repos/pineforge-4pass/pineforge-release/actions/workflows/"
+    "facts-fanout.yml/runs?branch=main&per_page=20"
+)
+MAX_QUERY_BYTES = 2 * 1024 * 1024
+MAX_STATUS_BYTES = 32 * 1024
+
+
+def stop_own_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        return
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.05, remaining))
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_bounded(command, seconds, limit, data=None):
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        start_new_session=True,
+    )
+    selector = selectors.DefaultSelector()
+    output = bytearray()
+    reason = None
+    stopped = False
+    offset = 0
+    input_data = memoryview(data) if data is not None else None
+    try:
+        for stream, kind in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, kind)
+        if input_data is not None:
+            os.set_blocking(process.stdin.fileno(), False)
+            if input_data:
+                selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+            else:
+                process.stdin.close()
+
+        deadline = time.monotonic() + seconds
+        while selector.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                reason = "timeout"
+                break
+            if selector.get_map():
+                events = selector.select(min(remaining, 0.25))
+            else:
+                time.sleep(min(remaining, 0.05))
+                continue
+            for key, _ in events:
+                stream = key.fileobj
+                if key.data == "stdin":
+                    try:
+                        offset += os.write(
+                            stream.fileno(), input_data[offset:offset + 65536]
+                        )
+                    except BrokenPipeError:
+                        reason = "stdin-closed"
+                        break
+                    if offset == len(input_data):
+                        selector.unregister(stream)
+                        stream.close()
+                    continue
+
+                size = 65536
+                if key.data == "stdout":
+                    size = min(size, limit - len(output) + 1)
+                chunk = os.read(stream.fileno(), size)
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                elif key.data == "stdout":
+                    if len(output) + len(chunk) > limit:
+                        reason = "stdout-limit"
+                        break
+                    output.extend(chunk)
+            if reason is not None:
+                break
+
+        if reason is not None:
+            stop_own_group(process)
+            stopped = True
+        else:
+            process.wait()
+        return process.returncode, bytes(output), reason
+    finally:
+        if not stopped and process.poll() is None:
+            stop_own_group(process)
+        for key in list(selector.get_map().values()):
+            selector.unregister(key.fileobj)
+            key.fileobj.close()
+        selector.close()
+
+
+def failure(diagnostic, query_exit=None, status_exit=None):
+    receipt = {
+        "alert": True,
+        "category": "telemetry",
+        "consumer": "web",
+        "diagnostic": diagnostic,
+        "exit_code": 2,
+        "installed": False,
+        "served_freshness": "unverified",
+        "status": "telemetry-alert",
+        "telemetry_missing_or_stale": True,
+    }
+    if query_exit is not None:
+        receipt["query_exit_code"] = query_exit
+    if status_exit is not None:
+        receipt["status_exit_code"] = status_exit
+    print(json.dumps(receipt, sort_keys=True))
+    return 2
+
+
+def main():
+    if len(sys.argv) != 2:
+        return failure("reviewed-checkout-required")
+    ghq = shutil.which("ghq")
+    if ghq is None:
+        return failure("github-client-unavailable")
+    try:
+        checkout = Path(sys.argv[1]).expanduser().resolve(strict=True)
+        helper = checkout / "scripts/facts_fanout.py"
+        if not helper.is_file():
+            return failure("reviewed-checkout-status-command-missing")
+        query_exit, raw, reason = run_bounded(
+            [ghq, "api", "--method", "GET", "--hostname", "github.com", RUNS],
+            45,
+            MAX_QUERY_BYTES,
+        )
+    except (OSError, ValueError):
+        return failure("github-query-unavailable")
+    if reason == "timeout":
+        return failure("github-query-timeout")
+    if reason == "stdout-limit":
+        return failure("github-response-too-large")
+    if reason is not None or query_exit != 0:
+        return failure("github-query-failed", query_exit=query_exit)
+
+    try:
+        status_exit, status_output, reason = run_bounded(
+            [sys.executable, str(helper), "status"],
+            10,
+            MAX_STATUS_BYTES,
+            data=raw,
+        )
+    except (OSError, ValueError):
+        return failure("status-parser-unavailable")
+    if reason == "timeout":
+        return failure("status-parser-timeout", status_exit=status_exit)
+    if reason == "stdout-limit":
+        return failure("status-receipt-too-large", status_exit=status_exit)
+    if reason is not None or status_exit not in (0, 1):
+        return failure("status-parser-failed", status_exit=status_exit)
+    try:
+        receipt = json.loads(status_output)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return failure("status-receipt-invalid", status_exit=status_exit)
+    if (not isinstance(receipt, dict)
+            or receipt.get("consumer") != "web"
+            or receipt.get("served_freshness") != "unverified"
+            or receipt.get("status") not in {"workflow-observed", "telemetry-alert"}):
+        return failure("status-receipt-invalid", status_exit=status_exit)
+    print(json.dumps(receipt, sort_keys=True))
+    return status_exit
+
+
+sys.exit(main())
+PY
 ```
 
 `status` reads at most 2 MiB and 20 run records, excludes cancellations, and
@@ -389,14 +595,19 @@ commit, workflow creation time or a retry.
 3. In `release-automation`, provision `FACTS_WEB_REPOSITORY` and verify the
    existing Contents-only App has the intended selected repository. Retain the
    environment's protected main / `v*` restrictions. Keep
-   `FACTS_WEB_DISPATCH_ENABLED` absent or `false`; inspect the disabled manual
-   plan, immutable source, setup receipt and artifact before enabling anything.
-   Do not restore the removed repository-level key fallback.
+   `FACTS_WEB_DISPATCH_ENABLED` set to the literal `false` at the protected
+   environment while rollout is off. Read the organization, repository and
+   environment values and verify the protected workflow's effective value is
+   `false`; an absent environment value can expose an inherited `true`. Inspect
+   the disabled manual plan, immutable source, setup receipt and artifact before
+   enabling anything. Do not restore the removed repository-level key fallback.
 4. Follow TOP's separately authorized receiver rehearsal on the fixed throwaway
    branch, preserving its source/receipt proof and exact Spot build. Branch-only
    proof is not deployment proof. Enable hub dispatch only after the receiver
-   and its independent rollout controls are ready. An enabled manual dispatch
-   with `dry_run=true` tests receipt delivery without requesting publication.
+   and its independent rollout controls are ready. For enabled manual
+   `dry_run=true` receipt delivery, keep the receiver publication gate disabled.
+   Enabled automatic main pushes and schedules send `dry_run=false`, so a manual
+   dry-run does not make it safe to enable receiver publication.
 5. Pages Git integration owns production build/deployment from main. Neither
    this hub nor the receiver rollout needs Cloudflare credentials, a Cloudflare
    API call or a Pages upload command. The receiver must observe the Pages
@@ -406,8 +617,12 @@ commit, workflow creation time or a retry.
 6. TOP's first authorized real main run must close source-versus-served proof
    within 30 minutes of the facts-byte change. Confirm welcome-template runtime
    override/readback in the consumer rollout. Keep release no-key-fallback proof
-   separate. Remove the enable flag to stop future hub minting/dispatch; retain
-   receipts and scheduled plan visibility. HPO wording waits for a genuine next
+   separate. To stop future hub minting/dispatch, set
+   `FACTS_WEB_DISPATCH_ENABLED` to the literal `false` in protected
+   `release-automation`, then read back organization, repository and environment
+   configuration and verify the effective value is `false`. Do not remove the
+   environment value: an inherited `true` could become effective. Retain receipts
+   and scheduled plan visibility. HPO wording waits for a genuine next
    descriptions-policy change.
 
 Affected offline acceptance (approved Spot host only):
