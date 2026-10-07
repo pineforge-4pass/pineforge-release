@@ -399,10 +399,12 @@ Platform contract: Python 3.9+ on POSIX macOS or Linux with `fork`, process grou
 nonblocking pipes and a pipe-capable selector. The supervisor uses only the
 Python standard library, with no `waitid`, `WNOWAIT` or Linux-only process API.
 The real status parser separately requires the unchanged pins in
-`facts/requirements-validation.txt`. Install them in the **same interpreter**
-used below, for example `python3 -m pip install -r
-/path/to/reviewed/pineforge-release/facts/requirements-validation.txt`; the
-recipe launches the parser with `sys.executable`. Run as the standalone,
+`facts/requirements-validation.txt`. First create a virtual environment with
+`python3 -m venv /path/to/pf-facts-venv` and activate it with
+`. /path/to/pf-facts-venv/bin/activate`. Install the pins using that environment's
+`python3 -m pip install -r /path/to/reviewed/pineforge-release/facts/requirements-validation.txt`
+and use the **same interpreter** below; the recipe launches the parser with
+`sys.executable`. Run as the standalone,
 single-threaded interpreter shown below with default child reaping (no external
 SIGCHLD handler or auto-reaper), permission to signal its children, and ordinary
 runnable kernel syscalls. Kernel suspension/uninterruptible I/O and termination
