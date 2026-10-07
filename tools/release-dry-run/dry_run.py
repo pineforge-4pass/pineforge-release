@@ -40,7 +40,12 @@ IMAGE = f"ghcr.io/{REPO}"
 ENGINE_DL = "https://github.com/pineforge-4pass/pineforge-engine/releases/download"
 ENGINE_RAW = "https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine"
 PYPI = "https://pypi.org/pypi/pineforge-codegen"
-CONSUMERS = ("pineforge-backtest-mcp", "pineforge-mcp-public", "pineforge-app")
+CONSUMERS = ("pineforge-backtest-mcp", "release-fixture-hosted", "release-fixture-application")
+CONSUMER_MATRIX = (
+    {"consumer": "offline"},
+    {"consumer": "hosted", "repository_secret": "RELEASE_HOSTED_MCP_REPOSITORY"},
+    {"consumer": "application", "repository_secret": "RELEASE_APPLICATION_REPOSITORY"},
+)
 IDENTITY = ["-c", "user.name=dry-run", "-c", "user.email=dry-run@localhost",
             "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
 
@@ -59,8 +64,9 @@ class Result:
     def __init__(self, job, actions):
         self.job, self.actions, self.notify = job, actions, []
 
-    ok = property(lambda self: self.job.ok)
-    failed_step = property(lambda self: self.job.failed_step)
+    ok = property(lambda self: self.job.ok and not self.job.skipped and all(child.ok for child in self.notify))
+    failed_step = property(lambda self: self.job.failed_step or
+                           next((child.failed_step for child in self.notify if not child.ok), ""))
     outputs = property(lambda self: self.job.outputs)
 
     def step(self, sid):
@@ -200,13 +206,15 @@ class World:
         if self.opts.verbose:
             print(line)
 
-    def run(self, workflow, job, *, event, event_name, ref, work=None, needs=None, matrix=None):
+    def run(self, workflow, job, *, event, event_name, ref, work=None, needs=None, matrix=None,
+            repository_secrets=None, run_id=4242):
         work = work or self.clone(ref)
         with open(self.state / "actions.jsonl", encoding="utf-8") as fh:
             mark = len(fh.readlines())
         res = wfrun.run_job(work / ".github" / "workflows" / workflow, job, event=event, repo=REPO,
                             workdir=work, state=self.state, event_name=event_name, ref=ref, needs=needs,
-                            matrix=matrix, metadata_action=self.opts.metadata_action, echo=self.log)
+                            matrix=matrix, repository_secrets=repository_secrets, run_id=run_id,
+                            metadata_action=self.opts.metadata_action, echo=self.log)
         with open(self.state / "actions.jsonl", encoding="utf-8") as fh:
             actions = [json.loads(line) for line in fh.readlines()[mark:]]
         return Result(res, actions)
@@ -227,11 +235,28 @@ class World:
             for build in res.calls(tool="docker/build-push-action"):
                 for t in build["tags"]:
                     self.image(t)
-            needs = {"publish": {"outputs": res.outputs, "result": "success"}}
-            for repo in CONSUMERS:
-                res.notify.append(self.run("publish.yml", "notify-consumers", event={"ref": ref},
-                                           event_name="push", ref=ref, work=work, needs=needs,
-                                           matrix={"repo": repo}))
+            res = self.fanout(res, tag, work=work)
+        return res
+
+    def fanout(self, published, tag, *, work=None, repository_secrets=None, outputs=None, run_id=4242):
+        ref = f"refs/tags/{tag}"
+        work = work or self.clone(ref)
+        workflow = work / ".github" / "workflows" / "publish.yml"
+        spec = wfrun.yaml.load(workflow.read_text(encoding="utf-8"), Loader=wfrun.yaml.BaseLoader)
+        matrix = spec["jobs"]["notify-consumers"]["strategy"]["matrix"]
+        expected = {"consumer": [row["consumer"] for row in CONSUMER_MATRIX],
+                    "include": [dict(row) for row in CONSUMER_MATRIX if "repository_secret" in row]}
+        if matrix != expected:
+            raise RuntimeError("notify-consumers matrix differs from the three neutral fixture roles")
+        rows = [{"consumer": consumer} for consumer in matrix["consumer"]]
+        for include in matrix["include"]:
+            next(row for row in rows if row["consumer"] == include["consumer"]).update(include)
+        res = Result(published.job, published.actions)
+        needs = {"publish": {"outputs": published.outputs if outputs is None else outputs, "result": "success"}}
+        for row in rows:
+            res.notify.append(self.run("publish.yml", "notify-consumers", event={"ref": ref},
+                                       event_name="push", ref=ref, work=work, needs=needs, matrix=row,
+                                       repository_secrets=repository_secrets, run_id=run_id))
         return res
 
     # -------------------------------------------------------------- checks
@@ -251,8 +276,23 @@ class World:
 
     def dispatched(self, res):
         return {c["repo"]: (c["fields"].get("client_payload[release_version]"),
-                            c["fields"].get("client_payload[prerelease]"))
+                            c["fields"].get("client_payload[prerelease]"),
+                            c["fields"].get("client_payload[run_id]"))
                 for c in res.calls(tool="gh", action="dispatch")}
+
+    def fanout_matches(self, res, version, prerelease, run_id=4242):
+        calls = res.calls(tool="gh", action="dispatch")
+        fields = {"event_type": "pineforge-release", "client_payload[release_version]": version,
+                  "client_payload[prerelease]": prerelease, "client_payload[run_id]": str(run_id)}
+        scopes = res.calls(tool="actions/create-github-app-token")
+        return (res.ok and len(res.notify) == len(CONSUMERS) and len(calls) == len(CONSUMERS)
+                and [entry["repo"] for entry in calls] == list(CONSUMERS)
+                and all(entry["fields"] == fields and entry.get("hostname") == "github.com"
+                        and entry.get("endpoint") == f"repos/pineforge-4pass/{entry['repo']}/dispatches"
+                        for entry in calls)
+                and [entry.get("repositories") for entry in scopes] == list(CONSUMERS)
+                and all(entry.get("owner") == "pineforge-4pass"
+                        and entry.get("github_api_url") == "https://api.github.com" for entry in scopes))
 
     def refused(self, res, step, message):
         return not res.ok and res.failed_step.startswith(step) and message in res.job.text()
@@ -307,7 +347,8 @@ def pair(w):
     w.check("publish v1.0.0-rc.1: GitHub Latest stays v0.1.25",
             w.load("gh-latest.json")["pineforge-release"] == "v0.1.25", w.load("gh-latest.json"))
     w.check("publish v1.0.0-rc.1: every consumer gets release_version=1.0.0-rc.1 prerelease=true",
-            w.dispatched(p) == {c: ("1.0.0-rc.1", "true") for c in CONSUMERS}, w.dispatched(p))
+            w.fanout_matches(p, "1.0.0-rc.1", "true"), w.dispatched(p))
+    fanout_failures(w, p, "v1.0.0-rc.1")
 
     before = w.tags()
     r = w.upstream("engine-release", {"version": "v1.0.0-rc.1", "prerelease": True, "run_id": 103})
@@ -341,7 +382,7 @@ def pair(w):
             rel.get("prerelease") is False and rel.get("latest") == "true"
             and w.load("gh-latest.json")["pineforge-release"] == "v1.0.0", rel.get("flags"))
     w.check("publish v1.0.0: every consumer gets release_version=1.0.0 prerelease=false",
-            w.dispatched(p) == {c: ("1.0.0", "false") for c in CONSUMERS}, w.dispatched(p))
+            w.fanout_matches(p, "1.0.0", "false"), w.dispatched(p))
 
     before, main = w.tags(), w.rev("main")
     r = w.upstream("engine-release", {"version": "v1.0.0-rc.1", "prerelease": True, "run_id": 106})
@@ -387,7 +428,14 @@ def reverse(w):
             r.ok and r.step("decide").get("mode") == "bump" and w.pins("v1.0.0-rc.1") == ("1.0.0-rc.1", "1.0.0-rc.1"),
             (r.failed_step, r.step("decide")))
 
-    w.image(f"{IMAGE}:1.0.0-rc.1")   # its publish run pushed the image (the pair world runs publish.yml)
+    published = w.publish("v1.0.0-rc.1")
+    w.check("reverse rc.1: real publish and all three scoped dispatches carry the same payload/run_id",
+            w.fanout_matches(published, "1.0.0-rc.1", "true"), w.dispatched(published))
+    sha = w.rev("v1.0.0-rc.1", short=True)
+    w.check("reverse rc.1: real metadata-action emits only fixed image tags",
+            w.pushed(published) == {f"{IMAGE}:{tag}" for tag in
+                                   ("1.0.0-rc.1", "engine1.0.0-rc.1-codegen1.0.0-rc.1", f"sha-{sha}")},
+            sorted(w.pushed(published)))
     before, main = w.tags(), w.rev("main")
     w.codegen_published("1.0.0")
     r = w.upstream("codegen-release", {"version": "1.0.0", "prerelease": False, "run_id": 203})
@@ -401,6 +449,14 @@ def reverse(w):
     w.check("engine 1.0.0 second: mode=bump release=1.0.0 prerelease=false; tag v1.0.0 pairs 1.0.0 + 1.0.0",
             r.ok and (d.get("mode"), d.get("release"), d.get("prerelease")) == ("bump", "1.0.0", "false")
             and w.pins("v1.0.0") == ("1.0.0", "1.0.0"), (r.failed_step, d))
+    published = w.publish("v1.0.0")
+    w.check("reverse stable: real publish and all three scoped dispatches carry the same payload/run_id",
+            w.fanout_matches(published, "1.0.0", "false"), w.dispatched(published))
+    sha = w.rev("v1.0.0", short=True)
+    w.check("reverse stable: real metadata-action emits stable moving and fixed image tags",
+            w.pushed(published) == {f"{IMAGE}:{tag}" for tag in
+                                   ("1.0.0", "1.0", "latest", "engine1.0.0-codegen1.0.0", f"sha-{sha}")},
+            sorted(w.pushed(published)))
 
 
 def lost_partner(w):
@@ -458,7 +514,7 @@ def legacy(w):
                                                       f"sha-{sha}")}, sorted(w.pushed(p)))
     w.check("re-run publish v0.1.26: GitHub Latest; consumers get prerelease=false",
             w.release(p, "v0.1.26").get("latest") == "true"
-            and w.dispatched(p) == {c: ("0.1.26", "false") for c in CONSUMERS}, w.dispatched(p))
+            and w.fanout_matches(p, "0.1.26", "false"), w.dispatched(p))
 
     work = w.commit_on_main("hand-made 1.0.1", VERSION="1.0.1\n")
     git("tag", "-a", "v1.0.1", "-m", "pineforge-release v1.0.1\n\nengine=1.0.1\ncodegen=1.0.0\n", cwd=work, env=w.env)
@@ -467,6 +523,54 @@ def legacy(w):
     w.check("a hand-made tag pairing engine 1.0.1 with codegen 1.0.0 fails before any build",
             w.refused(p, "Pairing rule", "refusing to publish engine 1.0.1 + codegen 1.0.0")
             and not p.calls(tool="docker/build-push-action"), p.failed_step)
+
+
+def fanout_failures(w, published, tag):
+    """Exercise consumer isolation and verify the fanout oracle rejects real defective runs."""
+    for index, row in enumerate(CONSUMER_MATRIX[1:], 1):
+        secret = row["repository_secret"]
+        for label, value in (("missing", None), ("empty", ""), ("owner/path", "fixture/target"),
+                             ("multiline", "fixture\ntarget")):
+            targets = dict(wfrun.DUMMY_REPOSITORY_SECRETS)
+            if value is None:
+                targets.pop(secret)
+            else:
+                targets[secret] = value
+            result = w.fanout(published, tag, repository_secrets=targets)
+            rejected = result.notify[index]
+            peers = [child for peer, child in enumerate(result.notify) if peer != index]
+            w.check(f"{row['consumer']} {label} target: only that consumer fails before App token/dispatch",
+                    not result.ok and w.refused(rejected, "Require one configured", "Missing or malformed")
+                    and not rejected.calls(tool="actions/create-github-app-token")
+                    and not rejected.calls(tool="gh", action="dispatch")
+                    and all(child.ok and len(child.calls(tool="gh", action="dispatch")) == 1 for child in peers)
+                    and set(w.dispatched(result)) == set(CONSUMERS) - {CONSUMERS[index]},
+                    (result.failed_step, w.dispatched(result)))
+    targets = {**wfrun.DUMMY_REPOSITORY_SECRETS, "RELEASE_HOSTED_MCP_REPOSITORY": "release-fixture-wrong"}
+    defective = w.fanout(published, tag, repository_secrets=targets)
+    w.check("fanout oracle rejects a successful dispatch to the wrong configured target",
+            defective.ok and not w.fanout_matches(defective, tag[1:], "true"), w.dispatched(defective))
+    for label, kwargs in (("release_version", {"tag": "v0.1.25"}),
+                          ("prerelease", {"outputs": {"prerelease": "false"}}),
+                          ("run_id", {"run_id": 4243})):
+        defective = w.fanout(published, kwargs.pop("tag", tag), **kwargs)
+        w.check(f"fanout oracle rejects a successful dispatch with wrong {label}",
+                defective.ok and not w.fanout_matches(defective, tag[1:], "true"), w.dispatched(defective))
+    for label, old, new in (
+            ("job", "  notify-consumers:\n", "  notify-consumers:\n    if: false\n"),
+            ("dispatch step", "      - name: Dispatch pineforge-release to consumer\n",
+             "      - name: Dispatch pineforge-release to consumer\n        if: false\n")):
+        work = w.clone(f"refs/tags/{tag}")
+        workflow = work / ".github" / "workflows" / "publish.yml"
+        text = workflow.read_text(encoding="utf-8")
+        if text.count(old) != 1:
+            raise RuntimeError(f"cannot inject skipped fanout {label} into the synthetic checkout")
+        workflow.write_text(text.replace(old, new), encoding="utf-8")
+        defective = w.fanout(published, tag, work=work)
+        w.check(f"fanout oracle rejects a skipped {label} (no dispatch is hidden)",
+                not w.fanout_matches(defective, tag[1:], "true")
+                and not defective.calls(tool="gh", action="dispatch")
+                and (not defective.ok if label == "job" else defective.ok), defective.text())
 
 
 WORLDS = {"pair": pair, "reverse": reverse, "lost-partner": lost_partner, "retag": retag, "legacy": legacy}

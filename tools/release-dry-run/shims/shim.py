@@ -177,17 +177,29 @@ def gh(argv):
             return 1
         return emit_json({"tagName": tag}, (opts.get("-q") or opts.get("--jq") or [None])[-1])
     if argv[:1] == ["api"]:
-        pos, opts, _ = parse(argv[1:], {"-f", "-F", "--field", "--raw-field", "-q", "--jq",
-                                         "-X", "--method", "-H", "--header"})
+        pos, opts, flags = parse(argv[1:], {"-f", "-F", "--field", "--raw-field", "-q", "--jq",
+                                         "-X", "--method", "-H", "--header", "--hostname"})
         endpoint = pos[0] if pos else ""
-        if endpoint.endswith("/dispatches"):
+        hostname = (opts.get("--hostname") or ["github.com"])[-1]
+        supported = {"-f", "-F", "--field", "--raw-field", "-q", "--jq", "-X", "--method",
+                     "-H", "--header", "--hostname"}
+        if hostname != "github.com" or flags or len(pos) != 1 or set(opts) - supported:
+            record(tool="gh", unsupported=argv)
+            say("gh", "unsupported api hostname or arguments")
+            return 1
+        if re.fullmatch(r"repos/[^/]+/[A-Za-z0-9][A-Za-z0-9_.-]*/dispatches", endpoint):
+            if set(opts) - {"-f", "-F", "--field", "--raw-field", "--hostname"}:
+                record(tool="gh", unsupported=argv)
+                say("gh", "unsupported dispatch arguments")
+                return 1
             fields = dict(kv.split("=", 1) for key in ("-f", "-F", "--field", "--raw-field")
                           for kv in opts.get(key, []))
-            record(tool="gh", action="dispatch", repo=endpoint.split("/")[2], fields=fields)
+            record(tool="gh", action="dispatch", repo=endpoint.split("/")[2], fields=fields,
+                   endpoint=endpoint, hostname=hostname)
             say("gh", f"WOULD DISPATCH to {endpoint.split('/')[2]}: {json.dumps(fields, sort_keys=True)}")
             return 0
         m = re.fullmatch(r"repos/[^/]+/([^/?]+)/releases(\?.*)?", endpoint)
-        if m and not opts.get("-X") and not opts.get("--method"):
+        if m and not (set(opts) - {"-q", "--jq", "--hostname"}):
             data = load(f"releases-{m.group(1)}.json", None)
             record(tool="gh", action="api", endpoint=endpoint, found=data is not None)
             if data is None:
