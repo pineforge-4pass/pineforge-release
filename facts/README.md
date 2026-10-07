@@ -522,9 +522,17 @@ def run_bounded(command, seconds, limit, data=None):
     try:
         for name in ("ctl", "go", "out", "err", "in"):
             fds[name + "_r"], fds[name + "_w"] = os.pipe()
-        pid = os.fork()
-        if pid == 0:
-            worker(command, fds)
+        # Do not let an inherited Python signal handler return the fork child
+        # into the parent's exception path before worker() takes control.
+        fork_handlers = {sig: signal.signal(sig, signal.SIG_IGN)
+                         for sig in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            pid = os.fork()
+            if pid == 0:
+                worker(command, fds)
+        finally:
+            for sig, handler in fork_handlers.items():
+                signal.signal(sig, handler)
         # Ownership is recorded immediately, before selector/pipe setup.
         # Both sides set the same group; the child cannot launch before GO.
         try:
