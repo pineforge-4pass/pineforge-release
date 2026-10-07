@@ -176,9 +176,12 @@ descriptions App/environment; the executor does not inspect secrets or mint
 live tokens to verify it. Live environment/App proof, including the authorized
 four-repository descriptions scope, remains pending. TOP reports that the old
 org App is Contents-only and that `release-automation` exists with target secrets.
-Its App key migration from repository secrets is still pending. Same-name
-`PINEFORGE_APP_*` secret inheritance must be resolved and verified before rollout;
-an environment declaration or successful mint alone cannot establish key origin.
+TOP reports that the new App key is already provisioned in `release-automation`,
+with repository copies replaced for compatibility. After the reviewed landing,
+TOP performs one authorized live proof, then removes this release repository's
+copy; engine/codegen environment moves follow separately. Environment secrets
+take precedence, but declaration or mint success cannot prove origin while the
+same-name repository fallback remains.
 
 1. Protect main. Configure environment `descriptions` with selected deployment
    **branch `main` only**, no tag patterns or other branches. Use the new
@@ -191,21 +194,20 @@ an environment declaration or successful mint alone cannot establish key origin.
    immutable source receipt and every delta. This comparison does not mint a
    token. A live App mint/apply proof needs TOP's separate authorization.
 3. Configure `release-automation` with selected deployment **branch `main` and
-   tag pattern `v*` only**. Copy the existing `PINEFORGE_APP_ID` and
-   `PINEFORGE_APP_PRIVATE_KEY` there. Provision
+   tag pattern `v*` only**. Confirm the new `PINEFORGE_APP_ID` and
+   `PINEFORGE_APP_PRIVATE_KEY` are provisioned there, together with
    `RELEASE_HOSTED_MCP_REPOSITORY` and `RELEASE_APPLICATION_REPOSITORY` as
    environment secrets containing the existing consumer repository short names.
    Confirm each neutral matrix label maps to its existing consumer. The offline
    public consumer stays explicit. Missing target setup fails before minting,
    rather than falling back to all repositories. Never put nonpublic identities
    in public YAML, artifacts or logs.
-4. Independently verify the protected release workflows and their existing tag,
-   paired-release and three-consumer behavior before removing repository-level
-   old-App keys. Tokens request Contents: write on only the job's repository;
-   no release job requests Administration. Confirm the reported Contents-only
-   old-App configuration and complete/verify environment-key migration and
-   repository-key removal; scoped workflow inputs do not change the installation
-   or prevent same-name repository-secret inheritance.
+4. Land the reviewed hub, run TOP's authorized live proof, then remove the release
+   repository-level App-key copy. Verify the next protected run without that
+   fallback. A no-op mint does not prove the bump push or consumer mapping;
+   those need their applicable release proof. Tokens request Contents: write on
+   only the job's repository, never Administration. Other repositories' key moves
+   are separate work; scoped inputs alone do not remove inherited credentials.
 5. After reviewed dry-run and separately authorized live proof, TOP may set
    `FACTS_DESCRIPTIONS_APPLY_ENABLED=true` in `descriptions`. Writes additionally
    require protected `refs/heads/main`, an authorized push/manual/schedule event,
