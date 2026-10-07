@@ -31,6 +31,14 @@ access; workflow third-party interactions are replayed locally:
   values never supply these names or credentials. Private deployment target
   identities are not fixture data. Each token action is recorded as a dummy
   scope, and `gh api --hostname github.com` is answered by the local shim.
+- Independent consumer execution requires the real workflow's explicit
+  `strategy.fail-fast: false`. Removing it or setting it to `true` fails before
+  any consumer token action or dispatch is replayed.
+- The dispatch shim constructs the nested JSON body from bracketed object
+  fields. `-F`/`--field` converts booleans, signed 64-bit integers and `null`;
+  `-f`/`--raw-field` preserves strings. The transcript records both flag kinds
+  and the resulting body. Unmodeled arrays, file inputs and repository
+  placeholders, as well as duplicate/conflicting paths, fail visibly.
 - Unknown expression syntax, actions, API hosts and unmodeled shim calls fail
   visibly. Failed or skipped consumer jobs cannot make a publish run green.
 
@@ -80,7 +88,8 @@ The pair world also runs the real consumer job with missing, empty, owner/path
 and multiline target configuration for each private role. Only that consumer
 must fail before token creation or dispatch; the other two still finish. Every
 successful fanout checks exactly three destinations, token scopes, hostname,
-event type and the complete `{release_version, prerelease, run_id}` payload.
+event type and the complete nested `client_payload` object: `release_version`
+is a string, `prerelease` is a JSON boolean and `run_id` is a JSON integer.
 
 ## Checking the checks
 
@@ -89,6 +98,9 @@ The full run includes negative controls: successful but wrong target,
 oracle. Skipped-job and skipped-dispatch controls modify only synthetic
 checkouts of the real workflow, not the source checkout, and must also be
 detected. The existing five worlds and failure/recovery assertions remain.
+Controls also remove/change `fail-fast: false` and switch each typed
+`prerelease`/`run_id` field from `-F` to `-f`: successful dispatches carrying
+the same text with the wrong JSON type must fail the oracle.
 
 To see a check catch a defect, break a workflow in a scratch clone and point
 the dry run at it:

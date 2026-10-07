@@ -11,12 +11,53 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "repo_descriptions.py"
 FACTS = REPO / "facts" / "facts.json"
+FROZEN_FACTS = REPO / "tests" / "fixtures" / "repo-descriptions-facts.json"
 POLICY = REPO / "facts" / "repo-descriptions.json"
+
+
+def percentages(score):
+    for field, count in (("excellentPct", score["excellent"]),
+                         ("strongPct", score["strong"]),
+                         ("excellentOrStrongPct", score["excellent"] + score["strong"])):
+        score[field] = float((Decimal(count) * 100 / score["graded"]).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP)) if score["graded"] else 0
+
+
+def advance_current(facts, delta):
+    """A consistent new population/provenance, independent of today's totals."""
+    facts = copy.deepcopy(facts)
+    score = facts["scoreboard"]
+    pair = next(pair for pair in score["pairs"] if not pair["hardProbes"] and not pair["corpusProbes"])
+    for group in (score, score["scopes"]["closed"], pair):
+        group["graded"] += delta
+        group["excellent"] += delta - 2
+        group["strong"] += 2
+        group["tiers"]["excellent"] += delta - 2
+        group["tiers"]["strong"] += 2
+    score["population"] += delta
+    score["closedProbes"] += delta
+    pair["closedProbes"] += delta
+    score["date"] = (date.fromisoformat(score["date"]) + timedelta(days=1)).isoformat()
+    score["id"] += "-fixture"
+    score["engineCommit"] = hashlib.sha1((score["engineCommit"] + "-fixture").encode()).hexdigest()
+    for field in ("snapshotSha256", "populationSha256"):
+        score[field] = hashlib.sha256((score[field] + "-fixture").encode()).hexdigest()
+    score["provenance"].update(baselineId=score["id"], promotionDate=score["date"] + "T00:00:00Z",
+                               **{field: score[field] for field in
+                                  ("engineCommit", "snapshotSha256", "populationSha256")})
+    provenance = score["provenance"]
+    score["source"] = (f'Registry baseline {provenance["baselineId"]}; digest-verified snapshot '
+                       f'{provenance["snapshotSha256"]}; private evidence sha256:'
+                       f'{provenance["privateEvidenceSha256"]}.')
+    percentages(score)
+    return facts
 
 
 class DescriptionCLI(unittest.TestCase):
@@ -48,17 +89,23 @@ class DescriptionCLI(unittest.TestCase):
         return json.loads(result.stdout)
 
     def test_real_canonical_snapshot_and_complete_manifest(self):
+        facts = json.loads(FACTS.read_text(encoding="utf-8"))
+        score, inventory = facts["scoreboard"], facts["inventory"]
         document = self.render()
         self.assertEqual(document["facts_sha256"], hashlib.sha256(FACTS.read_bytes()).hexdigest())
         rows = {row["role"]: row for row in document["repositories"]}
         self.assertEqual(set(rows), {"engine", "codegen-oss", "corpus", "hpo", "release", "backtest-mcp"})
         self.assertEqual(rows["hpo"]["disposition"], "HOLD")
-        self.assertIn("all 7,989 graded probes", rows["engine"]["expected"])
-        self.assertIn("7,983 excellent, 6 strong", rows["engine"]["expected"])
-        self.assertIn("6 strong", rows["engine"]["expected"])
-        self.assertIn("309 open-corpus strategies, 741 closed-test scripts",
+        self.assertIn(f'all {score["graded"]:,} graded probes', rows["engine"]["expected"])
+        self.assertIn(f'{score["excellent"]:,} excellent, {score["strong"]} strong', rows["engine"]["expected"])
+        self.assertIn(f'{inventory["corpusScripts"]} open-corpus strategies, '
+                      f'{inventory["closedScripts"]} closed-test scripts',
                       rows["engine"]["expected"])
-        self.assertIn("Historical script inventory (1.0.1): 309 scripts", rows["corpus"]["expected"])
+        self.assertIn(f'Historical script inventory ({inventory["sourceRelease"]}): '
+                      f'{inventory["corpusScripts"]:,} scripts', rows["corpus"]["expected"])
+        corpus = score["scopes"]["corpus"]
+        self.assertIn(f'{corpus["excellent"]:,}/{corpus["graded"]:,} excellent probes',
+                      rows["corpus"]["expected"])
         self.assertIn("PineForge Source License 1.2", rows["codegen-oss"]["expected"])
         self.assertIn("scoreboard.graded", rows["engine"]["tokens"])
         self.assertIn("inventory.closedScripts", rows["engine"]["tokens"])
@@ -67,42 +114,57 @@ class DescriptionCLI(unittest.TestCase):
                 self.assertIn("/" + source["commit"] + "/LICENSE", source["url"])
         self.assertEqual(self.invoke("render").stdout, self.invoke("render").stdout)
 
-    def test_future_main_does_not_relabel_inventory_or_released_metrics(self):
-        facts = json.loads(FACTS.read_text(encoding="utf-8"))
-        score = facts["scoreboard"]
-        # Grow current main consistently. Historical inventory/releases keep their own population.
-        for pair in score["pairs"]:
-            if pair["strong"] == 1:
-                pair.update(excellent=pair["excellent"] + 1, strong=0)
-                pair["tiers"].update(excellent=pair["excellent"], strong=0)
-        pair = score["pairs"][1]
-        pair.update(graded=pair["graded"] + 1011, excellent=pair["excellent"] + 1011,
-                    closedProbes=pair["closedProbes"] + 1011)
-        pair["tiers"]["excellent"] += 1011
-        score.update(graded=9000, excellent=8998, strong=2, population=9017,
-                     closedProbes=score["closedProbes"] + 1011, excellentPct=99.98, strongPct=0.02)
-        score["tiers"].update(excellent=8998, strong=2)
-        closed = score["scopes"]["closed"]
-        closed.update(graded=closed["graded"] + 1011, excellent=closed["excellent"] + 1015, strong=2)
-        closed["tiers"].update(excellent=closed["excellent"], strong=2)
-        score["populationSha256"] = "b" * 64
-        score["provenance"]["populationSha256"] = score["populationSha256"]
-        future = self.document("future.json", facts)
-        rows = {row["role"]: row for row in self.render(facts=future)["repositories"]}
-        self.assertIn("all 9,000 graded probes", rows["engine"]["expected"])
-        self.assertIn("8,998 excellent, 2 strong", rows["engine"]["expected"])
-        self.assertIn("309 open-corpus strategies, 741 closed-test scripts", rows["engine"]["expected"])
+    def test_frozen_snapshot_has_exact_golden_prose(self):
+        # This file is deliberately frozen; canonical promotions must not refresh it.
+        rows = {row["role"]: row for row in self.render(facts=FROZEN_FACTS)["repositories"]}
+        self.assertEqual(rows["engine"]["expected"],
+                         "Open-source C++17 engine for backtesting and forward execution, with a versioned C ABI; "
+                         "Pine Script v6 runs through code generation. Against TradingView's own trade lists, "
+                         "all 7,989 graded probes (309 open-corpus strategies, 741 closed-test scripts) grade "
+                         "excellent or strong: 7,983 excellent, 6 strong. Apache-2.0.")
+        self.assertEqual(rows["corpus"]["expected"],
+                         "Open Pine Script reference corpus and TradingView trade traces. Current graded corpus: "
+                         "309/309 excellent probes. Historical script inventory (1.0.1): 309 scripts. Apache-2.0.")
         policy = self.policy(lambda value: value["repositories"][0].update(
             template="Release probes: {{facts:releases.1.0.1.scoreboard.graded|int}}; "
+                     "current: {{facts:scoreboard.graded|int}}; date: {{facts:scoreboard.date|text}}; "
+                     "engine: {{facts:scoreboard.engineCommit|text}}."))
+        self.assertEqual(self.render(facts=FROZEN_FACTS, policy=policy)["repositories"][0]["expected"],
+                         "Release probes: 7989; current: 7989; date: 2026-10-07; "
+                         "engine: 49bb202944c54c9bffdb918e24a7f4fb1a7d838d.")
+
+    def test_future_main_does_not_relabel_inventory_or_released_metrics(self):
+        canonical = json.loads(FACTS.read_text(encoding="utf-8"))
+        inventory = canonical["inventory"]
+        release = inventory["sourceRelease"]
+        policy = self.policy(lambda value: value["repositories"][0].update(
+            template="Release probes: {{facts:releases." + release + ".scoreboard.graded|int}}; "
                      "current: {{facts:scoreboard.graded|int}}; "
                      "date: {{facts:scoreboard.date|text}}; "
                      "engine: {{facts:scoreboard.engineCommit|text}}."))
-        engine = self.render(facts=future, policy=policy)["repositories"][0]
-        self.assertEqual(engine["expected"],
-                         "Release probes: 7989; current: 9000; date: 2026-10-06; "
-                         "engine: 59082e696f0c7a95c1aa0d3179e1aac23f79fc04.")
-        self.assertNotEqual(self.render(facts=future)["facts_sha256"],
-                            self.render()["facts_sha256"])
+        facts = canonical
+        for delta in (1011, 23):
+            with self.subTest(delta=delta):
+                previous = facts
+                facts = advance_current(facts, delta)
+                score = facts["scoreboard"]
+                self.assertEqual(facts["inventory"], canonical["inventory"])
+                self.assertEqual(facts["releases"], canonical["releases"])
+                self.assertEqual(score["hardLane"], canonical["scoreboard"]["hardLane"])
+                for field in ("date", "engineCommit", "graded", "excellent", "strong"):
+                    self.assertNotEqual(score[field], previous["scoreboard"][field])
+                future = self.document("future.json", facts)
+                rows = {row["role"]: row for row in self.render(facts=future)["repositories"]}
+                self.assertIn(f'all {score["graded"]:,} graded probes', rows["engine"]["expected"])
+                self.assertIn(f'{score["excellent"]:,} excellent, {score["strong"]} strong',
+                              rows["engine"]["expected"])
+                self.assertIn(f'{inventory["corpusScripts"]} open-corpus strategies, '
+                              f'{inventory["closedScripts"]} closed-test scripts', rows["engine"]["expected"])
+                engine = self.render(facts=future, policy=policy)["repositories"][0]
+                self.assertEqual(engine["expected"],
+                                 f'Release probes: {canonical["releases"][release]["scoreboard"]["graded"]}; '
+                                 f'current: {score["graded"]}; date: {score["date"]}; engine: {score["engineCommit"]}.')
+                self.assertNotEqual(self.render(facts=future)["facts_sha256"], self.render()["facts_sha256"])
 
     def test_consistent_below_strong_snapshot_is_refused_before_output_or_live_reads(self):
         canonical = json.loads(FACTS.read_text(encoding="utf-8"))
@@ -116,10 +178,7 @@ class DescriptionCLI(unittest.TestCase):
             group["belowStrong"] += 1
             group["tiers"]["excellent"] -= 1
             group["tiers"]["moderate"] += 1
-        for field, count in (("excellentPct", scoreboard["excellent"]),
-                             ("strongPct", scoreboard["strong"]),
-                             ("excellentOrStrongPct", scoreboard["excellent"] + scoreboard["strong"])):
-            scoreboard[field] = round(count * 100 / scoreboard["graded"], 2)
+        percentages(scoreboard)
         self.assertEqual(facts["inventory"], canonical["inventory"])
         self.assertEqual(facts["releases"], canonical["releases"])
         self.assertEqual(scoreboard["hardLane"], canonical["scoreboard"]["hardLane"])
@@ -158,7 +217,7 @@ class DescriptionCLI(unittest.TestCase):
                 self.assertIn("all-graded", result.stderr)
 
     def test_changed_historical_tokens_are_read_not_hardcoded(self):
-        facts = json.loads(FACTS.read_text(encoding="utf-8"))
+        facts = json.loads(FROZEN_FACTS.read_text(encoding="utf-8"))
         facts["inventory"].update(corpusScripts=411, communityScripts=794, closedScripts=855)
         historic = facts["releases"][facts["inventory"]["sourceRelease"]]["scoreboard"]
         historic["population"] += 102
@@ -170,8 +229,7 @@ class DescriptionCLI(unittest.TestCase):
         for lane in (historic["pairs"][0], historic["hardLane"]):
             lane["corpusProbes"] += 102
             lane["hardProbes"] += 102
-        historic["excellentPct"] = round(historic["excellent"] * 100 / historic["graded"], 2)
-        historic["strongPct"] = round(historic["strong"] * 100 / historic["graded"], 2)
+        percentages(historic)
         engine = self.render(facts=self.document("inventory.json", facts))["repositories"][0]
         self.assertIn("411 open-corpus strategies, 855 closed-test scripts", engine["expected"])
 

@@ -243,7 +243,12 @@ class World:
         work = work or self.clone(ref)
         workflow = work / ".github" / "workflows" / "publish.yml"
         spec = wfrun.yaml.load(workflow.read_text(encoding="utf-8"), Loader=wfrun.yaml.BaseLoader)
-        matrix = spec["jobs"]["notify-consumers"]["strategy"]["matrix"]
+        strategy = spec["jobs"]["notify-consumers"]["strategy"]
+        # This replay runs each row independently. Bind that behavior to the
+        # real workflow instead of silently ignoring GitHub's fail-fast default.
+        if strategy.get("fail-fast") != "false":
+            raise RuntimeError("notify-consumers requires explicit strategy.fail-fast: false")
+        matrix = strategy["matrix"]
         expected = {"consumer": [row["consumer"] for row in CONSUMER_MATRIX],
                     "include": [dict(row) for row in CONSUMER_MATRIX if "repository_secret" in row]}
         if matrix != expected:
@@ -275,19 +280,27 @@ class World:
         return found[0] if found else {}
 
     def dispatched(self, res):
-        return {c["repo"]: (c["fields"].get("client_payload[release_version]"),
-                            c["fields"].get("client_payload[prerelease]"),
-                            c["fields"].get("client_payload[run_id]"))
+        return {c["repo"]: c["body"]
                 for c in res.calls(tool="gh", action="dispatch")}
 
     def fanout_matches(self, res, version, prerelease, run_id=4242):
         calls = res.calls(tool="gh", action="dispatch")
-        fields = {"event_type": "pineforge-release", "client_payload[release_version]": version,
-                  "client_payload[prerelease]": prerelease, "client_payload[run_id]": str(run_id)}
+        body = {"event_type": "pineforge-release", "client_payload": {
+            "release_version": version, "prerelease": prerelease, "run_id": run_id}}
+
+        def body_matches(entry):
+            actual = entry.get("body")
+            if actual != body:
+                return False
+            payload = actual["client_payload"]
+            # Python's True == 1 must not make incorrect JSON types pass.
+            return type(payload["prerelease"]) is bool and type(payload["run_id"]) is int
+
         scopes = res.calls(tool="actions/create-github-app-token")
-        return (res.ok and len(res.notify) == len(CONSUMERS) and len(calls) == len(CONSUMERS)
+        return (type(prerelease) is bool and type(run_id) is int
+                and res.ok and len(res.notify) == len(CONSUMERS) and len(calls) == len(CONSUMERS)
                 and [entry["repo"] for entry in calls] == list(CONSUMERS)
-                and all(entry["fields"] == fields and entry.get("hostname") == "github.com"
+                and all(body_matches(entry) and entry.get("hostname") == "github.com"
                         and entry.get("endpoint") == f"repos/pineforge-4pass/{entry['repo']}/dispatches"
                         for entry in calls)
                 and [entry.get("repositories") for entry in scopes] == list(CONSUMERS)
@@ -347,7 +360,7 @@ def pair(w):
     w.check("publish v1.0.0-rc.1: GitHub Latest stays v0.1.25",
             w.load("gh-latest.json")["pineforge-release"] == "v0.1.25", w.load("gh-latest.json"))
     w.check("publish v1.0.0-rc.1: every consumer gets release_version=1.0.0-rc.1 prerelease=true",
-            w.fanout_matches(p, "1.0.0-rc.1", "true"), w.dispatched(p))
+            w.fanout_matches(p, "1.0.0-rc.1", True), w.dispatched(p))
     fanout_failures(w, p, "v1.0.0-rc.1")
 
     before = w.tags()
@@ -382,7 +395,7 @@ def pair(w):
             rel.get("prerelease") is False and rel.get("latest") == "true"
             and w.load("gh-latest.json")["pineforge-release"] == "v1.0.0", rel.get("flags"))
     w.check("publish v1.0.0: every consumer gets release_version=1.0.0 prerelease=false",
-            w.fanout_matches(p, "1.0.0", "false"), w.dispatched(p))
+            w.fanout_matches(p, "1.0.0", False), w.dispatched(p))
 
     before, main = w.tags(), w.rev("main")
     r = w.upstream("engine-release", {"version": "v1.0.0-rc.1", "prerelease": True, "run_id": 106})
@@ -430,7 +443,7 @@ def reverse(w):
 
     published = w.publish("v1.0.0-rc.1")
     w.check("reverse rc.1: real publish and all three scoped dispatches carry the same payload/run_id",
-            w.fanout_matches(published, "1.0.0-rc.1", "true"), w.dispatched(published))
+            w.fanout_matches(published, "1.0.0-rc.1", True), w.dispatched(published))
     sha = w.rev("v1.0.0-rc.1", short=True)
     w.check("reverse rc.1: real metadata-action emits only fixed image tags",
             w.pushed(published) == {f"{IMAGE}:{tag}" for tag in
@@ -451,7 +464,7 @@ def reverse(w):
             and w.pins("v1.0.0") == ("1.0.0", "1.0.0"), (r.failed_step, d))
     published = w.publish("v1.0.0")
     w.check("reverse stable: real publish and all three scoped dispatches carry the same payload/run_id",
-            w.fanout_matches(published, "1.0.0", "false"), w.dispatched(published))
+            w.fanout_matches(published, "1.0.0", False), w.dispatched(published))
     sha = w.rev("v1.0.0", short=True)
     w.check("reverse stable: real metadata-action emits stable moving and fixed image tags",
             w.pushed(published) == {f"{IMAGE}:{tag}" for tag in
@@ -514,7 +527,7 @@ def legacy(w):
                                                       f"sha-{sha}")}, sorted(w.pushed(p)))
     w.check("re-run publish v0.1.26: GitHub Latest; consumers get prerelease=false",
             w.release(p, "v0.1.26").get("latest") == "true"
-            and w.fanout_matches(p, "0.1.26", "false"), w.dispatched(p))
+            and w.fanout_matches(p, "0.1.26", False), w.dispatched(p))
 
     work = w.commit_on_main("hand-made 1.0.1", VERSION="1.0.1\n")
     git("tag", "-a", "v1.0.1", "-m", "pineforge-release v1.0.1\n\nengine=1.0.1\ncodegen=1.0.0\n", cwd=work, env=w.env)
@@ -527,6 +540,23 @@ def legacy(w):
 
 def fanout_failures(w, published, tag):
     """Exercise consumer isolation and verify the fanout oracle rejects real defective runs."""
+    for label, replacement in (("true", "      fail-fast: true\n"), ("missing", "")):
+        work = w.clone(f"refs/tags/{tag}")
+        workflow = work / ".github" / "workflows" / "publish.yml"
+        text = workflow.read_text(encoding="utf-8")
+        original = "      fail-fast: false\n"
+        if text.count(original) != 1:
+            raise RuntimeError("cannot inject fail-fast control into the synthetic checkout")
+        workflow.write_text(text.replace(original, replacement), encoding="utf-8")
+        before = (w.state / "actions.jsonl").read_bytes()
+        try:
+            w.fanout(published, tag, work=work)
+        except RuntimeError as error:
+            refused = "strategy.fail-fast: false" in str(error)
+        else:
+            refused = False
+        w.check(f"consumer isolation rejects fail-fast {label} before any consumer runs",
+                refused and (w.state / "actions.jsonl").read_bytes() == before)
     for index, row in enumerate(CONSUMER_MATRIX[1:], 1):
         secret = row["repository_secret"]
         for label, value in (("missing", None), ("empty", ""), ("owner/path", "fixture/target"),
@@ -549,13 +579,27 @@ def fanout_failures(w, published, tag):
     targets = {**wfrun.DUMMY_REPOSITORY_SECRETS, "RELEASE_HOSTED_MCP_REPOSITORY": "release-fixture-wrong"}
     defective = w.fanout(published, tag, repository_secrets=targets)
     w.check("fanout oracle rejects a successful dispatch to the wrong configured target",
-            defective.ok and not w.fanout_matches(defective, tag[1:], "true"), w.dispatched(defective))
+            defective.ok and not w.fanout_matches(defective, tag[1:], True), w.dispatched(defective))
     for label, kwargs in (("release_version", {"tag": "v0.1.25"}),
                           ("prerelease", {"outputs": {"prerelease": "false"}}),
                           ("run_id", {"run_id": 4243})):
         defective = w.fanout(published, kwargs.pop("tag", tag), **kwargs)
         w.check(f"fanout oracle rejects a successful dispatch with wrong {label}",
-                defective.ok and not w.fanout_matches(defective, tag[1:], "true"), w.dispatched(defective))
+                defective.ok and not w.fanout_matches(defective, tag[1:], True), w.dispatched(defective))
+    for field in ("prerelease", "run_id"):
+        work = w.clone(f"refs/tags/{tag}")
+        workflow = work / ".github" / "workflows" / "publish.yml"
+        text = workflow.read_text(encoding="utf-8")
+        original = f'-F "client_payload[{field}]='
+        if text.count(original) != 1:
+            raise RuntimeError(f"cannot inject raw {field} control into the synthetic checkout")
+        workflow.write_text(text.replace(original, f'-f "client_payload[{field}]='), encoding="utf-8")
+        defective = w.fanout(published, tag, work=work)
+        calls = defective.calls(tool="gh", action="dispatch")
+        w.check(f"fanout oracle rejects string instead of typed {field}",
+                defective.ok and len(calls) == len(CONSUMERS)
+                and all(type(call["body"]["client_payload"][field]) is str for call in calls)
+                and not w.fanout_matches(defective, tag[1:], True), w.dispatched(defective))
     for label, old, new in (
             ("job", "  notify-consumers:\n", "  notify-consumers:\n    if: false\n"),
             ("dispatch step", "      - name: Dispatch pineforge-release to consumer\n",
@@ -568,7 +612,7 @@ def fanout_failures(w, published, tag):
         workflow.write_text(text.replace(old, new), encoding="utf-8")
         defective = w.fanout(published, tag, work=work)
         w.check(f"fanout oracle rejects a skipped {label} (no dispatch is hidden)",
-                not w.fanout_matches(defective, tag[1:], "true")
+                not w.fanout_matches(defective, tag[1:], True)
                 and not defective.calls(tool="gh", action="dispatch")
                 and (not defective.ok if label == "job" else defective.ok), defective.text())
 

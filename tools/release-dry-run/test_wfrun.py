@@ -8,8 +8,10 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import dry_run
 import wfrun
 
 
@@ -133,6 +135,112 @@ class EnvironmentTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("unsupported", result.stderr)
         self.assertFalse(any(entry.get("action") == "dispatch" for entry in self.actions()))
+
+    def test_api_fields_preserve_json_types_and_nested_objects(self):
+        env = {**wfrun.clean_env(), "HARNESS_STATE": str(self.state)}
+        for typed, raw in (("-F", "-f"), ("--field", "--raw-field")):
+            with self.subTest(typed=typed):
+                result = subprocess.run([str(wfrun.SHIMS / "gh"), "api", "--hostname", "github.com",
+                                         "repos/fixture/consumer/dispatches",
+                                         raw, "event_type=pineforge-release",
+                                         typed, "client_payload[prerelease]=true",
+                                         typed, "client_payload[run_id]=4242",
+                                         typed, "client_payload[optional]=null",
+                                         typed, "client_payload[nested][stable]=false",
+                                         typed, "client_payload[offset]=-7",
+                                         raw, "client_payload[raw_bool]=true",
+                                         raw, "client_payload[raw_number]=4242",
+                                         raw, "client_payload[raw_null]=null"],
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                call = self.actions()[-1]
+                self.assertEqual(call.get("body"), {
+                    "event_type": "pineforge-release", "client_payload": {
+                        "prerelease": True, "run_id": 4242, "optional": None,
+                        "nested": {"stable": False}, "offset": -7,
+                        "raw_bool": "true", "raw_number": "4242", "raw_null": "null"}})
+
+    def test_unmodeled_or_conflicting_fields_fail_without_dispatch(self):
+        env = {**wfrun.clean_env(), "HARNESS_STATE": str(self.state)}
+        for fields in (("-F", "missing-value"), ("-F",),
+                       ("-F", "payload[]=value"), ("-F", "payload[broken=value"),
+                       ("-F", "payload=@input.json"), ("-F", "payload={repo}"),
+                       ("-f", "payload=value", "-F", "payload[nested]=true"),
+                       ("-f", "payload[nested]=raw", "-F", "payload[nested]=true")):
+            with self.subTest(fields=fields):
+                result = subprocess.run([str(wfrun.SHIMS / "gh"), "api", "--hostname", "github.com",
+                                         "repos/fixture/consumer/dispatches", *fields],
+                                        env=env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unsupported", result.stderr)
+        self.assertFalse(any(entry.get("action") == "dispatch" for entry in self.actions()))
+
+    def test_long_equals_fields_and_gh_integer_conversion_boundaries(self):
+        env = {**wfrun.clean_env(), "HARNESS_STATE": str(self.state)}
+        result = subprocess.run([str(wfrun.SHIMS / "gh"), "api", "--hostname=github.com",
+                                 "repos/fixture/consumer/dispatches",
+                                 "--raw-field=event_type=pineforge-release",
+                                 "--field=client_payload[leading_zero]=00042",
+                                 "--field=client_payload[positive]=+7",
+                                 "--field=client_payload[overflow]=9223372036854775808",
+                                 "--field=client_payload[decimal]=1.5",
+                                 "--raw-field=client_payload[empty]="],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.actions()[-1]["body"], {
+            "event_type": "pineforge-release", "client_payload": {
+                "leading_zero": 42, "positive": 7, "overflow": "9223372036854775808",
+                "decimal": "1.5", "empty": ""}})
+
+
+class FanoutContractTest(unittest.TestCase):
+    """Execute the real consumer shell through the same fanout as the five worlds."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="fanout-contract-")
+        self.addCleanup(temp.cleanup)
+        opts = SimpleNamespace(out=Path(temp.name),
+                               checkout=Path(__file__).resolve().parents[2],
+                               metadata_action=None, verbose=False, describe="contract fixture")
+        self.world = dry_run.World("contract", opts, [])
+        self.addCleanup(self.world.transcript.close)
+        self.published = dry_run.Result(wfrun.JobResult(True, outputs={"prerelease": "true"}), [])
+
+    def fanout(self, old=None, new=None):
+        work = self.world.clone("refs/heads/main")
+        workflow = work / ".github/workflows/publish.yml"
+        if old is not None:
+            text = workflow.read_text()
+            self.assertEqual(text.count(old), 1)
+            workflow.write_text(text.replace(old, new))
+        return self.world.fanout(self.published, "v1.0.0-rc.1", work=work)
+
+    def test_failure_policy_requires_explicit_false_before_any_consumer(self):
+        for replacement in ("      fail-fast: true\n", ""):
+            with self.subTest(replacement=replacement):
+                before = (self.world.state / "actions.jsonl").read_bytes()
+                with self.assertRaisesRegex(RuntimeError, "fail-fast"):
+                    self.fanout("      fail-fast: false\n", replacement)
+                self.assertEqual((self.world.state / "actions.jsonl").read_bytes(), before)
+
+    def test_fanout_asserts_typed_nested_dispatch_body(self):
+        result = self.fanout()
+        self.assertTrue(self.world.fanout_matches(result, "1.0.0-rc.1", True), result.text())
+        for call in result.calls(tool="gh", action="dispatch"):
+            self.assertEqual(call.get("body"), {"event_type": "pineforge-release", "client_payload": {
+                "release_version": "1.0.0-rc.1", "prerelease": True, "run_id": 4242}})
+            self.assertIs(type(call["body"]["client_payload"]["prerelease"]), bool)
+            self.assertIs(type(call["body"]["client_payload"]["run_id"]), int)
+
+    def test_raw_prerelease_and_run_id_are_detected(self):
+        self.assertTrue(self.world.fanout_matches(self.fanout(), "1.0.0-rc.1", True))
+        for field in ("prerelease", "run_id"):
+            with self.subTest(field=field):
+                result = self.fanout(f'-F "client_payload[{field}]=', f'-f "client_payload[{field}]=')
+                self.assertTrue(result.ok, result.text())
+                self.assertFalse(self.world.fanout_matches(result, "1.0.0-rc.1", True))
+                for call in result.calls(tool="gh", action="dispatch"):
+                    self.assertIs(type(call["body"]["client_payload"][field]), str)
 
 
 if __name__ == "__main__":

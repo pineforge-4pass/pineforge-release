@@ -79,6 +79,46 @@ def emit_json(data, query):
     return proc.returncode
 
 
+def api_fields(opts):
+    """Model gh's named object fields; refuse unmodeled arrays/files/placeholders.
+
+    Both flag kinds build bracketed objects. Only -F/--field performs gh's
+    magic conversion (Go Atoi, then true/false/null); -f/--raw-field stays text.
+    """
+    body, fields = {}, []
+    for flag in ("-f", "--raw-field", "-F", "--field"):
+        for argument in opts.get(flag, []):
+            if "=" not in argument:
+                raise ValueError("field requires a value")
+            name, raw = argument.split("=", 1)
+            if not re.fullmatch(r"[^\[\]=]+(?:\[[^\[\]=]+\])*", name):
+                raise ValueError("unmodeled field path")
+            value = raw
+            if flag in {"-F", "--field"}:
+                if raw.startswith("@") or re.search(r"\{(?:owner|repo|branch)\}", raw):
+                    raise ValueError("unmodeled field file or placeholder")
+                if re.fullmatch(r"[+-]?[0-9]+", raw):
+                    integer = int(raw)
+                    # gh uses a signed machine integer on the supported 64-bit hosts.
+                    if -(2**63) <= integer < 2**63:
+                        value = integer
+                elif raw in {"true", "false", "null"}:
+                    value = {"true": True, "false": False, "null": None}[raw]
+            keys = name.replace("]", "").split("[")
+            target = body
+            for key in keys[:-1]:
+                if key not in target:
+                    target[key] = {}
+                if not isinstance(target[key], dict):
+                    raise ValueError("conflicting object field")
+                target = target[key]
+            if keys[-1] in target:
+                raise ValueError("duplicate field")
+            target[keys[-1]] = value
+            fields.append({"flag": flag, "name": name, "raw": raw})
+    return body, fields
+
+
 # ---------------------------------------------------------------------- curl
 def curl(argv):
     url = out = fmt = None
@@ -177,8 +217,13 @@ def gh(argv):
             return 1
         return emit_json({"tagName": tag}, (opts.get("-q") or opts.get("--jq") or [None])[-1])
     if argv[:1] == ["api"]:
-        pos, opts, flags = parse(argv[1:], {"-f", "-F", "--field", "--raw-field", "-q", "--jq",
-                                         "-X", "--method", "-H", "--header", "--hostname"})
+        try:
+            pos, opts, flags = parse(argv[1:], {"-f", "-F", "--field", "--raw-field", "-q", "--jq",
+                                             "-X", "--method", "-H", "--header", "--hostname"})
+        except IndexError:
+            record(tool="gh", unsupported=argv)
+            say("gh", "unsupported api arguments: missing option value")
+            return 1
         endpoint = pos[0] if pos else ""
         hostname = (opts.get("--hostname") or ["github.com"])[-1]
         supported = {"-f", "-F", "--field", "--raw-field", "-q", "--jq", "-X", "--method",
@@ -192,11 +237,15 @@ def gh(argv):
                 record(tool="gh", unsupported=argv)
                 say("gh", "unsupported dispatch arguments")
                 return 1
-            fields = dict(kv.split("=", 1) for key in ("-f", "-F", "--field", "--raw-field")
-                          for kv in opts.get(key, []))
-            record(tool="gh", action="dispatch", repo=endpoint.split("/")[2], fields=fields,
+            try:
+                body, fields = api_fields(opts)
+            except ValueError as error:
+                record(tool="gh", unsupported=argv)
+                say("gh", f"unsupported dispatch fields: {error}")
+                return 1
+            record(tool="gh", action="dispatch", repo=endpoint.split("/")[2], body=body, fields=fields,
                    endpoint=endpoint, hostname=hostname)
-            say("gh", f"WOULD DISPATCH to {endpoint.split('/')[2]}: {json.dumps(fields, sort_keys=True)}")
+            say("gh", f"WOULD DISPATCH to {endpoint.split('/')[2]}: {json.dumps(body, sort_keys=True)}")
             return 0
         m = re.fullmatch(r"repos/[^/]+/([^/?]+)/releases(\?.*)?", endpoint)
         if m and not (set(opts) - {"-q", "--jq", "--hostname"}):

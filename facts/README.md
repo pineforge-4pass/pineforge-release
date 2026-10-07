@@ -120,6 +120,13 @@ endpoint JSON, compares deterministic bytes, and runs subprocess acceptance that
 parses the actual SVG and JSON and checks their facts. `python-test.yml` also
 runs the existing description renderer acceptance regressions.
 
+Exact prose acceptance uses `tests/fixtures/repo-descriptions-facts.json`, a
+frozen snapshot that canonical promotions must not refresh. Current-facts
+checks derive their quantities and provenance from the supplied document;
+consistent synthetic advances change counts, date and engine together while
+preserving historical inventory and released scoreboards. Schema/semantic
+rejection and the unsupported below-strong-domain refusal remain required.
+
 `facts-descriptions.yml` replaces the retired duplicate drift workflow. A main
 push touching its path filters wakes it even when the commit includes other
 files. Manual dispatch defaults to `dry_run=true`; a schedule reconciles every
