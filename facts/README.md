@@ -189,8 +189,11 @@ their own rollout. Never inspect or hash secret values to establish origin.
    Administration: write and the required Metadata: read. Do not grant Contents
    write or install it on held/static rows. Keep the exact environment secrets
    `DESCRIPTIONS_APP_ID` and `DESCRIPTIONS_APP_PRIVATE_KEY`.
-2. Leave environment variable `FACTS_DESCRIPTIONS_APPLY_ENABLED` absent (or not
-   `true`). PRs have no App access. Dispatch with `dry_run=true` and review the
+2. Keep environment variable `FACTS_DESCRIPTIONS_APPLY_ENABLED` set to literal
+   `false` in `descriptions`. Read the organization, repository and environment
+   values and verify the protected workflow's effective value is `false`; an
+   absent environment value can expose an inherited `true`. PRs have no App
+   access. Dispatch with `dry_run=true` and review the
    immutable source receipt and every delta. This comparison does not mint a
    token. A live App mint/apply proof needs TOP's separate authorization.
 3. Configure `release-automation` with selected deployment **branch `main` and
@@ -211,8 +214,11 @@ their own rollout. Never inspect or hash secret values to establish origin.
    `FACTS_DESCRIPTIONS_APPLY_ENABLED=true` in `descriptions`. Writes additionally
    require protected `refs/heads/main`, an authorized push/manual/schedule event,
    and effective `dry_run=false`. With rollout enabled, push/schedule reconcile
-   automatically; manual dispatch retains its safe default. Removing the variable
-   disables all subsequent application without restoring the retired drift job.
+   automatically; manual dispatch retains its safe default. To stop subsequent
+   application, set the environment variable to literal `false`, then read back
+   organization, repository and environment values and verify the protected
+   workflow's effective value is `false`. Do not delete the environment value:
+   that can expose an inherited `true`. Keep the retired drift job retired.
 
 These are TOP operator commands, not steps executed by the implementation lane.
 Use the approved GitHub wrapper where one is required:
@@ -222,8 +228,11 @@ GH_HOST=github.com gh workflow run facts-descriptions.yml --repo pineforge-4pass
 # After independent review and authorized live proof only:
 GH_HOST=github.com gh variable set FACTS_DESCRIPTIONS_APPLY_ENABLED --repo pineforge-4pass/pineforge-release --env descriptions --body true
 GH_HOST=github.com gh workflow run facts-descriptions.yml --repo pineforge-4pass/pineforge-release --ref main -f dry_run=false
-# Disable future application:
-GH_HOST=github.com gh variable delete FACTS_DESCRIPTIONS_APPLY_ENABLED --repo pineforge-4pass/pineforge-release --env descriptions
+# Disable future application, then verify all scopes and the effective value:
+GH_HOST=github.com gh variable set FACTS_DESCRIPTIONS_APPLY_ENABLED --repo pineforge-4pass/pineforge-release --env descriptions --body false
+GH_HOST=github.com gh variable list --org pineforge-4pass
+GH_HOST=github.com gh variable list --repo pineforge-4pass/pineforge-release
+GH_HOST=github.com gh variable list --repo pineforge-4pass/pineforge-release --env descriptions
 ```
 
 ## Receipts, alerts and remaining proof
@@ -380,10 +389,20 @@ an additional two-second signal-0 observation checks group absence. No destructi
 signal is sent after reaping. Failure to establish cleanup emits a neutral
 `*-cleanup-failed` receipt with exit 2, never command output or a success receipt.
 Cleanup can add up to seven seconds to each command's 45/10-second budget.
+Handled SIGINT/SIGTERM only record cancellation; they never raise through fork,
+ownership or finalizer bookkeeping. Normal control flow observes cancellation
+and returns the existing neutral unavailable failure after bounded teardown.
+The parent keeps those handlers throughout cleanup, including repeated signals;
+it does not temporarily ignore cancellation or turn it into a success receipt.
 
 Platform contract: Python 3.9+ on POSIX macOS or Linux with `fork`, process groups,
-nonblocking pipes and a pipe-capable selector. No `waitid`, `WNOWAIT`, Linux-only
-process API or third-party package is required. Run as the standalone,
+nonblocking pipes and a pipe-capable selector. The supervisor uses only the
+Python standard library, with no `waitid`, `WNOWAIT` or Linux-only process API.
+The real status parser separately requires the unchanged pins in
+`facts/requirements-validation.txt`. Install them in the **same interpreter**
+used below, for example `python3 -m pip install -r
+/path/to/reviewed/pineforge-release/facts/requirements-validation.txt`; the
+recipe launches the parser with `sys.executable`. Run as the standalone,
 single-threaded interpreter shown below with default child reaping (no external
 SIGCHLD handler or auto-reaper), permission to signal its children, and ordinary
 runnable kernel syscalls. Kernel suspension/uninterruptible I/O and termination
@@ -416,6 +435,7 @@ STATUS_SECONDS = 10
 TERM_GRACE_SECONDS = 3
 REAP_SECONDS = 2
 EMPTY_PROBE_SECONDS = 2
+cancelled = False
 
 
 def close_fd(fd):
@@ -509,6 +529,8 @@ def worker(command, fds):
 
 def run_bounded(command, seconds, limit, data=None):
     """Return (real command exit, bounded stdout, neutral failure reason)."""
+    if cancelled:
+        return None, b"", "setup"
     deadline = time.monotonic() + seconds
     fds = {}
     pid = None
@@ -522,17 +544,11 @@ def run_bounded(command, seconds, limit, data=None):
     try:
         for name in ("ctl", "go", "out", "err", "in"):
             fds[name + "_r"], fds[name + "_w"] = os.pipe()
-        # Do not let an inherited Python signal handler return the fork child
-        # into the parent's exception path before worker() takes control.
-        fork_handlers = {sig: signal.signal(sig, signal.SIG_IGN)
-                         for sig in (signal.SIGINT, signal.SIGTERM)}
-        try:
-            pid = os.fork()
-            if pid == 0:
-                worker(command, fds)
-        finally:
-            for sig, handler in fork_handlers.items():
-                signal.signal(sig, handler)
+        # The inherited handler only records cancellation, so it cannot throw
+        # the child into the parent's bookkeeping before worker() takes over.
+        pid = os.fork()
+        if pid == 0:
+            worker(command, fds)
         # Ownership is recorded immediately, before selector/pipe setup.
         # Both sides set the same group; the child cannot launch before GO.
         try:
@@ -556,6 +572,9 @@ def run_bounded(command, seconds, limit, data=None):
         else:
             close_fd(fds.pop("in_w"))
         while True:
+            if cancelled:
+                reason = "setup"  # Existing neutral unavailable receipt.
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 reason = "timeout"
@@ -621,9 +640,8 @@ def run_bounded(command, seconds, limit, data=None):
     except BaseException:
         reason = "setup"
     finally:
-        # Repeated operator signals cannot interrupt this bounded finalizer.
-        saved = {sig: signal.signal(sig, signal.SIG_IGN)
-                 for sig in (signal.SIGINT, signal.SIGTERM)}
+        # The same recording-only handlers remain installed during teardown.
+        # No handler transition can throw past this bounded finalizer.
         try:
             if pid is not None and pid > 0:
                 if not teardown(pid, owned):
@@ -638,8 +656,8 @@ def run_bounded(command, seconds, limit, data=None):
                     reason = "cleanup-failed"
             for fd in fds.values():
                 close_fd(fd)
-            for sig, handler in saved.items():
-                signal.signal(sig, handler)
+    if cancelled and reason is None:
+        reason = "setup"
     return code, bytes(output), reason
 
 
@@ -720,12 +738,15 @@ def main():
             or receipt.get("served_freshness") != "unverified"
             or receipt.get("status") not in {"workflow-observed", "telemetry-alert"}):
         return failure("status-receipt-invalid", status_exit=status_exit)
+    if cancelled:
+        return failure("status-parser-unavailable")
     print(json.dumps(receipt, sort_keys=True))
     return status_exit
 
 
 def interrupted(*_):
-    raise KeyboardInterrupt
+    global cancelled
+    cancelled = True
 
 
 signal.signal(signal.SIGINT, interrupted)
