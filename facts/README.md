@@ -98,10 +98,11 @@ pinned commits and the `LICENSE` source path still match exactly.
 
 ## Stage 1 validation and descriptions reconciliation
 
-This slice validates and reconciles descriptions only. Export and promotion keep
-using the existing reviewed process. Website/MCP consumers, hosted cards, README
-switches, dispatch fanout, and the readable-text branch are later stages. The
-card renderer here emits bytes for validation; it deploys nothing.
+Stage 1 validates and reconciles descriptions. Export and promotion keep using
+the existing reviewed process. The independent Stage 2 dispatch signal is
+described below; consumer publication, hosted cards, README switches and the
+readable-text branch have separate rollout requirements. The card renderer here
+emits bytes for validation; it deploys nothing.
 
 Install the pinned validator in the approved test environment:
 
@@ -176,12 +177,11 @@ descriptions App/environment; the executor does not inspect secrets or mint
 live tokens to verify it. Live environment/App proof, including the authorized
 four-repository descriptions scope, remains pending. TOP reports that the old
 org App is Contents-only and that `release-automation` exists with target secrets.
-TOP reports that the new App key is already provisioned in `release-automation`,
-with repository copies replaced for compatibility. After the reviewed landing,
-TOP performs one authorized live proof, then removes this release repository's
-copy; engine/codegen environment moves follow separately. Environment secrets
-take precedence, but declaration or mint success cannot prove origin while the
-same-name repository fallback remains.
+TOP reports that the new App key is provisioned in `release-automation` and that
+this release repository's private-key fallback has been removed. This is a TOP
+setup receipt, not an executor secret inspection. The first protected release's
+no-fallback proof remains separate; engine/codegen environment moves follow
+their own rollout. Never inspect or hash secret values to establish origin.
 
 1. Protect main. Configure environment `descriptions` with selected deployment
    **branch `main` only**, no tag patterns or other branches. Use the new
@@ -202,9 +202,8 @@ same-name repository fallback remains.
    public consumer stays explicit. Missing target setup fails before minting,
    rather than falling back to all repositories. Never put nonpublic identities
    in public YAML, artifacts or logs.
-4. Land the reviewed hub, run TOP's authorized live proof, then remove the release
-   repository-level App-key copy. Verify the next protected run without that
-   fallback. A no-op mint does not prove the bump push or consumer mapping;
+4. Verify the next protected release without the repository-level App-key
+   fallback, which TOP reports removed. A no-op mint does not prove the bump push or consumer mapping;
    those need their applicable release proof. Tokens request Contents: write on
    only the job's repository, never Administration. Other repositories' key moves
    are separate work; scoped inputs alone do not remove inherited credentials.
@@ -274,3 +273,156 @@ The compatibility renderer still supports review-only `--format commands` and
 read-only `check --live --gh PATH`; it never executes its proposed commands.
 Use the guarded workflow for automated application. Do not promote static or
 held rows by manually applying compatibility output.
+
+## Stage 2 hub dispatch signal
+
+`facts-fanout.yml` wakes on a main push touching `facts/facts.json`, including a
+mixed commit, on manual dispatch, and at minutes 7, 22, 37 and 52 of each hour.
+Its job has a ten-minute timeout and its own `facts-web-dispatch` concurrency
+group with `cancel-in-progress: false`. It has no dependency on the descriptions
+workflow. Missed, failed or obsolete notifications are repaired by a later wake-up
+that resolves authoritative current main again; GitHub schedules can be delayed.
+
+The helper reuses the existing immutable GitHub source reader and complete
+schema/semantic validator. Preparation checks the local canonical input, verifies
+the public hub identity, resolves current main, fetches facts and schema by that
+immutable commit, verifies Git blob integrity and computes the facts SHA256.
+The remote schema must equal the reviewed local schema. A source move before
+preparation completes produces a `superseded` hold without permitting a mint.
+The selected commit, digest and requested boolean are bound in `payload.json`.
+Before sending, the helper validates those files again, compares fresh immutable
+bytes and checks main immediately before the POST. Source movement holds that
+snapshot for the next serialized run; a run never silently changes its source.
+There is no atomic transaction between a main read and a dispatch, so the receiver
+must also reconcile authoritative source and the next wake-up remains the repair
+path for a simultaneous source change.
+
+The single API write is a repository dispatch with event type `facts-update`.
+Its `client_payload` has **exactly** these fields:
+
+```json
+{"commit":"<40 lowercase hex characters>","sha256":"<64 lowercase hex characters>","dry_run":true}
+```
+
+The boolean is a JSON boolean, never a string or number. Unknown, missing and
+duplicate fields are refused. The target comes only from protected setup, never
+from that payload. Repeating the same source repeats this idempotent signal;
+the hub never writes facts or consumer files. A successful dispatch means GitHub
+accepted the signal with HTTP 204. It does not establish receiver completion,
+deployment or served freshness.
+
+The job declares environment `release-automation` and uses only its existing
+`PINEFORGE_APP_ID` / `PINEFORGE_APP_PRIVATE_KEY` plus the new environment secret
+`FACTS_WEB_REPOSITORY`. Set the latter to one short repository name within the
+fixed owner `pineforge-4pass`: 1–100 ASCII letters, digits, underscores, hyphens
+or dots, starting with a letter, digit, underscore or hyphen. Empty targets,
+controls, whitespace, separators, URLs, owner prefixes and encoded paths cannot
+be token targets. Missing target/key setup while disabled produces a visible
+`setup-required` receipt; invalid nonempty targets fail. When enabled, any
+missing setup fails before source calls or minting.
+
+The new environment variable `FACTS_WEB_DISPATCH_ENABLED` is **off by default**:
+absent, empty or `false` means no mint and no POST. Only literal `true` enables
+the signal, and minting also requires a successful validated preparation and a
+protected main push/manual/schedule context. The token action requests only the
+explicit secret-supplied repository and `permission-contents: write`. It never
+uses descriptions credentials or requests Administration. The helper checks
+credential presence only and does not inspect or hash their values.
+
+Manual `dry_run` defaults to `true` and an explicitly requested `false` survives
+workflow expression evaluation. With the dispatch gate off, either value only
+plans. Once TOP separately enables dispatch, either requested boolean is sent:
+`true` asks the receiver to validate without publishing. Enabled push/schedule
+runs send `false`; disabled automatic runs plan with `true`. The receiver must
+have its own protected publication gate. The hub's enable flag grants no receiver
+write authority.
+
+Public receipts and artifact names use the neutral label `web` and contain only
+public canonical commit/digest provenance, requested mode, setup secret names,
+status, category, numeric HTTP status, alert and exit code. The private target,
+token, URLs and response bodies are never copied into helper output. The target
+is passed as a secret directly to the scoped token action and is never a job
+output. Redirects are refused; errors retain a category and HTTP status when
+available. Generic authentication, network, rate-limit or mint failures fail
+visibly, with `permission_unavailable_proven=false`; a 403 is not evidence of
+missing permission. Mint failure remains unclassified because the token action
+does not expose a reliable structured cause.
+
+Each workflow run uploads `fanout-audit-{run_id}-{run_attempt}` containing
+`prepare.json` and, when minting was eligible, `dispatch.json`. Artifact upload
+requires a receipt. Cancellation does not alert. A setup/plan or superseded hold
+exits 0; validation, mint, transport or receipt failures exit 2. A setup-required
+receipt has `alert=true` even while rollout is deliberately off. All receipts
+keep `installed=false`. Missing receipts and failed uploads are missing telemetry,
+never a successful consumer health check.
+
+TOP's bounded, read-only workflow heartbeat is the following command from the
+reviewed checkout, with the approved GitHub wrapper on `PATH`:
+
+```sh
+set -o pipefail
+ghq api --method GET --hostname github.com \
+  'repos/pineforge-4pass/pineforge-release/actions/workflows/facts-fanout.yml/runs?branch=main&per_page=20' \
+  | python3 scripts/facts_fanout.py status
+```
+
+`status` reads at most 2 MiB and 20 run records, excludes cancellations, and
+returns a neutral JSON receipt. It alerts (exit 1) for absent/completed telemetry
+older than 30 minutes, a failed completed run in that window, or a noncompleted
+run older than 15 minutes. Malformed input exits 2. Exit 0 is `workflow-observed`,
+with `served_freshness=unverified`, not installation proof. This heartbeat checks
+workflow runs; TOP must also read each neutral artifact, including setup alerts.
+It cannot replace the receiver's source-versus-served digest check. That required
+30-minute freshness clock starts at the facts-byte change, not an unrelated main
+commit, workflow creation time or a retry.
+
+## TOP Stage 2 rollout checklist (leave dispatch off)
+
+1. Land the reviewed receiver first. Confirm it accepts `facts-update`, validates
+   exactly the three payload fields and authoritative current source, and gates
+   writes independently. Its protected code, scoped web-only App and tested
+   facts-only commit confinement belong to the separate consumer change.
+2. Obtain fresh independent and security reviews and the complete CI rollup on
+   the final hub and receiver trees. Spot subprocess/HTTP acceptance does not
+   replace live App, environment or receiver proof. No RTM or enablement follows
+   from the source change alone.
+3. In `release-automation`, provision `FACTS_WEB_REPOSITORY` and verify the
+   existing Contents-only App has the intended selected repository. Retain the
+   environment's protected main / `v*` restrictions. Keep
+   `FACTS_WEB_DISPATCH_ENABLED` absent or `false`; inspect the disabled manual
+   plan, immutable source, setup receipt and artifact before enabling anything.
+   Do not restore the removed repository-level key fallback.
+4. Follow TOP's separately authorized receiver rehearsal on the fixed throwaway
+   branch, preserving its source/receipt proof and exact Spot build. Branch-only
+   proof is not deployment proof. Enable hub dispatch only after the receiver
+   and its independent rollout controls are ready. An enabled manual dispatch
+   with `dry_run=true` tests receipt delivery without requesting publication.
+5. Pages Git integration owns production build/deployment from main. Neither
+   this hub nor the receiver rollout needs Cloudflare credentials, a Cloudflare
+   API call or a Pages upload command. The receiver must observe the Pages
+   GitHub check bound to its exact committed SHA, then independently verify
+   served provenance and canonical bytes/digest. Surface deployment races and
+   missing telemetry instead of attributing success to the wrong commit.
+6. TOP's first authorized real main run must close source-versus-served proof
+   within 30 minutes of the facts-byte change. Confirm welcome-template runtime
+   override/readback in the consumer rollout. Keep release no-key-fallback proof
+   separate. Remove the enable flag to stop future hub minting/dispatch; retain
+   receipts and scheduled plan visibility. HPO wording waits for a genuine next
+   descriptions-policy change.
+
+Affected offline acceptance (approved Spot host only):
+
+```sh
+python3 -m unittest discover -s tests -p 'test_facts_*.py' -v
+python3 -m unittest discover -s tests -p 'test_repo_descriptions.py' -v
+python3 scripts/facts_validate.py --facts facts/facts.json
+python3 scripts/repo_descriptions.py render --facts facts/facts.json
+```
+
+Fanout acceptance reuses the existing loopback GitHub fixture and runs the real
+parser, validator, workflow shell and dispatch helper. Only external GitHub
+responses and token-action outcomes are simulated. Tests capture exact POST
+bytes, exercise disabled/missing setup, strict payloads and targets, source
+movement, repeated signals, failures/redaction, independent workflow wiring and
+missing/stale telemetry. The implementation lane performs no live mint, dispatch,
+consumer publication or deployment.

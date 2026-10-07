@@ -1,0 +1,93 @@
+name: facts-fanout
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'facts/facts.json'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Ask the consumer to validate without publishing
+        type: boolean
+        default: true
+        required: true
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+
+# This signal serializes independently of descriptions and release automation.
+concurrency:
+  group: facts-web-dispatch
+  cancel-in-progress: false
+
+jobs:
+  web:
+    if: github.ref == 'refs/heads/main'
+    environment: release-automation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
+      # toJSON returns a nonempty string even for false; manual false is preserved.
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && toJSON(inputs.dry_run) || (vars.FACTS_WEB_DISPATCH_ENABLED != 'true' && 'true' || 'false') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install -r facts/requirements-validation.txt
+      - name: Validate source and plan dispatch
+        id: source
+        env:
+          FACTS_READ_TOKEN: ${{ github.token }}
+          FACTS_WEB_REPOSITORY: ${{ secrets.FACTS_WEB_REPOSITORY }}
+          PINEFORGE_APP_ID: ${{ secrets.PINEFORGE_APP_ID }}
+          PINEFORGE_APP_PRIVATE_KEY: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
+        run: |
+          python3 scripts/facts_fanout.py prepare --facts facts/facts.json --dry-run "$DRY_RUN" \
+            --output-dir "$RUNNER_TEMP/fanout-source" --github-output "$GITHUB_OUTPUT" \
+            --receipt "$RUNNER_TEMP/fanout-audit/prepare.json"
+      - name: Mint consumer token
+        id: app
+        if: >-
+          steps.source.outcome == 'success' && steps.source.outputs.mint_allowed == 'true' &&
+          github.ref == 'refs/heads/main' && github.ref_protected &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') &&
+          vars.FACTS_WEB_DISPATCH_ENABLED == 'true'
+        # The action has no structured permission-failure result. Report any failure
+        # as unclassified and fail visibly; never switch Apps or token scope.
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.PINEFORGE_APP_ID }}
+          private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
+          owner: pineforge-4pass
+          repositories: ${{ secrets.FACTS_WEB_REPOSITORY }}
+          permission-contents: write
+          github-api-url: https://api.github.com
+      - name: Send the validated signal and record its status
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.source.outputs.mint_allowed == 'true' }}
+        env:
+          FACTS_READ_TOKEN: ${{ github.token }}
+          FACTS_WEB_REPOSITORY: ${{ secrets.FACTS_WEB_REPOSITORY }}
+          FACTS_DISPATCH_TOKEN: ${{ steps.app.outputs.token }}
+          MINT_OUTCOME: ${{ steps.app.outcome }}
+        run: |
+          python3 scripts/facts_fanout.py dispatch --source-dir "$RUNNER_TEMP/fanout-source" \
+            --mint-outcome "$MINT_OUTCOME" --receipt "$RUNNER_TEMP/fanout-audit/dispatch.json"
+      - name: Preserve neutral consumer receipts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fanout-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fanout-audit/*.json
+          if-no-files-found: error
+      - name: Visible failure alert
+        if: ${{ failure() && !cancelled() }}
+        run: echo '::error::Consumer dispatch failed. Inspect the neutral receipt; absent receipts are missing telemetry. A dispatched signal is not installation proof.'
