@@ -167,7 +167,7 @@ class DescriptionCLI(unittest.TestCase):
                 self.assertNotEqual(self.render(facts=future)["facts_sha256"], self.render()["facts_sha256"])
 
     def test_consistent_below_strong_snapshot_is_refused_before_output_or_live_reads(self):
-        canonical = json.loads(FACTS.read_text(encoding="utf-8"))
+        canonical = json.loads(FROZEN_FACTS.read_text(encoding="utf-8"))
         facts = copy.deepcopy(canonical)
         scoreboard = facts["scoreboard"]
         pair = next(value for value in scoreboard["pairs"]
@@ -208,7 +208,7 @@ class DescriptionCLI(unittest.TestCase):
     def test_all_graded_claim_requires_exact_excellent_and_strong_sum(self):
         for difference in (-1, 1):
             with self.subTest(difference=difference):
-                facts = json.loads(FACTS.read_text(encoding="utf-8"))
+                facts = json.loads(FROZEN_FACTS.read_text(encoding="utf-8"))
                 facts["scoreboard"]["excellent"] += difference
                 result = self.invoke("render", "--format", "commands",
                                      facts=self.document("inconsistent-sum.json", facts))
