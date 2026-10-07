@@ -359,10 +359,39 @@ never a successful consumer health check.
 TOP's read-only workflow heartbeat uses the approved `ghq` wrapper on `PATH` and
 requires an explicit path to the reviewed checkout. It bounds the GitHub query
 to 45 seconds and 2 MiB of stdout, and the status parser to 10 seconds and 32
-KiB of stdout. A timeout or output-limit breach terminates only that child
-process group: it sends `SIGTERM`, waits at most three seconds, sends `SIGKILL`
-if the group remains, then waits at most two more seconds. Stderr is discarded;
-failures produce a neutral receipt rather than command output.
+KiB of stdout. Each budget starts before its command is created and covers
+process creation, process-group setup, `exec`, input, output and exit.
+
+The single-threaded parent forks an owned group-leader worker before any command
+creation. Both sides establish the worker's process group; the worker reports
+ready and waits for the parent's verified GO before creating the nested command.
+Only that worker calls `Popen`/`wait`, so command creation, `exec` and setup stalls
+cannot block the parent's deadline loop. A bounded 64-byte control channel carries
+the real command exit separately. The worker stays alive after reporting it.
+Stdout and stdin use nonblocking pipes; stderr is drained without retention.
+
+Every completion and exception enters cleanup, even after command or worker
+failure and when descendants have closed their pipes. Before reaping the worker,
+the parent sends TERM to its verified owned group, allows three seconds, then
+sends KILL. The unreaped worker (live or zombie) reserves its PID/PGID through the
+last destructive signal. Before ownership is established, only the unreaped
+child PID is signalled and no command is released. Reaping has a two-second bound;
+an additional two-second signal-0 observation checks group absence. No destructive
+signal is sent after reaping. Failure to establish cleanup emits a neutral
+`*-cleanup-failed` receipt with exit 2, never command output or a success receipt.
+Cleanup can add up to seven seconds to each command's 45/10-second budget.
+
+Platform contract: Python 3.9+ on POSIX macOS or Linux with `fork`, process groups,
+nonblocking pipes and a pipe-capable selector. No `waitid`, `WNOWAIT`, Linux-only
+process API or third-party package is required. Run as the standalone,
+single-threaded interpreter shown below with default child reaping (no external
+SIGCHLD handler or auto-reaper), permission to signal its children, and ordinary
+runnable kernel syscalls. Kernel suspension/uninterruptible I/O and termination
+of the watchdog itself cannot be bounded by a userspace watchdog. Commands must
+not change their group/session: escaped descendants are outside this ownership
+contract. A delayed orphan reaper or PGID reuse during the final observation may
+cause a conservative cleanup failure. Runtime acceptance on Linux does not
+constitute macOS runtime proof. Failures are neutral and rollout remains off.
 
 ```sh
 python3 - /path/to/reviewed/pineforge-release <<'PY'
@@ -382,117 +411,228 @@ RUNS = (
 )
 MAX_QUERY_BYTES = 2 * 1024 * 1024
 MAX_STATUS_BYTES = 32 * 1024
+QUERY_SECONDS = 45
+STATUS_SECONDS = 10
+TERM_GRACE_SECONDS = 3
+REAP_SECONDS = 2
+EMPTY_PROBE_SECONDS = 2
 
 
-def stop_own_group(process):
+def close_fd(fd):
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
-        return
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            break
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            time.sleep(min(0.05, remaining))
-    else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
+        os.close(fd)
+    except OSError:
         pass
 
 
-def run_bounded(command, seconds, limit, data=None):
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
-        start_new_session=True,
-    )
-    selector = selectors.DefaultSelector()
-    output = bytearray()
-    reason = None
-    stopped = False
-    offset = 0
-    input_data = memoryview(data) if data is not None else None
+def teardown(pid, owned):
+    # Do not poll/wait/reap before the LAST group signal. Even a failed worker
+    # stays our unreaped child, reserving its PID (and therefore this PGID).
+    ok = True
     try:
-        for stream, kind in ((process.stdout, "stdout"), (process.stderr, "stderr")):
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream, selectors.EVENT_READ, kind)
-        if input_data is not None:
-            os.set_blocking(process.stdin.fileno(), False)
-            if input_data:
-                selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
-            else:
-                process.stdin.close()
+        if owned:
+            os.killpg(pid, signal.SIGTERM)
+            time.sleep(TERM_GRACE_SECONDS)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        ok = False
+    try:
+        if owned:
+            os.killpg(pid, signal.SIGKILL)
+        else:
+            # No GO was sent: only this child can exist, never a command.
+            os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        ok = False
+    end = time.monotonic() + REAP_SECONDS
+    while True:
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                break
+        except ChildProcessError:
+            # Unexpected external reaping invalidates the ownership contract.
+            return False
+        except OSError:
+            return False
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+    if not owned:
+        return ok
+    end = time.monotonic() + EMPTY_PROBE_SECONDS
+    while True:
+        try:
+            # Observation only. Never send TERM/KILL after releasing the PID.
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return ok
+        except OSError:
+            return False
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
 
-        deadline = time.monotonic() + seconds
-        while selector.get_map() or process.poll() is None:
+
+def worker(command, fds):
+    try:
+        for name in ("ctl_r", "go_w", "in_w", "out_r", "err_r"):
+            close_fd(fds[name])
+        os.setpgid(0, 0)
+        # A caught handler resets to default on exec; unlike SIG_IGN it does
+        # not make the nested command ignore TERM. Keep the anchor for cleanup.
+        signal.signal(signal.SIGTERM, lambda *_: None)
+        signal.signal(signal.SIGINT, lambda *_: None)
+        os.set_blocking(fds["ctl_w"], False)
+        os.write(fds["ctl_w"], b"r\n")
+        if os.read(fds["go_r"], 1) != b"g":
+            os._exit(126)
+        process = subprocess.Popen(command, stdin=fds["in_r"],
+                                   stdout=fds["out_w"], stderr=fds["err_w"],
+                                   close_fds=True)
+        for name in ("in_r", "out_w", "err_w"):
+            close_fd(fds[name])
+        code = process.wait()  # Only the worker can block on command creation/exit.
+        os.write(fds["ctl_w"], ("x%d\n" % code).encode("ascii"))
+        # Stay alive even after the command exits; parent owns all teardown.
+        os.read(fds["go_r"], 1)
+    except BaseException:
+        try:
+            os.write(fds["ctl_w"], b"e\n")
+        except OSError:
+            pass
+    finally:
+        os._exit(127)
+
+
+def run_bounded(command, seconds, limit, data=None):
+    """Return (real command exit, bounded stdout, neutral failure reason)."""
+    deadline = time.monotonic() + seconds
+    fds = {}
+    pid = None
+    owned = False
+    selector = None
+    output = bytearray()
+    control = bytearray()
+    reason = None
+    code = None
+    state = "handshake"
+    try:
+        for name in ("ctl", "go", "out", "err", "in"):
+            fds[name + "_r"], fds[name + "_w"] = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            worker(command, fds)
+        # Ownership is recorded immediately, before selector/pipe setup.
+        # Both sides set the same group; the child cannot launch before GO.
+        try:
+            os.setpgid(pid, pid)
+        except OSError:
+            pass
+        owned = os.getpgid(pid) == pid
+        if not owned:
+            raise RuntimeError("group setup")
+        for name in ("ctl_w", "go_r", "in_r", "out_w", "err_w"):
+            close_fd(fds.pop(name))
+        for fd in fds.values():
+            os.set_blocking(fd, False)
+        selector = selectors.DefaultSelector()
+        for name, kind in (("ctl_r", "ctl"), ("out_r", "out"), ("err_r", "err")):
+            selector.register(fds[name], selectors.EVENT_READ, kind)
+        payload = memoryview(data) if data is not None else memoryview(b"")
+        offset = 0
+        if payload:
+            selector.register(fds["in_w"], selectors.EVENT_WRITE, "in")
+        else:
+            close_fd(fds.pop("in_w"))
+        while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 reason = "timeout"
                 break
-            if selector.get_map():
-                events = selector.select(min(remaining, 0.25))
-            else:
-                time.sleep(min(remaining, 0.05))
-                continue
-            for key, _ in events:
-                stream = key.fileobj
-                if key.data == "stdin":
+            # The worker's bounded record carries command exit independently
+            # of worker lifetime. Still drain all output and deliver all input.
+            if code is not None and all(k.data == "ctl" for k in selector.get_map().values()):
+                break
+            for key, _ in selector.select(min(remaining, 0.1)):
+                fd, kind = key.fd, key.data
+                if kind == "in":
                     try:
-                        offset += os.write(
-                            stream.fileno(), input_data[offset:offset + 65536]
-                        )
+                        offset += os.write(fd, payload[offset:offset + 65536])
+                    except BlockingIOError:
+                        continue
                     except BrokenPipeError:
                         reason = "stdin-closed"
                         break
-                    if offset == len(input_data):
-                        selector.unregister(stream)
-                        stream.close()
+                    if offset == len(payload):
+                        selector.unregister(fd)
+                        close_fd(fds.pop("in_w"))
                     continue
-
-                size = 65536
-                if key.data == "stdout":
-                    size = min(size, limit - len(output) + 1)
-                chunk = os.read(stream.fileno(), size)
-                if not chunk:
-                    selector.unregister(stream)
-                    stream.close()
-                elif key.data == "stdout":
+                size = min(65536, limit - len(output) + 1) if kind == "out" else 65536
+                if kind == "ctl":
+                    size = 65 - len(control)
+                try:
+                    chunk = os.read(fd, size)
+                except BlockingIOError:
+                    continue
+                if kind == "ctl":
+                    if not chunk:
+                        reason = "worker-failed"
+                        break
+                    control.extend(chunk)
+                    if len(control) > 64:
+                        reason = "worker-failed"
+                        break
+                    while b"\n" in control:
+                        record, _, tail = control.partition(b"\n")
+                        control[:] = tail
+                        if state == "handshake" and record == b"r":
+                            if os.getpgid(pid) != pid:
+                                raise RuntimeError("group changed")
+                            os.write(fds["go_w"], b"g")  # One byte, nonblocking.
+                            state = "running"
+                        elif state == "running" and record.startswith(b"x"):
+                            code = int(record[1:])
+                            state = "finished"
+                        else:
+                            reason = "worker-failed"
+                            break
+                elif not chunk:
+                    selector.unregister(fd)
+                elif kind == "out":
                     if len(output) + len(chunk) > limit:
                         reason = "stdout-limit"
                         break
                     output.extend(chunk)
+                if reason is not None:
+                    break
             if reason is not None:
                 break
-
-        if reason is not None:
-            stop_own_group(process)
-            stopped = True
-        else:
-            process.wait()
-        return process.returncode, bytes(output), reason
+    except BaseException:
+        reason = "setup"
     finally:
-        if not stopped and process.poll() is None:
-            stop_own_group(process)
-        for key in list(selector.get_map().values()):
-            selector.unregister(key.fileobj)
-            key.fileobj.close()
-        selector.close()
+        # Repeated operator signals cannot interrupt this bounded finalizer.
+        saved = {sig: signal.signal(sig, signal.SIG_IGN)
+                 for sig in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            if pid is not None and pid > 0:
+                if not teardown(pid, owned):
+                    reason = "cleanup-failed"
+        except BaseException:
+            reason = "cleanup-failed"
+        finally:
+            if selector is not None:
+                try:
+                    selector.close()
+                except Exception:
+                    reason = "cleanup-failed"
+            for fd in fds.values():
+                close_fd(fd)
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+    return code, bytes(output), reason
 
 
 def failure(diagnostic, query_exit=None, status_exit=None):
@@ -518,6 +658,8 @@ def failure(diagnostic, query_exit=None, status_exit=None):
 def main():
     if len(sys.argv) != 2:
         return failure("reviewed-checkout-required")
+    if os.name != "posix" or not hasattr(os, "fork"):
+        return failure("process-supervision-unavailable")
     ghq = shutil.which("ghq")
     if ghq is None:
         return failure("github-client-unavailable")
@@ -526,33 +668,39 @@ def main():
         helper = checkout / "scripts/facts_fanout.py"
         if not helper.is_file():
             return failure("reviewed-checkout-status-command-missing")
-        query_exit, raw, reason = run_bounded(
-            [ghq, "api", "--method", "GET", "--hostname", "github.com", RUNS],
-            45,
-            MAX_QUERY_BYTES,
-        )
     except (OSError, ValueError):
-        return failure("github-query-unavailable")
+        return failure("reviewed-checkout-required")
+    query_exit, raw, reason = run_bounded(
+        [os.path.abspath(ghq), "api", "--method", "GET", "--hostname",
+         "github.com", RUNS],
+        QUERY_SECONDS,
+        MAX_QUERY_BYTES,
+    )
+    if reason == "cleanup-failed":
+        return failure("github-query-cleanup-failed")
     if reason == "timeout":
         return failure("github-query-timeout")
     if reason == "stdout-limit":
         return failure("github-response-too-large")
+    if reason in ("setup", "worker-failed"):
+        return failure("github-query-unavailable")
     if reason is not None or query_exit != 0:
         return failure("github-query-failed", query_exit=query_exit)
 
-    try:
-        status_exit, status_output, reason = run_bounded(
-            [sys.executable, str(helper), "status"],
-            10,
-            MAX_STATUS_BYTES,
-            data=raw,
-        )
-    except (OSError, ValueError):
-        return failure("status-parser-unavailable")
+    status_exit, status_output, reason = run_bounded(
+        [sys.executable, str(helper), "status"],
+        STATUS_SECONDS,
+        MAX_STATUS_BYTES,
+        data=raw,
+    )
+    if reason == "cleanup-failed":
+        return failure("status-parser-cleanup-failed")
     if reason == "timeout":
-        return failure("status-parser-timeout", status_exit=status_exit)
+        return failure("status-parser-timeout")
     if reason == "stdout-limit":
-        return failure("status-receipt-too-large", status_exit=status_exit)
+        return failure("status-receipt-too-large")
+    if reason in ("setup", "worker-failed"):
+        return failure("status-parser-unavailable")
     if reason is not None or status_exit not in (0, 1):
         return failure("status-parser-failed", status_exit=status_exit)
     try:
@@ -568,6 +716,12 @@ def main():
     return status_exit
 
 
+def interrupted(*_):
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGINT, interrupted)
+signal.signal(signal.SIGTERM, interrupted)
 sys.exit(main())
 PY
 ```
