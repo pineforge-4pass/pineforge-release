@@ -69,7 +69,24 @@ class DescriptionCLI(unittest.TestCase):
 
     def test_future_main_does_not_relabel_inventory_or_released_metrics(self):
         facts = json.loads(FACTS.read_text(encoding="utf-8"))
-        facts["scoreboard"].update(graded=9000, excellent=8998, strong=2, population=9017)
+        score = facts["scoreboard"]
+        # Grow current main consistently. Historical inventory/releases keep their own population.
+        for pair in score["pairs"]:
+            if pair["strong"] == 1:
+                pair.update(excellent=pair["excellent"] + 1, strong=0)
+                pair["tiers"].update(excellent=pair["excellent"], strong=0)
+        pair = score["pairs"][1]
+        pair.update(graded=pair["graded"] + 1011, excellent=pair["excellent"] + 1011,
+                    closedProbes=pair["closedProbes"] + 1011)
+        pair["tiers"]["excellent"] += 1011
+        score.update(graded=9000, excellent=8998, strong=2, population=9017,
+                     closedProbes=score["closedProbes"] + 1011, excellentPct=99.98, strongPct=0.02)
+        score["tiers"].update(excellent=8998, strong=2)
+        closed = score["scopes"]["closed"]
+        closed.update(graded=closed["graded"] + 1011, excellent=closed["excellent"] + 1015, strong=2)
+        closed["tiers"].update(excellent=closed["excellent"], strong=2)
+        score["populationSha256"] = "b" * 64
+        score["provenance"]["populationSha256"] = score["populationSha256"]
         future = self.document("future.json", facts)
         rows = {row["role"]: row for row in self.render(facts=future)["repositories"]}
         self.assertIn("all 9,000 graded probes", rows["engine"]["expected"])
@@ -142,7 +159,19 @@ class DescriptionCLI(unittest.TestCase):
 
     def test_changed_historical_tokens_are_read_not_hardcoded(self):
         facts = json.loads(FACTS.read_text(encoding="utf-8"))
-        facts["inventory"].update(corpusScripts=411, closedScripts=855)
+        facts["inventory"].update(corpusScripts=411, communityScripts=794, closedScripts=855)
+        historic = facts["releases"][facts["inventory"]["sourceRelease"]]["scoreboard"]
+        historic["population"] += 102
+        historic["corpusProbes"] += 102
+        for group in (historic, historic["scopes"]["corpus"], historic["pairs"][0], historic["hardLane"]):
+            group["graded"] += 102
+            group["excellent"] += 102
+            group["tiers"]["excellent"] += 102
+        for lane in (historic["pairs"][0], historic["hardLane"]):
+            lane["corpusProbes"] += 102
+            lane["hardProbes"] += 102
+        historic["excellentPct"] = round(historic["excellent"] * 100 / historic["graded"], 2)
+        historic["strongPct"] = round(historic["strong"] * 100 / historic["graded"], 2)
         engine = self.render(facts=self.document("inventory.json", facts))["repositories"][0]
         self.assertIn("411 open-corpus strategies, 855 closed-test scripts", engine["expected"])
 
@@ -358,21 +387,52 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(self.invoke("apply").returncode, 2)
 
 
-class ReadOnlyWorkflow(unittest.TestCase):
-    def test_live_workflow_is_main_only_read_only_and_always_preserves_proposals(self):
-        text = (REPO / ".github" / "workflows" / "repo-description-drift.yml").read_text(encoding="utf-8")
+class DescriptionWorkflows(unittest.TestCase):
+    def test_replacement_is_guarded_main_only_and_retains_failure_receipts(self):
+        workflows = REPO / ".github/workflows"
+        self.assertFalse((workflows / "repo-description-drift.yml").exists())
+        text = (workflows / "facts-descriptions.yml").read_text(encoding="utf-8")
         self.assertIn("branches: [main]", text)
         self.assertIn("workflow_dispatch:", text)
         self.assertNotIn("pull_request:", text)
         self.assertIn("contents: read", text)
-        self.assertNotIn(": write", text)
-        for path in ["facts/facts.json", "facts/facts.schema.json", "facts/repo-descriptions.json",
-                     "scripts/repo_descriptions.py"]:
+        for path in ["facts/**", "scripts/facts_*.py", "scripts/repo_descriptions.py"]:
             self.assertIn(path, text)
-        self.assertIn("check --facts facts/facts.json --live", text)
+        self.assertIn("environment: descriptions", text)
+        self.assertIn("default: true", text)
+        self.assertIn("cancel-in-progress: false", text)
+        self.assertIn("schedule:", text)
+        self.assertIn("github.ref_protected", text)
+        self.assertIn("vars.FACTS_DESCRIPTIONS_APPLY_ENABLED == 'true'", text)
+        self.assertIn("env.DRY_RUN == 'false'", text)
+        self.assertIn("actions/create-github-app-token@v2", text)
+        self.assertIn("secrets.DESCRIPTIONS_APP_ID", text)
+        self.assertIn("secrets.DESCRIPTIONS_APP_PRIVATE_KEY", text)
+        self.assertNotIn("PINEFORGE_APP_", text)
+        self.assertIn("permission-administration: write", text)
+        self.assertNotIn("permission-contents: write", text)
+        self.assertIn("repositories: ${{ steps.source.outputs.repositories }}", text)
+        self.assertIn("MINT_OUTCOME: ${{ steps.app.outcome }}", text)
+        self.assertIn('--mint-outcome "$MINT_OUTCOME"', text)
         self.assertIn("actions/upload-artifact@", text)
-        self.assertIn("if: always()", text)
+        self.assertIn("if-no-files-found: error", text)
+        self.assertIn("failure() && !cancelled()", text)
         self.assertNotIn("gh repo edit", text)
+
+    def test_pr_validation_has_no_credentials_and_runs_actual_render_acceptance(self):
+        workflows = REPO / ".github/workflows"
+        for name in ("facts-validate.yml", "python-test.yml"):
+            text = (workflows / name).read_text()
+            self.assertIn("pull_request:", text)
+            self.assertIn("contents: read", text)
+            for forbidden in ("pull_request_target", "secrets.", "create-github-app-token", ": write"):
+                self.assertNotIn(forbidden, text)
+        text = (workflows / "facts-validate.yml").read_text()
+        for needed in ("facts/**", "scripts/facts_*.py", "tests/test_facts_*.py", ".github/workflows/**",
+                       "scripts/facts_validate.py", "scripts/repo_descriptions.py render",
+                       "scripts/facts_cards.py", "--format json", "--theme", "cmp ", "test_facts_*.py"):
+            self.assertIn(needed, text)
+        self.assertIn("test_repo_descriptions.py", (workflows / "python-test.yml").read_text())
 
 
 if __name__ == "__main__":

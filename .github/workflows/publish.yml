@@ -14,8 +14,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write   # gh release create
-  packages: write   # push to GHCR
+  contents: read
 
 env:
   REGISTRY: ghcr.io
@@ -24,6 +23,10 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: release-automation
+    permissions:
+      contents: write   # gh release create
+      packages: write   # push to GHCR
     outputs:
       prerelease: ${{ steps.pair.outputs.prerelease }}
     steps:
@@ -206,24 +209,41 @@ jobs:
   notify-consumers:
     needs: publish
     runs-on: ubuntu-latest
+    environment: release-automation
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
-        repo: [pineforge-backtest-mcp, pineforge-mcp-public, pineforge-app]
+        consumer: [offline, hosted, application]
+        include:
+          - consumer: hosted
+            repository_secret: RELEASE_HOSTED_MCP_REPOSITORY
+          - consumer: application
+            repository_secret: RELEASE_APPLICATION_REPOSITORY
+    env:
+      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || secrets[matrix.repository_secret] }}
     steps:
+      - name: Require one configured consumer repository
+        run: |
+          if ! [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+            echo '::error::Missing or malformed consumer repository setup'; exit 1
+          fi
       - name: Mint App token (scoped to one target)
         id: app
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.PINEFORGE_APP_ID }}
           private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
           owner: pineforge-4pass
-          repositories: ${{ matrix.repo }}
+          repositories: ${{ env.TARGET_REPOSITORY }}
+          permission-contents: write
+          github-api-url: https://api.github.com
 
-      - name: Dispatch pineforge-release -> ${{ matrix.repo }}
+      - name: Dispatch pineforge-release to consumer
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          REPO: ${{ matrix.repo }}
+          REPO: ${{ env.TARGET_REPOSITORY }}
           TAG: ${{ github.ref_name }}
           PRERELEASE: ${{ needs.publish.outputs.prerelease }}
           RUN_ID: ${{ github.run_id }}
@@ -234,9 +254,9 @@ jobs:
             true|false) ;;
             *) echo "::error::publish job gave no prerelease flag ('${PRERELEASE}')"; exit 1 ;;
           esac
-          gh api repos/pineforge-4pass/"${REPO}"/dispatches \
+          gh api --hostname github.com repos/pineforge-4pass/"${REPO}"/dispatches \
             -f event_type=pineforge-release \
             -F "client_payload[release_version]=${TAG#v}" \
             -F "client_payload[prerelease]=${PRERELEASE}" \
             -F "client_payload[run_id]=${RUN_ID}"
-          echo "dispatched pineforge-release -> ${REPO} (${TAG#v}, prerelease=${PRERELEASE})"
+          echo "dispatched pineforge-release (${TAG#v}, prerelease=${PRERELEASE})"
