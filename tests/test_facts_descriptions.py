@@ -41,6 +41,7 @@ class DescriptionsCLI(unittest.TestCase):
         self.bad_blob = False
         self.mismatch = False
         self.private_readback = False
+        self.wrong_readback = False
         self.move_on_read = False
         self.patch_count = 0
         test = self
@@ -89,6 +90,8 @@ class DescriptionsCLI(unittest.TestCase):
                                 test.state[repo]["description"] = payload["description"]
                             if test.private_readback:
                                 test.state[repo]["private"] = True
+                            if test.wrong_readback:
+                                test.state[repo]["full_name"] = "untrusted/identity"
                             data = test.state[repo]
                     else:
                         data = test.state[repo]
@@ -135,17 +138,18 @@ class DescriptionsCLI(unittest.TestCase):
         return self.invoke("reconcile", "--source-dir", str(self.directory / "source"),
                            "--dry-run", dry_run, "--setup", setup, "--mint-outcome", mint, env=env)
 
-    def test_current_main_stale_event_exact_patch_readback_holds_and_duplicate_noop(self):
+    def test_current_main_stale_event_exact_patch_readback_static_audit_and_duplicate_noop(self):
         source = self.prepare()
         self.assertEqual(source["source_commit"], self.commit)
         self.assertEqual(source["facts_sha256"], hashlib.sha256(FACTS.read_bytes()).hexdigest())
         self.assertNotEqual(source["source_commit"], self.env["GITHUB_SHA"])
         result = self.reconcile()
-        self.assertEqual(result.returncode, 1, result.stderr)  # audited static/HOLD drift is an alert
+        self.assertEqual(result.returncode, 1, result.stderr)  # audited static drift is an alert
         receipt = json.loads(result.stdout)
         self.assertEqual(receipt["source_commit"], self.commit)
         patches = [call for call in self.calls if call[0] == "PATCH"]
         managed = [row for row in self.expected if row["disposition"] == "managed"]
+        self.assertEqual([row["role"] for row in managed], ["engine", "codegen-oss", "corpus", "hpo"])
         self.assertEqual(len(patches), len(managed))
         self.assertEqual(patches[0][1], "/repos/" + managed[0]["repo"])
         for call, row in zip(patches, managed):
@@ -162,6 +166,52 @@ class DescriptionsCLI(unittest.TestCase):
         self.assertFalse(any(call[0] == "PATCH" for call in self.calls))
         self.assertTrue(all(row["status"] == "match" for row in json.loads(second.stdout)["repositories"]
                             if row["disposition"] == "managed"))
+
+    def only_hpo_drift(self):
+        for row in self.expected:
+            if row["role"] != "hpo":
+                self.state[row["repo"]]["description"] = row["expected"]
+        return next(row for row in self.expected if row["role"] == "hpo")
+
+    def test_hpo_drift_dry_run_then_exact_patch_and_readback(self):
+        hpo = self.only_hpo_drift()
+        self.prepare()
+        result = self.reconcile(dry_run="true")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        receipt = json.loads(result.stdout)
+        row = next(row for row in receipt["repositories"] if row["role"] == "hpo")
+        self.assertEqual(row["status"], "drift")
+        self.assertEqual(row["license_sources"], hpo["license_sources"])
+        self.assertEqual(self.patch_count, 0)
+        result = self.reconcile()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        patches = [call for call in self.calls if call[0] == "PATCH"]
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0][1], "/repos/pineforge-4pass/pineforge-hpo")
+        self.assertEqual(patches[0][2], json.dumps({"description": hpo["expected"]},
+                                                  ensure_ascii=True, separators=(",", ":")).encode())
+        self.assertEqual(self.calls[self.calls.index(patches[0]) + 1][:2], ("GET", patches[0][1]))
+        row = next(row for row in json.loads(result.stdout)["repositories"] if row["role"] == "hpo")
+        self.assertEqual(row["status"], "applied")
+        self.assertEqual(row["actual"], hpo["expected"])
+
+    def test_hpo_readback_mismatch_private_or_wrong_repository_fails(self):
+        hpo = self.only_hpo_drift()
+        self.prepare()
+        original = copy.deepcopy(self.state[hpo["repo"]])
+        for failure in ("mismatch", "private_readback", "wrong_readback"):
+            with self.subTest(failure=failure):
+                self.state[hpo["repo"]] = copy.deepcopy(original)
+                for flag in ("mismatch", "private_readback", "wrong_readback"):
+                    setattr(self, flag, flag == failure)
+                self.calls.clear()
+                result = self.reconcile()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("untrusted/identity", result.stdout + result.stderr)
+                row = next(row for row in json.loads(result.stdout)["repositories"] if row["role"] == "hpo")
+                self.assertEqual(row["status"], "error")
+                self.assertEqual([call[1] for call in self.calls if call[0] == "PATCH"],
+                                 ["/repos/" + hpo["repo"]])
 
     def test_dry_run_and_authorization_gates_never_patch(self):
         self.prepare()
@@ -235,7 +285,7 @@ class DescriptionsCLI(unittest.TestCase):
         result = self.invoke("reconcile", "--source-dir", str(fresh), "--dry-run", "false",
                              "--setup", "ready", "--mint-outcome", "success")
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(self.patch_count, 3)
+        self.assertEqual(self.patch_count, 4)
 
     def test_equal_descriptions_and_dry_run_match_are_success_without_mutations(self):
         for row in self.expected:
@@ -300,14 +350,18 @@ class DescriptionsCLI(unittest.TestCase):
 
     def test_nonpublic_or_wrong_identity_stops_all_writes_without_leaking_api_identity(self):
         self.prepare()
-        target = self.expected[-1]["repo"]
-        for mutation in ({"private": True}, {"private": False, "full_name": "untrusted/identity"}):
-            self.state[target].update(mutation)
-            self.calls.clear()
-            result = self.reconcile()
-            self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertNotIn("untrusted/identity", result.stdout + result.stderr)
-            self.assertFalse(any(call[0] == "PATCH" for call in self.calls))
+        for role in ("backtest-mcp", "hpo"):
+            target = next(row["repo"] for row in self.expected if row["role"] == role)
+            original = copy.deepcopy(self.state[target])
+            for mutation in ({"private": True}, {"private": False, "full_name": "untrusted/identity"}):
+                with self.subTest(role=role, mutation=mutation):
+                    self.state[target].update(mutation)
+                    self.calls.clear()
+                    result = self.reconcile()
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertNotIn("untrusted/identity", result.stdout + result.stderr)
+                    self.assertFalse(any(call[0] == "PATCH" for call in self.calls))
+            self.state[target] = original
 
     def test_targets_are_engine_first_and_exclude_audit_rows_even_if_policy_is_reordered(self):
         policy = json.loads(POLICY.read_text())
@@ -320,6 +374,7 @@ class DescriptionsCLI(unittest.TestCase):
         lines = dict(line.split("=", 1) for line in output.read_text().splitlines())
         targets = lines["repositories"].split(",")
         managed = [row for row in self.expected if row["disposition"] == "managed"]
+        self.assertEqual(targets, ["pineforge-engine", "pineforge-codegen-oss", "pineforge-corpus", "pineforge-hpo"])
         self.assertEqual(targets, [row["repo"].split("/")[1] for row in managed])
         self.assertEqual(self.reconcile().returncode, 1)
         self.assertEqual([call[1] for call in self.calls if call[0] == "PATCH"],
@@ -353,11 +408,14 @@ class DescriptionsCLI(unittest.TestCase):
         self.files["facts/repo-descriptions.json"] = json.dumps(policy).encode()
         self.prepare()
         self.assertEqual(self.reconcile().returncode, 1)
-        self.assertEqual(self.patch_count, 3)
+        self.assertEqual(self.patch_count, 4)
 
     def test_policy_cannot_promote_static_or_retarget_a_public_role(self):
         for role, change in (("release", {"disposition": "managed"}),
-                             ("engine", {"repo": "example/other"})):
+                             ("backtest-mcp", {"disposition": "managed"}),
+                             ("engine", {"repo": "example/other"}),
+                             ("hpo", {"repo": "example/other"}),
+                             ("hpo", {"public": False})):
             self.calls.clear()
             policy = json.loads(POLICY.read_text())
             next(row for row in policy["repositories"] if row["role"] == role).update(change)

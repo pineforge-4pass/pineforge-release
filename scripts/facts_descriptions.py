@@ -22,7 +22,7 @@ from repo_descriptions import (COMMIT, DEFAULT_POLICY, PUBLIC_REPOSITORIES, clea
 
 HUB = "pineforge-4pass/pineforge-release"
 SOURCE_FILES = ("facts/facts.json", "facts/repo-descriptions.json", "facts/facts.schema.json")
-MANAGED_ROLES = ("engine", "codegen-oss", "corpus")
+MANAGED_ROLES = ("engine", "codegen-oss", "corpus", "hpo")
 DIGEST = re.compile(r"[a-f0-9]{64}\Z")
 
 
@@ -121,7 +121,7 @@ class GitHub:
 
 def apply_policy(document):
     for row in document["repositories"]:
-        expected = "managed" if row["role"] in MANAGED_ROLES else "HOLD" if row["role"] == "hpo" else "static"
+        expected = "managed" if row["role"] in MANAGED_ROLES else "static"
         require(row["disposition"] == expected, "apply policy cannot promote held or static rows")
     return document
 

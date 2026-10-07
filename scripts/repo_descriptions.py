@@ -157,8 +157,6 @@ def render_document(facts, policy, facts_hash, policy_hash):
         seen_repos.add(identity)
         clean_text(row["reason"])
         disposition = row["disposition"]
-        if (row["role"] == "hpo" or identity.split("/")[1] == "pineforge-hpo") and disposition != "HOLD":
-            raise InputError("HPO must remain held; no setting-change command is permitted")
         if disposition == "HOLD":
             if "template" in row or "approved_text" not in row:
                 raise InputError("held rows require only approved_text")

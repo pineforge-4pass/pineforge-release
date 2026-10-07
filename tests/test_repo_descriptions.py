@@ -95,7 +95,7 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(document["facts_sha256"], hashlib.sha256(FACTS.read_bytes()).hexdigest())
         rows = {row["role"]: row for row in document["repositories"]}
         self.assertEqual(set(rows), {"engine", "codegen-oss", "corpus", "hpo", "release", "backtest-mcp"})
-        self.assertEqual(rows["hpo"]["disposition"], "HOLD")
+        self.assertEqual(rows["hpo"]["disposition"], "managed")
         self.assertIn(f'all {score["graded"]:,} graded probes', rows["engine"]["expected"])
         self.assertIn(f'{score["excellent"]:,} excellent, {score["strong"]} strong', rows["engine"]["expected"])
         self.assertIn(f'{inventory["corpusScripts"]} open-corpus strategies, '
@@ -291,36 +291,55 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(self.invoke("render", "--facts", str(FACTS)).returncode, 2)
         self.assertEqual(self.invoke("render", "--format=json", "--format", "commands").returncode, 2)
 
-    def test_hpo_cannot_be_unheld_by_swapping_roles(self):
+    def test_hpo_cannot_be_retargeted_by_swapping_roles(self):
         for identity in ("pineforge-4pass/pineforge-hpo", "pineforge-4pass/PineForge-HPO",
                          "PINEFORGE-4PASS/PINEFORGE-HPO"):
             with self.subTest(identity=identity):
                 def change(policy):
                     engine = next(row for row in policy["repositories"] if row["role"] == "engine")
-                    held = next(row for row in policy["repositories"] if row["role"] == "hpo")
-                    engine.update(role="hpo", disposition="HOLD", approved_text="Held engine")
-                    del engine["template"]
-                    held["source"]["url"] = held["source"]["url"].replace(held["repo"], identity)
-                    held["source"]["repo"] = identity
-                    held.update(role="engine", repo=identity, disposition="static",
-                                template="Changed held repository")
-                    del held["approved_text"]
+                    hpo = next(row for row in policy["repositories"] if row["role"] == "hpo")
+                    engine["role"] = "hpo"
+                    hpo["source"]["url"] = hpo["source"]["url"].replace(hpo["repo"], identity)
+                    hpo["source"]["repo"] = identity
+                    hpo.update(role="engine", repo=identity)
                 result = self.invoke("render", "--format", "commands", policy=self.policy(change))
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, "")
 
     def test_case_only_repository_duplicates_fail_without_partial_output(self):
-        def change(policy):
-            original, duplicate = policy["repositories"][:2]
-            identity = original["repo"].swapcase()
-            duplicate["repo"] = identity
-            duplicate["source"] = copy.deepcopy(original["source"])
-            duplicate["source"]["repo"] = identity
-            duplicate["source"]["url"] = duplicate["source"]["url"].replace(original["repo"], identity)
-        result = self.invoke("render", "--format", "commands", policy=self.policy(change))
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(result.stdout, "")
-        self.assertIn("duplicate", result.stderr)
+        for role in ("engine", "hpo"):
+            with self.subTest(role=role):
+                def change(policy):
+                    original = next(row for row in policy["repositories"] if row["role"] == role)
+                    duplicate = policy["repositories"][1]
+                    identity = original["repo"].swapcase()
+                    duplicate["repo"] = identity
+                    duplicate["source"] = copy.deepcopy(original["source"])
+                    duplicate["source"]["repo"] = identity
+                    duplicate["source"]["url"] = duplicate["source"]["url"].replace(original["repo"], identity)
+                result = self.invoke("render", "--format", "commands", policy=self.policy(change))
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("duplicate", result.stderr)
+
+    def test_hpo_released_policy_has_its_own_immutable_license_source(self):
+        rows = {row["role"]: row for row in self.render()["repositories"]}
+        hpo = rows["hpo"]
+        self.assertEqual(hpo["repo"], "pineforge-4pass/pineforge-hpo")
+        self.assertEqual(hpo["disposition"], "managed")
+        self.assertEqual(hpo["tokens"], [])
+        self.assertEqual(hpo["expected"],
+                         "Native C++ hyperparameter optimization for PineForge strategies. Source-available under "
+                         "the PineForge Source License 1.2: free for personal trading and noncommercial use; "
+                         "commercial use requires a license shared with codegen.")
+        source = hpo["public_source"]
+        self.assertEqual(source["repo"], hpo["repo"])
+        self.assertEqual(source["commit"], "dab7b6775588da0f112eb363a70561c212dce80b")
+        self.assertEqual(source["url"], f'https://github.com/{hpo["repo"]}/blob/{source["commit"]}/LICENSE')
+        self.assertEqual(hpo["license_sources"], [dict(id="hpo", label="PineForge Source License 1.2", **source)])
+        self.assertNotEqual(source["commit"], rows["codegen-oss"]["public_source"]["commit"])
+        self.assertIn("v0.11.0", hpo["reason"])
+        self.assertIn("versions through v0.10.0 retain Apache-2.0", hpo["reason"])
 
     def test_mixed_case_source_and_live_identities_are_accepted(self):
         def change(policy):
@@ -350,22 +369,25 @@ class DescriptionCLI(unittest.TestCase):
                    lambda value: value["licenses"]["codegen"].update(commit="main"),
                    lambda value: value["licenses"]["codegen"].update(url="https://example.com/LICENSE"),
                    lambda value: next(row for row in value["repositories"] if row["role"] == "hpo").update(
-                       disposition="managed", template="Mutate HPO")]
+                       public=False),
+                   lambda value: value["licenses"]["hpo"].update(commit="v0.11.0")]
         for change in changes:
             with self.subTest(change=change):
                 self.assertEqual(self.invoke("render", policy=self.policy(change)).returncode, 2)
 
-    def test_commands_are_quoted_text_and_hpo_is_never_a_command(self):
+    def test_commands_are_quoted_review_text_including_managed_hpo(self):
         dangerous = "Compiler's $(touch SHOULD_NOT_EXIST); `id` & shell text"
         policy = self.policy(lambda value: value["repositories"][0].update(template=dangerous))
         result = self.invoke("render", "--format", "commands", policy=policy)
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = [shlex.split(line) for line in result.stdout.splitlines() if not line.startswith("#")]
-        self.assertEqual(len(commands), 5)
+        self.assertEqual(len(commands), 6)
         self.assertEqual(commands[0], ["gh", "repo", "edit", "pineforge-4pass/pineforge-engine",
                                       "--description", dangerous])
-        self.assertTrue(all(command[3] != "pineforge-4pass/pineforge-hpo" for command in commands))
-        self.assertIn("# HOLD", result.stdout)
+        hpo = next(row for row in self.render()["repositories"] if row["role"] == "hpo")
+        self.assertEqual([command for command in commands if command[3] == hpo["repo"]],
+                         [["gh", "repo", "edit", hpo["repo"], "--description", hpo["expected"]]])
+        self.assertIn("# managed", result.stdout)
         self.assertIn("facts_sha256", result.stdout)
         self.assertFalse((self.root / "SHOULD_NOT_EXIST").exists())
 
@@ -418,7 +440,7 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(len(calls), 6)
         self.assertTrue(all(call[:5] == ["api", "--method", "GET", "--hostname", "github.com"] for call in calls))
 
-    def test_live_drift_including_held_hpo_and_explicit_null(self):
+    def test_live_drift_including_managed_hpo_and_explicit_null(self):
         for mode, role in [("drift", "engine"), ("drift", "hpo"), ("null", "engine"), ("empty", "engine")]:
             with self.subTest(mode=mode, role=role):
                 executable, env, target = self.fake_gh(mode, role)

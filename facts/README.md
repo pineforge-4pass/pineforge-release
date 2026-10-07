@@ -64,6 +64,16 @@ approved product wording, templates, and license labels with exact public
 retain their published text, are checked for drift, and never receive a command.
 Nonpublic repositories are excluded from public policy, output, and artifacts.
 
+HPO is now a managed public role following its v0.11.0 release. Its original
+code uses PineForge Source License 1.2 from v0.11.0; versions through v0.10.0
+remain Apache-2.0. Personal trading and noncommercial use are free under the
+license's definitions; commercial use needs a license, shared with codegen.
+The HPO policy has its own immutable [LICENSE](https://github.com/pineforge-4pass/pineforge-hpo/blob/dab7b6775588da0f112eb363a70561c212dce80b/LICENSE) pin, verified
+against the released [README](https://github.com/pineforge-4pass/pineforge-hpo/blob/dab7b6775588da0f112eb363a70561c212dce80b/README.md#license). This changes HPO's current
+description policy only; other products' terms and historical releases retain
+their existing pins. The conservative description adds no parity or performance
+claim.
+
 Quantities, dates, release identifiers, and product commits use
 `{{facts:token.name|format}}` from the explicitly supplied `facts.json`; formats
 are `int`, `grouped` (thousands separators), `decimal`, and `text` (strings only).
@@ -109,7 +119,7 @@ scope sums, percentages, unique lane identities, hard-lane evidence, source
 identities and matching provenance. Historical inventory binds to its source
 release and its sums, independently of current main. Remote schema references
 are disabled. Descriptions additionally enforce the all-graded claim, public
-role identities, license source URLs, length, and HPO's hold. Invalid inputs
+role identities, license source URLs, length, and fixed managed scope. Invalid inputs
 produce no stdout and no consumer calls. All source and policy bytes validate
 before prepare emits files or minting becomes eligible.
 
@@ -135,8 +145,8 @@ current main, fetches facts and policy by that immutable commit, verifies Git
 blob integrity, validates everything, and records SHA256. Reconcile validates
 that snapshot again and confirms the immutable bytes before comparisons.
 
-Only the three managed public roles (engine, codegen, corpus) can be token targets
-or writes. Engine runs first; HPO is held and static rows are audit-only. Every
+Only the four managed public roles (engine, codegen, corpus, HPO) can be token targets
+or writes, in that order. Static rows are audit-only. Every
 read confirms the exact public repository with case-insensitive owner/repository
 matching. Equal descriptions are no-ops. Writes use only
 `PATCH https://api.github.com/repos/{owner}/{repo}` with the exact JSON object
@@ -163,11 +173,16 @@ to the release App.
 TOP alone provisions settings/secrets and enables application after independent
 review and reviewed dry-run proof. Provisioning has been reported for the new
 descriptions App/environment; the executor does not inspect secrets or mint
-live tokens to verify it. Live environment/App proof remains pending.
+live tokens to verify it. Live environment/App proof, including the authorized
+four-repository descriptions scope, remains pending. TOP reports that the old
+org App is Contents-only and that `release-automation` exists with target secrets.
+Its App key migration from repository secrets is still pending. Same-name
+`PINEFORGE_APP_*` secret inheritance must be resolved and verified before rollout;
+an environment declaration or successful mint alone cannot establish key origin.
 
 1. Protect main. Configure environment `descriptions` with selected deployment
    **branch `main` only**, no tag patterns or other branches. Use the new
-   descriptions App, selected public managed repositories only, with
+   descriptions App, only the four selected public managed repositories above, with
    Administration: write and the required Metadata: read. Do not grant Contents
    write or install it on held/static rows. Keep the exact environment secrets
    `DESCRIPTIONS_APP_ID` and `DESCRIPTIONS_APP_PRIVATE_KEY`.
@@ -187,8 +202,10 @@ live tokens to verify it. Live environment/App proof remains pending.
 4. Independently verify the protected release workflows and their existing tag,
    paired-release and three-consumer behavior before removing repository-level
    old-App keys. Tokens request Contents: write on only the job's repository;
-   no release job requests Administration. TOP/owner must remove Administration
-   from the old App itself; scoped workflow inputs do not change the installation.
+   no release job requests Administration. Confirm the reported Contents-only
+   old-App configuration and complete/verify environment-key migration and
+   repository-key removal; scoped workflow inputs do not change the installation
+   or prevent same-name repository-secret inheritance.
 5. After reviewed dry-run and separately authorized live proof, TOP may set
    `FACTS_DESCRIPTIONS_APPLY_ENABLED=true` in `descriptions`. Writes additionally
    require protected `refs/heads/main`, an authorized push/manual/schedule event,
