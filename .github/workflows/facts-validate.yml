@@ -1,0 +1,55 @@
+name: facts-validate
+
+on:
+  pull_request:
+    paths:
+      - 'facts/**'
+      - 'scripts/repo_descriptions.py'
+      - 'scripts/facts_*.py'
+      - 'tests/test_repo_descriptions.py'
+      - 'tests/test_facts_*.py'
+      - 'tests/test_release_workflows.py'
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+    paths:
+      - 'facts/**'
+      - 'scripts/repo_descriptions.py'
+      - 'scripts/facts_*.py'
+      - 'tests/test_repo_descriptions.py'
+      - 'tests/test_facts_*.py'
+      - 'tests/test_release_workflows.py'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install -r facts/requirements-validation.txt
+      - name: Validate the whole canonical document and descriptions
+        run: |
+          python3 scripts/facts_validate.py --facts facts/facts.json
+          python3 scripts/repo_descriptions.py render --facts facts/facts.json
+      - name: Render deterministic full and corpus SVGs and endpoint JSON
+        run: |
+          set -euo pipefail
+          for variant in full corpus; do
+            for theme in light dark; do
+              python3 scripts/facts_cards.py --facts facts/facts.json --variant "$variant" --theme "$theme" > "$RUNNER_TEMP/$variant-$theme.svg"
+              python3 scripts/facts_cards.py --facts facts/facts.json --variant "$variant" --theme "$theme" > "$RUNNER_TEMP/repeat.svg"
+              cmp "$RUNNER_TEMP/$variant-$theme.svg" "$RUNNER_TEMP/repeat.svg"
+            done
+            python3 scripts/facts_cards.py --facts facts/facts.json --variant "$variant" --format json > "$RUNNER_TEMP/$variant.json"
+          done
+      - name: CLI acceptance including parsed SVG and JSON content
+        run: python3 -m unittest discover -s tests -p 'test_facts_*.py' -v

@@ -38,7 +38,7 @@ or trade rows. A main promotion or population rebind alone does not refill it.
 Hard-lane membership and its corpus/closed probe counts derive from registry
 `hard` surfaces. The lane table places them first without a hardcoded market.
 
-Maintainers export to a checkout, open a facts-only PR here, then refresh pinned
+Maintainers export to a checkout, open a facts update PR here, then refresh pinned
 copies in the website and hosted MCP. Their builds use committed copies so an
 offline build is deterministic and does not silently change when main advances;
 an online drift check compares those copies with this public repo's main file.
@@ -64,6 +64,16 @@ approved product wording, templates, and license labels with exact public
 retain their published text, are checked for drift, and never receive a command.
 Nonpublic repositories are excluded from public policy, output, and artifacts.
 
+HPO is now a managed public role following its v0.11.0 release. Its original
+code uses PineForge Source License 1.2 from v0.11.0; versions through v0.10.0
+remain Apache-2.0. Personal trading and noncommercial use are free under the
+license's definitions; commercial use needs a license, shared with codegen.
+The HPO policy has its own immutable [LICENSE](https://github.com/pineforge-4pass/pineforge-hpo/blob/dab7b6775588da0f112eb363a70561c212dce80b/LICENSE) pin, verified
+against the released [README](https://github.com/pineforge-4pass/pineforge-hpo/blob/dab7b6775588da0f112eb363a70561c212dce80b/README.md#license). This changes HPO's current
+description policy only; other products' terms and historical releases retain
+their existing pins. The conservative description adds no parity or performance
+claim.
+
 Quantities, dates, release identifiers, and product commits use
 `{{facts:token.name|format}}` from the explicitly supplied `facts.json`; formats
 are `int`, `grouped` (thousands separators), `decimal`, and `text` (strings only).
@@ -86,44 +96,181 @@ produce partial command proposals. GitHub owner/repository identities compare
 case-insensitively for source verification, duplicates, live reads, and holds;
 pinned commits and the `LICENSE` source path still match exactly.
 
-At **every promotion**, without delayed batching:
+## Stage 1 validation and descriptions reconciliation
 
-1. Immediately export canonical facts using `lab facts export`, following the
-   existing exporter/pinned-inventory process. A pipeline never creates a model.
-2. Render repository, README, website, and hosted-consumer outputs from that same
-   explicit snapshot; refresh pinned consumer copies and run `lab facts render`
-   and `lab facts check` for marked documentation.
-3. Render and inspect exact descriptions, source tokens, license sources, hashes,
-   and the proposed command text:
+This slice validates and reconciles descriptions only. Export and promotion keep
+using the existing reviewed process. Website/MCP consumers, hosted cards, README
+switches, dispatch fanout, and the readable-text branch are later stages. The
+card renderer here emits bytes for validation; it deploys nothing.
 
-   ```sh
-   python3 scripts/repo_descriptions.py render --facts facts/facts.json > descriptions.json
-   python3 scripts/repo_descriptions.py render --facts facts/facts.json --format commands > apply-commands.txt
-   ```
+Install the pinned validator in the approved test environment:
 
-4. TOP alone reviews and applies applicable commands. The renderer does not
-   execute its output; there is no apply mode. Held rows emit no command.
-5. Prove exact live agreement immediately after application:
+```sh
+python3 -m pip install -r facts/requirements-validation.txt
+python3 scripts/facts_validate.py --facts facts/facts.json
+python3 scripts/repo_descriptions.py render --facts facts/facts.json
+python3 scripts/facts_cards.py --facts facts/facts.json --variant full --format svg
+python3 scripts/facts_cards.py --facts facts/facts.json --variant corpus --format json
+```
 
-   ```sh
-   python3 scripts/repo_descriptions.py check --facts facts/facts.json --live
-   ```
+The complete Draft 2020-12 schema runs with format checking, followed by semantic
+checks on every current and released scoreboard: safe integer counts, tier/lane/
+scope sums, percentages, unique lane identities, hard-lane evidence, source
+identities and matching provenance. Historical inventory binds to its source
+release and its sums, independently of current main. Remote schema references
+are disabled. Descriptions additionally enforce the all-graded claim, public
+role identities, license source URLs, length, and fixed managed scope. Invalid inputs
+produce no stdout and no consumer calls. All source and policy bytes validate
+before prepare emits files or minting becomes eligible.
 
-Use `--policy FILE` for a reviewed alternate policy. `check --gh PATH` accepts an
-operator-supplied executable without embedding workstation paths in source.
-Checks issue one read-only GitHub API GET per public row with a sixty-second
-timeout, no shell, and exact public identity verification. JSON output includes
-expected/actual deltas; null is distinct from empty text. Exit codes are zero for
-all matches, one for drift (including held text), and two for input, API, auth, or
-timeout errors. Failed reads never count as matches. Descriptions must be
-nonempty, at most 350 Unicode characters, and free of line separators/control
-characters; malformed JSON, duplicate keys, unknown fields/tokens, invalid
-numbers, and unresolved templates fail closed. Facts are validated against the
-unchanged public schema with the supported standard-library validator.
+`facts-validate.yml` runs on PRs and main pushes touching `facts/**` or affected
+scripts, tests or workflows. Its token has only `contents: read`; PR code never
+receives App credentials. It renders full/corpus SVG in light/dark themes and
+endpoint JSON, compares deterministic bytes, and runs subprocess acceptance that
+parses the actual SVG and JSON and checks their facts. `python-test.yml` also
+runs the existing description renderer acceptance regressions.
 
-The read-only `repository-description-drift` workflow runs on relevant pushes to
-main and manual dispatch, not pull requests. It fails on drift/errors and uploads
-exact proposals, review-only command text, and live deltas even on failure. It
-has no write permission or automatic application. Offline CLI acceptance uses a
-fake third-party executable, not live GitHub; run it in the approved test
-environment with `python3 -m unittest discover -s tests -p 'test_repo_descriptions.py' -v`.
+Exact prose acceptance uses `tests/fixtures/repo-descriptions-facts.json`, a
+frozen snapshot that canonical promotions must not refresh. Current-facts
+checks derive their quantities and provenance from the supplied document;
+consistent synthetic advances change counts, date and engine together while
+preserving historical inventory and released scoreboards. Schema/semantic
+rejection and the unsupported below-strong-domain refusal remain required.
+
+`facts-descriptions.yml` replaces the retired duplicate drift workflow. A main
+push touching its path filters wakes it even when the commit includes other
+files. Manual dispatch defaults to `dry_run=true`; a schedule reconciles every
+half hour. The event commit is a wake-up, not the source pin: prepare resolves
+current main, fetches facts and policy by that immutable commit, verifies Git
+blob integrity, validates everything, and records SHA256. Reconcile validates
+that snapshot again and confirms the immutable bytes before comparisons.
+
+Only the four managed public roles (engine, codegen, corpus, HPO) can be token targets
+or writes, in that order. Static rows are audit-only. Every
+read confirms the exact public repository with case-insensitive owner/repository
+matching. Equal descriptions are no-ops. Writes use only
+`PATCH https://api.github.com/repos/{owner}/{repo}` with the exact JSON object
+`{"description": renderedText}`. There are no name, visibility or other keys.
+Every write is followed by a separate GET and exact readback comparison. Main
+is re-read immediately before each write. Source movement yields a superseded
+receipt and defers to a later serialized run. This avoids writing an already
+superseded snapshot; GitHub offers no atomic transaction between the source ref
+and repository settings, so the next scheduled run remains the recovery path
+for a main change concurrent with a request.
+
+The consumer has its own concurrency group, with `cancel-in-progress: false`.
+Cancelled runs do not emit alerts. Failed reads, network errors, rate limits,
+identity/visibility mismatches and refused PATCHes are errors. A failed token
+mint is explicitly `mint-failure-unclassified` and fails the run while reporting
+read-only drift: the action provides no reliable structured permission diagnosis.
+It never claims proven permission absence, and a PATCH 403 is never converted
+into a permission-unavailable success. Missing setup reports without displaying
+secret values. Read-only comparisons use `github.token`; there is no fallback
+to the release App.
+
+## TOP setup and migration checklist
+
+TOP alone provisions settings/secrets and enables application after independent
+review and reviewed dry-run proof. Provisioning has been reported for the new
+descriptions App/environment; the executor does not inspect secrets or mint
+live tokens to verify it. Live environment/App proof, including the authorized
+four-repository descriptions scope, remains pending. TOP reports that the old
+org App is Contents-only and that `release-automation` exists with target secrets.
+TOP reports that the new App key is already provisioned in `release-automation`,
+with repository copies replaced for compatibility. After the reviewed landing,
+TOP performs one authorized live proof, then removes this release repository's
+copy; engine/codegen environment moves follow separately. Environment secrets
+take precedence, but declaration or mint success cannot prove origin while the
+same-name repository fallback remains.
+
+1. Protect main. Configure environment `descriptions` with selected deployment
+   **branch `main` only**, no tag patterns or other branches. Use the new
+   descriptions App, only the four selected public managed repositories above, with
+   Administration: write and the required Metadata: read. Do not grant Contents
+   write or install it on held/static rows. Keep the exact environment secrets
+   `DESCRIPTIONS_APP_ID` and `DESCRIPTIONS_APP_PRIVATE_KEY`.
+2. Leave environment variable `FACTS_DESCRIPTIONS_APPLY_ENABLED` absent (or not
+   `true`). PRs have no App access. Dispatch with `dry_run=true` and review the
+   immutable source receipt and every delta. This comparison does not mint a
+   token. A live App mint/apply proof needs TOP's separate authorization.
+3. Configure `release-automation` with selected deployment **branch `main` and
+   tag pattern `v*` only**. Confirm the new `PINEFORGE_APP_ID` and
+   `PINEFORGE_APP_PRIVATE_KEY` are provisioned there, together with
+   `RELEASE_HOSTED_MCP_REPOSITORY` and `RELEASE_APPLICATION_REPOSITORY` as
+   environment secrets containing the existing consumer repository short names.
+   Confirm each neutral matrix label maps to its existing consumer. The offline
+   public consumer stays explicit. Missing target setup fails before minting,
+   rather than falling back to all repositories. Never put nonpublic identities
+   in public YAML, artifacts or logs.
+4. Land the reviewed hub, run TOP's authorized live proof, then remove the release
+   repository-level App-key copy. Verify the next protected run without that
+   fallback. A no-op mint does not prove the bump push or consumer mapping;
+   those need their applicable release proof. Tokens request Contents: write on
+   only the job's repository, never Administration. Other repositories' key moves
+   are separate work; scoped inputs alone do not remove inherited credentials.
+5. After reviewed dry-run and separately authorized live proof, TOP may set
+   `FACTS_DESCRIPTIONS_APPLY_ENABLED=true` in `descriptions`. Writes additionally
+   require protected `refs/heads/main`, an authorized push/manual/schedule event,
+   and effective `dry_run=false`. With rollout enabled, push/schedule reconcile
+   automatically; manual dispatch retains its safe default. Removing the variable
+   disables all subsequent application without restoring the retired drift job.
+
+These are TOP operator commands, not steps executed by the implementation lane.
+Use the approved GitHub wrapper where one is required:
+
+```sh
+GH_HOST=github.com gh workflow run facts-descriptions.yml --repo pineforge-4pass/pineforge-release --ref main -f dry_run=true
+# After independent review and authorized live proof only:
+GH_HOST=github.com gh variable set FACTS_DESCRIPTIONS_APPLY_ENABLED --repo pineforge-4pass/pineforge-release --env descriptions --body true
+GH_HOST=github.com gh workflow run facts-descriptions.yml --repo pineforge-4pass/pineforge-release --ref main -f dry_run=false
+# Disable future application:
+GH_HOST=github.com gh variable delete FACTS_DESCRIPTIONS_APPLY_ENABLED --repo pineforge-4pass/pineforge-release --env descriptions
+```
+
+## Receipts, alerts and remaining proof
+
+Each run uploads `descriptions-audit-{run_id}-{run_attempt}/receipt.json`, with
+schema `pineforge/facts-descriptions-receipt/v1`, consumer, source commit,
+facts/policy SHA256, dry-run flag, diagnostic, status, alert, exit code and only
+public policy rows. Rows include expected/actual text, disposition, status,
+source tokens and pinned license sources. `permission_unavailable_proven` stays
+false until a future reviewed implementation can classify mint failures reliably.
+
+Exit 0 means an exact comparison/application or a superseded hold (inspect status);
+exit 1 means drift or missing setup; exit 2 means validation, mint or API failure.
+Report-only drift fails visibly. Missing receipts, failed artifact uploads and
+source-resolution failures must never be interpreted as healthy telemetry.
+Cancelled superseded runs are ignored by failure monitoring. A new run resolves
+current main again, so duplicate events are no-ops and old events can reconcile
+the newest facts.
+
+Stage-1 heartbeat: poll the latest bounded main runs, exclude cancellations,
+alert on completed failures (including report-only drift), and flag absent/stale
+telemetry. For example, fetch a bounded page without logs or private data:
+
+```sh
+GH_HOST=github.com gh api --hostname github.com 'repos/pineforge-4pass/pineforge-release/actions/workflows/facts-descriptions.yml/runs?branch=main&per_page=20'
+```
+
+The executor handoff includes the exact bounded-time heartbeat command and its
+failure/staleness handling for TOP. Full source-versus-served digest monitoring
+with a **30-minute facts-change freshness threshold is pending stage 2**. The
+stage-1 run monitor is not served-state proof and unrelated main commits must
+not reset that future freshness clock.
+
+Offline acceptance commands (run on the approved Spot test host):
+
+```sh
+python3 -m unittest discover -s tests -p 'test_facts_*.py' -v
+python3 -m unittest discover -s tests -p 'test_repo_descriptions.py' -v
+python3 -m unittest discover -s tests -p 'test_release_*.py' -v
+python3 tests/test_fingerprint_canonical.py
+```
+
+New acceptance uses real CLI subprocesses against a loopback fake GitHub HTTP
+service; existing read-only renderer tests retain their fake third-party `gh`
+executable. Neither substitutes for live protected-environment/App proof.
+The compatibility renderer still supports review-only `--format commands` and
+read-only `check --live --gh PATH`; it never executes its proposed commands.
+Use the guarded workflow for automated application. Do not promote static or
+held rows by manually applying compatibility output.

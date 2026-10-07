@@ -163,9 +163,9 @@ pineforge-engine release ───────(engine-release)─┘    bump pin
                                                       → tag (App) → publish.yml
                                                           build+push image
                                                           → dispatch (pineforge-release)
-                                                            → pineforge-backtest-mcp
-                                                            → pineforge-mcp-public (private)
-                                                            → pineforge-app (private)
+                                                            → offline MCP (pineforge-backtest-mcp)
+                                                            → hosted MCP (configured private target)
+                                                            → application (configured private target)
 ```
 
 - `handle-upstream.yml` — receives `repository_dispatch` from engine / codegen-oss
@@ -175,7 +175,10 @@ pineforge-engine release ───────(engine-release)─┘    bump pin
 - `publish.yml` — on the pushed tag: checks the pair, waits for the upstream
   artifacts to be available, builds + pushes the multi-arch image to GHCR, cuts a
   GitHub Release, then dispatches `pineforge-release`
-  (`{release_version, prerelease, run_id}`) to both MCP repos and the app.
+  (`{release_version, prerelease, run_id}`) to the offline MCP, hosted MCP and
+  application roles. Private target repository names are configured in the
+  protected `release-automation` environment, not published in the workflow or
+  this diagram; each consumer gets an App token scoped to its configured target.
 
 The rules live in `scripts/release_pair.py` (unit-tested in `tests/`).
 `tools/release-dry-run/` replays both workflows offline through the 0.x and 1.0

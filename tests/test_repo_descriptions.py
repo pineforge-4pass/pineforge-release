@@ -11,12 +11,53 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "repo_descriptions.py"
 FACTS = REPO / "facts" / "facts.json"
+FROZEN_FACTS = REPO / "tests" / "fixtures" / "repo-descriptions-facts.json"
 POLICY = REPO / "facts" / "repo-descriptions.json"
+
+
+def percentages(score):
+    for field, count in (("excellentPct", score["excellent"]),
+                         ("strongPct", score["strong"]),
+                         ("excellentOrStrongPct", score["excellent"] + score["strong"])):
+        score[field] = float((Decimal(count) * 100 / score["graded"]).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP)) if score["graded"] else 0
+
+
+def advance_current(facts, delta):
+    """A consistent new population/provenance, independent of today's totals."""
+    facts = copy.deepcopy(facts)
+    score = facts["scoreboard"]
+    pair = next(pair for pair in score["pairs"] if not pair["hardProbes"] and not pair["corpusProbes"])
+    for group in (score, score["scopes"]["closed"], pair):
+        group["graded"] += delta
+        group["excellent"] += delta - 2
+        group["strong"] += 2
+        group["tiers"]["excellent"] += delta - 2
+        group["tiers"]["strong"] += 2
+    score["population"] += delta
+    score["closedProbes"] += delta
+    pair["closedProbes"] += delta
+    score["date"] = (date.fromisoformat(score["date"]) + timedelta(days=1)).isoformat()
+    score["id"] += "-fixture"
+    score["engineCommit"] = hashlib.sha1((score["engineCommit"] + "-fixture").encode()).hexdigest()
+    for field in ("snapshotSha256", "populationSha256"):
+        score[field] = hashlib.sha256((score[field] + "-fixture").encode()).hexdigest()
+    score["provenance"].update(baselineId=score["id"], promotionDate=score["date"] + "T00:00:00Z",
+                               **{field: score[field] for field in
+                                  ("engineCommit", "snapshotSha256", "populationSha256")})
+    provenance = score["provenance"]
+    score["source"] = (f'Registry baseline {provenance["baselineId"]}; digest-verified snapshot '
+                       f'{provenance["snapshotSha256"]}; private evidence sha256:'
+                       f'{provenance["privateEvidenceSha256"]}.')
+    percentages(score)
+    return facts
 
 
 class DescriptionCLI(unittest.TestCase):
@@ -48,17 +89,23 @@ class DescriptionCLI(unittest.TestCase):
         return json.loads(result.stdout)
 
     def test_real_canonical_snapshot_and_complete_manifest(self):
+        facts = json.loads(FACTS.read_text(encoding="utf-8"))
+        score, inventory = facts["scoreboard"], facts["inventory"]
         document = self.render()
         self.assertEqual(document["facts_sha256"], hashlib.sha256(FACTS.read_bytes()).hexdigest())
         rows = {row["role"]: row for row in document["repositories"]}
         self.assertEqual(set(rows), {"engine", "codegen-oss", "corpus", "hpo", "release", "backtest-mcp"})
-        self.assertEqual(rows["hpo"]["disposition"], "HOLD")
-        self.assertIn("all 7,989 graded probes", rows["engine"]["expected"])
-        self.assertIn("7,983 excellent, 6 strong", rows["engine"]["expected"])
-        self.assertIn("6 strong", rows["engine"]["expected"])
-        self.assertIn("309 open-corpus strategies, 741 closed-test scripts",
+        self.assertEqual(rows["hpo"]["disposition"], "managed")
+        self.assertIn(f'all {score["graded"]:,} graded probes', rows["engine"]["expected"])
+        self.assertIn(f'{score["excellent"]:,} excellent, {score["strong"]} strong', rows["engine"]["expected"])
+        self.assertIn(f'{inventory["corpusScripts"]} open-corpus strategies, '
+                      f'{inventory["closedScripts"]} closed-test scripts',
                       rows["engine"]["expected"])
-        self.assertIn("Historical script inventory (1.0.1): 309 scripts", rows["corpus"]["expected"])
+        self.assertIn(f'Historical script inventory ({inventory["sourceRelease"]}): '
+                      f'{inventory["corpusScripts"]:,} scripts', rows["corpus"]["expected"])
+        corpus = score["scopes"]["corpus"]
+        self.assertIn(f'{corpus["excellent"]:,}/{corpus["graded"]:,} excellent probes',
+                      rows["corpus"]["expected"])
         self.assertIn("PineForge Source License 1.2", rows["codegen-oss"]["expected"])
         self.assertIn("scoreboard.graded", rows["engine"]["tokens"])
         self.assertIn("inventory.closedScripts", rows["engine"]["tokens"])
@@ -67,28 +114,60 @@ class DescriptionCLI(unittest.TestCase):
                 self.assertIn("/" + source["commit"] + "/LICENSE", source["url"])
         self.assertEqual(self.invoke("render").stdout, self.invoke("render").stdout)
 
-    def test_future_main_does_not_relabel_inventory_or_released_metrics(self):
-        facts = json.loads(FACTS.read_text(encoding="utf-8"))
-        facts["scoreboard"].update(graded=9000, excellent=8998, strong=2, population=9017)
-        future = self.document("future.json", facts)
-        rows = {row["role"]: row for row in self.render(facts=future)["repositories"]}
-        self.assertIn("all 9,000 graded probes", rows["engine"]["expected"])
-        self.assertIn("8,998 excellent, 2 strong", rows["engine"]["expected"])
-        self.assertIn("309 open-corpus strategies, 741 closed-test scripts", rows["engine"]["expected"])
+    def test_frozen_snapshot_has_exact_golden_prose(self):
+        # This file is deliberately frozen; canonical promotions must not refresh it.
+        rows = {row["role"]: row for row in self.render(facts=FROZEN_FACTS)["repositories"]}
+        self.assertEqual(rows["engine"]["expected"],
+                         "Open-source C++17 engine for backtesting and forward execution, with a versioned C ABI; "
+                         "Pine Script v6 runs through code generation. Against TradingView's own trade lists, "
+                         "all 7,989 graded probes (309 open-corpus strategies, 741 closed-test scripts) grade "
+                         "excellent or strong: 7,983 excellent, 6 strong. Apache-2.0.")
+        self.assertEqual(rows["corpus"]["expected"],
+                         "Open Pine Script reference corpus and TradingView trade traces. Current graded corpus: "
+                         "309/309 excellent probes. Historical script inventory (1.0.1): 309 scripts. Apache-2.0.")
         policy = self.policy(lambda value: value["repositories"][0].update(
             template="Release probes: {{facts:releases.1.0.1.scoreboard.graded|int}}; "
+                     "current: {{facts:scoreboard.graded|int}}; date: {{facts:scoreboard.date|text}}; "
+                     "engine: {{facts:scoreboard.engineCommit|text}}."))
+        self.assertEqual(self.render(facts=FROZEN_FACTS, policy=policy)["repositories"][0]["expected"],
+                         "Release probes: 7989; current: 7989; date: 2026-10-07; "
+                         "engine: 49bb202944c54c9bffdb918e24a7f4fb1a7d838d.")
+
+    def test_future_main_does_not_relabel_inventory_or_released_metrics(self):
+        canonical = json.loads(FACTS.read_text(encoding="utf-8"))
+        inventory = canonical["inventory"]
+        release = inventory["sourceRelease"]
+        policy = self.policy(lambda value: value["repositories"][0].update(
+            template="Release probes: {{facts:releases." + release + ".scoreboard.graded|int}}; "
                      "current: {{facts:scoreboard.graded|int}}; "
                      "date: {{facts:scoreboard.date|text}}; "
                      "engine: {{facts:scoreboard.engineCommit|text}}."))
-        engine = self.render(facts=future, policy=policy)["repositories"][0]
-        self.assertEqual(engine["expected"],
-                         "Release probes: 7989; current: 9000; date: 2026-10-06; "
-                         "engine: 59082e696f0c7a95c1aa0d3179e1aac23f79fc04.")
-        self.assertNotEqual(self.render(facts=future)["facts_sha256"],
-                            self.render()["facts_sha256"])
+        facts = canonical
+        for delta in (1011, 23):
+            with self.subTest(delta=delta):
+                previous = facts
+                facts = advance_current(facts, delta)
+                score = facts["scoreboard"]
+                self.assertEqual(facts["inventory"], canonical["inventory"])
+                self.assertEqual(facts["releases"], canonical["releases"])
+                self.assertEqual(score["hardLane"], canonical["scoreboard"]["hardLane"])
+                for field in ("date", "engineCommit", "graded", "excellent", "strong"):
+                    self.assertNotEqual(score[field], previous["scoreboard"][field])
+                future = self.document("future.json", facts)
+                rows = {row["role"]: row for row in self.render(facts=future)["repositories"]}
+                self.assertIn(f'all {score["graded"]:,} graded probes', rows["engine"]["expected"])
+                self.assertIn(f'{score["excellent"]:,} excellent, {score["strong"]} strong',
+                              rows["engine"]["expected"])
+                self.assertIn(f'{inventory["corpusScripts"]} open-corpus strategies, '
+                              f'{inventory["closedScripts"]} closed-test scripts', rows["engine"]["expected"])
+                engine = self.render(facts=future, policy=policy)["repositories"][0]
+                self.assertEqual(engine["expected"],
+                                 f'Release probes: {canonical["releases"][release]["scoreboard"]["graded"]}; '
+                                 f'current: {score["graded"]}; date: {score["date"]}; engine: {score["engineCommit"]}.')
+                self.assertNotEqual(self.render(facts=future)["facts_sha256"], self.render()["facts_sha256"])
 
     def test_consistent_below_strong_snapshot_is_refused_before_output_or_live_reads(self):
-        canonical = json.loads(FACTS.read_text(encoding="utf-8"))
+        canonical = json.loads(FROZEN_FACTS.read_text(encoding="utf-8"))
         facts = copy.deepcopy(canonical)
         scoreboard = facts["scoreboard"]
         pair = next(value for value in scoreboard["pairs"]
@@ -99,10 +178,7 @@ class DescriptionCLI(unittest.TestCase):
             group["belowStrong"] += 1
             group["tiers"]["excellent"] -= 1
             group["tiers"]["moderate"] += 1
-        for field, count in (("excellentPct", scoreboard["excellent"]),
-                             ("strongPct", scoreboard["strong"]),
-                             ("excellentOrStrongPct", scoreboard["excellent"] + scoreboard["strong"])):
-            scoreboard[field] = round(count * 100 / scoreboard["graded"], 2)
+        percentages(scoreboard)
         self.assertEqual(facts["inventory"], canonical["inventory"])
         self.assertEqual(facts["releases"], canonical["releases"])
         self.assertEqual(scoreboard["hardLane"], canonical["scoreboard"]["hardLane"])
@@ -132,7 +208,7 @@ class DescriptionCLI(unittest.TestCase):
     def test_all_graded_claim_requires_exact_excellent_and_strong_sum(self):
         for difference in (-1, 1):
             with self.subTest(difference=difference):
-                facts = json.loads(FACTS.read_text(encoding="utf-8"))
+                facts = json.loads(FROZEN_FACTS.read_text(encoding="utf-8"))
                 facts["scoreboard"]["excellent"] += difference
                 result = self.invoke("render", "--format", "commands",
                                      facts=self.document("inconsistent-sum.json", facts))
@@ -141,8 +217,19 @@ class DescriptionCLI(unittest.TestCase):
                 self.assertIn("all-graded", result.stderr)
 
     def test_changed_historical_tokens_are_read_not_hardcoded(self):
-        facts = json.loads(FACTS.read_text(encoding="utf-8"))
-        facts["inventory"].update(corpusScripts=411, closedScripts=855)
+        facts = json.loads(FROZEN_FACTS.read_text(encoding="utf-8"))
+        facts["inventory"].update(corpusScripts=411, communityScripts=794, closedScripts=855)
+        historic = facts["releases"][facts["inventory"]["sourceRelease"]]["scoreboard"]
+        historic["population"] += 102
+        historic["corpusProbes"] += 102
+        for group in (historic, historic["scopes"]["corpus"], historic["pairs"][0], historic["hardLane"]):
+            group["graded"] += 102
+            group["excellent"] += 102
+            group["tiers"]["excellent"] += 102
+        for lane in (historic["pairs"][0], historic["hardLane"]):
+            lane["corpusProbes"] += 102
+            lane["hardProbes"] += 102
+        percentages(historic)
         engine = self.render(facts=self.document("inventory.json", facts))["repositories"][0]
         self.assertIn("411 open-corpus strategies, 855 closed-test scripts", engine["expected"])
 
@@ -204,36 +291,55 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(self.invoke("render", "--facts", str(FACTS)).returncode, 2)
         self.assertEqual(self.invoke("render", "--format=json", "--format", "commands").returncode, 2)
 
-    def test_hpo_cannot_be_unheld_by_swapping_roles(self):
+    def test_hpo_cannot_be_retargeted_by_swapping_roles(self):
         for identity in ("pineforge-4pass/pineforge-hpo", "pineforge-4pass/PineForge-HPO",
                          "PINEFORGE-4PASS/PINEFORGE-HPO"):
             with self.subTest(identity=identity):
                 def change(policy):
                     engine = next(row for row in policy["repositories"] if row["role"] == "engine")
-                    held = next(row for row in policy["repositories"] if row["role"] == "hpo")
-                    engine.update(role="hpo", disposition="HOLD", approved_text="Held engine")
-                    del engine["template"]
-                    held["source"]["url"] = held["source"]["url"].replace(held["repo"], identity)
-                    held["source"]["repo"] = identity
-                    held.update(role="engine", repo=identity, disposition="static",
-                                template="Changed held repository")
-                    del held["approved_text"]
+                    hpo = next(row for row in policy["repositories"] if row["role"] == "hpo")
+                    engine["role"] = "hpo"
+                    hpo["source"]["url"] = hpo["source"]["url"].replace(hpo["repo"], identity)
+                    hpo["source"]["repo"] = identity
+                    hpo.update(role="engine", repo=identity)
                 result = self.invoke("render", "--format", "commands", policy=self.policy(change))
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, "")
 
     def test_case_only_repository_duplicates_fail_without_partial_output(self):
-        def change(policy):
-            original, duplicate = policy["repositories"][:2]
-            identity = original["repo"].swapcase()
-            duplicate["repo"] = identity
-            duplicate["source"] = copy.deepcopy(original["source"])
-            duplicate["source"]["repo"] = identity
-            duplicate["source"]["url"] = duplicate["source"]["url"].replace(original["repo"], identity)
-        result = self.invoke("render", "--format", "commands", policy=self.policy(change))
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(result.stdout, "")
-        self.assertIn("duplicate", result.stderr)
+        for role in ("engine", "hpo"):
+            with self.subTest(role=role):
+                def change(policy):
+                    original = next(row for row in policy["repositories"] if row["role"] == role)
+                    duplicate = policy["repositories"][1]
+                    identity = original["repo"].swapcase()
+                    duplicate["repo"] = identity
+                    duplicate["source"] = copy.deepcopy(original["source"])
+                    duplicate["source"]["repo"] = identity
+                    duplicate["source"]["url"] = duplicate["source"]["url"].replace(original["repo"], identity)
+                result = self.invoke("render", "--format", "commands", policy=self.policy(change))
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("duplicate", result.stderr)
+
+    def test_hpo_released_policy_has_its_own_immutable_license_source(self):
+        rows = {row["role"]: row for row in self.render()["repositories"]}
+        hpo = rows["hpo"]
+        self.assertEqual(hpo["repo"], "pineforge-4pass/pineforge-hpo")
+        self.assertEqual(hpo["disposition"], "managed")
+        self.assertEqual(hpo["tokens"], [])
+        self.assertEqual(hpo["expected"],
+                         "Native C++ hyperparameter optimization for PineForge strategies. Source-available under "
+                         "the PineForge Source License 1.2: free for personal trading and noncommercial use; "
+                         "commercial use requires a license shared with codegen.")
+        source = hpo["public_source"]
+        self.assertEqual(source["repo"], hpo["repo"])
+        self.assertEqual(source["commit"], "dab7b6775588da0f112eb363a70561c212dce80b")
+        self.assertEqual(source["url"], f'https://github.com/{hpo["repo"]}/blob/{source["commit"]}/LICENSE')
+        self.assertEqual(hpo["license_sources"], [dict(id="hpo", label="PineForge Source License 1.2", **source)])
+        self.assertNotEqual(source["commit"], rows["codegen-oss"]["public_source"]["commit"])
+        self.assertIn("v0.11.0", hpo["reason"])
+        self.assertIn("versions through v0.10.0 retain Apache-2.0", hpo["reason"])
 
     def test_mixed_case_source_and_live_identities_are_accepted(self):
         def change(policy):
@@ -263,22 +369,25 @@ class DescriptionCLI(unittest.TestCase):
                    lambda value: value["licenses"]["codegen"].update(commit="main"),
                    lambda value: value["licenses"]["codegen"].update(url="https://example.com/LICENSE"),
                    lambda value: next(row for row in value["repositories"] if row["role"] == "hpo").update(
-                       disposition="managed", template="Mutate HPO")]
+                       public=False),
+                   lambda value: value["licenses"]["hpo"].update(commit="v0.11.0")]
         for change in changes:
             with self.subTest(change=change):
                 self.assertEqual(self.invoke("render", policy=self.policy(change)).returncode, 2)
 
-    def test_commands_are_quoted_text_and_hpo_is_never_a_command(self):
+    def test_commands_are_quoted_review_text_including_managed_hpo(self):
         dangerous = "Compiler's $(touch SHOULD_NOT_EXIST); `id` & shell text"
         policy = self.policy(lambda value: value["repositories"][0].update(template=dangerous))
         result = self.invoke("render", "--format", "commands", policy=policy)
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = [shlex.split(line) for line in result.stdout.splitlines() if not line.startswith("#")]
-        self.assertEqual(len(commands), 5)
+        self.assertEqual(len(commands), 6)
         self.assertEqual(commands[0], ["gh", "repo", "edit", "pineforge-4pass/pineforge-engine",
                                       "--description", dangerous])
-        self.assertTrue(all(command[3] != "pineforge-4pass/pineforge-hpo" for command in commands))
-        self.assertIn("# HOLD", result.stdout)
+        hpo = next(row for row in self.render()["repositories"] if row["role"] == "hpo")
+        self.assertEqual([command for command in commands if command[3] == hpo["repo"]],
+                         [["gh", "repo", "edit", hpo["repo"], "--description", hpo["expected"]]])
+        self.assertIn("# managed", result.stdout)
         self.assertIn("facts_sha256", result.stdout)
         self.assertFalse((self.root / "SHOULD_NOT_EXIST").exists())
 
@@ -331,7 +440,7 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(len(calls), 6)
         self.assertTrue(all(call[:5] == ["api", "--method", "GET", "--hostname", "github.com"] for call in calls))
 
-    def test_live_drift_including_held_hpo_and_explicit_null(self):
+    def test_live_drift_including_managed_hpo_and_explicit_null(self):
         for mode, role in [("drift", "engine"), ("drift", "hpo"), ("null", "engine"), ("empty", "engine")]:
             with self.subTest(mode=mode, role=role):
                 executable, env, target = self.fake_gh(mode, role)
@@ -358,21 +467,52 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(self.invoke("apply").returncode, 2)
 
 
-class ReadOnlyWorkflow(unittest.TestCase):
-    def test_live_workflow_is_main_only_read_only_and_always_preserves_proposals(self):
-        text = (REPO / ".github" / "workflows" / "repo-description-drift.yml").read_text(encoding="utf-8")
+class DescriptionWorkflows(unittest.TestCase):
+    def test_replacement_is_guarded_main_only_and_retains_failure_receipts(self):
+        workflows = REPO / ".github/workflows"
+        self.assertFalse((workflows / "repo-description-drift.yml").exists())
+        text = (workflows / "facts-descriptions.yml").read_text(encoding="utf-8")
         self.assertIn("branches: [main]", text)
         self.assertIn("workflow_dispatch:", text)
         self.assertNotIn("pull_request:", text)
         self.assertIn("contents: read", text)
-        self.assertNotIn(": write", text)
-        for path in ["facts/facts.json", "facts/facts.schema.json", "facts/repo-descriptions.json",
-                     "scripts/repo_descriptions.py"]:
+        for path in ["facts/**", "scripts/facts_*.py", "scripts/repo_descriptions.py"]:
             self.assertIn(path, text)
-        self.assertIn("check --facts facts/facts.json --live", text)
+        self.assertIn("environment: descriptions", text)
+        self.assertIn("default: true", text)
+        self.assertIn("cancel-in-progress: false", text)
+        self.assertIn("schedule:", text)
+        self.assertIn("github.ref_protected", text)
+        self.assertIn("vars.FACTS_DESCRIPTIONS_APPLY_ENABLED == 'true'", text)
+        self.assertIn("env.DRY_RUN == 'false'", text)
+        self.assertIn("actions/create-github-app-token@v2", text)
+        self.assertIn("secrets.DESCRIPTIONS_APP_ID", text)
+        self.assertIn("secrets.DESCRIPTIONS_APP_PRIVATE_KEY", text)
+        self.assertNotIn("PINEFORGE_APP_", text)
+        self.assertIn("permission-administration: write", text)
+        self.assertNotIn("permission-contents: write", text)
+        self.assertIn("repositories: ${{ steps.source.outputs.repositories }}", text)
+        self.assertIn("MINT_OUTCOME: ${{ steps.app.outcome }}", text)
+        self.assertIn('--mint-outcome "$MINT_OUTCOME"', text)
         self.assertIn("actions/upload-artifact@", text)
-        self.assertIn("if: always()", text)
+        self.assertIn("if-no-files-found: error", text)
+        self.assertIn("failure() && !cancelled()", text)
         self.assertNotIn("gh repo edit", text)
+
+    def test_pr_validation_has_no_credentials_and_runs_actual_render_acceptance(self):
+        workflows = REPO / ".github/workflows"
+        for name in ("facts-validate.yml", "python-test.yml"):
+            text = (workflows / name).read_text()
+            self.assertIn("pull_request:", text)
+            self.assertIn("contents: read", text)
+            for forbidden in ("pull_request_target", "secrets.", "create-github-app-token", ": write"):
+                self.assertNotIn(forbidden, text)
+        text = (workflows / "facts-validate.yml").read_text()
+        for needed in ("facts/**", "scripts/facts_*.py", "tests/test_facts_*.py", ".github/workflows/**",
+                       "scripts/facts_validate.py", "scripts/repo_descriptions.py render",
+                       "scripts/facts_cards.py", "--format json", "--theme", "cmp ", "test_facts_*.py"):
+            self.assertIn(needed, text)
+        self.assertIn("test_repo_descriptions.py", (workflows / "python-test.yml").read_text())
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 {
   "schema": "pineforge/repo-descriptions/v1",
-  "version": 1,
+  "version": 2,
   "labels": {
     "apache": "Apache-2.0",
     "source": "PineForge Source License 1.2"
@@ -23,6 +23,12 @@
       "repo": "pineforge-4pass/pineforge-corpus",
       "commit": "262bab123176989464cbab04aa94c72b3d3143be",
       "url": "https://github.com/pineforge-4pass/pineforge-corpus/blob/262bab123176989464cbab04aa94c72b3d3143be/LICENSE"
+    },
+    "hpo": {
+      "label": "source",
+      "repo": "pineforge-4pass/pineforge-hpo",
+      "commit": "dab7b6775588da0f112eb363a70561c212dce80b",
+      "url": "https://github.com/pineforge-4pass/pineforge-hpo/blob/dab7b6775588da0f112eb363a70561c212dce80b/LICENSE"
     }
   },
   "wording": {
@@ -74,14 +80,14 @@
       "role": "hpo",
       "repo": "pineforge-4pass/pineforge-hpo",
       "public": true,
-      "disposition": "HOLD",
-      "reason": "Published description is held/read-only pending authorization. No new license claim, release/catalog change, or setting-change command.",
+      "disposition": "managed",
+      "reason": "HPO v0.11.0 released original code under PineForge Source License 1.2; versions through v0.10.0 retain Apache-2.0. Free personal trading and noncommercial use; one commercial license covers HPO and codegen.",
       "source": {
         "repo": "pineforge-4pass/pineforge-hpo",
-        "commit": "d66788a6160b271d78270652acf7f8f82d906343",
-        "url": "https://github.com/pineforge-4pass/pineforge-hpo/blob/d66788a6160b271d78270652acf7f8f82d906343/LICENSE"
+        "commit": "dab7b6775588da0f112eb363a70561c212dce80b",
+        "url": "https://github.com/pineforge-4pass/pineforge-hpo/blob/dab7b6775588da0f112eb363a70561c212dce80b/LICENSE"
       },
-      "approved_text": "Native C++ hyperparameter optimization for PineForge strategies: grid, seeded random, dlib global search, and TPE (alpha)"
+      "template": "Native C++ hyperparameter optimization for PineForge strategies. Source-available under the {{license:hpo}}: free for personal trading and noncommercial use; commercial use requires a license shared with codegen."
     },
     {
       "role": "release",

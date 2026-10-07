@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import datetime
-import hashlib
 import json
 import math
 import os
@@ -16,114 +14,17 @@ import sys
 import unicodedata
 from pathlib import Path
 
+from facts_validate import InputError, decode, read_json, validate_facts
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_POLICY = ROOT / "facts" / "repo-descriptions.json"
-FACTS_SCHEMA = ROOT / "facts" / "facts.schema.json"
 API_TIMEOUT_SECONDS = 60
 MAX_INPUT_BYTES = 2 * 1024 * 1024
 ROLES = {"engine", "codegen-oss", "corpus", "hpo", "release", "backtest-mcp"}
+PUBLIC_REPOSITORIES = {role: "pineforge-4pass/pineforge-" + role for role in ROLES}
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 COMMIT = re.compile(r"[a-f0-9]{40}\Z")
 TOKEN = re.compile(r"\{\{(facts|license|word):([A-Za-z0-9_.-]+)(?:\|(int|grouped|decimal|text))?\}\}")
-
-
-class InputError(ValueError):
-    pass
-
-
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise InputError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-
-def decode(raw, name):
-    def invalid_constant(value):
-        raise InputError(f"non-finite JSON number: {value}")
-    try:
-        return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object,
-                          parse_constant=invalid_constant)
-    except (UnicodeError, ValueError, RecursionError) as error:
-        raise InputError(f"{name}: {error}") from error
-
-
-def read_json(path):
-    with Path(path).open("rb") as stream:
-        raw = stream.read(MAX_INPUT_BYTES + 1)
-    if len(raw) > MAX_INPUT_BYTES:
-        raise InputError(f"input exceeds {MAX_INPUT_BYTES} bytes: {path}")
-    return decode(raw, str(path)), hashlib.sha256(raw).hexdigest()
-
-
-def validate_schema(value, schema, root, location="facts"):
-    supported = {"$schema", "$id", "title", "$defs", "$ref", "type", "const", "anyOf",
-                 "required", "properties", "additionalProperties", "propertyNames", "items",
-                 "pattern", "minimum", "maximum", "format"}
-    if set(schema) - supported:
-        raise InputError("unsupported facts schema keyword; upgrade the validator explicitly")
-    if "$ref" in schema:
-        reference = schema["$ref"]
-        if not reference.startswith("#/$defs/"):
-            raise InputError("unsupported schema reference")
-        validate_schema(value, root["$defs"][reference[8:]], root, location)
-    if "anyOf" in schema:
-        for choice in schema["anyOf"]:
-            try:
-                validate_schema(value, choice, root, location)
-                break
-            except InputError:
-                continue
-        else:
-            raise InputError(f"{location}: does not match any allowed type")
-    types = {"object": isinstance(value, dict), "array": isinstance(value, list),
-             "string": isinstance(value, str), "integer": type(value) is int,
-             "number": type(value) in (int, float), "null": value is None}
-    if "type" in schema and not types.get(schema["type"], False):
-        raise InputError(f"{location}: expected {schema['type']}")
-    if "const" in schema and value != schema["const"]:
-        raise InputError(f"{location}: incorrect schema version")
-    if type(value) in (int, float):
-        if isinstance(value, float) and not math.isfinite(value):
-            raise InputError(f"{location}: non-finite number")
-        if "minimum" in schema and value < schema["minimum"]:
-            raise InputError(f"{location}: below minimum")
-        if "maximum" in schema and value > schema["maximum"]:
-            raise InputError(f"{location}: above maximum")
-    if isinstance(value, str):
-        if "pattern" in schema and not re.search(schema["pattern"], value, re.ASCII):
-            raise InputError(f"{location}: invalid spelling")
-        if "format" in schema:
-            try:
-                if schema["format"] == "date":
-                    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value, re.ASCII):
-                        raise ValueError("invalid date spelling")
-                    datetime.date.fromisoformat(value)
-                elif schema["format"] == "date-time":
-                    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", value, re.ASCII):
-                        raise ValueError("invalid timestamp spelling")
-                    datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-                else:
-                    raise ValueError("unsupported format")
-            except ValueError as error:
-                raise InputError(f"{location}: {error}") from error
-    if isinstance(value, dict):
-        if set(schema.get("required", [])) - set(value):
-            raise InputError(f"{location}: missing required fields")
-        properties = schema.get("properties", {})
-        for key, child in value.items():
-            if "propertyNames" in schema:
-                validate_schema(key, schema["propertyNames"], root, location)
-            rule = properties.get(key, schema.get("additionalProperties", True))
-            if rule is False:
-                raise InputError(f"{location}: unknown field {key}")
-            if isinstance(rule, dict):
-                validate_schema(child, rule, root, location + "." + key)
-    if isinstance(value, list) and "items" in schema:
-        for index, child in enumerate(value):
-            validate_schema(child, schema["items"], root, f"{location}[{index}]")
 
 
 def fields(value, required, optional=()):
@@ -151,6 +52,8 @@ def repository_identity(value):
 def source(value):
     fields(value, {"repo", "commit", "url"})
     identity = repository_identity(value["repo"])
+    if identity not in PUBLIC_REPOSITORIES.values():
+        raise InputError("source repository is not confirmed public")
     if not isinstance(value["commit"], str) or not COMMIT.fullmatch(value["commit"]):
         raise InputError("source must pin a full public commit")
     prefix, suffix = "https://github.com/", f"/blob/{value['commit']}/LICENSE"
@@ -216,13 +119,16 @@ def render_template(template, facts, policy):
 
 def render(facts_path, policy_path):
     facts, facts_hash = read_json(facts_path)
-    schema, _ = read_json(FACTS_SCHEMA)
-    validate_schema(facts, schema, schema)
+    policy, policy_hash = read_json(policy_path)
+    return render_document(facts, policy, facts_hash, policy_hash)
+
+
+def render_document(facts, policy, facts_hash, policy_hash):
+    validate_facts(facts)
     scoreboard = facts["scoreboard"]
     if (scoreboard["belowStrong"] != 0
             or scoreboard["excellent"] + scoreboard["strong"] != scoreboard["graded"]):
         raise InputError("engine all-graded claim requires belowStrong == 0 and excellent + strong == graded")
-    policy, policy_hash = read_json(policy_path)
     fields(policy, {"schema", "version", "labels", "licenses", "wording", "repositories"})
     if policy["schema"] != "pineforge/repo-descriptions/v1" or type(policy["version"]) is not int or policy["version"] < 1:
         raise InputError("invalid description policy version")
@@ -251,8 +157,6 @@ def render(facts_path, policy_path):
         seen_repos.add(identity)
         clean_text(row["reason"])
         disposition = row["disposition"]
-        if (row["role"] == "hpo" or identity.split("/")[1] == "pineforge-hpo") and disposition != "HOLD":
-            raise InputError("HPO must remain held; no setting-change command is permitted")
         if disposition == "HOLD":
             if "template" in row or "approved_text" not in row:
                 raise InputError("held rows require only approved_text")
@@ -273,6 +177,9 @@ def render(facts_path, policy_path):
                          license_sources=sources, public_source=row["source"]))
     if seen_roles != ROLES:
         raise InputError("incomplete confirmed-public manifest")
+    for row in rows:
+        if repository_identity(row["repo"]) != PUBLIC_REPOSITORIES[row["role"]]:
+            raise InputError("role does not match its confirmed-public repository")
     return dict(schema="pineforge/repo-descriptions-render/v1", policy_version=policy["version"],
                 facts_sha256=facts_hash, policy_sha256=policy_hash, repositories=rows)
 

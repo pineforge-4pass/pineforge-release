@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import operator
 import os
 import re
 import shutil
@@ -36,6 +37,12 @@ HERE = Path(__file__).resolve().parent
 SHIMS = HERE / "shims"
 KEEP_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "TERM")
 STEP_TIMEOUT = 300
+DUMMY_REPOSITORY_SECRETS = {
+    "RELEASE_HOSTED_MCP_REPOSITORY": "release-fixture-hosted",
+    "RELEASE_APPLICATION_REPOSITORY": "release-fixture-application",
+}
+FUNCTIONS = {"startsWith", "endsWith", "contains", "format", "success", "always",
+             "failure", "cancelled", "toJSON", "fromJSON"}
 
 
 def clean_env():
@@ -102,40 +109,41 @@ class Expr:
             raise SyntaxError(f"trailing tokens {self.toks[self.i:]}")
         return v
 
-    def p_or(self):
-        v = self.p_and()
+    def p_or(self, active=True):
+        v = self.p_and(active)
         while self.peek()[1] == "||":
             self.take()
-            r = self.p_and()
+            r = self.p_and(active and not truthy(v))
             v = v if truthy(v) else r
         return v
 
-    def p_and(self):
-        v = self.p_cmp()
+    def p_and(self, active=True):
+        v = self.p_cmp(active)
         while self.peek()[1] == "&&":
             self.take()
-            r = self.p_cmp()
+            r = self.p_cmp(active and truthy(v))
             v = r if truthy(v) else v
         return v
 
-    def p_cmp(self):
-        v = self.p_unary()
+    def p_cmp(self, active=True):
+        v = self.p_unary(active)
         while self.peek()[1] in ("==", "!=", "<", ">", "<=", ">="):
             op = self.take()[1]
-            r = self.p_unary()
-            v = compare(v, op, r)
+            r = self.p_unary(active)
+            v = compare(v, op, r) if active else None
         return v
 
-    def p_unary(self):
+    def p_unary(self, active=True):
         if self.peek()[1] == "!":
             self.take()
-            return not truthy(self.p_unary())
-        return self.p_primary()
+            value = self.p_unary(active)
+            return not truthy(value) if active else None
+        return self.p_primary(active)
 
-    def p_primary(self):
+    def p_primary(self, active=True):
         kind, val = self.take()
         if val == "(":
-            v = self.p_or()
+            v = self.p_or(active)
             self.take(")")
             return v
         if kind == "str":
@@ -148,20 +156,26 @@ class Expr:
             if val == "null":
                 return None
             if self.peek()[1] == "(":
+                if val not in FUNCTIONS:
+                    raise SyntaxError(f"unsupported function {val}")
                 self.take("(")
                 args = []
                 while self.peek()[1] != ")":
-                    args.append(self.p_or())
+                    args.append(self.p_or(active))
                     if self.peek()[1] == ",":
                         self.take()
+                        if self.peek()[1] == ")":
+                            raise SyntaxError("trailing function argument separator")
+                    elif self.peek()[1] != ")":
+                        raise SyntaxError("expected ',' or ')' after function argument")
                 self.take(")")
-                return call(val, args)
-            v = lookup(self.ctx, val)
+                return call(val, args) if active else None
+            v = lookup(self.ctx, val) if active else None
             while self.peek()[1] == "[":
                 self.take("[")
-                key = self.p_or()
+                key = self.p_or(active)
                 self.take("]")
-                v = v.get(key) if isinstance(v, dict) else None
+                v = v.get(key, "") if active and isinstance(v, dict) else ""
             return v
         raise SyntaxError(f"unexpected token {val!r}")
 
@@ -179,12 +193,16 @@ def compare(a, op, b):
                 return 0
             if isinstance(x, bool):
                 return int(x)
+            if x == "":
+                return 0
             try:
                 return float(x)
             except (TypeError, ValueError):
                 return float("nan")
         a, b = num(a), num(b)
-    return {"==": a == b, "!=": a != b, "<": a < b, ">": a > b, "<=": a <= b, ">=": a >= b}[op]
+    operations = {"==": operator.eq, "!=": operator.ne, "<": operator.lt, ">": operator.gt,
+                  "<=": operator.le, ">=": operator.ge}
+    return operations[op](a, b)
 
 
 def call(name, args):
@@ -217,9 +235,9 @@ def lookup(ctx, path):
     v = ctx
     for part in path.split("."):
         if isinstance(v, dict):
-            v = v.get(part)
+            v = v.get(part, "")
         else:
-            return None
+            return ""
     return v
 
 
@@ -371,6 +389,8 @@ class Job:
         name = uses.split("@")[0]
         with_ = {k: interpolate(v, self.ctx) for k, v in (step.get("with") or {}).items()}
         if name == "actions/create-github-app-token":
+            record(self.state, tool=name, repositories=with_.get("repositories"),
+                   owner=with_.get("owner"), github_api_url=with_.get("github-api-url"))
             self.log(f"  [stub] {name}: dummy token (repositories={with_.get('repositories', '<all>')})")
             return {"token": "dry-run-dummy-token"}
         if name == "actions/checkout":
@@ -391,12 +411,11 @@ class Job:
             for a in args:
                 self.log(f"           build-arg: {a}")
             return {"digest": "sha256:" + "0" * 64}
-        if name in ("pypa/gh-action-pypi-publish", "cloudflare/wrangler-action"):
-            record(self.state, tool=name, inputs=with_)
-            self.log(f"  [stub] {name}: WOULD PUBLISH/DEPLOY with {json.dumps(with_, sort_keys=True)[:400]}")
+        if name in ("docker/login-action", "docker/setup-qemu-action", "docker/setup-buildx-action"):
+            record(self.state, tool=name)
+            self.log(f"  [stub] {name}: external Docker setup only")
             return {}
-        self.log(f"  [stub] {name}: no-op")
-        return {}
+        raise RuntimeError(f"unsupported action {uses}")
 
     def metadata(self, with_):
         action = self.metadata_action
@@ -536,19 +555,22 @@ class Job:
 
 def run_job(workflow, job, *, event, repo, workdir, state, event_name="repository_dispatch",
             ref="refs/heads/main", needs=None, matrix=None, inputs=None, until="",
-            metadata_action=None, run_id=4242, echo=print):
+            metadata_action=None, run_id=4242, repository_secrets=None, echo=print):
     """Run JOB of the WORKFLOW file; returns a JobResult (outputs, step outputs, transcript)."""
     wf = yaml.load(Path(workflow).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     workdir = Path(workdir).resolve()
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=workdir, capture_output=True,
                          text=True).stdout.strip() or "0" * 40
+    targets = DUMMY_REPOSITORY_SECRETS if repository_secrets is None else repository_secrets
+    if set(targets) - set(DUMMY_REPOSITORY_SECRETS):
+        raise ValueError("only dummy consumer repository configuration is supported")
     ctx = {
         "github": {"event": event, "event_name": event_name, "ref": ref,
                    "ref_name": ref.split("/", 2)[-1], "repository": repo, "run_id": run_id,
                    "sha": sha, "actor": "dry-run", "token": "dry-run-dummy-token",
                    "action": event.get("action", ""), "repository_owner": repo.split("/")[0]},
         "secrets": {"GITHUB_TOKEN": "dry-run-dummy-token", "PINEFORGE_APP_ID": "0",
-                    "PINEFORGE_APP_PRIVATE_KEY": "dry-run-dummy-key"},
+                    "PINEFORGE_APP_PRIVATE_KEY": "dry-run-dummy-key", **targets},
         "inputs": inputs or {}, "vars": {}, "needs": needs or {}, "matrix": matrix or {},
         "runner": {"temp": tempfile.gettempdir(), "os": "Linux"},
     }
@@ -580,6 +602,7 @@ def main():
     ap.add_argument("--matrix", action="append", default=[], help="KEY=VALUE")
     ap.add_argument("--inputs", default="{}", help="JSON: inputs context")
     ap.add_argument("--metadata-action", default="", help="a checkout of docker/metadata-action")
+    ap.add_argument("--repository-secrets", help="JSON dummy repository configuration ({} tests missing targets)")
     args = ap.parse_args()
     check_bash()
     event = json.loads(Path(args.event).read_text()) if Path(args.event).is_file() else json.loads(args.event)
@@ -587,6 +610,7 @@ def main():
                      state=args.state, event_name=args.event_name, ref=args.ref,
                      needs=json.loads(args.needs), matrix=dict(kv.split("=", 1) for kv in args.matrix),
                      inputs=json.loads(args.inputs), until=args.until,
+                     repository_secrets=json.loads(args.repository_secrets) if args.repository_secrets is not None else None,
                      metadata_action=args.metadata_action or None)
     sys.exit(0 if result.ok else 1)
 

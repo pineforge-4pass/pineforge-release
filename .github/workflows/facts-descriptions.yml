@@ -1,0 +1,104 @@
+name: facts-descriptions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'facts/**'
+      - 'scripts/repo_descriptions.py'
+      - 'scripts/facts_*.py'
+      - 'tests/test_repo_descriptions.py'
+      - 'tests/test_facts_*.py'
+      - '.github/workflows/facts-descriptions.yml'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Compare without applying descriptions
+        type: boolean
+        default: true
+        required: true
+  schedule:
+    - cron: '17,47 * * * *'
+
+permissions:
+  contents: read
+
+# This consumer serializes independently of release automation and future consumers.
+concurrency:
+  group: facts-descriptions
+  cancel-in-progress: false
+
+jobs:
+  descriptions:
+    if: github.ref == 'refs/heads/main'
+    environment: descriptions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FACTS_DESCRIPTIONS_APPLY_ENABLED: ${{ vars.FACTS_DESCRIPTIONS_APPLY_ENABLED }}
+      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || vars.FACTS_DESCRIPTIONS_APPLY_ENABLED != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install -r facts/requirements-validation.txt
+      - name: Validate and resolve immutable current main
+        id: source
+        env:
+          FACTS_READ_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/facts_descriptions.py prepare --facts facts/facts.json \
+            --output-dir "$RUNNER_TEMP/facts-source" --github-output "$GITHUB_OUTPUT"
+      - name: Check descriptions setup without displaying secrets
+        id: setup
+        env:
+          APP_ID: ${{ secrets.DESCRIPTIONS_APP_ID }}
+          APP_KEY: ${{ secrets.DESCRIPTIONS_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
+            echo 'state=ready' >> "$GITHUB_OUTPUT"
+          else
+            echo 'state=missing' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Mint descriptions token for managed public repositories only
+        id: app
+        if: >-
+          github.ref == 'refs/heads/main' && github.ref_protected &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') &&
+          vars.FACTS_DESCRIPTIONS_APPLY_ENABLED == 'true' && env.DRY_RUN == 'false' &&
+          steps.setup.outputs.state == 'ready'
+        # Preserve the failed outcome for a report; reconcile must return failure for any mint failure.
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DESCRIPTIONS_APP_ID }}
+          private-key: ${{ secrets.DESCRIPTIONS_APP_PRIVATE_KEY }}
+          owner: pineforge-4pass
+          repositories: ${{ steps.source.outputs.repositories }}
+          permission-administration: write
+          github-api-url: https://api.github.com
+      - name: Compare or apply and write the run receipt
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.setup.outcome == 'success' }}
+        env:
+          FACTS_READ_TOKEN: ${{ github.token }}
+          FACTS_WRITE_TOKEN: ${{ steps.app.outputs.token }}
+          SETUP: ${{ steps.setup.outputs.state }}
+          MINT_OUTCOME: ${{ steps.app.outcome }}
+        run: |
+          python3 scripts/facts_descriptions.py reconcile --source-dir "$RUNNER_TEMP/facts-source" \
+            --dry-run "$DRY_RUN" --setup "$SETUP" --mint-outcome "$MINT_OUTCOME" \
+            --receipt "$RUNNER_TEMP/descriptions-audit/receipt.json"
+      - name: Preserve the public receipt even when reconciliation fails
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: descriptions-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/descriptions-audit/receipt.json
+          if-no-files-found: error
+      - name: Visible failure or report-only drift alert
+        if: ${{ failure() && !cancelled() }}
+        run: echo '::error::Descriptions reconciliation failed or reported drift; inspect the public receipt. Missing receipt is missing telemetry, never healthy.'

@@ -30,13 +30,18 @@ permissions:
 jobs:
   bump:
     runs-on: ubuntu-latest
+    environment: release-automation
     steps:
       - name: Mint org App token
         id: app
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.PINEFORGE_APP_ID }}
           private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
+          owner: pineforge-4pass
+          repositories: pineforge-release
+          permission-contents: write
+          github-api-url: https://api.github.com
 
       - name: Checkout main (App token bypasses the ruleset + re-fires publish.yml)
         uses: actions/checkout@v4

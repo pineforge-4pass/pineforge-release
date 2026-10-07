@@ -164,8 +164,31 @@ class PublishTest(unittest.TestCase):
         body = _step(self.text, "Dispatch pineforge-release")
         self.assertIn("PRERELEASE: ${{ needs.publish.outputs.prerelease }}", body)
         self.assertIn('-F "client_payload[prerelease]=${PRERELEASE}"', body)
-        self.assertIn("repo: [pineforge-backtest-mcp, pineforge-mcp-public, pineforge-app]",
+        self.assertIn("consumer: [offline, hosted, application]",
                       self.text)
+
+
+class AppScopeTest(unittest.TestCase):
+    def test_release_jobs_use_protected_environment_and_contents_only_tokens(self):
+        for name in ("publish.yml", "handle-upstream.yml"):
+            text = (WORKFLOWS / name).read_text()
+            self.assertIn("environment: release-automation", text)
+            self.assertNotIn("permission-administration", text)
+            self.assertNotIn("create-github-app-token@v1", text)
+            self.assertIn("permission-contents: write", text)
+            self.assertIn("github-api-url: https://api.github.com", text)
+        handler = (WORKFLOWS / "handle-upstream.yml").read_text()
+        self.assertIn("repositories: pineforge-release", handler)
+        publish = (WORKFLOWS / "publish.yml").read_text()
+        self.assertIn("repositories: ${{ env.TARGET_REPOSITORY }}", publish)
+        self.assertIn("repository_secret: RELEASE_HOSTED_MCP_REPOSITORY", publish)
+        self.assertIn("repository_secret: RELEASE_APPLICATION_REPOSITORY", publish)
+        self.assertIn("secrets[matrix.repository_secret]", publish)
+        self.assertLess(publish.index("Require one configured consumer"), publish.index("Mint App token"))
+        self.assertNotIn("echo \"dispatched pineforge-release -> ${REPO}", publish)
+        notify = publish[publish.index("  notify-consumers:"):]
+        self.assertIn("permissions:\n      contents: read", notify)
+        self.assertNotIn("packages: write", notify)
 
 
 class PythonTestGateTest(unittest.TestCase):
