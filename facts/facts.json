@@ -1,21 +1,21 @@
 {
   "schema": "pineforge/facts/v1",
   "scoreboard": {
-    "source": "Registry baseline pineforge-parity-baseline-20261007-codegen-bfc4ddce; digest-verified snapshot 72846683626e5563e17ca94e043b3b5079021a3c94dbdb61237e28bcf16c71b5; private evidence sha256:fb3e46e0899c0306108ef64ed09f6c4e2de203d04ef8b51eed74c84dc515f9fb.",
+    "source": "Registry baseline pineforge-parity-baseline-20261007-engine-b3192bfc; digest-verified snapshot 28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2; private evidence sha256:8a9598552b9c54e375a27c6494b75fea1a2a7d74331f166e67908ba2e0160684.",
     "provenance": {
-      "baselineId": "pineforge-parity-baseline-20261007-codegen-bfc4ddce",
-      "snapshotSha256": "72846683626e5563e17ca94e043b3b5079021a3c94dbdb61237e28bcf16c71b5",
+      "baselineId": "pineforge-parity-baseline-20261007-engine-b3192bfc",
+      "snapshotSha256": "28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2",
       "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
-      "engineCommit": "49bb202944c54c9bffdb918e24a7f4fb1a7d838d",
+      "engineCommit": "b3192bfc2f5a24bf4efd6d1d01e01e8fe619dfed",
       "codegenCommit": "bfc4ddce453db1ba810692af9b9ba3310d87f0ac",
-      "promotionDate": "2026-10-07T16:47:40.000Z",
-      "privateEvidenceSha256": "fb3e46e0899c0306108ef64ed09f6c4e2de203d04ef8b51eed74c84dc515f9fb"
+      "promotionDate": "2026-10-07T22:32:23.000Z",
+      "privateEvidenceSha256": "8a9598552b9c54e375a27c6494b75fea1a2a7d74331f166e67908ba2e0160684"
     },
-    "id": "pineforge-parity-baseline-20261007-codegen-bfc4ddce",
+    "id": "pineforge-parity-baseline-20261007-engine-b3192bfc",
     "date": "2026-10-07",
-    "engineCommit": "49bb202944c54c9bffdb918e24a7f4fb1a7d838d",
+    "engineCommit": "b3192bfc2f5a24bf4efd6d1d01e01e8fe619dfed",
     "codegenCommit": "bfc4ddce453db1ba810692af9b9ba3310d87f0ac",
-    "snapshotSha256": "72846683626e5563e17ca94e043b3b5079021a3c94dbdb61237e28bcf16c71b5",
+    "snapshotSha256": "28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2",
     "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
     "population": 8006,
     "anomaliesExcluded": 17,
@@ -2179,6 +2179,464 @@
             "tiers": {
               "excellent": 635,
               "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "NYSE:F",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 505,
+            "graded": 505,
+            "excellent": 505,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 505,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "OANDA:EURUSD",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 653,
+            "graded": 653,
+            "excellent": 652,
+            "strong": 1,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 652,
+              "strong": 1,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "OANDA:EURUSD",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 453,
+            "graded": 453,
+            "excellent": 453,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 453,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "OANDA:XAUUSD",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 695,
+            "graded": 695,
+            "excellent": 694,
+            "strong": 1,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 694,
+              "strong": 1,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "OANDA:XAUUSD",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 456,
+            "graded": 456,
+            "excellent": 456,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 456,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ]
+      }
+    },
+    "1.4.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.4.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261007-engine-b3192bfc; digest-verified snapshot 28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2; private evidence sha256:8a9598552b9c54e375a27c6494b75fea1a2a7d74331f166e67908ba2e0160684.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261007-engine-b3192bfc",
+          "snapshotSha256": "28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "b3192bfc2f5a24bf4efd6d1d01e01e8fe619dfed",
+          "codegenCommit": "bfc4ddce453db1ba810692af9b9ba3310d87f0ac",
+          "promotionDate": "2026-10-07T22:32:23.000Z",
+          "privateEvidenceSha256": "8a9598552b9c54e375a27c6494b75fea1a2a7d74331f166e67908ba2e0160684"
+        },
+        "id": "pineforge-parity-baseline-20261007-engine-b3192bfc",
+        "date": "2026-10-07",
+        "engineCommit": "b3192bfc2f5a24bf4efd6d1d01e01e8fe619dfed",
+        "codegenCommit": "bfc4ddce453db1ba810692af9b9ba3310d87f0ac",
+        "snapshotSha256": "28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "CME_MINI:ES1!",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 76,
+            "graded": 76,
+            "excellent": 76,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 76,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "CME_MINI:ES1!",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 35,
+            "graded": 35,
+            "excellent": 35,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 35,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "CME_MINI:NQ1!",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 74,
+            "graded": 74,
+            "excellent": 74,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 74,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "CME_MINI:NQ1!",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 37,
+            "graded": 37,
+            "excellent": 37,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 37,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "NASDAQ:AAPL",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 632,
+            "graded": 632,
+            "excellent": 631,
+            "strong": 1,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 631,
+              "strong": 1,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "NASDAQ:AAPL",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 464,
+            "graded": 464,
+            "excellent": 464,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 464,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "NSE:NIFTY",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 314,
+            "graded": 314,
+            "excellent": 314,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 314,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "NSE:NIFTY",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 225,
+            "graded": 225,
+            "excellent": 225,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 225,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "NYSE:F",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 637,
+            "graded": 637,
+            "excellent": 636,
+            "strong": 1,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 636,
+              "strong": 1,
               "moderate": 0,
               "weak": 0,
               "minimal": 0,
