@@ -1,11 +1,22 @@
 name: Mirror build proof (throwaway)
 
 # Throwaway hosted-run proof, never merged: it runs only on its own branch and
-# on manual dispatch. On a GitHub-hosted runner it shows that every image the
-# mirror change in publish.yml names is served by mirror.gcr.io as a multi-arch
-# index with linux/amd64 and linux/arm64, and that the multi-arch build of
-# docker/Dockerfile succeeds with the same QEMU and Buildx set-up steps as the
-# publish job. It pushes no image, logs in to no registry and uses no secret.
+# on manual dispatch. It has read access to the repository contents only
+# (contents: read), logs in to no registry, uses no secret and pushes no image
+# (push: false).
+#
+# On a GitHub-hosted runner it shows that the mirror change in publish.yml holds:
+#   - mirror.gcr.io serves every image the change names as a multi-arch index
+#     with linux/amd64 and linux/arm64;
+#   - the QEMU and Buildx set-up steps below are the ones in publish.yml, and
+#     they carry the mirror values (the form check reads those values literally,
+#     not only by equality with publish.yml);
+#   - the multi-arch build of docker/Dockerfile succeeds with those same set-up
+#     steps while Docker Hub is unreachable inside the BuildKit container.
+# BuildKit asks the mirror first and falls back to Docker Hub without saying so,
+# so a green build alone cannot show where a base image came from. With Docker
+# Hub blocked first, a green build means every base image (debian:bookworm-slim,
+# in all three stages, for both platforms) came through the mirror.
 
 on:
   push:
@@ -110,6 +121,11 @@ jobs:
               ("docker/setup-qemu-action", ("image",)),
               ("docker/setup-buildx-action", ("driver-opts", "buildkitd-config-inline")),
           )
+          # The mirror values themselves, written out here: equality with
+          # publish.yml alone would also pass for two files that had both lost them.
+          QEMU_IMAGE = "mirror.gcr.io/tonistiigi/binfmt:latest"
+          BUILDX_DRIVER_OPTS = "image=mirror.gcr.io/moby/buildkit:buildx-stable-1"
+          BUILDX_CONFIG_LINES = ('[registry."docker.io"]', 'mirrors = ["mirror.gcr.io"]')
 
 
           def steps_using(path, action):
@@ -120,6 +136,22 @@ jobs:
                   for step in job.get("steps") or []:
                       if str(step.get("uses", "")).split("@", 1)[0] == action:
                           found.append(step)
+              return found
+
+
+          def mirror_problems(action, step_with):
+              found = []
+              if action == "docker/setup-qemu-action":
+                  if step_with.get("image") != QEMU_IMAGE:
+                      found.append("image is not " + QEMU_IMAGE)
+              else:
+                  if step_with.get("driver-opts") != BUILDX_DRIVER_OPTS:
+                      found.append("driver-opts is not " + BUILDX_DRIVER_OPTS)
+                  config = step_with.get("buildkitd-config-inline")
+                  lines = [line.strip() for line in config.splitlines()] if isinstance(config, str) else []
+                  for wanted in BUILDX_CONFIG_LINES:
+                      if wanted not in lines:
+                          found.append("buildkitd-config-inline has no line " + wanted)
               return found
 
 
@@ -144,12 +176,17 @@ jobs:
                   problems.append(action + ": the version pin differs from publish.yml")
               if publish_with != proof_with:
                   problems.append(action + ": the with mapping differs from publish.yml")
+              if publish_step != proof_step:
+                  problems.append(action + ": the step as a whole differs from publish.yml")
+              for label, step_with in (("publish.yml", publish_with), ("this file", proof_with)):
+                  for found in mirror_problems(action, step_with):
+                      problems.append(action + " in " + label + ": " + found)
 
           if problems:
               for problem in problems:
                   print("::error::" + problem)
               sys.exit(1)
-          print("The QEMU and Buildx set-up steps match publish.yml.")
+          print("The QEMU and Buildx set-up steps match publish.yml and carry the mirror values.")
           PY
 
       - uses: docker/setup-qemu-action@v3
@@ -167,6 +204,100 @@ jobs:
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
+
+      # BuildKit asks the mirror first for each Docker Hub name it resolves and,
+      # when the mirror fails, falls back to Docker Hub without saying so. This
+      # step closes that way out before the build runs: it appends 0.0.0.0 entries
+      # for Docker Hub's hosts to /etc/hosts in the BuildKit container the Buildx
+      # set-up step started, then proves the block with a request from inside that
+      # container. It fails closed: any error, a request that gets through, or a
+      # request that fails in some other way fails the step, and so the proof.
+      - name: Make Docker Hub unreachable for the build
+        id: block
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          hub_hosts=(
+            registry-1.docker.io
+            auth.docker.io
+            index.docker.io
+            docker.io
+            production.cloudflare.docker.com
+            registry.hub.docker.com
+          )
+
+          # The BuildKit container the Buildx set-up step started: exactly one.
+          names="$(docker ps --filter 'name=buildx_buildkit' --format '{{.Names}}')"
+          case "${names}" in
+            "")
+              echo "::error::no running container matches the name filter buildx_buildkit"
+              exit 1
+              ;;
+            *$'\n'*)
+              echo "::error::more than one running container matches the name filter buildx_buildkit:"
+              printf '%s\n' "${names}"
+              exit 1
+              ;;
+          esac
+          container="${names}"
+          echo "BuildKit container: ${container}"
+
+          # Append a 0.0.0.0 entry for each Docker Hub host to the container's
+          # /etc/hosts (as root, through docker exec), then read the file back and
+          # check that every line is there.
+          {
+            printf '\n'
+            for host in "${hub_hosts[@]}"; do
+              printf '0.0.0.0 %s\n' "${host}"
+            done
+          } | docker exec -i --user 0 "${container}" sh -c 'cat >> /etc/hosts'
+          hosts_file="$(docker exec "${container}" cat /etc/hosts)"
+          printf '%s\n' "${hosts_file}"
+          for host in "${hub_hosts[@]}"; do
+            if ! grep -Fxq "0.0.0.0 ${host}" <<<"${hosts_file}"; then
+              echo "::error::/etc/hosts of ${container} has no line '0.0.0.0 ${host}'"
+              exit 1
+            fi
+          done
+
+          # Prove the block from inside the same container: a request to Docker
+          # Hub's registry has to fail, and fail with a refused connection (0.0.0.0
+          # is the container itself, where nothing listens on port 443). An HTTP
+          # answer, even an error status such as 401, means the request got through.
+          # Use the first of wget, curl and nc that the container has.
+          tool=
+          for candidate in wget curl nc; do
+            if docker exec "${container}" sh -c 'command -v "$1" >/dev/null' sh "${candidate}"; then
+              tool="${candidate}"
+              break
+            fi
+          done
+          if [ -z "${tool}" ]; then
+            echo "::error::the BuildKit container has none of wget, curl or nc, so the block cannot be proved"
+            exit 1
+          fi
+          case "${tool}" in
+            wget) request=(wget -O /dev/null -T 10 https://registry-1.docker.io/v2/) ;;
+            curl) request=(curl -sS -o /dev/null --connect-timeout 10 --max-time 20 https://registry-1.docker.io/v2/) ;;
+            nc) request=(nc -w 10 registry-1.docker.io 443) ;;
+          esac
+          echo "Request from inside ${container}: ${request[*]}"
+          if output="$(timeout 60 docker exec "${container}" "${request[@]}" 2>&1)"; then
+            status=0
+          else
+            status=$?
+          fi
+          echo "Exit status: ${status}"
+          printf '%s\n' "${output}"
+          if [ "${status}" -eq 0 ]; then
+            echo "::error::the request got through to Docker Hub from inside the BuildKit container: the block does not work"
+            exit 1
+          fi
+          if ! grep -Eiq 'refused|can.?t connect|cannot connect|failed to connect|couldn.?t connect' <<<"${output}"; then
+            echo "::error::the request failed, but not with a refused connection: the block is not proved"
+            exit 1
+          fi
+          echo "Docker Hub is unreachable from inside the BuildKit container: the request failed with a refused connection."
 
       - name: Multi-arch build (nothing is pushed)
         id: build
@@ -186,14 +317,16 @@ jobs:
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           MIRROR_OUTCOME: ${{ steps.mirror.outcome }}
           FORM_OUTCOME: ${{ steps.form.outcome }}
+          BLOCK_OUTCOME: ${{ steps.block.outcome }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
         run: |
           set -euo pipefail
           # The two set-up steps are copied from publish.yml without a step id, so
-          # their result is read from the steps around them: the build runs only
-          # when both passed.
-          case "${BUILD_OUTCOME:-}" in
-            success|failure)
+          # their result is read from the steps around them: the Docker Hub block
+          # and the build run only when both passed, so either one having run
+          # means they did.
+          case "${BLOCK_OUTCOME:-}/${BUILD_OUTCOME:-}" in
+            success/*|failure/*|*/success|*/failure)
               setup=success
               ;;
             *)
@@ -204,4 +337,4 @@ jobs:
               fi
               ;;
           esac
-          echo "Proof summary: checkout=${CHECKOUT_OUTCOME:-not-run} mirror=${MIRROR_OUTCOME:-not-run} workflow-form=${FORM_OUTCOME:-not-run} qemu-and-buildx-setup=${setup} build=${BUILD_OUTCOME:-not-run}"
+          echo "Proof summary: checkout=${CHECKOUT_OUTCOME:-not-run} mirror=${MIRROR_OUTCOME:-not-run} workflow-form=${FORM_OUTCOME:-not-run} qemu-and-buildx-setup=${setup} docker-hub-block=${BLOCK_OUTCOME:-not-run} build=${BUILD_OUTCOME:-not-run}"
