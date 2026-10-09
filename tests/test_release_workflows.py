@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Wiring checks: the release workflows run scripts/release_pair.py where its
-rules apply and never fall back to an rc-unsafe version sort, and the
+rules apply and never fall back to an rc-unsafe version sort, the
 notify-consumers decision (no dispatch to the application for a prerelease) is
-run under bash. Stdlib only."""
+run under bash, and no workflow image comes from Docker Hub (the emulation and
+BuildKit images and the base images go through a mirror). Stdlib only."""
 from __future__ import annotations
 
 import re
@@ -27,6 +28,80 @@ def _run_script(step: str) -> str:
     """The shell script of a step's `run: |` block, as the runner writes it out."""
     marker = "\n        run: |\n"
     return textwrap.dedent(step[step.index(marker) + len(marker):]).rstrip("\n") + "\n"
+
+
+# Docker Hub's own registry hosts. A name with no registry host at all (postgres:16,
+# library/node) also means Docker Hub: it is Docker's default registry.
+_HUB_HOSTS = {"docker.io", "index.docker.io", "registry-1.docker.io", "registry.hub.docker.com"}
+# `docker run|create|pull` options that take the next word as their value (--opt=value carries its own).
+_VALUE_OPTIONS = {
+    "-e", "--env", "--env-file", "-h", "--hostname", "-l", "--label", "-m", "--memory", "-p", "--publish",
+    "-u", "--user", "-v", "--volume", "-w", "--workdir", "--add-host", "--cap-add", "--cap-drop", "--cpus",
+    "--device", "--entrypoint", "--gpus", "--group-add", "--ip", "--mount", "--name", "--net", "--network",
+    "--platform", "--pull", "--restart", "--security-opt", "--shm-size", "--tmpfs", "--ulimit",
+    "--volumes-from",
+}
+
+
+def _workflows() -> list[Path]:
+    """Every workflow file in the repository."""
+    return sorted(p for p in WORKFLOWS.iterdir() if p.suffix in (".yml", ".yaml"))
+
+
+def _steps_using(text: str, action: str) -> list[str]:
+    """The body of every workflow step that runs `action`, at any version."""
+    steps = text.split("\n      - ")[1:]
+    return [s for s in steps if re.search(r"(?m)^ *uses: " + re.escape(action) + "@", s)]
+
+
+def _inputs(step: str) -> dict[str, str]:
+    """A step's `with:` inputs: a one-line value as written, a `|` block dedented."""
+    pad = " " * 10
+    raw: dict[str, list[str]] = {}
+    key = None
+    for line in step.partition("\n        with:\n")[2].split("\n"):
+        if line.strip() and not line.startswith(pad):
+            break  # back at the step's own keys
+        if line.startswith(pad + "#"):
+            continue  # a YAML comment between two inputs
+        m = re.match(pad + r"([A-Za-z0-9_-]+):[ ]?(.*)$", line)
+        if m:
+            key = m.group(1)
+            raw[key] = [m.group(2)]
+        elif key is not None:
+            raw[key].append(line)
+    return {k: textwrap.dedent("\n".join(v[1:])).strip("\n") if v[0].startswith("|")
+            else v[0].split(" #")[0].strip().strip("\"'")
+            for k, v in raw.items()}
+
+
+def _names_docker_hub(ref: str) -> bool:
+    """True when an image reference has no registry host (Docker Hub is the default) or names Docker Hub's.
+    As Docker reads a reference, the part before the first `/` is a host only if it holds a `.` or a `:`
+    or is `localhost`."""
+    first, slash, _ = ref.partition("/")
+    has_host = bool(slash) and ("." in first or ":" in first or first == "localhost")
+    return not has_host or first in _HUB_HOSTS
+
+
+def _hub_images(text: str) -> list[str]:
+    """The Docker Hub names in workflow text: the value of an `image:` or `container:` key (a service, a job
+    container, an action input), a `uses: docker://` step, and the image a `docker pull|run|create` command
+    names. Comments are skipped. A name with no readable registry host counts, a shell variable included:
+    where it points cannot be told, so write the host out."""
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    code = re.sub(r"\\\n[ \t]*", " ", code)  # a command split over lines is one command
+    refs = re.findall(r"(?m)^ *(?:- )?(?:image|container): *(\S+)", code)
+    refs += re.findall(r"(?m)^ *(?:- )?uses: *docker://(\S+)", code)
+    for args in re.findall(r"\bdocker +(?:(?:image|container) +)?(?:pull|run|create)\b([^;&|\n]*)", code):
+        words = args.split()
+        i = 0
+        while i < len(words) and words[i].startswith("-"):
+            i += 2 if words[i] in _VALUE_OPTIONS else 1
+        if i < len(words):
+            refs.append(words[i])
+    names = [r.strip("\"'") for r in refs]
+    return [n for n in names if _names_docker_hub(n)]
 
 
 class HandleUpstreamTest(unittest.TestCase):
@@ -309,6 +384,93 @@ class NotifyConsumersTest(unittest.TestCase):
                     self.assertEqual(written, "")
                     if flag is not None:
                         self.assertIn("::error::publish job gave no prerelease flag ('" + flag + "')", done.stdout)
+
+
+class DockerHubFreeTest(unittest.TestCase):
+    """The publish job pulls nothing from Docker Hub: the emulation and BuildKit images and every base image
+    come through a mirror. An action's own default image (tonistiigi/binfmt, moby/buildkit) is a Docker Hub
+    name that never appears in the workflow, so these read the inputs that replace it."""
+
+    BINFMT = "mirror.gcr.io/tonistiigi/binfmt:latest"
+    BUILDKIT = "image=mirror.gcr.io/moby/buildkit:buildx-stable-1"
+    DOCKER_IO = '[registry."docker.io"]'
+    MIRRORS = 'mirrors = ["mirror.gcr.io"]'
+    # (workflow text, the one Docker Hub name it holds): the check must see each of these.
+    HUB_NAMES = (
+        ("    services:\n      db:\n        image: postgres:16\n", "postgres:16"),
+        ("    container: node:20\n", "node:20"),
+        ("    container:\n      image: library/node:20\n", "library/node:20"),
+        ("      - uses: docker://alpine:3\n", "alpine:3"),
+        ("        with:\n          image: tonistiigi/binfmt:latest\n", "tonistiigi/binfmt:latest"),
+        ("        image: docker.io/library/redis:7\n", "docker.io/library/redis:7"),
+        ("          docker pull alpine\n", "alpine"),
+        ('          docker run --rm -v "$PWD:/w" -e A=b node:20 npm test\n', "node:20"),
+        ("          docker run --rm \\\n            -p 5432:5432 \\\n            postgres:16\n", "postgres:16"),
+        ("          docker version && docker pull busybox:1\n", "busybox:1"),
+    )
+    # Text the check must let through: a registry host, a comment, another docker command.
+    CLEAN = (
+        "      - uses: docker/setup-qemu-action@v3\n"
+        "        with:\n          image: mirror.gcr.io/tonistiigi/binfmt:latest\n",
+        "    services:\n      db:\n        image: mirror.gcr.io/library/postgres:16\n",
+        "    container: ghcr.io/owner/tool:1\n",
+        "          docker pull ghcr.io/owner/tool:1\n",
+        '          docker run --rm -v "$PWD:/w" localhost:5000/tool:1 --help\n',
+        "          # docker pull alpine would come from Docker Hub\n",
+        "          docker login ghcr.io\n",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflows = {p.name: p.read_text(encoding="utf-8") for p in _workflows()}
+
+    def _steps(self, action):
+        """(workflow, step body) of every step, in any workflow, that runs `action`."""
+        return [(name, step) for name, text in self.workflows.items() for step in _steps_using(text, action)]
+
+    def test_publish_sets_up_emulation_and_buildx(self):
+        # The checks below look at every such step; publish.yml must have some for them to look at.
+        for action in ("docker/setup-qemu-action", "docker/setup-buildx-action"):
+            with self.subTest(action=action):
+                self.assertTrue(_steps_using(self.workflows["publish.yml"], action))
+
+    def test_every_qemu_step_pulls_the_emulation_image_from_the_mirror(self):
+        for name, step in self._steps("docker/setup-qemu-action"):
+            with self.subTest(workflow=name):
+                self.assertEqual(_inputs(step).get("image"), self.BINFMT)
+
+    def test_every_buildx_step_pulls_buildkit_from_the_mirror(self):
+        for name, step in self._steps("docker/setup-buildx-action"):
+            with self.subTest(workflow=name):
+                options = [ln.strip() for ln in _inputs(step).get("driver-opts", "").splitlines()]
+                self.assertIn(self.BUILDKIT, options)
+
+    def test_every_buildx_step_mirrors_docker_io_for_base_images(self):
+        # BuildKit asks the mirror first for every Docker Hub name: the FROM lines in
+        # docker/Dockerfile and any `# syntax=` frontend.
+        for name, step in self._steps("docker/setup-buildx-action"):
+            with self.subTest(workflow=name):
+                config = _inputs(step).get("buildkitd-config-inline", "")
+                lines = [ln.strip() for ln in config.splitlines()]
+                self.assertIn(self.DOCKER_IO, lines)
+                rest = lines[lines.index(self.DOCKER_IO) + 1:]
+                table = rest[:next((i for i, ln in enumerate(rest) if ln.startswith("[")), len(rest))]
+                self.assertIn(self.MIRRORS, table)
+
+    def test_no_workflow_names_a_docker_hub_image(self):
+        for name, text in self.workflows.items():
+            with self.subTest(workflow=name):
+                self.assertEqual(_hub_images(text), [])
+
+    def test_the_check_finds_a_docker_hub_name_wherever_it_hides(self):
+        for text, ref in self.HUB_NAMES:
+            with self.subTest(text=text):
+                self.assertEqual(_hub_images(text), [ref])
+
+    def test_the_check_lets_a_registry_host_and_a_comment_through(self):
+        for text in self.CLEAN:
+            with self.subTest(text=text):
+                self.assertEqual(_hub_images(text), [])
 
 
 class PythonTestGateTest(unittest.TestCase):

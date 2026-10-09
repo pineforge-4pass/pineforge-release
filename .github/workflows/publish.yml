@@ -131,7 +131,20 @@ jobs:
           [ -n "$ok" ] || { echo "::error::engine ${E} tarballs or codegen ${C} not available after wait"; exit 1; }
 
       - uses: docker/setup-qemu-action@v3
+        with:
+          # The emulation image comes from a public mirror of Docker Hub
+          # (mirror.gcr.io), not from Docker Hub itself.
+          image: mirror.gcr.io/tonistiigi/binfmt:latest
       - uses: docker/setup-buildx-action@v3
+        with:
+          # Same for the BuildKit image ...
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+          # ... and BuildKit asks the mirror first for every Docker Hub name it
+          # resolves: the base images in docker/Dockerfile and any `# syntax=`
+          # frontend.
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       - name: Image metadata
         id: meta
