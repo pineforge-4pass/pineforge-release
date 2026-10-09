@@ -78,29 +78,44 @@ GitHub deployment or Pages publication.
 
 | world | what it proves |
 |---|---|
-| `pair` | Engine rc.1 first waits; codegen rc.1 completes the pair (tag `v1.0.0-rc.1`, pins in the tag message). The rc image gets only its fixed tags (no `latest`, no `1.0`), a GitHub prerelease with `--latest=false`, and `prerelease=true` to all three consumers. A duplicate event is a no-op. 1.0.0 then pairs the same way and takes `1.0`, `latest` and GitHub Latest, even with a draft `v9.9.9` present. Refused: a late rc, a 0.x event after 1.0, a contradicting prerelease flag, a mismatched pair (named), and a probe answered 503. |
-| `reverse` | Codegen first, engine second, for rc.1 and then 1.0.0: the same pairs, real metadata-action tag assertions and all three scoped fanout payloads, including `run_id`. |
+| `pair` | Engine rc.1 first waits; codegen rc.1 completes the pair (tag `v1.0.0-rc.1`, pins in the tag message). The rc image gets only its fixed tags (no `latest`, no `1.0`), a GitHub prerelease with `--latest=false`, and `prerelease=true` to the offline and hosted consumers only: the application leg stays green, mints no App token, sends no dispatch and logs that it receives a prerelease by hand-off. A duplicate event is a no-op. 1.0.0 then pairs the same way, takes `1.0`, `latest` and GitHub Latest, even with a draft `v9.9.9` present, and goes to all three consumers. Refused: a late rc, a 0.x event after 1.0, a contradicting prerelease flag, a mismatched pair (named), and a probe answered 503. |
+| `reverse` | Codegen first, engine second, for rc.1 and then 1.0.0: the same pairs, real metadata-action tag assertions and the scoped fanout payloads (offline and hosted for rc.1, all three for 1.0.0), including `run_id`. |
 | `lost-partner` | The partner's dispatch never arrives. Re-running the waiting run (same event) completes the pair. |
 | `retag` | The release commit reached `main` but its tag push failed. The next event tags that commit. |
 | `legacy` | 0.x as before: a patch bump, `latest` and GitHub Latest. A failing `gh release list` fails the step instead of creating the release. A hand-made tag with a mismatched 1.0 pair fails before any build. |
 
-The pair world also runs the real consumer job with missing, empty, owner/path
-and multiline target configuration for each private role. Only that consumer
-must fail before token creation or dispatch; the other two still finish. Every
-successful fanout checks exactly three destinations, token scopes, hostname,
-event type and the complete nested `client_payload` object: `release_version`
-is a string, `prerelease` is a JSON boolean and `run_id` is a JSON integer.
+The pair world also runs the real consumer job, for the rc.1 prerelease and for
+1.0.0, with missing, empty, owner/path and multiline target configuration for
+each private role. For a stable release only that consumer must fail before
+token creation or dispatch; the other two still finish. For a prerelease the
+hosted role behaves the same, while the application role is withheld: its leg
+stays green with no token or dispatch whatever its configuration, because a
+prerelease reaches the application by hand-off instead. Every successful
+fanout checks exactly its expected destinations (offline and hosted for a
+prerelease, all three for a stable release), token scopes, hostname, event type
+and the complete nested `client_payload` object: `release_version` is a string,
+`prerelease` is a JSON boolean and `run_id` is a JSON integer. All three
+consumer legs always run green, and the withheld application leg must log the
+hand-off line once.
 
 ## Checking the checks
 
-The full run includes negative controls: successful but wrong target,
-`release_version`, `prerelease`, or `run_id` dispatches must fail the fanout
-oracle. Skipped-job and skipped-dispatch controls modify only synthetic
-checkouts of the real workflow, not the source checkout, and must also be
-detected. The existing five worlds and failure/recovery assertions remain.
-Controls also remove/change `fail-fast: false` and switch each typed
-`prerelease`/`run_id` field from `-F` to `-f`: successful dispatches carrying
-the same text with the wrong JSON type must fail the oracle.
+The full run includes negative controls, for both the prerelease and the stable
+fanout: successful but wrong target, `release_version`, `prerelease` (the
+opposite of the real flag), or `run_id` dispatches must fail the fanout oracle.
+Skipped-job and skipped-dispatch controls modify only synthetic checkouts of
+the real workflow, not the source checkout, and must also be detected; the
+skipped-dispatch control turns the dispatch step's own existing condition into
+`if: false` (never a second `if:` key), and an edit that finds no target or
+several is a harness error. A prerelease control also breaks the decision step
+in a synthetic checkout: only its first condition changes and every guard
+stays, so the application leg dispatches and mints its token on an all-green
+run. The unmodified oracle must reject that run, and the control checks that
+the run really reached the application dispatch. The existing five worlds and
+failure/recovery assertions remain. Controls also remove/change
+`fail-fast: false` and switch each typed `prerelease`/`run_id` field from `-F`
+to `-f`: successful dispatches carrying the same text with the wrong JSON type
+must fail the oracle.
 
 To see a check catch a defect, break a workflow in a scratch clone and point
 the dry run at it:
