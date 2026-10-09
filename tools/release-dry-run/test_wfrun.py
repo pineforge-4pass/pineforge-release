@@ -71,15 +71,27 @@ class EnvironmentTest(unittest.TestCase):
         self.state.mkdir()
         self.workflow = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "publish.yml"
 
-    def notify(self, consumer, secret=None, **kwargs):
+    # Target configuration the consumer job must refuse (the missing one leaves the secret out).
+    BAD_TARGETS = (("missing", None), ("empty", ""), ("owner/path", "fixture/target"),
+                   ("multiline", "fixture\ntarget"))
+
+    def notify(self, consumer, secret=None, *, prerelease="false", **kwargs):
+        """One notify-consumers leg of a publish run whose prerelease output is PRERELEASE (None: not given)."""
         matrix = {"consumer": consumer}
         if secret:
             matrix["repository_secret"] = secret
-        return wfrun.run_job(self.workflow, "notify-consumers", event={"ref": "refs/tags/v1.0.0"},
+        ref = "refs/tags/v1.0.0-rc.1" if prerelease == "true" else "refs/tags/v1.0.0"
+        return wfrun.run_job(self.workflow, "notify-consumers", event={"ref": ref},
                              repo="pineforge-4pass/pineforge-release", workdir=self.root, state=self.state,
-                             event_name="push", ref="refs/tags/v1.0.0", matrix=matrix,
-                             needs={"publish": {"result": "success", "outputs": {"prerelease": "false"}}},
+                             event_name="push", ref=ref, matrix=matrix,
+                             needs={"publish": {"result": "success",
+                                                "outputs": {} if prerelease is None else {"prerelease": prerelease}}},
                              echo=None, **kwargs)
+
+    @staticmethod
+    def application_targets(value):
+        """Dummy repository configuration whose application target is VALUE (None: not configured)."""
+        return {} if value is None else {"RELEASE_APPLICATION_REPOSITORY": value}
 
     def actions(self):
         logfile = self.state / "actions.jsonl"
@@ -109,6 +121,66 @@ class EnvironmentTest(unittest.TestCase):
         self.assertEqual(result.failed_step, "Require one configured consumer repository")
         self.assertFalse(self.actions())
         self.assertTrue(self.notify("offline", repository_secrets={}).ok)
+
+    def test_application_on_a_prerelease_is_withheld_whatever_its_target(self):
+        for label, value in (("configured", "release-fixture-application"), *self.BAD_TARGETS):
+            with self.subTest(target=label):
+                result = self.notify("application", "RELEASE_APPLICATION_REPOSITORY", prerelease="true",
+                                     repository_secrets=self.application_targets(value))
+                self.assertTrue(result.ok, result.text())
+                self.assertEqual(result.steps["notify"]["outputs"], {"dispatch": "false"})
+                self.assertEqual(result.log.count(f"   | {dry_run.HANDOFF}"), 1)
+                for step in ("Require one configured consumer repository", "Mint App token (scoped to one target)",
+                             "Dispatch pineforge-release to consumer"):
+                    self.assertTrue(any(line.startswith(f"-- skip  : {step}") for line in result.log), step)
+        self.assertFalse(self.actions())   # no App token, no dispatch, for any target
+
+    def test_stable_application_with_a_bad_target_still_fails_before_the_token(self):
+        for label, value in self.BAD_TARGETS:
+            with self.subTest(target=label):
+                result = self.notify("application", "RELEASE_APPLICATION_REPOSITORY",
+                                     repository_secrets=self.application_targets(value))
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failed_step, "Require one configured consumer repository")
+                self.assertEqual(result.steps["notify"]["outputs"], {"dispatch": "true"})
+        self.assertFalse(self.actions())
+
+    def test_prerelease_still_reaches_offline_and_hosted_and_hosted_still_needs_its_target(self):
+        for consumer, secret in (("offline", None), ("hosted", "RELEASE_HOSTED_MCP_REPOSITORY")):
+            with self.subTest(consumer=consumer):
+                result = self.notify(consumer, secret, prerelease="true")
+                self.assertTrue(result.ok, result.text())
+                self.assertEqual(result.steps["notify"]["outputs"], {"dispatch": "true"})
+        dispatches = [entry for entry in self.actions() if entry.get("action") == "dispatch"]
+        self.assertEqual([entry["repo"] for entry in dispatches], ["pineforge-backtest-mcp", "release-fixture-hosted"])
+        self.assertTrue(all(entry["body"]["client_payload"]["prerelease"] is True for entry in dispatches))
+        broken = self.notify("hosted", "RELEASE_HOSTED_MCP_REPOSITORY", prerelease="true", repository_secrets={})
+        self.assertFalse(broken.ok)
+        self.assertEqual(broken.failed_step, "Require one configured consumer repository")
+
+    def test_malformed_flags_fail_before_any_token_for_every_consumer(self):
+        for consumer, secret in (("offline", None), ("hosted", "RELEASE_HOSTED_MCP_REPOSITORY"),
+                                 ("application", "RELEASE_APPLICATION_REPOSITORY")):
+            for flag in (None, "", "True", "yes", "null", "true\nfalse"):
+                with self.subTest(consumer=consumer, flag=flag):
+                    result = self.notify(consumer, secret, prerelease=flag)
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.failed_step, "Decide consumer notification")
+                    self.assertEqual(result.steps["notify"]["outputs"], {})
+        self.assertFalse(self.actions())
+
+    def test_dispatch_condition_is_evaluated_by_the_runner(self):
+        spec = wfrun.yaml.load(self.workflow.read_text(encoding="utf-8"), Loader=wfrun.yaml.BaseLoader)
+        steps = {step["name"]: step for step in spec["jobs"]["notify-consumers"]["steps"]}
+        self.assertEqual(next(iter(steps)), "Decide consumer notification")
+        for name in ("Require one configured consumer repository", "Mint App token (scoped to one target)",
+                     "Dispatch pineforge-release to consumer"):
+            with self.subTest(step=name):
+                condition = steps[name]["if"]
+                for value, expected in (("true", True), ("false", False), ("", False)):
+                    context = {"steps": {"notify": {"outputs": {"dispatch": value}}}}
+                    self.assertIs(wfrun.evaluate_if(condition, context), expected)
+                self.assertIs(wfrun.evaluate_if(condition, {"steps": {}}), False)
 
     def test_credential_overrides_are_refused(self):
         with self.assertRaises(ValueError):
@@ -241,6 +313,68 @@ class FanoutContractTest(unittest.TestCase):
                 self.assertFalse(self.world.fanout_matches(result, "1.0.0-rc.1", True))
                 for call in result.calls(tool="gh", action="dispatch"):
                     self.assertIs(type(call["body"]["client_payload"][field]), str)
+
+    def stable_fanout(self):
+        published = dry_run.Result(wfrun.JobResult(True, outputs={"prerelease": "false"}), [])
+        return self.world.fanout(published, "v1.0.0", work=self.world.clone("refs/heads/main"))
+
+    def test_a_prerelease_leaves_the_application_out_and_a_stable_release_does_not(self):
+        prerelease, stable = self.fanout(), self.stable_fanout()
+        self.assertEqual(len(prerelease.notify), len(dry_run.CONSUMERS))   # all three legs stay visible
+        self.assertEqual([call["repo"] for call in prerelease.calls(tool="gh", action="dispatch")],
+                         list(dry_run.CONSUMERS[:-1]))
+        self.assertEqual([call["repositories"] for call in prerelease.calls(tool="actions/create-github-app-token")],
+                         list(dry_run.CONSUMERS[:-1]))
+        self.assertTrue(prerelease.ok and self.world.withheld(prerelease.notify[-1]), prerelease.text())
+        self.assertEqual([call["repo"] for call in stable.calls(tool="gh", action="dispatch")],
+                         list(dry_run.CONSUMERS))
+        self.assertTrue(self.world.fanout_matches(prerelease, "1.0.0-rc.1", True), prerelease.text())
+        self.assertFalse(self.world.fanout_matches(prerelease, "1.0.0-rc.1", False))
+        self.assertTrue(self.world.fanout_matches(stable, "1.0.0", False), stable.text())
+        self.assertFalse(self.world.fanout_matches(stable, "1.0.0", True))
+
+    def test_oracle_rejects_an_application_dispatch_on_a_prerelease(self):
+        # Only the decision's first condition changes: every guard stays, so the whole run is green.
+        result = self.fanout(dry_run.DECISION_CONJUNCTION, dry_run.DECISION_MUTANT)
+        self.assertTrue(result.ok, result.text())
+        self.assertEqual([call["repo"] for call in result.calls(tool="gh", action="dispatch")],
+                         list(dry_run.CONSUMERS))
+        self.assertFalse(self.world.fanout_matches(result, "1.0.0-rc.1", True))
+
+
+class SyntheticEditTest(unittest.TestCase):
+    """The harness edits copies of the real workflow only where it finds exactly one target."""
+
+    @classmethod
+    def setUpClass(cls):
+        workflow = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "publish.yml"
+        cls.text = workflow.read_text(encoding="utf-8")
+
+    def test_the_dispatch_guard_is_rewritten_in_place_not_duplicated(self):
+        edited = dry_run.replace_in_step(self.text, dry_run.DISPATCH_STEP, dry_run.DISPATCH_GUARD,
+                                         "        if: false\n", "a skipped dispatch")
+        step = edited[edited.index(f"- name: {dry_run.DISPATCH_STEP}"):]
+        self.assertEqual(step.count("\n        if:"), 1)
+        self.assertEqual(step.count("\n        if: false\n"), 1)
+        self.assertEqual(edited.count(dry_run.DISPATCH_GUARD), self.text.count(dry_run.DISPATCH_GUARD) - 1)
+
+    def test_the_decision_mutant_changes_only_its_conjunction(self):
+        edited = dry_run.replace_in_step(self.text, dry_run.DECISION_STEP, dry_run.DECISION_CONJUNCTION,
+                                         dry_run.DECISION_MUTANT, "an application dispatch")
+        self.assertEqual(edited.count(dry_run.DECISION_MUTANT), 1)
+        self.assertEqual(edited.count(dry_run.DECISION_CONJUNCTION), 0)
+        self.assertEqual(edited.count(dry_run.DISPATCH_GUARD), self.text.count(dry_run.DISPATCH_GUARD))
+
+    def test_a_missing_or_repeated_target_is_a_harness_error(self):
+        for label, step, old in (("a missing step", "No such step", dry_run.DISPATCH_GUARD),
+                                 ("a missing guard", dry_run.DISPATCH_STEP, "        if: no such guard\n"),
+                                 ("a repeated target", dry_run.DISPATCH_STEP, "\n")):
+            with self.subTest(label), self.assertRaisesRegex(RuntimeError, "cannot inject"):
+                dry_run.replace_in_step(self.text, step, old, "x", "a test edit")
+        with self.assertRaisesRegex(RuntimeError, "cannot inject"):
+            dry_run.replace_once(self.text, "no such text", "x", "a test edit")
+        with self.assertRaisesRegex(RuntimeError, "cannot inject"):
+            dry_run.replace_once(self.text + self.text, "  notify-consumers:\n", "x", "a test edit")
 
 
 if __name__ == "__main__":

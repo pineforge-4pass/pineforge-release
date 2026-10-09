@@ -179,6 +179,9 @@ pineforge-engine release ───────(engine-release)─┘    bump pin
   application roles. Private target repository names are configured in the
   protected `release-automation` environment, not published in the workflow or
   this diagram; each consumer gets an App token scoped to its configured target.
+  A prerelease reaches the application by hand-off, with no repository dispatch
+  and no App token; stable releases still notify it, and the offline and hosted
+  MCP roles are notified for every release.
 
 The rules live in `scripts/release_pair.py` (unit-tested in `tests/`).
 `tools/release-dry-run/` replays both workflows offline through the 0.x and 1.0

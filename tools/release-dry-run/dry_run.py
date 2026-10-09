@@ -46,6 +46,15 @@ CONSUMER_MATRIX = (
     {"consumer": "hosted", "repository_secret": "RELEASE_HOSTED_MCP_REPOSITORY"},
     {"consumer": "application", "repository_secret": "RELEASE_APPLICATION_REPOSITORY"},
 )
+# A prerelease is not dispatched to the application (the last consumer): its leg stays
+# green, mints no App token and logs this line. The rest is text of the real job that
+# the synthetic checkouts below alter.
+HANDOFF = "Application is not notified for a prerelease; it receives the release by hand-off."
+DECISION_STEP = "Decide consumer notification"
+DECISION_CONJUNCTION = '[ "$CONSUMER" = application ] && [ "$PRERELEASE" = true ]'
+DECISION_MUTANT = '[ "$CONSUMER" = application ] && [ "$PRERELEASE" = never ]'
+DISPATCH_STEP = "Dispatch pineforge-release to consumer"
+DISPATCH_GUARD = "        if: steps.notify.outputs.dispatch == 'true'\n"
 IDENTITY = ["-c", "user.name=dry-run", "-c", "user.email=dry-run@localhost",
             "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
 
@@ -283,7 +292,20 @@ class World:
         return {c["repo"]: c["body"]
                 for c in res.calls(tool="gh", action="dispatch")}
 
+    def withheld(self, leg):
+        """The application leg of a prerelease: green, its decision step said no and logged the
+        hand-off line once, and the leg minted no App token and sent no dispatch."""
+        decision = leg.job.steps.get("notify") or {}
+        return bool(leg.ok and decision.get("outcome") == "success"
+                    and decision.get("outputs") == {"dispatch": "false"}
+                    and leg.job.log.count(f"   | {HANDOFF}") == 1
+                    and not leg.calls(tool="actions/create-github-app-token")
+                    and not leg.calls(tool="gh", action="dispatch"))
+
     def fanout_matches(self, res, version, prerelease, run_id=4242):
+        """A prerelease is dispatched to every consumer but the application, whose leg stays green
+        and sends nothing; a stable release is dispatched to all of them. Three green legs always."""
+        sent = list(CONSUMERS[:-1] if prerelease else CONSUMERS)
         calls = res.calls(tool="gh", action="dispatch")
         body = {"event_type": "pineforge-release", "client_payload": {
             "release_version": version, "prerelease": prerelease, "run_id": run_id}}
@@ -298,14 +320,15 @@ class World:
 
         scopes = res.calls(tool="actions/create-github-app-token")
         return (type(prerelease) is bool and type(run_id) is int
-                and res.ok and len(res.notify) == len(CONSUMERS) and len(calls) == len(CONSUMERS)
-                and [entry["repo"] for entry in calls] == list(CONSUMERS)
+                and res.ok and len(res.notify) == len(CONSUMERS) and len(calls) == len(sent)
+                and [entry["repo"] for entry in calls] == sent
                 and all(body_matches(entry) and entry.get("hostname") == "github.com"
                         and entry.get("endpoint") == f"repos/pineforge-4pass/{entry['repo']}/dispatches"
                         for entry in calls)
-                and [entry.get("repositories") for entry in scopes] == list(CONSUMERS)
+                and [entry.get("repositories") for entry in scopes] == sent
                 and all(entry.get("owner") == "pineforge-4pass"
-                        and entry.get("github_api_url") == "https://api.github.com" for entry in scopes))
+                        and entry.get("github_api_url") == "https://api.github.com" for entry in scopes)
+                and (not prerelease or self.withheld(res.notify[-1])))
 
     def refused(self, res, step, message):
         return not res.ok and res.failed_step.startswith(step) and message in res.job.text()
@@ -359,9 +382,13 @@ def pair(w):
             rel.get("prerelease") is True and rel.get("latest") == "false", rel.get("flags"))
     w.check("publish v1.0.0-rc.1: GitHub Latest stays v0.1.25",
             w.load("gh-latest.json")["pineforge-release"] == "v0.1.25", w.load("gh-latest.json"))
-    w.check("publish v1.0.0-rc.1: every consumer gets release_version=1.0.0-rc.1 prerelease=true",
+    w.check("publish v1.0.0-rc.1: offline and hosted get release_version=1.0.0-rc.1 prerelease=true; "
+            "the application gets no dispatch",
             w.fanout_matches(p, "1.0.0-rc.1", True), w.dispatched(p))
-    fanout_failures(w, p, "v1.0.0-rc.1")
+    w.check("publish v1.0.0-rc.1: the application leg is green, mints no App token, sends no dispatch "
+            "and logs the hand-off line",
+            len(p.notify) == len(CONSUMERS) and w.withheld(p.notify[-1]), (p.failed_step, w.dispatched(p)))
+    fanout_failures(w, p, "v1.0.0-rc.1", True)
 
     before = w.tags()
     r = w.upstream("engine-release", {"version": "v1.0.0-rc.1", "prerelease": True, "run_id": 103})
@@ -396,6 +423,7 @@ def pair(w):
             and w.load("gh-latest.json")["pineforge-release"] == "v1.0.0", rel.get("flags"))
     w.check("publish v1.0.0: every consumer gets release_version=1.0.0 prerelease=false",
             w.fanout_matches(p, "1.0.0", False), w.dispatched(p))
+    fanout_failures(w, p, "v1.0.0", False)
 
     before, main = w.tags(), w.rev("main")
     r = w.upstream("engine-release", {"version": "v1.0.0-rc.1", "prerelease": True, "run_id": 106})
@@ -442,7 +470,8 @@ def reverse(w):
             (r.failed_step, r.step("decide")))
 
     published = w.publish("v1.0.0-rc.1")
-    w.check("reverse rc.1: real publish and all three scoped dispatches carry the same payload/run_id",
+    w.check("reverse rc.1: real publish; the offline and hosted scoped dispatches carry the same payload/run_id "
+            "and the application is withheld",
             w.fanout_matches(published, "1.0.0-rc.1", True), w.dispatched(published))
     sha = w.rev("v1.0.0-rc.1", short=True)
     w.check("reverse rc.1: real metadata-action emits only fixed image tags",
@@ -538,8 +567,34 @@ def legacy(w):
             and not p.calls(tool="docker/build-push-action"), p.failed_step)
 
 
-def fanout_failures(w, published, tag):
-    """Exercise consumer isolation and verify the fanout oracle rejects real defective runs."""
+def replace_once(text, old, new, what):
+    """TEXT with its one OLD replaced by NEW; no match or several is a harness error, never a broad replace."""
+    if text.count(old) != 1:
+        raise RuntimeError(f"cannot inject {what} into the synthetic checkout")
+    return text.replace(old, new)
+
+
+def replace_in_step(text, step, old, new, what):
+    """replace_once inside the one workflow step named STEP, so the edit cannot land in another step."""
+    head = f"      - name: {step}\n"
+    if text.count(head) != 1:
+        raise RuntimeError(f"cannot inject {what}: step {step!r} is not in the synthetic checkout exactly once")
+    start = text.index(head)
+    end = text.find("\n      - ", start + len(head))
+    end = len(text) if end < 0 else end
+    return text[:start] + replace_once(text[start:end], old, new, what) + text[end:]
+
+
+def fanout_failures(w, published, tag, prerelease):
+    """Exercise consumer isolation and verify the fanout oracle rejects real defective runs.
+
+    PUBLISHED is the successful publish run of TAG and PRERELEASE its channel: a prerelease is
+    dispatched to every consumer but the application, a stable release to all of them.
+    """
+    channel = "prerelease" if prerelease else "stable"
+    if published.outputs.get("prerelease") != ("true" if prerelease else "false"):
+        raise RuntimeError(f"the publish run of {tag} is not a {channel} run")
+    dispatched, version = CONSUMERS[:-1] if prerelease else CONSUMERS, tag[1:]
     for label, replacement in (("true", "      fail-fast: true\n"), ("missing", "")):
         work = w.clone(f"refs/tags/{tag}")
         workflow = work / ".github" / "workflows" / "publish.yml"
@@ -555,8 +610,15 @@ def fanout_failures(w, published, tag):
             refused = "strategy.fail-fast: false" in str(error)
         else:
             refused = False
-        w.check(f"consumer isolation rejects fail-fast {label} before any consumer runs",
+        w.check(f"consumer isolation rejects fail-fast {label} before any consumer runs ({channel})",
                 refused and (w.state / "actions.jsonl").read_bytes() == before)
+
+    def leg_ok(repo, leg):
+        """A leg with valid configuration: dispatched to once, or (the application on a prerelease) withheld."""
+        if repo in dispatched:
+            return leg.ok and len(leg.calls(tool="gh", action="dispatch")) == 1
+        return w.withheld(leg)
+
     for index, row in enumerate(CONSUMER_MATRIX[1:], 1):
         secret = row["repository_secret"]
         for label, value in (("missing", None), ("empty", ""), ("owner/path", "fixture/target"),
@@ -567,25 +629,33 @@ def fanout_failures(w, published, tag):
             else:
                 targets[secret] = value
             result = w.fanout(published, tag, repository_secrets=targets)
-            rejected = result.notify[index]
-            peers = [child for peer, child in enumerate(result.notify) if peer != index]
-            w.check(f"{row['consumer']} {label} target: only that consumer fails before App token/dispatch",
-                    not result.ok and w.refused(rejected, "Require one configured", "Missing or malformed")
-                    and not rejected.calls(tool="actions/create-github-app-token")
-                    and not rejected.calls(tool="gh", action="dispatch")
-                    and all(child.ok and len(child.calls(tool="gh", action="dispatch")) == 1 for child in peers)
-                    and set(w.dispatched(result)) == set(CONSUMERS) - {CONSUMERS[index]},
+            leg = result.notify[index]
+            peers = [(CONSUMERS[peer], child) for peer, child in enumerate(result.notify) if peer != index]
+            if CONSUMERS[index] in dispatched:
+                name = f"{row['consumer']} {label} target: only that consumer fails before App token/dispatch"
+                outcome = (not result.ok and w.refused(leg, "Require one configured", "Missing or malformed")
+                           and not leg.calls(tool="actions/create-github-app-token")
+                           and not leg.calls(tool="gh", action="dispatch"))
+            else:
+                # The withheld application never reads its target: green, no token, no dispatch.
+                name = (f"{row['consumer']} {label} target on a prerelease: the withheld leg stays green "
+                        "with no App token/dispatch")
+                outcome = result.ok and w.withheld(leg)
+            w.check(f"{name} ({channel})",
+                    outcome and all(leg_ok(repo, child) for repo, child in peers)
+                    and set(w.dispatched(result)) == set(dispatched) - {CONSUMERS[index]},
                     (result.failed_step, w.dispatched(result)))
     targets = {**wfrun.DUMMY_REPOSITORY_SECRETS, "RELEASE_HOSTED_MCP_REPOSITORY": "release-fixture-wrong"}
     defective = w.fanout(published, tag, repository_secrets=targets)
-    w.check("fanout oracle rejects a successful dispatch to the wrong configured target",
-            defective.ok and not w.fanout_matches(defective, tag[1:], True), w.dispatched(defective))
+    w.check(f"fanout oracle rejects a successful dispatch to the wrong configured target ({channel})",
+            defective.ok and not w.fanout_matches(defective, version, prerelease), w.dispatched(defective))
+    # The wrong prerelease flag is the opposite of the real one, whichever channel this is.
     for label, kwargs in (("release_version", {"tag": "v0.1.25"}),
-                          ("prerelease", {"outputs": {"prerelease": "false"}}),
+                          ("prerelease", {"outputs": {"prerelease": "false" if prerelease else "true"}}),
                           ("run_id", {"run_id": 4243})):
         defective = w.fanout(published, kwargs.pop("tag", tag), **kwargs)
-        w.check(f"fanout oracle rejects a successful dispatch with wrong {label}",
-                defective.ok and not w.fanout_matches(defective, tag[1:], True), w.dispatched(defective))
+        w.check(f"fanout oracle rejects a successful dispatch with wrong {label} ({channel})",
+                defective.ok and not w.fanout_matches(defective, version, prerelease), w.dispatched(defective))
     for field in ("prerelease", "run_id"):
         work = w.clone(f"refs/tags/{tag}")
         workflow = work / ".github" / "workflows" / "publish.yml"
@@ -596,25 +666,43 @@ def fanout_failures(w, published, tag):
         workflow.write_text(text.replace(original, f'-f "client_payload[{field}]='), encoding="utf-8")
         defective = w.fanout(published, tag, work=work)
         calls = defective.calls(tool="gh", action="dispatch")
-        w.check(f"fanout oracle rejects string instead of typed {field}",
-                defective.ok and len(calls) == len(CONSUMERS)
+        w.check(f"fanout oracle rejects string instead of typed {field} ({channel})",
+                defective.ok and len(calls) == len(dispatched)
                 and all(type(call["body"]["client_payload"][field]) is str for call in calls)
-                and not w.fanout_matches(defective, tag[1:], True), w.dispatched(defective))
-    for label, old, new in (
-            ("job", "  notify-consumers:\n", "  notify-consumers:\n    if: false\n"),
-            ("dispatch step", "      - name: Dispatch pineforge-release to consumer\n",
-             "      - name: Dispatch pineforge-release to consumer\n        if: false\n")):
+                and not w.fanout_matches(defective, version, prerelease), w.dispatched(defective))
+    for label in ("job", "dispatch step"):
         work = w.clone(f"refs/tags/{tag}")
         workflow = work / ".github" / "workflows" / "publish.yml"
         text = workflow.read_text(encoding="utf-8")
-        if text.count(old) != 1:
-            raise RuntimeError(f"cannot inject skipped fanout {label} into the synthetic checkout")
-        workflow.write_text(text.replace(old, new), encoding="utf-8")
+        if label == "job":
+            text = replace_once(text, "  notify-consumers:\n", "  notify-consumers:\n    if: false\n",
+                                "skipped fanout job")
+        else:
+            # The dispatch step already has its guard: that one value becomes false, no second `if:` key.
+            text = replace_in_step(text, DISPATCH_STEP, DISPATCH_GUARD, "        if: false\n",
+                                   "skipped fanout dispatch step")
+        workflow.write_text(text, encoding="utf-8")
         defective = w.fanout(published, tag, work=work)
-        w.check(f"fanout oracle rejects a skipped {label} (no dispatch is hidden)",
-                not w.fanout_matches(defective, tag[1:], True)
+        w.check(f"fanout oracle rejects a skipped {label} (no dispatch is hidden) ({channel})",
+                not w.fanout_matches(defective, version, prerelease)
                 and not defective.calls(tool="gh", action="dispatch")
                 and (not defective.ok if label == "job" else defective.ok), defective.text())
+    if prerelease:
+        # A broken decision: only its first condition changes and every guard stays, so the application
+        # leg dispatches and mints its token on an all-green run. The unmodified oracle must reject it.
+        work = w.clone(f"refs/tags/{tag}")
+        workflow = work / ".github" / "workflows" / "publish.yml"
+        workflow.write_text(replace_in_step(workflow.read_text(encoding="utf-8"), DECISION_STEP,
+                                            DECISION_CONJUNCTION, DECISION_MUTANT,
+                                            "application dispatch on a prerelease"), encoding="utf-8")
+        defective = w.fanout(published, tag, work=work)
+        application = defective.notify[-1]
+        w.check(f"fanout oracle rejects an application dispatch on a prerelease ({channel})",
+                defective.ok and len(defective.notify) == len(CONSUMERS)
+                and [call["repo"] for call in defective.calls(tool="gh", action="dispatch")] == list(CONSUMERS)
+                and application.calls(tool="gh", action="dispatch", repo=CONSUMERS[-1])
+                and application.calls(tool="actions/create-github-app-token", repositories=CONSUMERS[-1])
+                and not w.fanout_matches(defective, version, prerelease), w.dispatched(defective))
 
 
 WORLDS = {"pair": pair, "reverse": reverse, "lost-partner": lost_partner, "retag": retag, "legacy": legacy}
