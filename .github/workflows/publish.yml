@@ -224,13 +224,36 @@ jobs:
     env:
       TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || secrets[matrix.repository_secret] }}
     steps:
+      # A prerelease reaches the application by hand-off, so its leg sends nothing
+      # for one and still ends green. The three steps after this one run only when
+      # it decides to dispatch; a missing or malformed flag fails here, for every
+      # consumer, before any repository check or token.
+      - name: Decide consumer notification
+        id: notify
+        env:
+          CONSUMER: ${{ matrix.consumer }}
+          PRERELEASE: ${{ needs.publish.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          case "$PRERELEASE" in
+            true|false) ;;
+            *) echo "::error::publish job gave no prerelease flag ('${PRERELEASE}')"; exit 1 ;;
+          esac
+          if [ "$CONSUMER" = application ] && [ "$PRERELEASE" = true ]; then
+            echo 'dispatch=false' >> "$GITHUB_OUTPUT"
+            echo 'Application is not notified for a prerelease; it receives the release by hand-off.'
+          else
+            echo 'dispatch=true' >> "$GITHUB_OUTPUT"
+          fi
       - name: Require one configured consumer repository
+        if: steps.notify.outputs.dispatch == 'true'
         run: |
           if ! [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
             echo '::error::Missing or malformed consumer repository setup'; exit 1
           fi
       - name: Mint App token (scoped to one target)
         id: app
+        if: steps.notify.outputs.dispatch == 'true'
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.PINEFORGE_APP_ID }}
@@ -241,6 +264,7 @@ jobs:
           github-api-url: https://api.github.com
 
       - name: Dispatch pineforge-release to consumer
+        if: steps.notify.outputs.dispatch == 'true'
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ env.TARGET_REPOSITORY }}

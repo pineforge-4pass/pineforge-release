@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """Wiring checks: the release workflows run scripts/release_pair.py where its
-rules apply and never fall back to an rc-unsafe version sort. Stdlib only."""
+rules apply and never fall back to an rc-unsafe version sort, and the
+notify-consumers decision (no dispatch to the application for a prerelease) is
+run under bash. Stdlib only."""
 from __future__ import annotations
 
+import re
+import shutil
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -14,6 +21,12 @@ def _step(text: str, name: str) -> str:
     start = text.index(f"- name: {name}")
     nxt = text.find("\n      - ", start + 1)
     return text[start:] if nxt < 0 else text[start:nxt]
+
+
+def _run_script(step: str) -> str:
+    """The shell script of a step's `run: |` block, as the runner writes it out."""
+    marker = "\n        run: |\n"
+    return textwrap.dedent(step[step.index(marker) + len(marker):]).rstrip("\n") + "\n"
 
 
 class HandleUpstreamTest(unittest.TestCase):
@@ -159,7 +172,7 @@ class PublishTest(unittest.TestCase):
         self.assertIn("--prerelease --latest=false", body)
         self.assertIn("python3 scripts/release_pair.py latest-tag --stable", body)
 
-    def test_prerelease_flag_reaches_every_consumer(self):
+    def test_prerelease_flag_is_in_every_dispatch_payload(self):
         self.assertIn("prerelease: ${{ steps.pair.outputs.prerelease }}", self.text)
         body = _step(self.text, "Dispatch pineforge-release")
         self.assertIn("PRERELEASE: ${{ needs.publish.outputs.prerelease }}", body)
@@ -189,6 +202,113 @@ class AppScopeTest(unittest.TestCase):
         notify = publish[publish.index("  notify-consumers:"):]
         self.assertIn("permissions:\n      contents: read", notify)
         self.assertNotIn("packages: write", notify)
+
+
+class NotifyConsumersTest(unittest.TestCase):
+    """A prerelease is not dispatched to the application; the other five
+    consumer/channel combinations still are. The decision step's own shell runs
+    here, so the test follows the workflow rather than a copy of its rule."""
+
+    CONSUMERS = ("offline", "hosted", "application")
+    HANDOFF = "Application is not notified for a prerelease; it receives the release by hand-off."
+    GATE = "\n        if: steps.notify.outputs.dispatch == 'true'\n"
+    GATED = ("Require one configured consumer repository",
+             "Mint App token",
+             "Dispatch pineforge-release")
+
+    @classmethod
+    def setUpClass(cls):
+        text = (WORKFLOWS / "publish.yml").read_text(encoding="utf-8")
+        cls.notify = text[text.index("\n  notify-consumers:\n"):]
+        at = cls.notify.index("\n    steps:\n") + 1
+        cls.job_head, cls.job_steps = cls.notify[:at], cls.notify[at:]
+        cls.decide = _step(cls.notify, "Decide consumer notification")
+        cls.script = _run_script(cls.decide)
+        cls.bash = shutil.which("bash")
+        if cls.bash is None:
+            raise AssertionError("bash is needed to run the notify-consumers decision step")
+
+    def _decide(self, consumer, flag):
+        """Run the decision script the way the runner does: its two inputs and a
+        GITHUB_OUTPUT file, nothing else. PATH is an empty directory, so only
+        shell builtins can run (no gh, curl or token). A flag of None leaves
+        PRERELEASE unset. Returns (completed process, GITHUB_OUTPUT text)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "no-programs").mkdir()
+            script = root / "decide.sh"
+            script.write_text(self.script, encoding="utf-8")
+            out = root / "github_output"
+            out.write_text("", encoding="utf-8")
+            env = {"PATH": str(root / "no-programs"), "GITHUB_OUTPUT": str(out), "CONSUMER": consumer}
+            if flag is not None:
+                env["PRERELEASE"] = flag
+            done = subprocess.run([self.bash, "--noprofile", "--norc", str(script)], cwd=root, env=env,
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+            return done, out.read_text(encoding="utf-8")
+
+    def test_all_three_consumers_stay_visible_legs(self):
+        # The application's prerelease leg is decided by steps, not by a
+        # job-level condition (the matrix context is not available there) or a
+        # matrix edit, so all three legs still appear and end green.
+        self.assertIn("\n        consumer: [offline, hosted, application]\n", self.job_head)
+        self.assertIn("\n      fail-fast: false\n", self.job_head)
+        self.assertNotIn("exclude:", self.job_head)
+        self.assertNotIn("\n    if:", self.job_head)
+        self.assertIn("\n      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp'"
+                      " || secrets[matrix.repository_secret] }}\n", self.job_head)
+
+    def test_the_decision_is_the_first_step_and_always_runs(self):
+        first = self.job_steps.split("\n      - ", 1)[1]
+        self.assertTrue(first.startswith("name: Decide consumer notification\n        id: notify\n"), first[:80])
+        self.assertNotIn("\n        if:", self.decide)
+
+    def test_the_decision_reads_the_consumer_and_the_publish_flag(self):
+        self.assertIn("\n        env:\n          CONSUMER: ${{ matrix.consumer }}\n"
+                      "          PRERELEASE: ${{ needs.publish.outputs.prerelease }}\n"
+                      "        run: |\n", self.decide)
+
+    def test_the_decision_uses_no_secret_token_or_network(self):
+        self.assertNotIn("uses:", self.decide)
+        for word in ("secrets.", "GH_TOKEN", "TARGET_REPOSITORY", "steps.app"):
+            self.assertNotIn(word, self.decide)
+        self.assertIsNone(re.search(r"\b(gh|curl|wget)\b", self.script))
+
+    def test_every_dispatch_step_is_gated_on_the_decision(self):
+        # Dropping the condition from any one of them lets a prerelease reach
+        # that step for the application: the repository check, the token mint
+        # or the dispatch itself.
+        for name in self.GATED:
+            with self.subTest(step=name):
+                self.assertEqual(_step(self.notify, name).count(self.GATE), 1)
+        self.assertEqual(self.notify.count("steps.notify.outputs.dispatch"), len(self.GATED))
+        order = [self.job_steps.index("- name: " + name) for name in ("Decide consumer notification",) + self.GATED]
+        self.assertEqual(order, sorted(order))
+
+    def test_the_dispatch_still_checks_the_flag_and_sends_the_same_payload(self):
+        body = _step(self.notify, "Dispatch pineforge-release")
+        self.assertIn('*) echo "::error::publish job gave no prerelease flag (\'${PRERELEASE}\')"; exit 1 ;;', body)
+        self.assertIn('-F "client_payload[prerelease]=${PRERELEASE}"', body)
+
+    def test_only_the_application_on_a_prerelease_is_withheld(self):
+        for consumer in self.CONSUMERS:
+            for flag in ("true", "false"):
+                withheld = consumer == "application" and flag == "true"
+                with self.subTest(consumer=consumer, prerelease=flag):
+                    done, written = self._decide(consumer, flag)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertEqual(written, "dispatch=false\n" if withheld else "dispatch=true\n")
+                    self.assertEqual(done.stdout.splitlines(), [self.HANDOFF] if withheld else [])
+
+    def test_a_missing_or_malformed_flag_fails_every_consumer_before_any_output(self):
+        for consumer in self.CONSUMERS:
+            for flag in (None, "", "True", "TRUE", "yes", "null", " true", "false ", "false\n", "true\nfalse"):
+                with self.subTest(consumer=consumer, prerelease=flag):
+                    done, written = self._decide(consumer, flag)
+                    self.assertNotEqual(done.returncode, 0)
+                    self.assertEqual(written, "")
+                    if flag is not None:
+                        self.assertIn("::error::publish job gave no prerelease flag ('" + flag + "')", done.stdout)
 
 
 class PythonTestGateTest(unittest.TestCase):
