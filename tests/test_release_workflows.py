@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """Wiring checks: the release workflows run scripts/release_pair.py where its
-rules apply and never fall back to an rc-unsafe version sort, and the
+rules apply and never fall back to an rc-unsafe version sort, the
 notify-consumers decision (no dispatch to the application for a prerelease) is
-run under bash. Stdlib only."""
+run under bash, and the engine's runtime harness (eight files) is synced from
+the pinned engine tag by one script and checked against recorded sha256 values
+when the image is built. Stdlib only."""
 from __future__ import annotations
 
+import ast
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github" / "workflows"
+REPO = WORKFLOWS.parent.parent
 
 
 def _step(text: str, name: str) -> str:
@@ -27,6 +32,14 @@ def _run_script(step: str) -> str:
     """The shell script of a step's `run: |` block, as the runner writes it out."""
     marker = "\n        run: |\n"
     return textwrap.dedent(step[step.index(marker) + len(marker):]).rstrip("\n") + "\n"
+
+
+def _run_block(dockerfile: str, needle: str) -> str:
+    """The RUN instruction of the Dockerfile that holds needle (an instruction ends at a blank line)."""
+    at = dockerfile.index(needle)
+    start = dockerfile.rindex("\nRUN ", 0, at) + 1
+    end = dockerfile.find("\n\n", at)
+    return dockerfile[start:] if end < 0 else dockerfile[start:end]
 
 
 class HandleUpstreamTest(unittest.TestCase):
@@ -97,6 +110,19 @@ class HandleUpstreamTest(unittest.TestCase):
         self.assertIn("RETAG:   ${{ steps.decide.outputs.retag }}", body)
         self.assertIn('if [ "$RETAG" = true ]; then', body)
         self.assertLess(body.index('if [ "$RETAG" = true ]; then'), body.index('printf \'%s\\n\' "$next" > VERSION'))
+
+    def test_the_harness_is_synced_by_the_script_from_the_pinned_tag(self):
+        body = _step(self.text, "Bump VERSION")
+        sync = 'bash scripts/sync-harness.sh "${E}"'
+        stage = "git add VERSION ${harness}"
+        self.assertIn(sync, body)
+        # every synced file, the sums file included, is staged together with VERSION
+        self.assertIn('harness="$(bash scripts/sync-harness.sh --files)"', body)
+        self.assertIn(stage, body)
+        self.assertLess(body.index(sync), body.index(stage))
+        # no second copy of the fetch, and nothing in the workflow sets the ref override
+        self.assertNotIn("raw.githubusercontent.com", self.text)
+        self.assertNotIn("PF_ENGINE_REF", self.text)
 
 
 class PublishTest(unittest.TestCase):
@@ -309,6 +335,107 @@ class NotifyConsumersTest(unittest.TestCase):
                     self.assertEqual(written, "")
                     if flag is not None:
                         self.assertIn("::error::publish job gave no prerelease flag ('" + flag + "')", done.stdout)
+
+
+class HarnessSyncTest(unittest.TestCase):
+    """The release image carries exactly the engine's eight runtime harness files. One script holds
+    the list and syncs it from the pinned engine tag; the Dockerfile installs that list and checks
+    the installed files against the sums the script recorded. Text checks only: nothing is fetched
+    or built here."""
+
+    MODULES = ("bind_compiled_inventory.py", "request_feed_inventory.py", "run_execution_observer.py",
+               "run_phase_transport.py", "selected_window_plan.py", "selected_window_report.py")
+    HARNESS = tuple(sorted(MODULES + ("entrypoint.sh", "run_json.py")))
+    SUMS = "HARNESS-SHA256SUMS"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = (REPO / "scripts" / "sync-harness.sh").read_text(encoding="utf-8")
+        cls.dockerfile = (REPO / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        array = re.search(r"^FILES=\(\n(.*?)^\)$", cls.script, re.S | re.M)
+        cls.listed = array.group(1).split() if array else []
+        cls.copied = re.findall(r"^COPY docker/(\S+)\s+/opt/pineforge/bin/(\S+)\s*$", cls.dockerfile, re.M)
+
+    def test_the_list_is_the_eight_engine_harness_files(self):
+        self.assertEqual(self.listed, list(self.HARNESS))
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                self.assertIn(name, self.listed)
+
+    def test_the_eight_files_are_committed_in_docker(self):
+        for name in self.HARNESS:
+            with self.subTest(file=name):
+                self.assertTrue((REPO / "docker" / name).is_file())
+
+    def test_no_test_file_or_readme_is_synced_or_installed(self):
+        self.assertTrue(self.listed, "scripts/sync-harness.sh has no FILES list")
+        for name in self.listed + [src for src, _ in self.copied]:
+            with self.subTest(file=name):
+                self.assertFalse(name.endswith("_test.py") or name.upper().startswith("README"), name)
+        self.assertNotIn("_test.py", self.dockerfile)
+        self.assertNotIn("README", self.dockerfile)
+
+    def test_the_dockerfile_installs_exactly_the_list_next_to_run_json(self):
+        self.assertTrue(self.listed, "scripts/sync-harness.sh has no FILES list")
+        self.assertEqual(sorted(src for src, _ in self.copied if src != self.SUMS), self.listed)
+        self.assertIn((self.SUMS, self.SUMS), self.copied)
+        for src, dst in self.copied:
+            with self.subTest(file=src):
+                self.assertEqual(src, dst)  # one directory, under its own name: importable from run_json.py's
+
+    def test_the_build_checks_the_installed_files_against_the_recorded_sums(self):
+        check = "sha256sum -c --strict HARNESS-SHA256SUMS"
+        self.assertIn(check, self.dockerfile)
+        block = _run_block(self.dockerfile, check)
+        self.assertTrue(block.startswith("RUN set -eu; \\\n"), block[:40])
+        self.assertIn("cd /opt/pineforge/bin; \\\n", block)
+        self.assertIn('want="' + " ".join(self.HARNESS) + '"; \\\n', block)
+        self.assertIn('[ "$listed" != "$want" ] || [ "$present" != "$want" ]', block)
+        self.assertIn("exit 1;", block)
+        self.assertNotIn("|| true", block)
+        # after the last harness COPY, before the user drop
+        self.assertLess(self.dockerfile.rindex("\nCOPY docker/"), self.dockerfile.index(check))
+        self.assertLess(self.dockerfile.index(check), self.dockerfile.index("\nUSER "))
+
+    def test_the_default_ref_is_the_pinned_engine_tag(self):
+        self.assertIn("set -euo pipefail\n", self.script)
+        self.assertIn('REF="${PF_ENGINE_REF:-v${E}}"\n', self.script)
+        self.assertEqual(len(re.findall(r"^REF=", self.script, re.M)), 1)
+        self.assertIn('BASE="https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/${REF}/docker"\n',
+                      self.script)
+        self.assertEqual(self.script.count("raw.githubusercontent.com"), 1)
+
+    def test_the_script_fetches_every_file_and_records_the_sums_of_what_it_fetched(self):
+        fetch = 'curl -fsSL "${BASE}/${f}" -o "docker/${f}"'
+        write = '( cd docker && "${sha256[@]}" -- "${FILES[@]}" ) > "docker/${SUMS}"'
+        self.assertIn('for f in "${FILES[@]}"; do\n  ' + fetch + "\n", self.script)
+        self.assertIn(write, self.script)
+        self.assertLess(self.script.index(fetch), self.script.index(write))
+        # --files names the sums file with the synced files, for the workflow's git add
+        self.assertIn('printf \'docker/%s\\n\' "${FILES[@]}" "${SUMS}"', self.script)
+
+    def test_every_module_the_harness_imports_is_in_the_list(self):
+        self.assertTrue(self.listed, "scripts/sync-harness.sh has no FILES list")
+        allowed = set(sys.stdlib_module_names) | {"pineforge_codegen"} | {n[:-3] for n in self.listed if n.endswith(".py")}
+        for name in self.listed:
+            if not name.endswith(".py"):
+                continue
+            tree = ast.parse((REPO / "docker" / name).read_text(encoding="utf-8"), filename=name)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    modules = [node.module]
+                else:
+                    continue
+                for module in modules:
+                    with self.subTest(file=name, imports=module):
+                        self.assertIn(module.split(".")[0], allowed)
+
+    def test_the_entrypoint_is_the_engines_with_the_selected_window_path(self):
+        entry = (REPO / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn('"${PINEFORGE_REPORT_POLICY:-}" == "selected-window/v1"', entry)
+        self.assertIn('python3 "${PREFIX}/bin/bind_compiled_inventory.py"', entry)
 
 
 class PythonTestGateTest(unittest.TestCase):
