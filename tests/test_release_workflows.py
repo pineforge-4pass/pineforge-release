@@ -8,6 +8,7 @@ when the image is built. Stdlib only."""
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import shutil
 import subprocess
@@ -366,6 +367,22 @@ class HarnessSyncTest(unittest.TestCase):
         for name in self.HARNESS:
             with self.subTest(file=name):
                 self.assertTrue((REPO / "docker" / name).is_file())
+
+    def test_the_sums_file_lists_exactly_the_files_present(self):
+        path = REPO / "docker" / self.SUMS
+        self.assertTrue(path.is_file(), f"docker/{self.SUMS} is not committed")
+        text = path.read_bytes().decode("utf-8")
+        # the shape scripts/sync-harness.sh writes: "<sha256>  <name>" and a newline per file, no blank line
+        self.assertRegex(text, r"\A(?:[0-9a-f]{64}  [^\s/]+\n)+\Z")
+        entries = re.findall(r"^([0-9a-f]{64})  (\S+)$", text, re.M)
+        for _, name in entries:
+            with self.subTest(file=name):
+                self.assertFalse(name.endswith("_test.py") or name.upper().startswith("README"), name)
+        # the eight files, in the order of the script's list and of the build's check: none missing, extra or twice
+        self.assertEqual([name for _, name in entries], list(self.HARNESS))
+        for digest, name in entries:
+            with self.subTest(file=name):
+                self.assertEqual(digest, hashlib.sha256((REPO / "docker" / name).read_bytes()).hexdigest())
 
     def test_no_test_file_or_readme_is_synced_or_installed(self):
         self.assertTrue(self.listed, "scripts/sync-harness.sh has no FILES list")
