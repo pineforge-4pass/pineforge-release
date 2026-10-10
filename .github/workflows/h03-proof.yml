@@ -85,7 +85,7 @@ jobs:
           docker build --progress=plain -f docker/Dockerfile.h03proof \
             --build-arg ENGINE_VERSION=1.5.0-rc.1 --build-arg CODEGEN_VERSION=0.0.0 \
             -t h03-proof . 2>&1 | tee "${RUNNER_TEMP}/build-good.log"
-          grep -F 'harness: the eight files match HARNESS-SHA256SUMS' "${RUNNER_TEMP}/build-good.log"
+          grep -E '^#[0-9]+ [0-9.]+ harness: the eight files match HARNESS-SHA256SUMS$' "${RUNNER_TEMP}/build-good.log"
           grep -E 'harness ABI [0-9]+ matches engine' "${RUNNER_TEMP}/build-good.log"
           docker run --rm --entrypoint sh h03-proof -c 'cd /opt/pineforge/bin && ls -A && sha256sum -- *.py entrypoint.sh' | tee "${RUNNER_TEMP}/image-bin.txt"
           expected="$(sort -k2 .github/h03-proof/expected-sha256.txt)"
@@ -105,14 +105,14 @@ jobs:
           m = len(d) // 2
           p.write_bytes(d[:m] + bytes([d[m] ^ 1]) + d[m + 1:])
           PY
+          rc=0
           docker build --progress=plain -f docker/Dockerfile.h03proof \
             --build-arg ENGINE_VERSION=1.5.0-rc.1 --build-arg CODEGEN_VERSION=0.0.0 \
-            -t h03-proof-bad1 . > "${RUNNER_TEMP}/build-bad1.log" 2>&1
-          rc=$?
+            -t h03-proof-bad1 . > "${RUNNER_TEMP}/build-bad1.log" 2>&1 || rc=$?
           tail -n 25 "${RUNNER_TEMP}/build-bad1.log"
           test "${rc}" != 0
-          grep -F 'run_json.py: FAILED' "${RUNNER_TEMP}/build-bad1.log"
-          ! grep -F 'harness: the eight files match' "${RUNNER_TEMP}/build-bad1.log"
+          grep -E '^#[0-9]+ [0-9.]+ run_json.py: FAILED$' "${RUNNER_TEMP}/build-bad1.log"
+          if grep -E '^#[0-9]+ [0-9.]+ harness: the eight files match HARNESS-SHA256SUMS$' "${RUNNER_TEMP}/build-bad1.log"; then echo "::error::success line in a failed build"; exit 1; fi
           echo "build failed (exit ${rc}) on the changed byte, as required"
           git checkout -- docker/run_json.py
 
@@ -120,14 +120,14 @@ jobs:
         run: |
           set -uo pipefail
           sed -i '/ run_json.py$/d' docker/HARNESS-SHA256SUMS
+          rc=0
           docker build --progress=plain -f docker/Dockerfile.h03proof \
             --build-arg ENGINE_VERSION=1.5.0-rc.1 --build-arg CODEGEN_VERSION=0.0.0 \
-            -t h03-proof-bad2 . > "${RUNNER_TEMP}/build-bad2.log" 2>&1
-          rc=$?
+            -t h03-proof-bad2 . > "${RUNNER_TEMP}/build-bad2.log" 2>&1 || rc=$?
           tail -n 25 "${RUNNER_TEMP}/build-bad2.log"
           test "${rc}" != 0
-          grep -F 'ERROR: HARNESS-SHA256SUMS lists [' "${RUNNER_TEMP}/build-bad2.log"
-          ! grep -F 'harness: the eight files match' "${RUNNER_TEMP}/build-bad2.log"
+          grep -E '^#[0-9]+ [0-9.]+ ERROR: HARNESS-SHA256SUMS lists \[[a-z_. ]+\] and bin/ holds \[[a-z_. ]+\]; both must be' "${RUNNER_TEMP}/build-bad2.log"
+          if grep -E '^#[0-9]+ [0-9.]+ harness: the eight files match HARNESS-SHA256SUMS$' "${RUNNER_TEMP}/build-bad2.log"; then echo "::error::success line in a failed build"; exit 1; fi
           echo "build failed (exit ${rc}) on the removed sums line, as required"
           git checkout -- docker/HARNESS-SHA256SUMS
 
@@ -169,7 +169,7 @@ jobs:
           docker build --progress=plain -f docker/Dockerfile.h03proof \
             --build-arg ENGINE_VERSION=1.5.0-rc.1 --build-arg CODEGEN_VERSION=0.0.0 \
             -t h03-proof-lib . 2>&1 | tee "${RUNNER_TEMP}/build-lib.log"
-          grep -F 'harness: the eight files match HARNESS-SHA256SUMS' "${RUNNER_TEMP}/build-lib.log"
+          grep -E '^#[0-9]+ [0-9.]+ harness: the eight files match HARNESS-SHA256SUMS$' "${RUNNER_TEMP}/build-lib.log"
           docker run --rm --entrypoint sh h03-proof-lib -c 'ls -l /opt/pineforge/lib && sha256sum /opt/pineforge/lib/libpineforge_window_plan.so' | tee "${RUNNER_TEMP}/image-lib.txt"
           built="$(sha256sum engine-install/lib/libpineforge_window_plan.so | cut -d' ' -f1)"
           grep -F "${built}  /opt/pineforge/lib/libpineforge_window_plan.so" "${RUNNER_TEMP}/image-lib.txt"
