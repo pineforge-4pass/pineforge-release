@@ -1,0 +1,176 @@
+name: H03 harness sync proof (throwaway)
+
+# Throwaway hosted-run proof, never merged: it runs only on its own branch and on manual dispatch.
+# contents: read only, no secret, no registry login, no image pushed.
+#
+# It proves, against the engine commit below (the pinned fix head, public):
+#   sha     the eight harness files committed under docker/ and docker/HARNESS-SHA256SUMS equal the
+#           engine's own files at that commit, by three independent routes: the raw files fetched
+#           here and hashed here, the literal table in .github/h03-proof/expected-sha256.txt (read
+#           from engine git), and a re-run of scripts/sync-harness.sh with PF_ENGINE_REF.
+#   image   the hub Dockerfile's final stage, byte for byte, builds with the harness check and the
+#           ABI check; the installed files hash to the table; and the same build FAILS when one
+#           harness byte is changed and when one sums line is removed.
+#   lib     the engine built from that commit and installed with cmake --install puts
+#           libpineforge_window_plan.so in lib/, and it arrives in the hub image's /opt/pineforge/lib.
+# It does NOT prove: the release-tarball download stage (needs a released tag), the PyPI codegen
+# stage, or the capabilities probe; those run at the cut.
+
+on:
+  push:
+    branches: [sm/h03-proof-20261010]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ENGINE_SHA: bfffbf939ac2e8ec062d6cd9de8f3905d24ce89b
+
+jobs:
+  sha:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Committed files equal the engine's raw files and the engine-git table
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/raw"
+          names="$(cut -c67- .github/h03-proof/expected-sha256.txt)"
+          test "$(printf '%s\n' ${names} | wc -l)" = 8
+          for f in ${names}; do
+            curl -fsSL "https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/${ENGINE_SHA}/docker/${f}" -o "${RUNNER_TEMP}/raw/${f}"
+          done
+          bad=0
+          while read -r want f; do
+            raw="$(sha256sum "${RUNNER_TEMP}/raw/${f}" | cut -d' ' -f1)"
+            committed="$(sha256sum "docker/${f}" | cut -d' ' -f1)"
+            if [ "${raw}" = "${want}" ] && [ "${committed}" = "${want}" ]; then s=OK; else s=MISMATCH; bad=1; fi
+            printf '%-30s table=%.16s raw=%.16s committed=%.16s %s\n' "${f}" "${want}" "${raw}" "${committed}" "${s}"
+          done < .github/h03-proof/expected-sha256.txt
+          test "${bad}" = 0
+          cmp .github/h03-proof/expected-sha256.txt docker/HARNESS-SHA256SUMS
+          echo "docker/HARNESS-SHA256SUMS is byte-equal to the engine-git table"
+
+      - name: A re-run of the sync script at the engine commit changes nothing
+        run: |
+          set -euo pipefail
+          PF_ENGINE_REF="${ENGINE_SHA}" scripts/sync-harness.sh 1.5.0-rc.1
+          git status --porcelain
+          test -z "$(git status --porcelain)"
+          echo "sync output equals the committed tree"
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Proof Dockerfile (only the two download stages stubbed)
+        run: python3 .github/h03-proof/proof_dockerfile.py
+
+      - name: Engine header from the engine commit; no library in this job
+        run: |
+          set -euo pipefail
+          mkdir -p engine-install/include/pineforge engine-install/lib
+          curl -fsSL "https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/${ENGINE_SHA}/include/pineforge/pineforge.h" -o engine-install/include/pineforge/pineforge.h
+          echo "this job installs no engine library" > engine-install/lib/NO-LIBRARY-IN-THIS-JOB
+          grep '^#define PF_ABI_VERSION' engine-install/include/pineforge/pineforge.h
+
+      - name: Control first, the real build passes and the installed files hash to the table
+        run: |
+          set -euo pipefail
+          docker build --progress=plain -f docker/Dockerfile.h03proof \
+            --build-arg ENGINE_VERSION=1.5.0-rc.1 --build-arg CODEGEN_VERSION=0.0.0 \
+            -t h03-proof . 2>&1 | tee "${RUNNER_TEMP}/build-good.log"
+          grep -F 'harness: the eight files match HARNESS-SHA256SUMS' "${RUNNER_TEMP}/build-good.log"
+          grep -E 'harness ABI [0-9]+ matches engine' "${RUNNER_TEMP}/build-good.log"
+          docker run --rm --entrypoint sh h03-proof -c 'cd /opt/pineforge/bin && ls -A && sha256sum -- *.py entrypoint.sh' | tee "${RUNNER_TEMP}/image-bin.txt"
+          expected="$(sort -k2 .github/h03-proof/expected-sha256.txt)"
+          installed="$(grep '  ' "${RUNNER_TEMP}/image-bin.txt" | sort -k2)"
+          test "${expected}" = "${installed}"
+          echo "the eight installed files equal the engine-git table"
+          docker run --rm --entrypoint sh h03-proof -c 'cd /opt/pineforge/bin && cat HARNESS-SHA256SUMS' | cmp - .github/h03-proof/expected-sha256.txt
+          echo "the installed HARNESS-SHA256SUMS equals the table"
+
+      - name: Forced failure 1, one changed byte in run_json.py fails the build
+        run: |
+          set -uo pipefail
+          python3 -I - <<'PY'
+          from pathlib import Path
+          p = Path("docker/run_json.py")
+          d = p.read_bytes()
+          m = len(d) // 2
+          p.write_bytes(d[:m] + bytes([d[m] ^ 1]) + d[m + 1:])
+          PY
+          docker build --progress=plain -f docker/Dockerfile.h03proof \
+            --build-arg ENGINE_VERSION=1.5.0-rc.1 --build-arg CODEGEN_VERSION=0.0.0 \
+            -t h03-proof-bad1 . > "${RUNNER_TEMP}/build-bad1.log" 2>&1
+          rc=$?
+          tail -n 25 "${RUNNER_TEMP}/build-bad1.log"
+          test "${rc}" != 0
+          grep -F 'run_json.py: FAILED' "${RUNNER_TEMP}/build-bad1.log"
+          ! grep -F 'harness: the eight files match' "${RUNNER_TEMP}/build-bad1.log"
+          echo "build failed (exit ${rc}) on the changed byte, as required"
+          git checkout -- docker/run_json.py
+
+      - name: Forced failure 2, one sums line removed fails the build
+        run: |
+          set -uo pipefail
+          sed -i '/ run_json.py$/d' docker/HARNESS-SHA256SUMS
+          docker build --progress=plain -f docker/Dockerfile.h03proof \
+            --build-arg ENGINE_VERSION=1.5.0-rc.1 --build-arg CODEGEN_VERSION=0.0.0 \
+            -t h03-proof-bad2 . > "${RUNNER_TEMP}/build-bad2.log" 2>&1
+          rc=$?
+          tail -n 25 "${RUNNER_TEMP}/build-bad2.log"
+          test "${rc}" != 0
+          grep -F 'ERROR: HARNESS-SHA256SUMS lists [' "${RUNNER_TEMP}/build-bad2.log"
+          ! grep -F 'harness: the eight files match' "${RUNNER_TEMP}/build-bad2.log"
+          echo "build failed (exit ${rc}) on the removed sums line, as required"
+          git checkout -- docker/HARNESS-SHA256SUMS
+
+  lib:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Engine at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: pineforge-4pass/pineforge-engine
+          ref: bfffbf939ac2e8ec062d6cd9de8f3905d24ce89b
+          path: engine-src
+          persist-credentials: false
+
+      - name: Engine build and cmake --install, as the engine's release workflow does
+        run: |
+          set -euo pipefail
+          test "$(git -C engine-src rev-parse HEAD)" = "${ENGINE_SHA}"
+          sudo apt-get update
+          sudo apt-get install -y libeigen3-dev
+          cmake -S engine-src -B "${RUNNER_TEMP}/engine-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPINEFORGE_BUILD_TESTS=OFF \
+            -DPINEFORGE_BUILD_TUTORIAL=OFF \
+            -DPINEFORGE_VERSION_SOURCE=FILE \
+            -DCMAKE_INSTALL_PREFIX="${PWD}/engine-install"
+          cmake --build "${RUNNER_TEMP}/engine-build" -j 4
+          cmake --install "${RUNNER_TEMP}/engine-build"
+          ls -l engine-install/lib
+          test -s engine-install/lib/libpineforge_window_plan.so
+
+      - name: The hub image carries the library
+        run: |
+          set -euo pipefail
+          python3 .github/h03-proof/proof_dockerfile.py
+          docker build --progress=plain -f docker/Dockerfile.h03proof \
+            --build-arg ENGINE_VERSION=1.5.0-rc.1 --build-arg CODEGEN_VERSION=0.0.0 \
+            -t h03-proof-lib . 2>&1 | tee "${RUNNER_TEMP}/build-lib.log"
+          grep -F 'harness: the eight files match HARNESS-SHA256SUMS' "${RUNNER_TEMP}/build-lib.log"
+          docker run --rm --entrypoint sh h03-proof-lib -c 'ls -l /opt/pineforge/lib && sha256sum /opt/pineforge/lib/libpineforge_window_plan.so' | tee "${RUNNER_TEMP}/image-lib.txt"
+          built="$(sha256sum engine-install/lib/libpineforge_window_plan.so | cut -d' ' -f1)"
+          grep -F "${built}  /opt/pineforge/lib/libpineforge_window_plan.so" "${RUNNER_TEMP}/image-lib.txt"
+          echo "libpineforge_window_plan.so is in the image, byte-equal to the cmake --install output"
