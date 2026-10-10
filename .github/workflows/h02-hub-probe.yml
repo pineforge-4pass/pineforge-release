@@ -1,0 +1,107 @@
+# Throwaway probe, never merged: it runs only on its own branch, when a push
+# changes .github/h02-hub-probe.trigger, and on manual dispatch. Permissions
+# are contents read only; there is no login, no secret, and it will push
+# nothing.
+#
+# On a GitHub-hosted runner it answers one question: does Docker Hub serve the
+# three images directly right now? The answer is PASS, or the exact error. It
+# pulls directly from Docker Hub WITHOUT the mirror on purpose, so the three
+# references below name docker.io and carry no mirror host.
+
+name: Docker Hub direct-pull probe (throwaway)
+
+on:
+  push:
+    branches: [sm/h02-build-proof-20261010]
+    # A push starts the probe only when it changes the trigger file, so pushing
+    # this workflow file alone does not start it.
+    paths: [.github/h02-hub-probe.trigger]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hub-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Pull the three images directly from Docker Hub
+        id: pull
+        # The runner's default shell command turns errexit on. This template
+        # leaves it off, so a failed pull is recorded and the step goes on; the
+        # script sets its own options.
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+
+          # The three references, each with the explicit docker.io host.
+          images=(
+            docker.io/tonistiigi/binfmt:latest
+            docker.io/moby/buildkit:buildx-stable-1
+            docker.io/library/debian:bookworm-slim
+          )
+          max_attempts=3
+          results=()
+
+          echo "host date at start (date -u): $(date -u)"
+
+          for image in "${images[@]}"; do
+            result=FAIL
+            last_status=
+            last_output=
+            attempt=1
+            while [ "${attempt}" -le "${max_attempts}" ]; do
+              echo "attempt ${attempt} of ${max_attempts}: docker pull ${image}"
+              if last_output="$(docker pull "${image}" 2>&1)"; then
+                last_status=0
+              else
+                last_status=$?
+              fi
+              printf '%s\n' "${last_output}"
+              echo "attempt ${attempt} exit status: ${last_status}"
+              if [ "${last_status}" -eq 0 ]; then
+                result=PASS
+                break
+              fi
+              if [ "${attempt}" -lt "${max_attempts}" ]; then
+                echo "waiting 10 seconds before the next attempt"
+                sleep 10
+              fi
+              attempt=$((attempt + 1))
+            done
+            results+=("${result}")
+            if [ "${result}" = PASS ]; then
+              if digest_line="$(grep -m1 '^Digest:' <<<"${last_output}")"; then
+                echo "${image}: pulled on attempt ${attempt}, digest line:"
+                echo "${digest_line}"
+              else
+                echo "${image}: pulled on attempt ${attempt}, but its output has no Digest line"
+              fi
+            else
+              echo "${image}: not pulled in ${max_attempts} attempts; last attempt exit status ${last_status}, its exact output is above"
+            fi
+          done
+
+          echo "host date at end (date -u): $(date -u)"
+
+          # One line per image, then the verdict; the step fails unless all three pulled.
+          verdict=PASS
+          for index in "${!images[@]}"; do
+            echo "PROBE ${images[$index]} ${results[$index]}"
+            if [ "${results[$index]}" != PASS ]; then
+              verdict=FAIL
+            fi
+          done
+          echo "PROBE RESULT: ${verdict}"
+          if [ "${verdict}" != PASS ]; then
+            exit 1
+          fi
+
+      - name: Summary of the pull step
+        if: always()
+        env:
+          PULL_OUTCOME: ${{ steps.pull.outcome }}
+        run: |
+          set -uo pipefail
+          echo "Hub probe summary: pull step outcome=${PULL_OUTCOME:-not-run} (success means all three images pulled)"
