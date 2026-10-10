@@ -87,9 +87,37 @@ RUN mkdir -p /opt/pineforge/bin
 COPY --from=engine  /opt/pineforge/lib       /opt/pineforge/lib
 COPY --from=engine  /opt/pineforge/include   /opt/pineforge/include
 COPY --from=codegen /opt/codegen             /opt/pineforge/pycodegen
+# The harness is the engine's runtime files for the pinned engine tag, all eight and nothing
+# else: scripts/sync-harness.sh writes them into docker/ and records their sha256 in
+# HARNESS-SHA256SUMS, which the build checks below. entrypoint.sh calls
+# bind_compiled_inventory.py; run_json.py imports the other modules from its own directory.
 COPY docker/run_json.py   /opt/pineforge/bin/run_json.py
 COPY docker/entrypoint.sh /opt/pineforge/bin/entrypoint.sh
+COPY docker/bind_compiled_inventory.py /opt/pineforge/bin/bind_compiled_inventory.py
+COPY docker/request_feed_inventory.py  /opt/pineforge/bin/request_feed_inventory.py
+COPY docker/run_execution_observer.py  /opt/pineforge/bin/run_execution_observer.py
+COPY docker/run_phase_transport.py     /opt/pineforge/bin/run_phase_transport.py
+COPY docker/selected_window_plan.py    /opt/pineforge/bin/selected_window_plan.py
+COPY docker/selected_window_report.py  /opt/pineforge/bin/selected_window_report.py
+COPY docker/HARNESS-SHA256SUMS         /opt/pineforge/bin/HARNESS-SHA256SUMS
 RUN chmod +x /opt/pineforge/bin/entrypoint.sh /opt/pineforge/bin/run_json.py
+
+# Every harness file in the image must be byte for byte the engine's file at the ref that
+# scripts/sync-harness.sh synced from: the script recorded the sha256 of each fetched file in
+# HARNESS-SHA256SUMS and the build recomputes them here, on the installed files. The sums file
+# must name exactly the eight files above, in this order, and nothing else may sit in bin/;
+# a missing, extra, changed or empty entry fails the build.
+RUN set -eu; \
+    cd /opt/pineforge/bin; \
+    want="bind_compiled_inventory.py entrypoint.sh request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \
+    listed="$(sed 's/^[0-9a-f]\{64\}  //' HARNESS-SHA256SUMS | tr '\n' ' ' | sed 's/ $//')"; \
+    present="$(LC_ALL=C ls -A | grep -v '^HARNESS-SHA256SUMS$' | tr '\n' ' ' | sed 's/ $//')"; \
+    if [ "$listed" != "$want" ] || [ "$present" != "$want" ]; then \
+      echo "ERROR: HARNESS-SHA256SUMS lists [${listed}] and bin/ holds [${present}]; both must be exactly [${want}]" >&2; exit 1; \
+    fi; \
+    sha256sum -c --strict HARNESS-SHA256SUMS; \
+    echo "harness: the eight files match HARNESS-SHA256SUMS"
+
 # The harness (run_json.py) mirrors the engine's C structs; it must be the copy
 # from the pinned engine tag. Fail the build if its ABI differs from the header
 # in the bundled tarball (0.1.23/0.1.24 shipped an ABI-2 harness on ABI-3 libs).
