@@ -56,6 +56,7 @@ class FactsValidationCLI(unittest.TestCase):
             "inventory-release": lambda f: f["inventory"].update(sourceRelease="99.0.0"),
             "inventory-digest": lambda f: f["inventory"].update(populationSha256="a" * 64),
             "inventory-source": lambda f: f["inventory"].update(source=f["inventory"]["source"] + " additional locator"),
+            "inventory-missing": lambda f: f.pop("inventory"),
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "facts.json"

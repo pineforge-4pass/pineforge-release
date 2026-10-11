@@ -165,22 +165,22 @@ def validate_facts(facts):
         require(release["source"] == f"https://github.com/pineforge-4pass/pineforge-engine/blob/v{version}/README.md#validation-scoreboard",
                 "release source identity differs")
         scoreboard_invariants(release["scoreboard"])
-    if "inventory" in facts:
-        inventory = facts["inventory"]
-        release = facts["releases"].get(inventory["sourceRelease"])
-        require(release is not None, "inventory source release is missing")
-        historic = release["scoreboard"]
-        require(inventory["populationSha256"] == historic["populationSha256"], "inventory population differs from release")
-        require(inventory["closedScripts"] == inventory["communityScripts"] + inventory["probeScripts"],
-                "historical script sum differs")
-        require(inventory["closedProbes"] == inventory["communityProbes"] + inventory["probeScriptProbes"]
-                == historic["closedProbes"], "historical probe sum differs")
-        require(inventory["corpusScripts"] == historic["corpusProbes"], "historical corpus inventory differs")
-        prefix = ("https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/"
-                  f'{inventory["sourceCommit"]}/README.md#validation-scoreboard; historical release '
-                  f'{inventory["sourceRelease"]} ')
-        require(inventory["source"] == prefix + "authored-script and closed-trade inventory, independent of the active population; not registry row or slug totals.",
-                "inventory source identity differs")
+    require("inventory" in facts, "inventory is missing")
+    inventory = facts["inventory"]
+    release = facts["releases"].get(inventory["sourceRelease"])
+    require(release is not None, "inventory source release is missing")
+    historic = release["scoreboard"]
+    require(inventory["populationSha256"] == historic["populationSha256"], "inventory population differs from release")
+    require(inventory["closedScripts"] == inventory["communityScripts"] + inventory["probeScripts"],
+            "historical script sum differs")
+    require(inventory["closedProbes"] == inventory["communityProbes"] + inventory["probeScriptProbes"]
+            == historic["closedProbes"], "historical probe sum differs")
+    require(inventory["corpusScripts"] == historic["corpusProbes"], "historical corpus inventory differs")
+    prefix = ("https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/"
+              f'{inventory["sourceCommit"]}/README.md#validation-scoreboard; historical release '
+              f'{inventory["sourceRelease"]} ')
+    require(inventory["source"] == prefix + "authored-script and closed-trade inventory, independent of the active population; not registry row or slug totals.",
+            "inventory source identity differs")
     return facts
 
 
