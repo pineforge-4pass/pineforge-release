@@ -375,6 +375,12 @@
               "type": "null"
             }
           ]
+        },
+        "tvTradesCompared": {
+          "$ref": "#/$defs/count"
+        },
+        "tvTradesComparedSource": {
+          "const": "Sum over the graded probes of this baseline of the trades compared with TradingView, each probe counted once; a position closed in several parts counts once; trades still open at the end of TradingView's list are excluded."
         }
       }
     },
