@@ -404,20 +404,18 @@ class DockerfileTargetTest(unittest.TestCase):
                         self.assertNotIn("=", body, "HPO arguments must have no defaults")
                         self.assertIn(stage.name, reached)
 
-    def test_release_stage_matches_the_round_one_parent_except_for_its_name(self):
-        git = shutil.which("git")
-        if git is None:
-            self.skipTest("git unavailable; original runtime comparison needs a git checkout")
-        checkout = subprocess.run([git, "rev-parse", "--is-inside-work-tree"], cwd=REPO,
-                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
-        if checkout.returncode or checkout.stdout.strip() != b"true":
-            self.skipTest("not in a git checkout; cannot read 989a0fd9~1:docker/Dockerfile")
-        baseline = subprocess.run([git, "show", "989a0fd9~1:docker/Dockerfile"], cwd=REPO,
-                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
-        self.assertEqual(baseline.returncode, 0,
-                         "git checkout must provide the round-one parent Dockerfile")
-        old_final = _dockerfile_stages(baseline.stdout.decode("utf-8"))[-1]
-        self.assertEqual(_without_stage_alias(self.named["release"]), old_final.text)
+    # sha256 of the final stage of docker/Dockerfile as it was before the hpo stages were added (what a
+    # plain `docker build` built then), kept the way _dockerfile_stages keeps a stage: from its FROM line
+    # to the line before the next heading, bytes unchanged. It is pinned here, not read from git history,
+    # because a shallow CI checkout and a main reached by a squash merge do not contain that commit.
+    ORIGINAL_RUNTIME_STAGE_SHA256 = "a632a13892deaeb350733b8ca8917b9889db69d0894a611498c3ab6da8c333a2"
+
+    def test_release_stage_matches_the_original_runtime_except_for_its_name(self):
+        text = _without_stage_alias(self.named["release"])
+        self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                         self.ORIGINAL_RUNTIME_STAGE_SHA256,
+                         "the release stage must stay byte for byte the original runtime stage "
+                         "(only its name may differ)")
 
     def test_hpo_inherits_release_and_retains_its_runtime_contract(self):
         hpo = self.named["hpo"]
