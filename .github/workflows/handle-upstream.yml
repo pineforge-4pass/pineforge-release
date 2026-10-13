@@ -3,6 +3,7 @@ name: handle-upstream
 # Inbound hub handler. Fired by an upstream release:
 #   pineforge-engine      release.yml -> event_type=engine-release  {version: vX.Y.Z, prerelease, run_id}
 #   pineforge-codegen-oss release.yml -> event_type=codegen-release {version: X.Y.Z, prerelease, run_id}
+#   pineforge-hpo         release.yml -> event_type=hpo-release     {version: X.Y.Z, prerelease, run_id}
 # `prerelease` (true|false) is optional and must agree with the version.
 #
 # 0.x line: moves the dispatched component's pin, freezes the other one,
@@ -11,6 +12,8 @@ name: handle-upstream
 # prerelease included: the first event of a pair records its pin in the run
 # log and builds nothing; the partner's event finds the first one's published
 # artifacts, and the release version becomes the pair version.
+# Hpo joins at the single cutoff in scripts/release_pair.py: then an event
+# probes both partners and the tag records all three versions.
 # The App-token-pushed tag fires publish.yml (build the combined image -> fan
 # out to the MCPs and the app). A GITHUB_TOKEN-pushed tag would NOT re-trigger
 # publish.yml; the App token (a non-default credential) does. Idempotent, with
@@ -18,7 +21,7 @@ name: handle-upstream
 
 on:
   repository_dispatch:
-    types: [engine-release, codegen-release]
+    types: [engine-release, codegen-release, hpo-release]
 
 concurrency:
   group: handle-upstream
@@ -64,10 +67,17 @@ jobs:
           case "$EVENT" in
             engine-release)  component=engine ;;
             codegen-release) component=codegen ;;
+            hpo-release)     component=hpo ;;
             *) echo "::error::unexpected event '$EVENT'"; exit 1 ;;
           esac
-          if ! printf '%s' "${RAW_VERSION:-}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'; then
-            echo "::error::rejected untrusted version '${RAW_VERSION:-}'"; exit 1
+          if [ "$component" = hpo ]; then
+            if ! [[ "${RAW_VERSION:-}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+|(a|b|rc)[0-9]+)?$ ]]; then
+              echo "::error::rejected untrusted version '${RAW_VERSION:-}'"; exit 1
+            fi
+          else
+            if ! printf '%s' "${RAW_VERSION:-}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'; then
+              echo "::error::rejected untrusted version '${RAW_VERSION:-}'"; exit 1
+            fi
           fi
           case "${RAW_PRERELEASE:-}" in
             ''|true|false) ;;
@@ -77,9 +87,10 @@ jobs:
           if [ -n "${RUN_ID:-}" ] && ! [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then
             echo "::error::bad run_id"; exit 1
           fi
-          # The release rules take X.Y.Z or X.Y.Z-{alpha,beta,rc}.N (one PyPI
-          # spelling each); anything else fails here. Emits bare/line/prerelease/pypi.
-          facts="$(python3 scripts/release_pair.py info "$RAW_VERSION")"
+          # The release rules keep engine/codegen semver-only and normalize
+          # either hpo spelling. The emitted bare version is always semver;
+          # hpo_pep440 supplies the wheel's version without workflow conversion.
+          facts="$(python3 scripts/release_pair.py info "$RAW_VERSION" --component="$component")"
           VER="$(printf '%s\n' "$facts" | sed -n 's/^bare=//p')"
           {
             echo "component=$component"
@@ -102,11 +113,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # The landed pins live in the latest tag's annotated message (engine=/
-      # codegen=); for the one-time bootstrap off a pre-redesign tag (no such
+      # codegen=/hpo=); for the one-time bootstrap off a pre-redesign tag (no such
       # lines) we read them from that tag's committed docker/Dockerfile ARG. No
       # source pin is written. "Latest" is semver precedence (v1.0.0 outranks
       # v1.0.0-rc.1; git's v:refname sort puts the rc first).
-      - name: Resolve the landed (engine, codegen) pin pair
+      - name: Resolve the landed component pins
         id: pins
         run: |
           set -euo pipefail
@@ -117,8 +128,13 @@ jobs:
           oldpin() { [ -n "$LATEST" ] && git show "$LATEST:docker/Dockerfile" 2>/dev/null | sed -n -E "s/^ARG $1=([0-9][^[:space:]]*)$/\1/p" | head -1 || true; }
           Eprev="$(msg engine)";  [ -n "$Eprev" ] || Eprev="$(oldpin ENGINE_VERSION)"
           Cprev="$(msg codegen)"; [ -n "$Cprev" ] || Cprev="$(oldpin CODEGEN_VERSION)"
-          { echo "latest=$LATEST"; echo "eprev=$Eprev"; echo "cprev=$Cprev"; } >> "$GITHUB_OUTPUT"
-          echo "landed at ${LATEST:-∅}: engine ${Eprev:-∅}, codegen ${Cprev:-∅}"
+          Hprev=""
+          if [ -n "$LATEST" ] && python3 scripts/release_pair.py info "$LATEST" | grep -q '^hpo_pairing=true$'; then
+            Hprev="$(msg hpo)"
+            python3 scripts/release_pair.py check --release="${LATEST#v}" --engine="$Eprev" --codegen="$Cprev" --hpo="$Hprev" >/dev/null
+          fi
+          { echo "latest=$LATEST"; echo "eprev=$Eprev"; echo "cprev=$Cprev"; echo "hprev=$Hprev"; } >> "$GITHUB_OUTPUT"
+          echo "landed at ${LATEST:-∅}: engine ${Eprev:-∅}, codegen ${Cprev:-∅}${Hprev:+, hpo ${Hprev}}"
 
       # From 1.0.0 on a pair completes only once the OTHER component has
       # published the same version. Each upstream dispatches after its artifacts
@@ -127,13 +143,15 @@ jobs:
       # pair, so a probe that cannot tell (anything but 200 or 404) fails the run
       # (re-run it) instead of waiting. When the version is missing, the
       # partner's newest release tells a pending pair from a mismatched one.
-      - name: Probe the partner release (1.0 line)
+      - name: Probe the partner releases (pairing line)
         id: partner
         if: steps.in.outputs.line == 'pair'
         env:
           COMPONENT: ${{ steps.in.outputs.component }}
           VER:       ${{ steps.in.outputs.version }}
           PYPI:      ${{ steps.in.outputs.pypi }}
+          HPO_PAIRING: ${{ steps.in.outputs.hpo_pairing }}
+          HPO_VERSION: ${{ steps.in.outputs.hpo_pep440 }}
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -142,39 +160,63 @@ jobs:
             curl -sSL "${head[@]}" -o /dev/null -w '%{http_code}' --max-time 30 \
               --retry 4 --retry-delay 5 --retry-all-errors "$2" 2>/dev/null || true
           }
-          if [ "$COMPONENT" = engine ]; then
-            partner="codegen ${VER} (PyPI ${PYPI})"
-            codes="$(http GET "https://pypi.org/pypi/pineforge-codegen/${PYPI}/json")"
-          else
-            partner="engine v${VER} tarballs"
-            base="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${VER}"
-            codes="$(http HEAD "${base}/pineforge-v${VER}-linux-x86_64.tar.gz") $(http HEAD "${base}/pineforge-v${VER}-linux-aarch64.tar.gz")"
-          fi
-          [ -n "${codes// /}" ] || { echo "::error::no HTTP status for ${partner}; re-run this job"; exit 1; }
-          published=true
-          for code in $codes; do
-            case "$code" in
-              200) ;;
-              404) published=false ;;
-              *) echo "::error::could not tell whether ${partner} is published (HTTP ${codes}); re-run this job"; exit 1 ;;
+          partners="engine codegen"
+          [ "${HPO_PAIRING:-}" != true ] || partners="engine codegen hpo"
+          for kind in $partners; do
+            [ "$kind" != "$COMPONENT" ] || continue
+            case "$kind" in
+              codegen)
+                partner="codegen ${VER} (PyPI ${PYPI})"
+                codes="$(http GET "https://pypi.org/pypi/pineforge-codegen/${PYPI}/json")" ;;
+              engine)
+                partner="engine v${VER} tarballs"
+                base="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${VER}"
+                codes="$(http HEAD "${base}/pineforge-v${VER}-linux-x86_64.tar.gz") $(http HEAD "${base}/pineforge-v${VER}-linux-aarch64.tar.gz")" ;;
+              hpo)
+                partner="hpo ${HPO_VERSION} wheel"
+                base="https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v${HPO_VERSION}"
+                codes="$(http HEAD "${base}/pineforge_hpo-${HPO_VERSION}-py3-none-any.whl")" ;;
+              *) echo "::error::unexpected partner '$kind'"; exit 1 ;;
             esac
-          done
-          latest=""
-          if [ "$published" = false ]; then
-            if [ "$COMPONENT" = engine ]; then
-              json="$(curl -fsSL --max-time 30 --retry 4 --retry-delay 5 --retry-all-errors https://pypi.org/pypi/pineforge-codegen/json)" \
-                || { echo "::error::could not read codegen's releases from PyPI; re-run this job"; exit 1; }
-              latest="$(printf '%s' "$json" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["releases"]))' \
-                | python3 scripts/release_pair.py latest-pep440)"
-            else
-              tags="$(gh api 'repos/pineforge-4pass/pineforge-engine/releases?per_page=100' -q '.[] | select(.draft | not) | .tag_name')" \
-                || { echo "::error::could not read the engine's releases; re-run this job"; exit 1; }
-              latest="$(printf '%s\n' "$tags" | python3 scripts/release_pair.py latest-tag)"
-              latest="${latest#v}"
+            [ -n "${codes// /}" ] || { echo "::error::no HTTP status for ${partner}; re-run this job"; exit 1; }
+            published=true
+            for code in $codes; do
+              case "$code" in
+                200) ;;
+                404) published=false ;;
+                *) echo "::error::could not tell whether ${partner} is published (HTTP ${codes}); re-run this job"; exit 1 ;;
+              esac
+            done
+            latest=""
+            if [ "$published" = false ]; then
+              if [ "$kind" = codegen ]; then
+                json="$(curl -fsSL --max-time 30 --retry 4 --retry-delay 5 --retry-all-errors https://pypi.org/pypi/pineforge-codegen/json)" \
+                  || { echo "::error::could not read codegen's releases from PyPI; re-run this job"; exit 1; }
+                latest="$(printf '%s' "$json" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["releases"]))' \
+                  | python3 scripts/release_pair.py latest-pep440)"
+              else
+                case "$kind" in
+                  engine) endpoint='repos/pineforge-4pass/pineforge-engine/releases?per_page=100' ;;
+                  hpo) endpoint='repos/pineforge-4pass/pineforge-hpo/releases?per_page=100' ;;
+                esac
+                tags="$(gh api "$endpoint" -q '.[] | select(.draft | not) | .tag_name')" \
+                  || { echo "::error::could not read ${kind}'s releases; re-run this job"; exit 1; }
+                if [ "$kind" = hpo ]; then
+                  # Drafts alone are filtered above: hpo rc wheels are GitHub
+                  # prereleases, so they must participate in newest-version checks.
+                  latest="$(printf '%s\n' "$tags" | python3 scripts/release_pair.py latest-pep440 --tags)"
+                else
+                  latest="$(printf '%s\n' "$tags" | python3 scripts/release_pair.py latest-tag)"
+                  latest="${latest#v}"
+                fi
+              fi
             fi
-          fi
-          { echo "published=$published"; echo "partner_latest=$latest"; } >> "$GITHUB_OUTPUT"
-          echo "${partner} published: ${published}${latest:+ (its newest release: ${latest})}"
+            { echo "${kind}_published=$published"; echo "${kind}_latest=$latest"; } >> "$GITHUB_OUTPUT"
+            if [ "$COMPONENT" != hpo ] && [ "$kind" != hpo ]; then
+              { echo "published=$published"; echo "partner_latest=$latest"; } >> "$GITHUB_OUTPUT"
+            fi
+            echo "${partner} published: ${published}${latest:+ (its newest release: ${latest})}"
+          done
 
       - name: Decide action (pairing rule + idempotent + recover half-failed release + downgrade guard)
         id: decide
@@ -184,9 +226,18 @@ jobs:
           PAYLOAD_PRERELEASE: ${{ steps.in.outputs.payload_prerelease }}
           EPREV:     ${{ steps.pins.outputs.eprev }}
           CPREV:     ${{ steps.pins.outputs.cprev }}
+          HPREV:     ${{ steps.pins.outputs.hprev }}
+          HPO_PAIRING: ${{ steps.in.outputs.hpo_pairing }}
           PUBLISHED: ${{ steps.partner.outputs.published }}
           PARTNER_LATEST: ${{ steps.partner.outputs.partner_latest }}
-          FORCE:     ${{ github.event.client_payload.force }}
+          ENGINE_PUBLISHED: ${{ steps.partner.outputs.engine_published }}
+          CODEGEN_PUBLISHED: ${{ steps.partner.outputs.codegen_published }}
+          HPO_PUBLISHED: ${{ steps.partner.outputs.hpo_published }}
+          ENGINE_LATEST: ${{ steps.partner.outputs.engine_latest }}
+          CODEGEN_LATEST: ${{ steps.partner.outputs.codegen_latest }}
+          HPO_LATEST: ${{ steps.partner.outputs.hpo_latest }}
+          # Preserve the existing 0.x forced downgrade; no other event reads force.
+          FORCE: ${{ steps.in.outputs.line == 'legacy' && steps.in.outputs.component != 'hpo' && github.event.client_payload.force || '' }}
         run: |
           set -euo pipefail
           ver="$(tr -d '[:space:]' < VERSION)"
@@ -195,11 +246,16 @@ jobs:
           # Monotonicity (downgrade) guard on the DISPATCHED component, the 1.0
           # pairing rule, and noop / republish / bump / wait: see the script.
           echo "cur_ver=$ver" >> "$GITHUB_OUTPUT"
+          partners=()
+          if [ "${HPO_PAIRING:-}" = true ]; then
+            partners=(--engine-published="${ENGINE_PUBLISHED:-false}" --codegen-published="${CODEGEN_PUBLISHED:-false}" --hpo-published="${HPO_PUBLISHED:-false}"
+                      --engine-latest="${ENGINE_LATEST:-}" --codegen-latest="${CODEGEN_LATEST:-}" --hpo-latest="${HPO_LATEST:-}")
+          fi
           python3 scripts/release_pair.py decide \
             --component="$COMPONENT" --version="$VER" --prerelease-flag="${PAYLOAD_PRERELEASE:-}" \
             --prev-engine="$EPREV" --prev-codegen="$CPREV" --current-release="$ver" \
             --other-published="${PUBLISHED:-false}" --image-exists="$image" --force="${FORCE:-}" \
-            --partner-latest="${PARTNER_LATEST:-}" | tee -a "$GITHUB_OUTPUT"
+            --partner-latest="${PARTNER_LATEST:-}" --prev-hpo="${HPREV:-}" "${partners[@]}" | tee -a "$GITHUB_OUTPUT"
 
       - name: No-op
         if: steps.decide.outputs.mode == 'noop'
@@ -211,11 +267,22 @@ jobs:
           COMPONENT: ${{ steps.in.outputs.component }}
           VER:       ${{ steps.in.outputs.version }}
           AWAITING:  ${{ steps.decide.outputs.awaiting }}
+          HPO_VERSION: ${{ steps.in.outputs.hpo_pep440 }}
           EPREV:     ${{ steps.pins.outputs.eprev }}
           CPREV:     ${{ steps.pins.outputs.cprev }}
+          HPREV:     ${{ steps.pins.outputs.hprev }}
         run: |
           set -euo pipefail
-          line="pair pending: ${COMPONENT} ${VER} recorded, waiting for ${AWAITING} ${VER}; the landed pair stays engine ${EPREV} + codegen ${CPREV} and nothing is built or published"
+          waiting=""
+          IFS=, read -r -a partners <<< "$AWAITING"
+          for partner in "${partners[@]}"; do
+            partner_version="$VER"
+            [ "$partner" != hpo ] || partner_version="$HPO_VERSION"
+            waiting="${waiting:+${waiting} + }${partner} ${partner_version}"
+          done
+          event_version="$VER"
+          [ "$COMPONENT" != hpo ] || event_version="$HPO_VERSION"
+          line="pair pending: ${COMPONENT} ${event_version} recorded, waiting for ${waiting}; the landed pair stays engine ${EPREV} + codegen ${CPREV}${HPREV:+ + hpo ${HPREV}} and nothing is built or published"
           echo "::notice title=pineforge pair pending::${line}"
           printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
 
@@ -233,20 +300,26 @@ jobs:
         env:
           E:       ${{ steps.decide.outputs.engine }}
           C:       ${{ steps.decide.outputs.codegen }}
+          H:       ${{ steps.decide.outputs.hpo }}
           LINE:    ${{ steps.decide.outputs.line }}
           RELEASE: ${{ steps.decide.outputs.release }}
           RETAG:   ${{ steps.decide.outputs.retag }}
         run: |
           set -euo pipefail
           git fetch --tags --quiet
+          components="engine ${E} + codegen ${C}${H:+ + hpo ${H}}"
+          tag_message() {
+            printf 'pineforge-release v%s\n\nengine=%s\ncodegen=%s\n' "$1" "$E" "$C"
+            if [ -n "$H" ]; then printf 'hpo=%s\n' "$H"; fi
+          }
           if [ "$RETAG" = true ]; then
             # A pair release whose tag push failed: main already carries its
             # release commit (VERSION = the pair version). Tag that commit.
-            commit="$(git log HEAD --format=%H -n 1 --fixed-strings --grep="chore(release): v${RELEASE} — engine ${E} + codegen ${C}")"
+            commit="$(git log HEAD --format=%H -n 1 --fixed-strings --grep="chore(release): v${RELEASE} — ${components}")"
             [ -n "$commit" ] || { echo "::error::VERSION is ${RELEASE} but main has no release commit for it; refusing to tag"; exit 1; }
-            git tag -a "v${RELEASE}" "$commit" -m "$(printf 'pineforge-release v%s\n\nengine=%s\ncodegen=%s\n' "$RELEASE" "$E" "$C")"
+            git tag -a "v${RELEASE}" "$commit" -m "$(tag_message "$RELEASE")"
             git push origin "v${RELEASE}"
-            echo "tagged v${RELEASE} at ${commit} (engine ${E} + codegen ${C}); publish.yml will build + fan out."
+            echo "tagged v${RELEASE} at ${commit} (${components}); publish.yml will build + fan out."
             exit 0
           fi
           if [ "$LINE" = pair ]; then
@@ -254,7 +327,7 @@ jobs:
             next="$RELEASE"
             [ -n "$next" ] || { echo "::error::pair release without a version"; exit 1; }
             if git rev-parse -q --verify "refs/tags/v${next}" >/dev/null; then
-              echo "::error::tag v${next} already exists without engine=${E} codegen=${C}; refusing to re-tag"; exit 1
+              echo "::error::tag v${next} already exists without engine=${E} codegen=${C}${H:+ hpo=${H}}; refusing to re-tag"; exit 1
             fi
           else
             # 0.x: patch-bump this repo's own version; skip any pre-existing tag.
@@ -267,7 +340,7 @@ jobs:
             done
           fi
           printf '%s\n' "$next" > VERSION
-          # No source pin is written — the (engine, codegen) pair is recorded in the
+          # No source pin is written — the component pins are recorded in the
           # IMMUTABLE annotated tag message (read back by publish.yml) + image labels.
           # Keep the harness in step with the pinned engine tag v${E}: the engine's runtime files
           # (run_json.py mirrors the engine structs; the entrypoint and every module they run) and
@@ -278,8 +351,8 @@ jobs:
           harness="$(bash scripts/sync-harness.sh --files)"
           git add VERSION ${harness}
           git diff --cached --quiet && { echo "::error::nothing staged — refusing empty release"; exit 1; }
-          git commit -m "chore(release): v${next} — engine ${E} + codegen ${C}"
-          git tag -a "v${next}" -m "$(printf 'pineforge-release v%s\n\nengine=%s\ncodegen=%s\n' "$next" "$E" "$C")"
+          git commit -m "chore(release): v${next} — ${components}"
+          git tag -a "v${next}" -m "$(tag_message "$next")"
           git push origin HEAD:main
           git push origin "v${next}"
-          echo "pushed v${next} (engine ${E} + codegen ${C}); publish.yml will build + fan out."
+          echo "pushed v${next} (${components}); publish.yml will build + fan out."

@@ -223,6 +223,7 @@ python3 tools/release-dry-run/dry_run.py                       # needs bash >= 4
 
 Credentials are a single org GitHub App (`PINEFORGE_APP_ID` /
 `PINEFORGE_APP_PRIVATE_KEY`); no personal access tokens.
+Operators may trigger events manually with their own gh login; no personal token is stored in this repository.
 
 ## Image tags
 

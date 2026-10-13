@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -23,6 +24,8 @@ from pathlib import Path
 
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 REPO = WORKFLOWS.parent.parent
+sys.path.insert(0, str(REPO / "scripts"))
+import release_pair as rp  # noqa: E402
 
 
 def _step(text: str, name: str) -> str:
@@ -209,6 +212,408 @@ class PublishTest(unittest.TestCase):
         self.assertIn('-F "client_payload[prerelease]=${PRERELEASE}"', body)
         self.assertIn("consumer: [offline, hosted, application]",
                       self.text)
+
+
+class HpoWorkflowTest(unittest.TestCase):
+    """Run the real payload, probe and publish guard scripts on local fixtures.
+
+    Only these shell steps run: every HTTP/API command resolves to the dry-run
+    shims, and git can use local paths only. Nothing builds or publishes here.
+    """
+
+    COMPONENTS = ("engine", "codegen", "hpo")
+    SHIMS = REPO / "tools" / "release-dry-run" / "shims"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.handler = (WORKFLOWS / "handle-upstream.yml").read_text(encoding="utf-8")
+        cls.publisher = (WORKFLOWS / "publish.yml").read_text(encoding="utf-8")
+
+    def fixture(self, root):
+        (root / "scripts").mkdir()
+        shutil.copyfile(REPO / "scripts" / "release_pair.py", root / "scripts" / "release_pair.py")
+        (root / "VERSION").write_text("1.5.9\n", encoding="utf-8")
+        (root / "state").mkdir()
+        (root / "gitconfig-empty").touch()
+
+    def environment(self, root):
+        return {"PATH": f"{self.SHIMS}{os.pathsep}{os.environ.get('PATH', os.defpath)}",
+                "HARNESS_STATE": str(root / "state"), "PYTHONDONTWRITEBYTECODE": "1",
+                "GIT_ALLOW_PROTOCOL": "file", "GIT_CONFIG_GLOBAL": str(root / "gitconfig-empty"),
+                "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "TMPDIR": str(root)}
+
+    def shell(self, root, text, step, values):
+        out = root / "outputs"
+        out.write_text("", encoding="utf-8")
+        summary = root / "summary"
+        summary.write_text("", encoding="utf-8")
+        env = self.environment(root)
+        env.update({"GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summary), **values})
+        done = subprocess.run(["bash", "--noprofile", "--norc", "-c", _run_script(_step(text, step))],
+                              cwd=root, env=env, capture_output=True, text=True, timeout=30)
+        written = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+        return done, written
+
+    def test_only_existing_release_triggers_can_reach_the_jobs(self):
+        self.assertIn("types: [engine-release, codegen-release, hpo-release]", self.handler)
+        self.assertIn('tags: ["v*"]', self.publisher)
+        for text in (self.handler, self.publisher):
+            triggers = text[text.index("\non:\n"):text.index("\npermissions:\n")]
+            for forbidden in ("workflow_dispatch:", "workflow_run:", "pull_request:", "schedule:"):
+                self.assertNotIn(forbidden, triggers)
+
+    def test_hpo_payload_boundary_and_whole_value_allowlist(self):
+        cutoff_note = f"hpo joins the pairing at {rp.HPO_PAIRING_FROM}"
+        cases = (("1.5.9", "", "123", False, cutoff_note),
+                 ("1.6.0-alpha.1", "true", "123", False, cutoff_note),
+                 ("1.6.0a1", "true", "123", False, cutoff_note),
+                 ("1.6.0-beta.1", "true", "123", False, cutoff_note),
+                 ("1.6.0b1", "true", "123", False, cutoff_note),
+                 ("1.6.0-rc.1", "true", "123", True, ""),
+                 ("1.6.0rc1", "true", "123", True, ""),
+                 ("v1.6.0rc1", "true", "123", True, ""),
+                 ("v1.6.0-rc.12", "true", "123", True, ""),
+                 ("1.6.0rc12", "true", "123", True, ""),
+                 ("1.6.1a1", "true", "123", True, ""),
+                 ("1.6.1b1", "true", "123", True, ""),
+                 ("v1.6.0", "false", "123", True, ""),
+                 ("1.6.1-rc.1", "true", "123", True, ""),
+                 ("1.6.0", "", "", True, ""),
+                 ("1.6", "", "123", False, "rejected untrusted version"),
+                 ("1.6.0;id", "", "123", False, "rejected untrusted version"),
+                 ("1.6.0-rc1", "", "123", False, "rejected untrusted version"),
+                 ("1.6.0.rc1", "", "123", False, "rejected untrusted version"),
+                 ("1.6.0RC1", "", "123", False, "rejected untrusted version"),
+                 ("1.6.0.post1", "", "123", False, "rejected untrusted version"),
+                 ("1.6.0.dev1", "", "123", False, "rejected untrusted version"),
+                 ("1.6.0c1", "", "123", False, "rejected untrusted version"),
+                 ("1.6.0rc01", "", "123", False, "rejected version"),
+                 ("1.6.0rc1\n1.6.0", "", "123", False, "rejected untrusted version"),
+                 ("1.6.0\n1.6.1", "", "123", False, "rejected untrusted version"),
+                 ("1.6.0", "yes", "123", False, "rejected untrusted prerelease"),
+                 ("1.6.0", "false\ntrue", "123", False, "rejected untrusted prerelease"),
+                 ("1.6.0", "false", "123\n456", False, "bad run_id"),
+                 ("1.6.0", "false", "12x", False, "bad run_id"))
+        for version, flag, run_id, accepted, message in cases:
+            with self.subTest(version=version, flag=flag, run_id=run_id), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                done, out = self.shell(root, self.handler, "Validate payload",
+                                       {"EVENT": "hpo-release", "RAW_VERSION": version,
+                                        "RAW_PRERELEASE": flag, "RUN_ID": run_id})
+                self.assertEqual(done.returncode == 0, accepted, done.stdout + done.stderr)
+                if accepted:
+                    self.assertEqual(out["component"], "hpo")
+                    self.assertEqual(out["version"], rp.hpo_version(version, to_semver=True))
+                    self.assertEqual(out["hpo_pep440"], rp.hpo_version(out["version"]))
+                else:
+                    self.assertIn(message, done.stdout + done.stderr)
+                    self.assertEqual(out, {})
+
+    def test_engine_codegen_payloads_keep_their_existing_version_rules(self):
+        cases = (("1.5.9", True), ("1.6.0-alpha.1", True), ("1.6.0-beta.1", True),
+                 ("v1.6.0-rc.1", True), ("1.6.0", True), ("1.6.0rc1", False),
+                 ("v1.6.0rc1", False), ("1.6.0a1", False), ("1.6.0b1", False),
+                 ("1.6.0.rc1", False), ("1.6.0\n1.6.1", False))
+        for component in self.COMPONENTS[:2]:
+            for version, accepted in cases:
+                with self.subTest(component=component, version=version), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self.fixture(root)
+                    done, out = self.shell(root, self.handler, "Validate payload",
+                                           {"EVENT": f"{component}-release", "RAW_VERSION": version,
+                                            "RAW_PRERELEASE": "", "RUN_ID": "123"})
+                    self.assertEqual(done.returncode == 0, accepted, done.stdout + done.stderr)
+                    if accepted:
+                        self.assertEqual(out["version"], str(rp.parse(version)))
+                    else:
+                        self.assertEqual(out, {})
+
+    def test_every_event_checks_prerelease_agreement_in_the_real_decision_step(self):
+        for component in self.COMPONENTS:
+            for version, flag in (("1.6.0", "true"), ("1.6.1-rc.1", "false")):
+                with self.subTest(component=component, version=version), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self.fixture(root)
+                    done, out = self.shell(root, self.handler, "Decide action",
+                                           {"COMPONENT": component, "VER": version, "PAYLOAD_PRERELEASE": flag,
+                                            "EPREV": "1.5.9", "CPREV": "1.5.9", "HPREV": "",
+                                            "PUBLISHED": "false", "PARTNER_LATEST": "", "FORCE": ""})
+                    self.assertNotEqual(done.returncode, 0)
+                    self.assertIn("contradicts version", done.stderr)
+                    self.assertNotIn("mode", out)
+
+    @staticmethod
+    def urls(version):
+        engine = f"https://github.com/pineforge-4pass/pineforge-engine/releases/download/v{version}"
+        hp = rp.hpo_version(version)
+        hpo = f"https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v{hp}"
+        return {"engine": [f"{engine}/pineforge-v{version}-linux-{arch}.tar.gz" for arch in ("x86_64", "aarch64")],
+                "codegen": [f"https://pypi.org/pypi/pineforge-codegen/{rp.parse(version).pep440}/json"],
+                "hpo": [f"{hpo}/pineforge_hpo-{hp}-py3-none-any.whl"]}
+
+    def probe(self, root, component, statuses, *, hpo_pairing="true", text=None,
+              version="1.6.0", hpo_releases=None):
+        urls = self.urls(version)
+        http = {url: {"status": statuses.get(name, 200)} for name, paths in urls.items() for url in paths}
+        http["https://pypi.org/pypi/pineforge-codegen/json"] = {
+            "status": 200, "body": json.dumps({"releases": {"1.5.9": []}})}
+        (root / "state" / "http.json").write_text(json.dumps(http), encoding="utf-8")
+        for name in ("engine", "hpo"):
+            releases = (hpo_releases or []) if name == "hpo" else []
+            (root / "state" / f"releases-pineforge-{name}.json").write_text(json.dumps(releases), encoding="utf-8")
+        done, out = self.shell(root, text or self.handler, "Probe the partner",
+                               {"COMPONENT": component, "VER": version, "PYPI": rp.parse(version).pep440,
+                                "HPO_VERSION": rp.hpo_version(version),
+                                "HPO_PAIRING": hpo_pairing})
+        log = root / "state" / "actions.jsonl"
+        calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return done, out, calls
+
+    def test_each_event_probes_exactly_the_other_two_components(self):
+        for version in ("1.6.0-rc.1", "1.6.0-rc.12", "1.6.0"):
+            for component in self.COMPONENTS:
+                with self.subTest(version=version, component=component), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self.fixture(root)
+                    done, out, calls = self.probe(root, component, {}, version=version)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    partners = set(self.COMPONENTS) - {component}
+                    expected = {url for name in partners for url in self.urls(version)[name]}
+                    self.assertEqual({call["url"] for call in calls if call["tool"] == "curl"}, expected)
+                    for partner in partners:
+                        self.assertEqual(out[f"{partner}_published"], "true")
+                    for call in calls:
+                        if call.get("url") in self.urls(version)["hpo"]:
+                            self.assertEqual(call["method"], "HEAD")
+
+    def test_hpo_latest_probe_counts_prereleases_and_orders_pep440_tags(self):
+        cases = [((("v1.6.0rc1", False, True),), "1.6.0-rc.1", False),
+                 ((("v1.6.0rc2", False, True), ("v1.6.0rc12", False, True),
+                   ("v1.6.0", True, False)), "1.6.0-rc.12", True),
+                 ((("v1.6.0", False, False), ("v1.6.0rc12", False, True)), "1.6.0", True)]
+        for inventory, expected, mismatched in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                releases = [{"tag_name": tag, "draft": draft, "prerelease": pre}
+                            for tag, draft, pre in inventory]
+                done, out, _ = self.probe(root, "engine", {"hpo": 404}, version="1.6.0-rc.1",
+                                           hpo_releases=releases)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual((out["hpo_published"], out["hpo_latest"]), ("false", expected))
+                if not mismatched:
+                    decision, _ = rp.decide("engine", "1.6.0-rc.1", "true", "1.5.9", "1.5.9", "1.5.9",
+                                            False, True, False, partners_published={"codegen": True},
+                                            partners_latest={"hpo": out["hpo_latest"]})
+                    self.assertEqual((decision["mode"], decision["awaiting"]), ("wait", "hpo"))
+                else:
+                    with self.assertRaisesRegex(rp.RuleError, "mismatched pair"):
+                        rp.decide("engine", "1.6.0-rc.1", "true", "1.5.9", "1.5.9", "1.5.9",
+                                  False, True, False, partners_latest={"hpo": out["hpo_latest"]})
+
+    def test_404_is_pending_and_every_uncertain_status_fails_each_event(self):
+        for component in self.COMPONENTS:
+            for partner in set(self.COMPONENTS) - {component}:
+                for status in (404, 0, 403, 429, 500, 503):
+                    with self.subTest(component=component, partner=partner, status=status), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        self.fixture(root)
+                        done, out, _ = self.probe(root, component, {partner: status})
+                        if status == 404:
+                            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                            self.assertEqual(out[f"{partner}_published"], "false")
+                        else:
+                            self.assertNotEqual(done.returncode, 0)
+                            self.assertIn("could not tell whether", done.stdout + done.stderr)
+
+    def test_unmodeled_asset_request_fails_instead_of_waiting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            mutant = self.handler.replace("pineforge_hpo-", "unmodeled_hpo-")
+            self.assertNotEqual(mutant, self.handler)
+            done, _, calls = self.probe(root, "engine", {}, text=mutant)
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn("could not tell whether", done.stdout + done.stderr)
+            self.assertTrue(any(call.get("unsupported") for call in calls))
+
+    def test_existing_pair_probe_skips_hpo(self):
+        for component in self.COMPONENTS[:2]:
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                done, out, calls = self.probe(root, component, {}, hpo_pairing="")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(out["published"], "true")
+                self.assertFalse(any("pineforge-hpo" in call.get("url", "") for call in calls))
+
+    def publish_guards(self, root, version, hpo):
+        env = self.environment(root)
+        def git(*args):
+            done = subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@localhost",
+                                   "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false",
+                                   "-c", "core.hooksPath=/dev/null", *args],
+                                  cwd=root, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        git("init", "-q")
+        git("add", "VERSION", "scripts/release_pair.py")
+        git("commit", "-q", "-m", "fixture")
+        message = f"pineforge-release v{version}\n\nengine={version}\ncodegen={version}\n"
+        if hpo is not None:
+            message += f"hpo={hpo}\n"
+        git("tag", "-a", f"v{version}", "-m", message)
+        pins, out = self.shell(root, self.publisher, "Read pins", {"REF": f"v{version}"})
+        if pins.returncode:
+            return pins, out
+        return self.shell(root, self.publisher, "Pairing rule",
+                          {"REF": f"v{version}", "E": out["engine"], "C": out["codegen"],
+                           "H": out.get("hpo", "")})
+
+    def test_landed_tag_publish_guards_at_the_cutoff(self):
+        cases = (("1.5.0", None, True, ""), ("1.5.9", None, True, ""), ("1.5.9", "bad", True, ""),
+                 ("1.6.0-alpha.1", None, True, ""), ("1.6.0-beta.1", "bad", True, ""),
+                 ("1.6.0-rc.1", None, False, ""), ("1.6.0-rc.1", "bad", False, ""),
+                 ("1.6.0-rc.1", "1.6.0rc1", False, ""), ("1.6.0-rc.1", "1.6.0-rc.2", False, ""),
+                 ("1.6.0-rc.1", "1.6.0-rc.1", True, "1.6.0-rc.1"),
+                 ("1.6.0", None, False, ""), ("1.6.0", "bad", False, ""), ("1.6.0", "1.6.1", False, ""),
+                 ("1.6.0", "1.6.0-rc.1", False, ""), ("1.6.0", "1.6.0", True, "1.6.0"),
+                 ("1.6.1-rc.1", None, False, ""), ("1.6.1-rc.1", "1.6.1-rc.2", False, ""),
+                 ("1.6.1-rc.1", "1.6.1-rc.1", True, "1.6.1-rc.1"))
+        for version, hpo, accepted, expected_hpo in cases:
+            with self.subTest(version=version, hpo=hpo), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                done, out = self.publish_guards(root, version, hpo)
+                self.assertEqual(done.returncode == 0, accepted, done.stdout + done.stderr)
+                if accepted:
+                    self.assertEqual(out.get("hpo", ""), expected_hpo)
+                else:
+                    self.assertIn("hpo", done.stdout + done.stderr)
+
+    def test_real_publish_decision_selects_target_and_arguments_at_the_boundary(self):
+        cases = (("1.5.9", "", ()), ("1.6.0-alpha.1", "", ()), ("1.6.0-beta.1", "", ()),
+                 ("1.6.0-rc.1", "hpo", ("HPO_VERSION=1.6.0rc1",)),
+                 ("1.6.0", "hpo", ("HPO_VERSION=1.6.0",)))
+        for version, target, arguments in cases:
+            with self.subTest(version=version):
+                result = rp.check(version, version, version, hpo=version)
+                selected = tuple(result[key] for key in ("hpo_version_arg", "hpo_wheel_arg")
+                                 if key in result)
+                self.assertEqual(result.get("target", ""), target)
+                self.assertEqual(selected, arguments)
+                if not target:
+                    self.assertNotIn("target", result)
+                    self.assertNotIn("hpo", result)
+
+    def test_optional_release_asset_digest_is_a_checked_build_argument(self):
+        digest = "a" * 64
+        for version in (rp.HPO_PAIRING_FROM, "1.6.1-rc.1"):
+            for asset_digest in (digest, f"sha256:{digest}"):
+                with self.subTest(version=version, digest=asset_digest):
+                    result = rp.check(version, version, version, hpo=version,
+                                      hpo_wheel_digest=asset_digest)
+                    self.assertEqual(result["target"], "hpo")
+                    self.assertEqual(result["hpo_version_arg"], f"HPO_VERSION={rp.hpo_version(version)}")
+                    self.assertEqual(result["hpo_wheel_arg"], f"HPO_WHEEL_SHA256={digest}")
+            for invalid in ("bad", "sha512:" + digest, digest + "\n", digest + "\n" + digest):
+                with self.subTest(version=version, invalid=invalid), self.assertRaises(rp.RuleError):
+                    rp.check(version, version, version, hpo=version, hpo_wheel_digest=invalid)
+        for version in ("1.5.9", "1.6.0-alpha.1", "1.6.0-beta.1"):
+            with self.subTest(version=version):
+                result = rp.check(version, version, version, hpo="ignored", hpo_wheel_digest="ignored")
+                self.assertNotIn("target", result)
+                self.assertNotIn("hpo_version_arg", result)
+                self.assertNotIn("hpo_wheel_arg", result)
+
+    def test_waiting_for_the_wheel_has_exact_decision_note_and_run_summary(self):
+        version = rp.HPO_PAIRING_FROM
+        spellings = {name: rp.hpo_version(version) if name == "hpo" else version for name in self.COMPONENTS}
+        cases = (("engine", {}, ["codegen", "hpo"]), ("codegen", {}, ["engine", "hpo"]),
+                 ("engine", {"codegen": True}, ["hpo"]), ("codegen", {"engine": True}, ["hpo"]),
+                 ("hpo", {}, ["engine", "codegen"]))
+        for component, published, missing in cases:
+            with self.subTest(component=component, published=published), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                result, note = rp.decide(
+                    component, spellings[component], "true", "1.5.9", "1.5.9", "1.5.9",
+                    False, True, False, partners_published=published)
+                self.assertEqual(result["mode"], "wait")
+                self.assertEqual(result["awaiting"].split(","), missing)
+                self.assertEqual(result["release"], "")
+                pending = ", ".join(f"{name} {spellings[name]}" for name in missing)
+                self.assertEqual(note, f"mode=wait: {component} {spellings[component]} recorded; "
+                                 f"waiting for {pending}; landed engine 1.5.9 + codegen 1.5.9 + "
+                                 "hpo (not paired yet). Nothing is built or published.")
+                done, _ = self.shell(root, self.handler, "Wait for the partner",
+                                     {"COMPONENT": component, "VER": version, "HPO_VERSION": spellings["hpo"],
+                                      "AWAITING": result["awaiting"], "EPREV": result["eprev"],
+                                      "CPREV": result["cprev"], "HPREV": result["hprev"]})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                waiting = " + ".join(f"{name} {spellings[name]}" for name in missing)
+                expected = (f"pair pending: {component} {spellings[component]} recorded, waiting for {waiting}; "
+                            "the landed pair stays engine 1.5.9 + codegen 1.5.9 and nothing is built or published")
+                self.assertEqual((root / "summary").read_text(), expected + "\n")
+                self.assertEqual(done.stdout, f"::notice title=pineforge pair pending::{expected}\n")
+
+    def test_real_artifact_wait_uses_hpo_pep440_urls(self):
+        for version in ("1.6.0-rc.1", "1.6.0-rc.12", "1.6.0"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                urls = self.urls(version)
+                http = {url: {"status": 200} for paths in urls.values() for url in paths}
+                (root / "state" / "http.json").write_text(json.dumps(http), encoding="utf-8")
+                checked = rp.check(version, version, version, hpo=version)
+                done, _ = self.shell(root, self.publisher, "Wait for upstream artifacts",
+                                     {"E": version, "C": version, "CP": checked["codegen_pypi"],
+                                      "H": checked["hpo_pep440"]})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                calls = [json.loads(line) for line in (root / "state" / "actions.jsonl").read_text().splitlines()]
+                self.assertEqual({call["url"] for call in calls if call["tool"] == "curl"},
+                                 {url for paths in urls.values() for url in paths})
+                self.assertTrue(all(call["method"] == "HEAD" for call in calls
+                                    if call.get("url") in urls["hpo"]))
+
+    def test_real_asset_digest_step_emits_only_checked_hpo_build_arguments(self):
+        version, digest = rp.HPO_PAIRING_FROM, "b" * 64
+        pep440 = rp.hpo_version(version)
+        for asset_digest, expected, accepted in ((None, "", True), (f"sha256:{digest}", digest, True),
+                                                 ("bad", "", False)):
+            with self.subTest(digest=asset_digest), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                metadata = {"tag_name": f"v{pep440}", "assets": [
+                    {"name": f"pineforge_hpo-{pep440}-py3-none-any.whl", "digest": asset_digest},
+                    {"name": "unrelated.whl", "digest": "sha256:" + "c" * 64}]}
+                (root / "state" / f"release-pineforge-hpo-v{pep440}.json").write_text(
+                    json.dumps(metadata), encoding="utf-8")
+                done, result = self.shell(root, self.publisher, "Read hpo wheel digest",
+                                          {"REF": f"v{version}", "E": version, "C": version,
+                                           "H": version, "HP": pep440})
+                self.assertEqual(done.returncode == 0, accepted, done.stdout + done.stderr)
+                if accepted:
+                    self.assertEqual(result["target"], "hpo")
+                    self.assertEqual(result["hpo"], version)
+                    self.assertEqual(result["hpo_pep440"], pep440)
+                    self.assertEqual(result["hpo_version_arg"], f"HPO_VERSION={pep440}")
+                    self.assertEqual(result.get("hpo_wheel_arg", ""),
+                                     f"HPO_WHEEL_SHA256={expected}" if expected else "")
+                else:
+                    self.assertEqual(result, {})
+
+    def test_unavailable_release_metadata_fails_the_digest_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            version = rp.HPO_PAIRING_FROM
+            done, result = self.shell(root, self.publisher, "Read hpo wheel digest",
+                                      {"REF": f"v{version}", "E": version, "C": version,
+                                       "H": version, "HP": rp.hpo_version(version)})
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn("could not read hpo", done.stdout + done.stderr)
+            self.assertEqual(result, {})
 
 
 class AppScopeTest(unittest.TestCase):

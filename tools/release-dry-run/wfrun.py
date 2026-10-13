@@ -31,7 +31,8 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import yaml
+sys.dont_write_bytecode = True
+import yaml  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 SHIMS = HERE / "shims"
@@ -56,7 +57,8 @@ def hermetic_git(env, root):
     empty = Path(root) / "gitconfig-empty"
     empty.touch()
     env.update({"GIT_ALLOW_PROTOCOL": "file", "GIT_CONFIG_GLOBAL": str(empty),
-                "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+                "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
+                "TMPDIR": str(Path(root).resolve()), "PYTHONDONTWRITEBYTECODE": "1"})
     return env
 
 
@@ -357,7 +359,15 @@ class Job:
         self.metadata_action = Path(metadata_action) if metadata_action else None
         self.result = JobResult(ok=True)
         self.echo = echo
-        self.tmp = Path(tempfile.mkdtemp(prefix="wfrun-"))
+        self.state.mkdir(parents=True, exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix="wfrun-", dir=self.state))
+        self.ctx["runner"]["temp"] = str(self.tmp)
+
+    def isolated_env(self):
+        env = clean_env()
+        env.update({"TMPDIR": str(self.tmp), "XDG_CACHE_HOME": str(self.tmp / "cache"),
+                    "PYTHONDONTWRITEBYTECODE": "1"})
+        return env
 
     def log(self, msg):
         self.result.log.append(msg)
@@ -366,7 +376,7 @@ class Job:
 
     def base_env(self):
         g = self.ctx["github"]
-        env = clean_env()
+        env = self.isolated_env()
         env["PATH"] = f"{SHIMS}{os.pathsep}{env.get('PATH', '')}"
         hermetic_git(env, self.tmp)
         event_path = self.tmp / "event.json"
@@ -404,7 +414,7 @@ class Job:
             tags = [t.strip() for t in (with_.get("tags") or "").splitlines() if t.strip()]
             args = [a.strip() for a in (with_.get("build-args") or "").splitlines() if a.strip()]
             record(self.state, tool=name, push=with_.get("push"), platforms=with_.get("platforms"),
-                   tags=tags, build_args=args)
+                   tags=tags, build_args=args, target=with_.get("target"))
             self.log(f"  [stub] {name}: WOULD BUILD, push={with_.get('push')} platforms={with_.get('platforms')}")
             for t in tags:
                 self.log(f"           tag: {t}")
@@ -421,7 +431,7 @@ class Job:
         action = self.metadata_action
         spec = yaml.load((action / "action.yml").read_text(), Loader=yaml.BaseLoader)
         g = self.ctx["github"]
-        env = clean_env()
+        env = self.isolated_env()
         for key, meta in (spec.get("inputs") or {}).items():
             default = (meta or {}).get("default")
             if key not in with_ and default is not None:
@@ -572,19 +582,21 @@ def run_job(workflow, job, *, event, repo, workdir, state, event_name="repositor
         "secrets": {"GITHUB_TOKEN": "dry-run-dummy-token", "PINEFORGE_APP_ID": "0",
                     "PINEFORGE_APP_PRIVATE_KEY": "dry-run-dummy-key", **targets},
         "inputs": inputs or {}, "vars": {}, "needs": needs or {}, "matrix": matrix or {},
-        "runner": {"temp": tempfile.gettempdir(), "os": "Linux"},
+        "runner": {"temp": str(Path(state).resolve()), "os": "Linux"},
     }
     runner = Job(wf, job, ctx, workdir, state, until, metadata_action, echo)
     title = f"### {Path(workflow).name} :: job {job}"
     if matrix:
         title += f" (matrix {matrix})"
     runner.log(title + f" :: {event_name} {json.dumps(event.get('client_payload', event.get('inputs', event)))}")
-    result = runner.run()
-    if result.outputs:
-        runner.log(f"   > job outputs: {json.dumps(result.outputs, sort_keys=True)}")
-    runner.log(f"### result: {'skipped' if result.skipped else 'success' if result.ok else 'FAILURE'}")
-    shutil.rmtree(runner.tmp, ignore_errors=True)
-    return result
+    try:
+        result = runner.run()
+        if result.outputs:
+            runner.log(f"   > job outputs: {json.dumps(result.outputs, sort_keys=True)}")
+        runner.log(f"### result: {'skipped' if result.skipped else 'success' if result.ok else 'FAILURE'}")
+        return result
+    finally:
+        shutil.rmtree(runner.tmp, ignore_errors=True)
 
 
 def main():

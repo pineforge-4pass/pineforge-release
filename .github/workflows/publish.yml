@@ -4,8 +4,10 @@ name: publish
 # and the app. Fires on the v* tag that handle-upstream.yml pushes with the App
 # token (or a manual tag). The tag value equals VERSION (asserted below).
 # From 1.0.0 on the image pairs engine and codegen at the release version
-# (scripts/release_pair.py check). A prerelease tag (vX.Y.Z-rc.N) is published
-# as a GitHub prerelease with the fixed tags X.Y.Z-rc.N, engine<E>-codegen<C>
+# (scripts/release_pair.py check). The hpo cutoff also lives in that script:
+# from it, the tag must explicitly pin hpo and the checked pin goes to the build.
+# A prerelease tag (vX.Y.Z-rc.N) is published as a GitHub prerelease with the
+# fixed tags X.Y.Z-rc.N, engine<E>-codegen<C>
 # and sha-<short> only, and sends `prerelease: true` downstream; `latest` and
 # the moving `X.Y` follow the newest stable release only.
 
@@ -54,15 +56,20 @@ jobs:
           # so cat-file would see 'commit' and we'd never read the annotated message.
           # Re-fetch tags (forced) to restore the annotated tag objects.
           git fetch --force --tags origin >/dev/null 2>&1 || true
-          e=""; c=""
+          facts="$(python3 scripts/release_pair.py info "$REF")"
+          hpo_pairing="$(printf '%s\n' "$facts" | sed -n 's/^hpo_pairing=//p')"
+          e=""; c=""; h=""
           # Trust the tag message ONLY if REF is an ANNOTATED tag — a lightweight
           # tag's %(contents:body) leaks the target commit body, not our keys.
           if [ "$(git cat-file -t "$REF" 2>/dev/null || true)" = tag ]; then
             e="$(git for-each-ref --format='%(contents:body)' "refs/tags/$REF" | sed -n 's/^engine=//p'  | head -1)"
             c="$(git for-each-ref --format='%(contents:body)' "refs/tags/$REF" | sed -n 's/^codegen=//p' | head -1)"
+            if [ "$hpo_pairing" = true ]; then
+              h="$(git for-each-ref --format='%(contents:body)' "refs/tags/$REF" | sed -n 's/^hpo=//p' | head -1)"
+            fi
           fi
           if ! semver "$e" || ! semver "$c"; then
-            line="$(python3 scripts/release_pair.py info "$REF" | sed -n 's/^line=//p')"
+            line="$(printf '%s\n' "$facts" | sed -n 's/^line=//p')"
             if [ "$line" = pair ]; then
               # From 1.0.0 on the release version IS the pair version.
               echo "::warning::tag ${REF} lacks valid engine=/codegen= in its message — using the pair version ${REF#v}"
@@ -76,8 +83,11 @@ jobs:
           fi
           semver "$e" || { echo "::error::bad engine version '$e'"; exit 1; }
           semver "$c" || { echo "::error::bad codegen version '$c'"; exit 1; }
-          { echo "engine=$e"; echo "codegen=$c"; } >> "$GITHUB_OUTPUT"
-          echo "pins: engine=$e codegen=$c"
+          if [ "$hpo_pairing" = true ]; then
+            semver "$h" || { echo "::error::tag ${REF} (engine ${e} + codegen ${c}) requires valid hpo= in its annotated message; got '${h}'"; exit 1; }
+          fi
+          { echo "engine=$e"; echo "codegen=$c"; if [ "$hpo_pairing" = true ]; then echo "hpo=$h"; fi; } >> "$GITHUB_OUTPUT"
+          echo "pins: engine=$e codegen=$c${h:+ hpo=$h}"
 
       # From 1.0.0 on engine and codegen share one version, prerelease included,
       # and the release version is that version: a mismatched pair fails here
@@ -92,11 +102,14 @@ jobs:
           REF: ${{ github.ref_name }}
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
+          H: ${{ steps.pins.outputs.hpo }}
         run: |
           set -euo pipefail
           newest="$(git tag -l 'v*' | python3 scripts/release_pair.py latest-tag --stable)"
+          hpo=()
+          [ -z "$H" ] || hpo=(--hpo="$H")
           python3 scripts/release_pair.py check --release="${REF#v}" --engine="$E" --codegen="$C" \
-            --newest-stable="$newest" | tee -a "$GITHUB_OUTPUT"
+            --newest-stable="$newest" "${hpo[@]}" | tee -a "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -110,6 +123,7 @@ jobs:
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
           CP: ${{ steps.pair.outputs.codegen_pypi }}
+          H: ${{ steps.pair.outputs.hpo_pep440 }}
         run: |
           set -euo pipefail
           # The Dockerfile builds FROM the engine static-lib tarball (per arch),
@@ -118,17 +132,50 @@ jobs:
           # PyPI spells a codegen prerelease the PEP 440 way (1.0.0rc1); pip
           # reads the Dockerfile's ==1.0.0-rc.1 pin as that same version.
           base="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${E}"
+          hpo_ready() {
+            [ -n "$H" ] || return 0
+            local code
+            code="$(curl -sSIL -o /dev/null -w '%{http_code}' --max-time 30 \
+              --retry 4 --retry-delay 5 --retry-all-errors \
+              "https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v${H}/pineforge_hpo-${H}-py3-none-any.whl" 2>/dev/null || true)"
+            case "$code" in
+              200) return 0 ;;
+              404) return 1 ;;
+              *) echo "::error::could not tell whether hpo ${H} is published (HTTP ${code:-no status}); re-run this job"; exit 1 ;;
+            esac
+          }
           ok=
           for i in $(seq 1 20); do
             if curl -fsIL "${base}/pineforge-v${E}-linux-x86_64.tar.gz"  >/dev/null 2>&1 \
                && curl -fsIL "${base}/pineforge-v${E}-linux-aarch64.tar.gz" >/dev/null 2>&1 \
-               && curl -fsSL "https://pypi.org/pypi/pineforge-codegen/${CP}/json" >/dev/null 2>&1; then
+               && curl -fsSL "https://pypi.org/pypi/pineforge-codegen/${CP}/json" >/dev/null 2>&1 \
+               && hpo_ready; then
               ok=1; break
             fi
-            echo "waiting for engine ${E} tarballs + codegen ${C} (PyPI ${CP}) ... (${i})"
+            echo "waiting for engine ${E} tarballs + codegen ${C} (PyPI ${CP})${H:+ + hpo ${H}} ... (${i})"
             sleep 15
           done
-          [ -n "$ok" ] || { echo "::error::engine ${E} tarballs or codegen ${C} not available after wait"; exit 1; }
+          [ -n "$ok" ] || { echo "::error::engine ${E} tarballs or codegen ${C}${H:+ or hpo ${H}} not available after wait"; exit 1; }
+
+      - name: Read hpo wheel digest
+        id: wheel
+        if: steps.pair.outputs.target == 'hpo'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ github.ref_name }}
+          E: ${{ steps.pins.outputs.engine }}
+          C: ${{ steps.pins.outputs.codegen }}
+          H: ${{ steps.pair.outputs.hpo }}
+          HP: ${{ steps.pair.outputs.hpo_pep440 }}
+        run: |
+          set -euo pipefail
+          asset="pineforge_hpo-${HP}-py3-none-any.whl"
+          digest="$(gh api "repos/pineforge-4pass/pineforge-hpo/releases/tags/v${HP}" \
+            -q ".assets[] | select(.name == \"${asset}\") | .digest // empty")" \
+            || { echo "::error::could not read hpo ${HP} release asset metadata; re-run this job"; exit 1; }
+          # Older assets may have no digest. A supplied digest must be a SHA256.
+          python3 scripts/release_pair.py check --release="${REF#v}" --engine="$E" --codegen="$C" \
+            --hpo="$H" --hpo-wheel-digest="$digest" | tee -a "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -157,6 +204,7 @@ jobs:
             org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2
 
       - name: Build + push (multi-arch)
+        if: steps.pair.outputs.target != 'hpo'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -168,6 +216,27 @@ jobs:
           build-args: |
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            RELEASE_VERSION=${{ github.ref_name }}
+            RELEASE_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build + push hpo (multi-arch)
+        if: steps.pair.outputs.target == 'hpo'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: ${{ steps.pair.outputs.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ENGINE_VERSION=${{ steps.pins.outputs.engine }}
+            CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            ${{ steps.pair.outputs.hpo_version_arg }}
+            ${{ steps.wheel.outputs.hpo_wheel_arg }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
           cache-from: type=gha
