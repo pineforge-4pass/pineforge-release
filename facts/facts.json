@@ -1,21 +1,21 @@
 {
   "schema": "pineforge/facts/v1",
   "scoreboard": {
-    "source": "Registry baseline pineforge-parity-baseline-20261007-engine-b3192bfc; digest-verified snapshot 28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2; private evidence sha256:8a9598552b9c54e375a27c6494b75fea1a2a7d74331f166e67908ba2e0160684.",
+    "source": "Registry baseline pineforge-parity-baseline-20261012-engine-9da4c984; digest-verified snapshot 81ce976cb4dd09b9d1063bc22035c7fb0861c7a91cf6d6a7347f64bd3e4a3c37; private evidence sha256:a6ccc1a2fa6f76f80df234b35bb662fe96414b559ba18b1da5ee8e0e6b1c232f.",
     "provenance": {
-      "baselineId": "pineforge-parity-baseline-20261007-engine-b3192bfc",
-      "snapshotSha256": "28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2",
+      "baselineId": "pineforge-parity-baseline-20261012-engine-9da4c984",
+      "snapshotSha256": "81ce976cb4dd09b9d1063bc22035c7fb0861c7a91cf6d6a7347f64bd3e4a3c37",
       "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
-      "engineCommit": "b3192bfc2f5a24bf4efd6d1d01e01e8fe619dfed",
-      "codegenCommit": "bfc4ddce453db1ba810692af9b9ba3310d87f0ac",
-      "promotionDate": "2026-10-07T22:32:23.000Z",
-      "privateEvidenceSha256": "8a9598552b9c54e375a27c6494b75fea1a2a7d74331f166e67908ba2e0160684"
+      "engineCommit": "9da4c9840461fbd333b4566591b3f10fa34f8b00",
+      "codegenCommit": "e8a462914c0ab96a2a46976afcdc7ecff0100e12",
+      "promotionDate": "2026-10-12T22:56:28.000Z",
+      "privateEvidenceSha256": "a6ccc1a2fa6f76f80df234b35bb662fe96414b559ba18b1da5ee8e0e6b1c232f"
     },
-    "id": "pineforge-parity-baseline-20261007-engine-b3192bfc",
-    "date": "2026-10-07",
-    "engineCommit": "b3192bfc2f5a24bf4efd6d1d01e01e8fe619dfed",
-    "codegenCommit": "bfc4ddce453db1ba810692af9b9ba3310d87f0ac",
-    "snapshotSha256": "28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2",
+    "id": "pineforge-parity-baseline-20261012-engine-9da4c984",
+    "date": "2026-10-12",
+    "engineCommit": "9da4c9840461fbd333b4566591b3f10fa34f8b00",
+    "codegenCommit": "e8a462914c0ab96a2a46976afcdc7ecff0100e12",
+    "snapshotSha256": "81ce976cb4dd09b9d1063bc22035c7fb0861c7a91cf6d6a7347f64bd3e4a3c37",
     "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
     "population": 8006,
     "anomaliesExcluded": 17,
@@ -453,7 +453,9 @@
           "no-trades": 0
         }
       }
-    ]
+    ],
+    "tvTradesCompared": 4692951,
+    "tvTradesComparedSource": "Sum over the graded probes of this baseline of the trades compared with TradingView, each probe counted once; a position closed in several parts counts once; trades still open at the end of TradingView's list are excluded."
   },
   "releases": {
     "1.0.1": {

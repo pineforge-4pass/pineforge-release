@@ -22,6 +22,25 @@ class FactsValidationCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["sha256"], hashlib.sha256(FACTS.read_bytes()).hexdigest())
 
+    def test_compared_trade_count_is_one_paired_active_integer_and_optional(self):
+        canonical = json.loads(FACTS.read_text())
+        score = canonical["scoreboard"]
+        self.assertIsInstance(score["tvTradesCompared"], int)
+        self.assertNotIsInstance(score["tvTradesCompared"], bool)
+        self.assertGreater(score["tvTradesCompared"], 0)
+        self.assertNotIn("tvTradesCompared", canonical["inventory"])
+        for release in canonical["releases"].values():
+            self.assertNotIn("tvTradesCompared", release["scoreboard"])
+        # Both fields absent is a valid file: the pair is optional, never half present.
+        absent = copy.deepcopy(canonical)
+        absent["scoreboard"].pop("tvTradesCompared")
+        absent["scoreboard"].pop("tvTradesComparedSource")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "facts.json"
+            path.write_text(json.dumps(absent))
+            result = self.invoke(path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_complete_schema_and_semantic_negatives_have_no_output(self):
         canonical = json.loads(FACTS.read_text())
         changes = {
@@ -57,6 +76,20 @@ class FactsValidationCLI(unittest.TestCase):
             "inventory-digest": lambda f: f["inventory"].update(populationSha256="a" * 64),
             "inventory-source": lambda f: f["inventory"].update(source=f["inventory"]["source"] + " additional locator"),
             "inventory-missing": lambda f: f.pop("inventory"),
+            "compared-without-source": lambda f: f["scoreboard"].pop("tvTradesComparedSource"),
+            "source-without-compared": lambda f: f["scoreboard"].pop("tvTradesCompared"),
+            "compared-source-text": lambda f: f["scoreboard"].update(
+                tvTradesComparedSource=f["scoreboard"]["tvTradesComparedSource"] + " Exported by a tool."),
+            "compared-negative": lambda f: f["scoreboard"].update(tvTradesCompared=-1),
+            "compared-float": lambda f: f["scoreboard"].update(tvTradesCompared=1.5),
+            "compared-bool": lambda f: f["scoreboard"].update(tvTradesCompared=True),
+            "compared-unsafe-integer": lambda f: f["scoreboard"].update(tvTradesCompared=2**53),
+            "compared-in-release": lambda f: f["releases"]["1.0.1"]["scoreboard"].update(
+                tvTradesCompared=f["scoreboard"]["tvTradesCompared"],
+                tvTradesComparedSource=f["scoreboard"]["tvTradesComparedSource"]),
+            "compared-per-lane": lambda f: f["scoreboard"]["pairs"][0].update(tvTradesCompared=1),
+            "compared-per-scope": lambda f: f["scoreboard"]["scopes"]["corpus"].update(tvTradesCompared=1),
+            "trade-rows-public": lambda f: f["scoreboard"].update(tvTradeRows=1),
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "facts.json"

@@ -17,6 +17,20 @@ only, referenced by `privateEvidenceSha256`; they are not public trade or script
 inventories. Website-only metadata, MCP quotas, endpoints and gallery data stay
 in the website facts module.
 
+## Trades compared with TradingView
+
+`scoreboard.tvTradesCompared` is one integer: the number of trades compared with
+TradingView for the active baseline. `scoreboard.tvTradesComparedSource` states
+how it is counted: "Sum over the graded probes of this baseline of the trades
+compared with TradingView, each probe counted once; a position closed in several
+parts counts once; trades still open at the end of TradingView's list are
+excluded." Quote that sentence with the number. `lab facts export` writes both
+fields together, from the graded results of the baseline's own sweep; they are
+the only public trade count, with no breakdown by probe, lane or symbol, and
+the validator refuses any other trade-count field. Release snapshots under
+`releases` do not carry them, and `inventory.tvTrades` stays the historical
+release inventory it was; the two numbers answer different questions.
+
 ## Inventory source and refill rule
 
 `inventory` is historical, independent of the active scoreboard. `sourceRelease`,

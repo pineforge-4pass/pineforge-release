@@ -161,10 +161,16 @@ def validate_facts(facts):
         raise InputError(f"facts schema validation failed ({error.validator})")
     scalar_safety(facts)
     scoreboard_invariants(facts["scoreboard"])
+    # The one public trade count: both fields together on the active scoreboard, never on a release snapshot.
+    active = facts["scoreboard"]
+    require(("tvTradesCompared" in active) == ("tvTradesComparedSource" in active),
+            "tvTradesCompared and tvTradesComparedSource must be present together")
     for version, release in facts["releases"].items():
         require(release["source"] == f"https://github.com/pineforge-4pass/pineforge-engine/blob/v{version}/README.md#validation-scoreboard",
                 "release source identity differs")
         scoreboard_invariants(release["scoreboard"])
+        require("tvTradesCompared" not in release["scoreboard"] and "tvTradesComparedSource" not in release["scoreboard"],
+                "release scoreboards do not carry the compared trade count")
     require("inventory" in facts, "inventory is missing")
     inventory = facts["inventory"]
     release = facts["releases"].get(inventory["sourceRelease"])
