@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,8 @@ from unittest.mock import patch
 
 import dry_run
 import wfrun
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+import release_pair as rp  # noqa: E402
 
 
 class ExpressionTest(unittest.TestCase):
@@ -375,6 +378,68 @@ class SyntheticEditTest(unittest.TestCase):
             dry_run.replace_once(self.text, "no such text", "x", "a test edit")
         with self.assertRaisesRegex(RuntimeError, "cannot inject"):
             dry_run.replace_once(self.text + self.text, "  notify-consumers:\n", "x", "a test edit")
+
+
+class HermeticReplayTest(unittest.TestCase):
+    def test_step_writable_directories_stay_under_state_and_do_not_cache_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            state.mkdir()
+            workflow = root / "workflow.yml"
+            workflow.write_text("jobs:\n  check:\n    steps:\n      - run: echo checked\n", encoding="utf-8")
+            captured = []
+            original = wfrun.Job.base_env
+            def inspect_env(job):
+                env = original(job)
+                captured.append((env, job.ctx["runner"]["temp"]))
+                return env
+            with patch.object(wfrun.Job, "base_env", inspect_env):
+                result = wfrun.run_job(workflow, "check", event={}, repo="fixture/repo",
+                                       workdir=root, state=state, echo=None)
+            self.assertTrue(result.ok, result.text())
+            self.assertTrue(captured)
+            for env, runner_temp in captured:
+                for name in ("RUNNER_TEMP", "TMPDIR", "XDG_CACHE_HOME"):
+                    self.assertTrue(Path(env[name]).is_relative_to(state), name)
+                self.assertTrue(Path(runner_temp).is_relative_to(state))
+                self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
+
+    def test_metadata_action_must_be_prepared_and_never_auto_cloned(self):
+        with patch.object(dry_run.subprocess, "run") as run:
+            with self.assertRaisesRegex(SystemExit, "--metadata-action"):
+                dry_run.metadata_action(None, Path(__file__).resolve().parents[2])
+            run.assert_not_called()
+
+    def test_checked_target_and_arguments_use_the_real_expression_evaluator(self):
+        for version, target in (("1.5.9", ""), (f"{rp.HPO_PAIRING_FROM}-rc.1", ""),
+                                (rp.HPO_PAIRING_FROM, "hpo"), ("1.6.1-rc.1", "hpo")):
+            with self.subTest(version=version):
+                outputs = rp.check(version, version, version, hpo=version)
+                context = {"steps": {"pair": {"outputs": outputs}}}
+                self.assertEqual(wfrun.interpolate("${{ steps.pair.outputs.target }}", context), target)
+                self.assertEqual(wfrun.interpolate("${{ steps.pair.outputs.hpo_version_arg }}", context),
+                                 f"HPO_VERSION={version}" if target else "")
+
+    def test_local_release_fixtures_have_real_version_trees_and_tag_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            opts = SimpleNamespace(out=Path(tmp), checkout=Path(__file__).resolve().parents[2],
+                                   metadata_action=None, verbose=False, describe="local release fixture")
+            world = dry_run.World("local-fixture", opts, [])
+            self.addCleanup(world.transcript.close)
+            before = world.show("main", "README.md")
+            world.record_tag("1.5.9")
+            self.assertEqual(world.show("main", "VERSION"), "1.5.9")
+            self.assertEqual(world.pins("v1.5.9", include_hpo=True), ("1.5.9", "1.5.9", None))
+            self.assertEqual(world.show("main", "README.md"), before)
+            version = rp.HPO_PAIRING_FROM
+            world.record_tag(version, version, tagged=False)
+            self.assertEqual(world.show("main", "VERSION"), version)
+            self.assertNotIn(f"v{version}", world.tags())
+            self.assertEqual(world.subject("main"),
+                             f"chore(release): v{version} — engine {version} + codegen {version} + hpo {version}")
+            world.record_tag(version, version)
+            self.assertEqual(world.pins(f"v{version}", include_hpo=True), (version,) * 3)
 
 
 if __name__ == "__main__":

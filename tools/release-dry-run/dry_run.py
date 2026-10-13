@@ -6,14 +6,14 @@ check what every run would tag, build, release and send downstream.
 Each world starts from a local bare origin seeded from a checkout of this repo
 (its working tree, on a synthetic history whose newest tag is v0.1.25 = engine
 0.13.1 + codegen 0.10.4) and a state directory the shims answer from: which
-engine tarballs and PyPI versions exist, which images the registry has, this
+engine tarballs, PyPI versions and hpo release wheels exist, which images the registry has, this
 repo's GitHub releases. git pushes land in the local origin; builds, releases
 and dispatches are logged as what WOULD happen. Nothing leaves the machine and
 no token is read or needed.
 
 docker/metadata-action runs for real (node), so the image tags checked are the
-action's own: pass a checkout of it with --metadata-action, or the script
-clones the major version publish.yml uses into a cache directory once.
+action's own: supply a prepared checkout with --metadata-action. The replay
+never clones from a real service or writes a cache outside its output directory.
 
 usage: python3 tools/release-dry-run/dry_run.py [-k WORLD] [-v] [--out DIR]
            [--checkout DIR] [--metadata-action DIR]
@@ -22,6 +22,7 @@ Exits 0 when every check passes, 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -29,9 +30,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from itertools import permutations
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(HERE))
 import wfrun  # noqa: E402
 
@@ -39,6 +42,7 @@ REPO = "pineforge-4pass/pineforge-release"
 IMAGE = f"ghcr.io/{REPO}"
 ENGINE_DL = "https://github.com/pineforge-4pass/pineforge-engine/releases/download"
 ENGINE_RAW = "https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine"
+HPO_DL = "https://github.com/pineforge-4pass/pineforge-hpo/releases/download"
 PYPI = "https://pypi.org/pypi/pineforge-codegen"
 CONSUMERS = ("pineforge-backtest-mcp", "release-fixture-hosted", "release-fixture-application")
 CONSUMER_MATRIX = (
@@ -59,9 +63,9 @@ IDENTITY = ["-c", "user.name=dry-run", "-c", "user.email=dry-run@localhost",
             "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
 
 
-def git(*args, cwd=None, env=None):
+def git(*args, cwd=None, env=None, stdin=None):
     proc = subprocess.run(["git", *IDENTITY, *map(str, args)], cwd=cwd, env=env,
-                          capture_output=True, text=True)
+                          input=stdin, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(map(str, args))}: {proc.stderr.strip()}")
     return proc.stdout.strip()
@@ -102,10 +106,19 @@ class World:
         self._http, self.pypi = {}, []
         (self.state / "actions.jsonl").touch()
         shutil.copy(opts.checkout / "docker" / "run_json.py", self.state / "run_json.py")
+        sync = (opts.checkout / "scripts" / "sync-harness.sh").read_text(encoding="utf-8")
+        manifest = re.search(r"^FILES=\(\n(.*?)^\)$", sync, re.S | re.M)
+        self.harness = manifest.group(1).split() if manifest else []
+        if not self.harness or any(Path(name).name != name for name in self.harness):
+            raise RuntimeError("could not read the sync-harness.sh file manifest")
+        (self.state / "harness").mkdir()
+        for name in self.harness:
+            shutil.copy(opts.checkout / "docker" / name, self.state / "harness" / name)
         self.save("images.json", [f"{IMAGE}:0.1.25"])
         self.save("gh-releases.json", [self.gh_release("v0.1.25"), self.gh_release("v0.1.24")])
         self.save("gh-latest.json", {"pineforge-release": "v0.1.25", "pineforge-engine": "v0.13.1"})
         self.save("releases-pineforge-engine.json", [])
+        self.save("releases-pineforge-hpo.json", [])
         for v in ("0.13.0", "0.13.1"):
             self.engine_published(v)
         for v in ("0.10.3", "0.10.4"):
@@ -138,7 +151,18 @@ class World:
                   [{"tag_name": f"v{v}", "draft": False, "prerelease": "-" in v}] + rels)
         for arch in ("linux-x86_64", "linux-aarch64"):
             self.http(f"{ENGINE_DL}/v{v}/pineforge-v{v}-{arch}.tar.gz", status)
-        self.http(f"{ENGINE_RAW}/v{v}/docker/run_json.py", file="run_json.py")
+        for name in self.harness:
+            self.http(f"{ENGINE_RAW}/v{v}/docker/{name}", file=f"harness/{name}")
+
+    def hpo_published(self, v, status=200, *, digest=None):
+        """The hpo GitHub Release and its wheel; there is no package index."""
+        rels = self.load("releases-pineforge-hpo.json")
+        self.save("releases-pineforge-hpo.json",
+                  [{"tag_name": f"v{v}", "draft": False, "prerelease": "-" in v}] + rels)
+        self.http(f"{HPO_DL}/v{v}/pineforge_hpo-{v}-py3-none-any.whl", status)
+        self.save(f"release-pineforge-hpo-v{v}.json", {
+            "tag_name": f"v{v}", "assets": [
+                {"name": f"pineforge_hpo-{v}-py3-none-any.whl", "digest": digest}]})
 
     def codegen_published(self, pep440):
         """The codegen release.yml: the PyPI upload, then its dispatch."""
@@ -194,10 +218,34 @@ class World:
     def tags(self):
         return set(git("tag", "-l", "v*", cwd=self.origin, env=self.env).split())
 
-    def pins(self, tag):
+    def pins(self, tag, *, include_hpo=False):
         body = git("for-each-ref", "--format=%(contents:body)", f"refs/tags/{tag}", cwd=self.origin, env=self.env)
         kv = dict(line.split("=", 1) for line in body.splitlines() if "=" in line)
-        return kv.get("engine"), kv.get("codegen")
+        components = ("engine", "codegen", "hpo") if include_hpo else ("engine", "codegen")
+        return tuple(kv.get(name) for name in components)
+
+    def record_tag(self, version, hpo=None, *, tagged=True):
+        """Write a release fixture directly in the temporary bare repository."""
+        components = f"engine {version} + codegen {version}"
+        if hpo is not None:
+            components += f" + hpo {hpo}"
+        version_file = self.state / "fixture-VERSION"
+        version_file.write_text(f"{version}\n", encoding="utf-8")
+        blob = git("hash-object", "-w", version_file, cwd=self.origin, env=self.env)
+        entries = git("ls-tree", "main", cwd=self.origin, env=self.env).splitlines()
+        if sum(entry.endswith("\tVERSION") for entry in entries) != 1:
+            raise RuntimeError("release fixture requires exactly one VERSION tree entry")
+        entries = [f"100644 blob {blob}\tVERSION" if entry.endswith("\tVERSION") else entry for entry in entries]
+        tree = git("mktree", cwd=self.origin, env=self.env, stdin="\n".join(entries) + "\n")
+        commit = git("commit-tree", tree, "-p", "main", "-m", f"chore(release): v{version} — {components}",
+                     cwd=self.origin, env=self.env)
+        git("update-ref", "refs/heads/main", commit, cwd=self.origin, env=self.env)
+        if not tagged:
+            return
+        body = f"pineforge-release v{version}\n\nengine={version}\ncodegen={version}\n"
+        if hpo is not None:
+            body += f"hpo={hpo}\n"
+        git("tag", "-a", f"v{version}", commit, "-m", body, cwd=self.origin, env=self.env)
 
     def show(self, ref, path):
         return git("show", f"{ref}:{path}", cwd=self.origin, env=self.env).strip()
@@ -567,6 +615,181 @@ def legacy(w):
             and not p.calls(tool="docker/build-push-action"), p.failed_step)
 
 
+def _no_publication(result):
+    return not (result.calls(tool="docker/build-push-action")
+                or result.calls(tool="gh", action="release create")
+                or result.calls(tool="gh", action="dispatch"))
+
+
+def _triple_order(w, order):
+    """One independent 1.5.9 -> 1.6.0 history, replaying the real workflows."""
+    components, version = ("engine", "codegen", "hpo"), "1.6.0"
+    w.engine_published("1.5.9")
+    w.codegen_published("1.5.9")
+    w.record_tag("1.5.9")
+    before, main = w.tags(), w.rev("main")
+    published = set()
+    digest = hashlib.sha256(f"hpo wheel fixture {version}".encode()).hexdigest()
+    for index, component in enumerate(order, 1):
+        if component == "hpo":
+            w.hpo_published(version, digest=f"sha256:{digest}")
+        else:
+            getattr(w, f"{component}_published")(version)
+        published.add(component)
+        r = w.upstream(f"{component}-release", {"version": version, "prerelease": False, "run_id": 600 + index})
+        d = r.step("decide")
+        missing = set(components) - published
+        if missing:
+            w.check(f"arrival {index} {component}: wait names every missing partner",
+                    r.ok and d.get("mode") == "wait" and d.get("release") == ""
+                    and set(d.get("awaiting", "").split(",")) == missing
+                    and all(f"{name} {version}" in r.text() for name in missing), (r.failed_step, d))
+            w.check(f"arrival {index}: main/tags unchanged; no build, release or dispatch",
+                    w.unchanged(before, main) and _no_publication(r), w.unchanged(before, main, why=True))
+        else:
+            w.check("third arrival completes engine == codegen == hpo == release",
+                    r.ok and d.get("mode") == "bump" and d.get("release") == version
+                    and tuple(d.get(name) for name in components) == (version,) * 3, (r.failed_step, d))
+    tag = f"v{version}"
+    body = git("for-each-ref", "--format=%(contents:body)", f"refs/tags/{tag}", cwd=w.origin, env=w.env)
+    w.check("annotated tag has the three adjacent version pins",
+            tag in w.tags() and w.pins(tag, include_hpo=True) == (version,) * 3
+            and f"engine={version}\ncodegen={version}\nhpo={version}" in body, body)
+    w.check("release commit and VERSION agree with the triple",
+            w.show("main", "VERSION") == version
+            and w.subject("main") == f"chore(release): {tag} — engine {version} + codegen {version} + hpo {version}")
+    w.check("the event changed no facts", not git("diff", f"{main}..main", "--name-only", "--", "facts",
+                                                cwd=w.origin, env=w.env))
+    p = w.publish(tag)
+    builds = p.calls(tool="docker/build-push-action")
+    expected = {f"ENGINE_VERSION={version}", f"CODEGEN_VERSION={version}", f"HPO_VERSION={version}",
+                f"HPO_WHEEL_SHA256={digest}",
+                f"RELEASE_VERSION={tag}", f"RELEASE_GIT_SHA={w.rev(tag)}"}
+    w.check("publish checks all pins, selects hpo and passes its version and wheel digest",
+            p.ok and p.step("pair").get("hpo") == version and len(builds) == 1
+            and builds[0].get("target") == "hpo"
+            and len(builds[0]["build_args"]) == len(expected) and set(builds[0]["build_args"]) == expected,
+            (p.failed_step, builds))
+    sha = w.rev(tag, short=True)
+    w.check("triple stable publish keeps the existing fixed/moving image tags and fanout",
+            w.pushed(p) == {f"{IMAGE}:{t}" for t in (version, "1.6", "latest", "engine1.6.0-codegen1.6.0", f"sha-{sha}")}
+            and w.release(p, tag).get("latest") == "true" and w.fanout_matches(p, version, False),
+            (sorted(w.pushed(p)), w.dispatched(p)))
+    before, main = w.tags(), w.rev("main")
+    for component in components:
+        r = w.upstream(f"{component}-release", {"version": version, "prerelease": False})
+        w.check(f"duplicate {component}: noop with the landed triple",
+                r.ok and r.step("decide").get("mode") == "noop"
+                and w.unchanged(before, main) and _no_publication(r), (r.failed_step, r.step("decide")))
+
+
+def triple(w):
+    """All six 1.6.0 arrival orders, the hpo cutoff, old tags, mismatches and uncertain probes."""
+    components = ("engine", "codegen", "hpo")
+    for order in permutations(components):
+        child = World(f"triple/{'-'.join(order)}", w.opts, w.report)
+        try:
+            _triple_order(child, order)
+        except Exception as err:
+            child.check(f"arrival order reached the end ({type(err).__name__})", False, err)
+        finally:
+            child.transcript.close()
+
+    # A landed pre-cutoff tag has no hpo pin and still builds as before.
+    w.engine_published("1.5.0")
+    w.codegen_published("1.5.0")
+    w.record_tag("1.5.0")
+    p = w.publish("v1.5.0")
+    builds = p.calls(tool="docker/build-push-action")
+    w.check("landed v1.5.0 without hpo= still publishes with the old build arguments",
+            p.ok and w.pins("v1.5.0", include_hpo=True) == ("1.5.0", "1.5.0", None)
+            and "hpo" not in p.step("pair") and len(builds) == 1
+            and builds[0].get("target") is None
+            and len(builds[0]["build_args"]) == 4
+            and not any(arg.startswith("HPO_") for arg in builds[0]["build_args"]), (p.failed_step, builds))
+    before, main = w.tags(), w.rev("main")
+    for version in ("0.13.2", "1.5.0", "1.5.9", "1.6.0-rc.1"):
+        r = w.upstream("hpo-release", {"version": version, "force": True})
+        w.check(f"hpo {version} refused before any pin/tag/build changes",
+                w.refused(r, "Validate payload", "hpo joins the pairing at 1.6.0")
+                and w.unchanged(before, main) and _no_publication(r), r.failed_step)
+    for payload, message in (({"version": "1.6.0;id"}, "rejected untrusted version"),
+                             ({"version": "1.6.0\n1.6.1"}, "rejected version"),
+                             ({"version": "1.6.0", "prerelease": "yes"}, "rejected untrusted prerelease"),
+                             ({"version": "1.6.0", "run_id": "12\n34"}, "bad run_id")):
+        r = w.upstream("hpo-release", payload)
+        w.check(f"hpo malformed payload refused ({message})",
+                w.refused(r, "Validate payload", message) and w.unchanged(before, main) and _no_publication(r), r.failed_step)
+
+    for component in components:
+        getattr(w, f"{component}_published")("1.6.0")
+    r = w.upstream("hpo-release", {"version": "1.6.0", "prerelease": False})
+    w.check("hpo event with both partners published lands the triple",
+            r.ok and r.step("decide").get("mode") == "bump"
+            and w.pins("v1.6.0", include_hpo=True) == ("1.6.0",) * 3, (r.failed_step, r.step("decide")))
+    before, main = w.tags(), w.rev("main")
+    w.hpo_published("1.6.1")
+    r = w.upstream("hpo-release", {"version": "1.6.1", "prerelease": False})
+    w.check("hpo 1.6.1 while engine/codegen are landed at 1.6.0 waits for both",
+            r.ok and r.step("decide").get("awaiting") == "engine,codegen"
+            and r.step("decide").get("mode") == "wait" and w.unchanged(before, main) and _no_publication(r),
+            (r.failed_step, r.step("decide")))
+    for component, version, odd in (("engine", "1.6.2", ("engine 1.6.2", "hpo 1.6.1")),
+                                    ("codegen", "1.6.3", ("engine 1.6.2", "codegen 1.6.3", "hpo 1.6.1")),
+                                    ("hpo", "1.6.1", ("engine 1.6.2", "codegen 1.6.3", "hpo 1.6.1"))):
+        getattr(w, f"{component}_published")(version)
+        r = w.upstream(f"{component}-release", {"version": version, "prerelease": False})
+        w.check(f"{component} mismatched new partners fail naming every odd version",
+                w.refused(r, "Decide action", "mismatched pair") and all(pin in r.text() for pin in odd)
+                and w.unchanged(before, main) and _no_publication(r), r.failed_step)
+    for component in components:
+        getattr(w, f"{component}_published")("1.6.4")
+    for component in components:
+        for status in (0, 403, 503):
+            hpo_status, engine_status = (200, status) if component == "hpo" else (status, 200)
+            w.http(f"{HPO_DL}/v1.6.4/pineforge_hpo-1.6.4-py3-none-any.whl", hpo_status)
+            w.http(f"{ENGINE_DL}/v1.6.4/pineforge-v1.6.4-linux-x86_64.tar.gz", engine_status)
+            r = w.upstream(f"{component}-release", {"version": "1.6.4", "prerelease": False})
+            w.check(f"{component} cannot tell (HTTP {status}): fails for re-run, never pending/published",
+                    w.refused(r, "Probe the partner release", "could not tell whether")
+                    and w.unchanged(before, main) and _no_publication(r), r.failed_step)
+    w.http(f"{ENGINE_DL}/v1.6.4/pineforge-v1.6.4-linux-x86_64.tar.gz")
+    work = w.clone("refs/heads/main")
+    workflow = work / ".github" / "workflows" / "handle-upstream.yml"
+    workflow.write_text(replace_once(workflow.read_text(), "pineforge_hpo-", "unmodeled_hpo-",
+                                     "unknown hpo asset"), encoding="utf-8")
+    r = w.run("handle-upstream.yml", "bump", event={"action": "engine-release", "client_payload": {"version": "1.6.4"}},
+              event_name="repository_dispatch", ref="refs/heads/main", work=work)
+    w.check("unmodeled hpo asset request fails the real workflow instead of a false pending result",
+            w.refused(r, "Probe the partner release", "could not tell whether")
+            and r.calls(tool="curl", status=0) and w.unchanged(before, main) and _no_publication(r), r.failed_step)
+
+    for label, hpo in (("missing", None), ("invalid", "bad"), ("mismatch", "1.6.1")):
+        child = World(f"triple/publish-{label}", w.opts, w.report)
+        try:
+            child.record_tag("1.6.0", hpo)
+            p = child.publish("v1.6.0")
+            child.check(f"v1.6.0 tag with {label} hpo fails before any build/release/dispatch",
+                        not p.ok and "hpo" in p.text() and _no_publication(p), p.failed_step)
+        finally:
+            child.transcript.close()
+
+    child = World("triple/retag", w.opts, w.report)
+    try:
+        child.record_tag("1.5.9")
+        for component in components:
+            getattr(child, f"{component}_published")("1.6.0")
+        child.record_tag("1.6.0", "1.6.0", tagged=False)
+        main = child.rev("main")
+        r = child.upstream("hpo-release", {"version": "1.6.0", "prerelease": False})
+        child.check("half-done triple tags the existing commit with all three pins",
+                    r.ok and r.step("decide").get("retag") == "true"
+                    and child.rev("main") == main and child.rev("v1.6.0") == main
+                    and child.pins("v1.6.0", include_hpo=True) == ("1.6.0",) * 3, r.failed_step)
+    finally:
+        child.transcript.close()
+
+
 def replace_once(text, old, new, what):
     """TEXT with its one OLD replaced by NEW; no match or several is a harness error, never a broad replace."""
     if text.count(old) != 1:
@@ -705,23 +928,15 @@ def fanout_failures(w, published, tag, prerelease):
                 and not w.fanout_matches(defective, version, prerelease), w.dispatched(defective))
 
 
-WORLDS = {"pair": pair, "reverse": reverse, "lost-partner": lost_partner, "retag": retag, "legacy": legacy}
+WORLDS = {"pair": pair, "reverse": reverse, "lost-partner": lost_partner, "retag": retag,
+          "legacy": legacy, "triple": triple}
 
 
 # ------------------------------------------------------------------- setup
 def metadata_action(arg, checkout):
-    if arg:
-        path = Path(arg).resolve()
-    else:
-        text = (checkout / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
-        major = re.search(r"docker/metadata-action@(v\d+)", text).group(1)
-        cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-        path = cache / "pineforge-release-dry-run" / f"metadata-action-{major}"
-        if not (path / "dist" / "index.js").is_file():
-            print(f"cloning docker/metadata-action {major} (the version publish.yml uses) into {path}")
-            shutil.rmtree(path, ignore_errors=True)
-            subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", major,
-                            "https://github.com/docker/metadata-action", str(path)], check=True)
+    if not arg:
+        sys.exit("dry_run: supply --metadata-action DIR with a prepared checkout; replay is offline")
+    path = Path(arg).resolve()
     if not (path / "dist" / "index.js").is_file():
         sys.exit(f"dry_run: {path} is not a checkout of docker/metadata-action (no dist/index.js)")
     return path
@@ -733,7 +948,7 @@ def main():
     ap.add_argument("-v", dest="verbose", action="store_true", help="print every run's transcript")
     ap.add_argument("--out", help="where worlds and transcripts go (default: a new temporary directory)")
     ap.add_argument("--checkout", default=str(HERE.parent.parent), help="the checkout to seed origin from")
-    ap.add_argument("--metadata-action", help="a checkout of docker/metadata-action (default: clone it once)")
+    ap.add_argument("--metadata-action", help="a prepared checkout of docker/metadata-action (required; no clone)")
     opts = ap.parse_args()
     unknown = set(opts.only) - set(WORLDS)
     if unknown:

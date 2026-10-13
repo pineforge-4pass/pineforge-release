@@ -6,13 +6,15 @@ scenario can check what WOULD have been fetched, created, pushed or sent.
 A call the shims do not model fails (exit 1) instead of pretending to work.
 
 State files (all optional):
-  http.json          {url: {"status": N, "body": str | "file": name}}; other URLs
-                     answer 404, status 0 means "no answer" (curl prints 000)
+  http.json          {url: {"status": N, "body": str | "file": name, "method": str}};
+                     absent modeled artifact URLs answer 404; unknown requests
+                     fail with 000. Status 0 means "no answer" (curl prints 000).
   images.json        [image refs that exist in the registry]
   gh-releases.json   this repo's GitHub releases, newest first:
                      [{"tagName", "isDraft", "isPrerelease"}]
   gh-latest.json     {repo name: tag GitHub shows as Latest}
   releases-<repo>.json  REST `repos/<owner>/<repo>/releases` answer
+  release-pineforge-hpo-v<version>.json  the hpo release and its asset digests
   gh-release-list.fail  present: `gh release list` fails
 """
 from __future__ import annotations
@@ -120,9 +122,27 @@ def api_fields(opts):
 
 
 # ---------------------------------------------------------------------- curl
+SEMVER = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:alpha|beta|rc)\.(?:0|[1-9][0-9]*))?"
+PEP440 = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:(?:a|b|rc)(?:0|[1-9][0-9]*))?"
+
+
+def artifact_method(url):
+    """The inventory routes we can answer even before a version is published."""
+    if re.fullmatch(r"https://github.com/pineforge-4pass/pineforge-engine/releases/download/"
+                    rf"v(?P<v>{SEMVER})/pineforge-v(?P=v)-linux-(?:x86_64|aarch64)\.tar\.gz", url):
+        return "HEAD"
+    if re.fullmatch(r"https://github.com/pineforge-4pass/pineforge-hpo/releases/download/"
+                    rf"v(?P<v>{SEMVER})/pineforge_hpo-(?P=v)-py3-none-any\.whl", url):
+        return "HEAD"
+    if re.fullmatch(rf"https://pypi.org/pypi/pineforge-codegen/{PEP440}/json", url):
+        return "GET"
+    return None
+
+
 def curl(argv):
     url = out = fmt = None
     fail = False
+    method, unsupported, urls = "GET", [], []
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -132,22 +152,57 @@ def curl(argv):
                 out = argv[i + 1]
             elif a in ("-w", "--write-out"):
                 fmt = argv[i + 1]
+            elif a in ("-X", "--request"):
+                method = argv[i + 1]
+            elif a in ("-H", "--header"):
+                unsupported.append(a)
             i += 2
             continue
         if a.startswith(("http://", "https://")):
             url = a
-        elif a == "--fail" or (re.fullmatch(r"-[A-Za-z]+", a) and "f" in a):
+            urls.append(a)
+        elif a == "--fail":
             fail = True
+        elif a == "--head":
+            method = "HEAD"
+        elif re.fullmatch(r"-[sSfIL]+", a):
+            fail = fail or "f" in a
+            if "I" in a:
+                method = "HEAD"
+        elif a not in ("--retry-all-errors", "--location", "--silent", "--show-error"):
+            unsupported.append(a)
         i += 1
-    if url is None:
+    if len(urls) != 1 or unsupported or method not in ("GET", "HEAD") or (fmt and fmt != "%{http_code}"):
+        record(tool="curl", unsupported=argv)
         say("curl", f"unsupported call: curl {' '.join(argv)}")
+        if fmt == "%{http_code}":
+            sys.stdout.write("000")
         return 2
     hit = load("http.json", {}).get(url)
+    modeled = artifact_method(url)
+    expected = hit.get("method", modeled or "GET") if hit else modeled
+    if expected is None or method != expected:
+        record(tool="curl", unsupported=argv, url=url, method=method, status=0)
+        say("curl", f"unmodeled request: {method} {url}")
+        if fmt:
+            sys.stdout.write("000")
+        return 2
+    if out and out != "/dev/null" and not Path(out).resolve().is_relative_to(STATE.parent.resolve()):
+        record(tool="curl", unsupported=argv)
+        say("curl", "output is outside the world's directory")
+        return 2
     status = hit["status"] if hit else 404
-    record(tool="curl", url=url, status=status)
+    record(tool="curl", url=url, method=method, status=status)
     say("curl", f"{url} -> {status:03d}")
     if status == 200 and out != "/dev/null":
-        body = (STATE / hit["file"]).read_text(encoding="utf-8") if "file" in hit else hit.get("body", "")
+        if "file" in hit:
+            path = (STATE / hit["file"]).resolve()
+            if not path.is_relative_to(STATE.resolve()):
+                say("curl", "fixture file is outside state")
+                return 2
+            body = path.read_text(encoding="utf-8")
+        else:
+            body = hit.get("body", "")
         if out:
             Path(out).write_text(body, encoding="utf-8")
         else:
@@ -247,6 +302,14 @@ def gh(argv):
                    endpoint=endpoint, hostname=hostname)
             say("gh", f"WOULD DISPATCH to {endpoint.split('/')[2]}: {json.dumps(body, sort_keys=True)}")
             return 0
+        m = re.fullmatch(rf"repos/pineforge-4pass/pineforge-hpo/releases/tags/v({SEMVER})", endpoint)
+        if m and not (set(opts) - {"-q", "--jq", "--hostname"}):
+            data = load(f"release-pineforge-hpo-v{m.group(1)}.json", None)
+            record(tool="gh", action="api", endpoint=endpoint, found=data is not None)
+            if data is None:
+                say("gh", f"api {endpoint} -> HTTP 404")
+                return 1
+            return emit_json(data, (opts.get("-q") or opts.get("--jq") or [None])[-1])
         m = re.fullmatch(r"repos/[^/]+/([^/?]+)/releases(\?.*)?", endpoint)
         if m and not (set(opts) - {"-q", "--jq", "--hostname"}):
             data = load(f"releases-{m.group(1)}.json", None)

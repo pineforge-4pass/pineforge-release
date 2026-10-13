@@ -2,27 +2,40 @@
 
 `dry_run.py` replays this repo's real `handle-upstream.yml` and `publish.yml`
 on a Linux test host and checks what each run would tag, build, release and send
-downstream. It covers the 0.x line and the 1.0 line: `v1.0.0-rc.1`, then
-`v1.0.0`, in either arrival order, plus the refusals and recoveries.
+downstream. It covers the 0.x line, the 1.0 pair line, and the three-component
+`triple` world: all six engine/codegen/hpo arrival orders at `1.6.0`, plus
+the cutoff, refusals, mismatches and recoveries. The cutoff is defined only by
+`HPO_PAIRING_FROM` in `scripts/release_pair.py`, compared by semver precedence;
+`1.6.0-rc.1` still uses two-component pairing and refuses an hpo event.
 
 Workflow execution is dummy-only: no production credential or real App token
-is read, minted or needed. It makes no GitHub write or Pages call. Dependency
-installation and the initial public metadata-action checkout need network
-access; workflow third-party interactions are replayed locally:
+is read, minted or needed. It sends nothing to a real service. Dependencies
+and a checkout of the workflow's metadata-action version must already be
+prepared on the signed Spot host; the replay never downloads either. Workflow
+third-party interactions are replayed locally:
 
 - git pushes go to a local bare origin. It is seeded from a checkout of this
   repo (its working tree, uncommitted edits included) on a synthetic history
   whose newest tag is `v0.1.25` (engine 0.13.1 + codegen 0.10.4).
 - `curl`, `gh`, `docker` and `sleep` are shims (`shims/`). They answer from the
-  world's state directory: which engine tarballs and PyPI versions exist, which
-  images the registry has, and this repo's GitHub releases. Every call is logged
+  world's state directory: which engine tarballs, PyPI versions and hpo GitHub
+  Release wheels exist, which images the registry has, and this repo's GitHub
+  releases. Their asset metadata also supplies an optional SHA256 digest. Every call is logged
   to `state/actions.jsonl` as what WOULD have happened. A call the shims do not
-  model fails instead of pretending to work.
+  model fails instead of pretending to work. Only a correctly spelled artifact
+  inventory route can answer 404 for a version not published yet; unknown URLs,
+  methods or options fail with 000, including a misspelled hpo asset request.
 - `uses:` steps are stubbed (checkout = the prepared work tree, App token =
   a dummy, build-push = logged). `docker/metadata-action` runs for real under
   `node`, so the image tags checked are the action's own.
 - Only a short allowlist of your environment reaches a step. git in a step can
-  only use local paths and ignores your git config.
+  only use local paths and ignores your git config. Job scratch directories,
+  temporary files and action caches stay inside the world's state directory.
+  Python bytecode caching is disabled so replay does not write to the source
+  checkout or installed packages. All synced engine harness files are explicit
+  fixtures, read from the existing `scripts/sync-harness.sh` manifest.
+  New release/tag fixtures write objects and refs directly in the temporary
+  bare repository, including release commits whose tag has not landed yet.
 - The real `consumer` matrix and its `repository_secret` includes are checked
   and passed unchanged: `offline`, `hosted`, and `application`. The public
   offline repository remains `pineforge-backtest-mcp`. Dummy configuration is
@@ -54,15 +67,16 @@ cache directory; keep build/test transcripts internal. The commands below are
 run on that host, with no production credentials copied to it:
 
 ```bash
-python3 -m pip install pyyaml        # or use a virtualenv
-python3 tools/release-dry-run/dry_run.py
+python3 tools/release-dry-run/dry_run.py --metadata-action /prepared/docker-metadata-action
+python3 tools/release-dry-run/dry_run.py -k triple --metadata-action /prepared/docker-metadata-action
 python3 -m unittest discover -s tools/release-dry-run -p 'test_wfrun.py' -v
 python3 -m unittest discover -s tests -p 'test_release_*.py' -v
 ```
 
-The first run clones `docker/metadata-action` at the major version
-`publish.yml` uses into `~/.cache/pineforge-release-dry-run/`. Pass
-`--metadata-action DIR` to use a checkout you already have.
+`--metadata-action DIR` is required: supply the prepared `docker/metadata-action`
+checkout at the version `publish.yml` uses. It must contain `dist/index.js` and
+its dependencies. The replay reads that checkout and uses only its local
+GitHub API stand-in; it never auto-clones or writes a home-directory cache.
 
 Each check prints `PASS` or `FAIL`. The exit status is 0 only when every check
 passes. Transcripts and state go to a new temporary directory (`--out DIR` to
@@ -83,6 +97,7 @@ GitHub deployment or Pages publication.
 | `lost-partner` | The partner's dispatch never arrives. Re-running the waiting run (same event) completes the pair. |
 | `retag` | The release commit reached `main` but its tag push failed. The next event tags that commit. |
 | `legacy` | 0.x as before: a patch bump, `latest` and GitHub Latest. A failing `gh release list` fails the step instead of creating the release. A hand-made tag with a mismatched 1.0 pair fails before any build. |
+| `triple` | Six independent 1.5.9 -> 1.6.0 histories cover every engine/codegen/hpo arrival order. The first two events wait and name every missing partner without moving main, tagging, building or dispatching; the third records three adjacent pins. Publish checks the triple, selects the explicit `hpo` target and supplies the matching `HPO_VERSION` and available `HPO_WHEEL_SHA256`, with the existing stable image tags and fanout. A landed v1.5.0 tag without `hpo=` still publishes with the old build arguments and no target. Hpo events below the cutoff (including 1.6.0-rc.1) and malformed payloads are refused. Hpo 1.6.1 with landed engine/codegen 1.6.0 waits for both; different new partner versions fail naming all odd versions. Uncertain HTTP statuses and an unmodeled hpo URL fail; missing, invalid or mismatched hpo tag pins fail before any build/release/dispatch. Duplicate triples are no-ops, and half-done triples tag the existing release commit. |
 
 The pair world also runs the real consumer job, for the rc.1 prerelease and for
 1.0.0, with missing, empty, owner/path and multiline target configuration for
@@ -111,8 +126,8 @@ several is a harness error. A prerelease control also breaks the decision step
 in a synthetic checkout: only its first condition changes and every guard
 stays, so the application leg dispatches and mints its token on an all-green
 run. The unmodified oracle must reject that run, and the control checks that
-the run really reached the application dispatch. The existing five worlds and
-failure/recovery assertions remain. Controls also remove/change
+the run really reached the application dispatch. All existing worlds and
+failure/recovery assertions remain alongside `triple`. Controls also remove/change
 `fail-fast: false` and switch each typed `prerelease`/`run_id` field from `-F`
 to `-f`: successful dispatches carrying the same text with the wrong JSON type
 must fail the oracle.
@@ -122,7 +137,7 @@ the dry run at it:
 
 ```bash
 git clone -q . /tmp/mutant && sed -i.bak 's/ --exclude-drafts//' /tmp/mutant/.github/workflows/publish.yml
-python3 tools/release-dry-run/dry_run.py --checkout /tmp/mutant   # FAIL: "... GitHub Latest although a draft v9.9.9 exists"
+python3 tools/release-dry-run/dry_run.py --checkout /tmp/mutant --metadata-action /prepared/docker-metadata-action   # FAIL: "... GitHub Latest although a draft v9.9.9 exists"
 ```
 
 `wfrun.py` is the generic runner underneath. It runs one job of any workflow
