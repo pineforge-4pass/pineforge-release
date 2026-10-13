@@ -233,8 +233,8 @@ jobs:
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=release-amd64
+          cache-to: type=gha,scope=release-amd64,mode=max
 
       - name: Inspect release arm64
         if: steps.pair.outputs.target != 'hpo'
@@ -252,8 +252,8 @@ jobs:
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=release-arm64
+          cache-to: type=gha,scope=release-arm64,mode=max
 
       - name: Inspect hpo amd64
         if: steps.pair.outputs.target == 'hpo'
@@ -275,8 +275,8 @@ jobs:
             ${{ steps.toolchain.outputs.args }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=hpo-amd64
+          cache-to: type=gha,scope=hpo-amd64,mode=max
 
       - name: Inspect hpo arm64
         if: steps.pair.outputs.target == 'hpo'
@@ -298,8 +298,8 @@ jobs:
             ${{ steps.toolchain.outputs.args }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=hpo-arm64
+          cache-to: type=gha,scope=hpo-arm64,mode=max
 
       - name: Read Debian package inventories
         run: |
@@ -338,6 +338,7 @@ jobs:
             --release-assets "$RUNNER_TEMP/source-assets.json" --sources-list "$RUNNER_TEMP/$SOURCE_LIST"
 
       - name: Build + push (multi-arch)
+        id: push_release
         if: steps.pair.outputs.target != 'hpo'
         uses: docker/build-push-action@v6
         with:
@@ -352,10 +353,15 @@ jobs:
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha,scope=release-amd64
+            type=gha,scope=release-arm64
+          cache-to: |
+            type=gha,scope=release-amd64,mode=max
+            type=gha,scope=release-arm64,mode=max
 
       - name: Build + push hpo (multi-arch)
+        id: push_hpo
         if: steps.pair.outputs.target == 'hpo'
         uses: docker/build-push-action@v6
         with:
@@ -374,8 +380,41 @@ jobs:
             ${{ steps.toolchain.outputs.args }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha,scope=hpo-amd64
+            type=gha,scope=hpo-arm64
+          cache-to: |
+            type=gha,scope=hpo-amd64,mode=max
+            type=gha,scope=hpo-arm64,mode=max
+
+      - name: Check pushed Debian source mirror
+        env:
+          RELEASE_DIGEST: ${{ steps.push_release.outputs.digest }}
+          HPO_DIGEST: ${{ steps.push_hpo.outputs.digest }}
+          RELEASE_PUSH_OUTCOME: ${{ steps.push_release.outcome }}
+          HPO_PUSH_OUTCOME: ${{ steps.push_hpo.outcome }}
+          SOURCE_LIST: ${{ steps.source_set.outputs.list-asset }}
+        run: |
+          set -euo pipefail
+          # This DETECTS drift; it does not prevent it: tags are already pushed
+          # and sources are never deleted.
+          case "${RELEASE_PUSH_OUTCOME}:${HPO_PUSH_OUTCOME}" in
+            success:skipped) digest="$RELEASE_DIGEST" ;;
+            skipped:success) digest="$HPO_DIGEST" ;;
+            *) echo "::error::expected exactly one successful image push"; exit 1 ;;
+          esac
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::missing or malformed pushed image digest"; exit 1; }
+          image="${REGISTRY}/${IMAGE}@${digest}"
+          docker pull --platform linux/amd64 "$image"
+          docker run --rm --platform linux/amd64 --entrypoint dpkg-query "$image" \
+            -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' > "$RUNNER_TEMP/pushed-debian-amd64.tsv"
+          docker pull --platform linux/arm64 "$image"
+          docker run --rm --platform linux/arm64 --entrypoint dpkg-query "$image" \
+            -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' > "$RUNNER_TEMP/pushed-debian-arm64.tsv"
+          python3 scripts/release_sources.py check --registry docker/SOURCE-SETS.tsv \
+            --amd64 "$RUNNER_TEMP/pushed-debian-amd64.tsv" --arm64 "$RUNNER_TEMP/pushed-debian-arm64.tsv" \
+            --release-assets "$RUNNER_TEMP/source-assets.json" --sources-list "$RUNNER_TEMP/$SOURCE_LIST"
 
       - name: GitHub Release
         env:

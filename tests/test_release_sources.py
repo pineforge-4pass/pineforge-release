@@ -11,6 +11,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,7 +20,7 @@ import unittest
 from pathlib import Path
 
 from test_release_hpo_image import (
-    _build_arguments, _dockerfile_stages, _reachable_stages,
+    _build_arguments, _dockerfile_instructions, _dockerfile_stages, _reachable_stages,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -121,6 +123,11 @@ class SourceGuardTest(unittest.TestCase):
         self.assertEqual(result.stdout, "", "a refusal must never emit a successful set-id")
         self.assertIn(message, result.stderr)
 
+    def source_asset_positions(self):
+        # The SOURCES.list metadata is last in self.assets; the last SOURCE
+        # archive is at len(self.pairs) - 1, and must be tested separately.
+        return (("first", 0), ("middle", len(self.pairs) // 2), ("last", len(self.pairs) - 1))
+
     def test_01_no_registered_set_is_refused(self):
         self.registry.write_text(REGISTRY_HEADER + "# no mirrors yet\n", encoding="utf-8")
         self.refused(self.check(), f"source set {_set_id(self.pairs)} is not in registry")
@@ -131,18 +138,27 @@ class SourceGuardTest(unittest.TestCase):
         self.refused(self.check([]), "missing release asset: set-02.SOURCES.list")
 
     def test_03_one_named_source_asset_missing_is_refused(self):
-        name = self.assets[0]["name"]
-        self.refused(self.check(self.assets[1:]), f"missing release asset: {name}")
+        for position, index in self.source_asset_positions():
+            with self.subTest(position=position):
+                name = self.assets[index]["name"]
+                assets = [item.copy() for item in self.assets if item["name"] != name]
+                self.refused(self.check(assets), f"missing release asset: {name}")
 
     def test_04_wrong_source_asset_digest_is_refused(self):
-        item = self.assets[0]
-        item["digest"] = "sha256:" + hashlib.sha256(b"a different fixture").hexdigest()
-        self.refused(self.check(), f"digest mismatch for {item['name']}")
+        for position, index in self.source_asset_positions():
+            with self.subTest(position=position):
+                assets = [item.copy() for item in self.assets]
+                item = assets[index]
+                item["digest"] = "sha256:" + hashlib.sha256(b"a different fixture").hexdigest()
+                self.refused(self.check(assets), f"digest mismatch for {item['name']}")
 
     def test_05_wrong_source_asset_size_is_refused(self):
-        item = self.assets[0]
-        item["size"] += 1
-        self.refused(self.check(), f"size mismatch for {item['name']}")
+        for position, index in self.source_asset_positions():
+            with self.subTest(position=position):
+                assets = [item.copy() for item in self.assets]
+                item = assets[index]
+                item["size"] += 1
+                self.refused(self.check(assets), f"size mismatch for {item['name']}")
 
     def test_06_image_pair_absent_from_list_is_refused(self):
         pairs = self.pairs + [("fixture-extra", "1.0-1")]
@@ -183,8 +199,11 @@ class SourceGuardTest(unittest.TestCase):
         self.refused(self.check(), "registry pair count 83 does not match image pair count 84")
 
     def test_12_duplicate_release_asset_name_is_refused(self):
-        self.assets.append(self.assets[0].copy())
-        self.refused(self.check(), f"duplicate release asset: {self.assets[0]['name']}")
+        for position, index in self.source_asset_positions():
+            with self.subTest(position=position):
+                assets = [item.copy() for item in self.assets]
+                assets.append(assets[index].copy())
+                self.refused(self.check(assets), f"duplicate release asset: {assets[index]['name']}")
 
     def test_13_extra_list_pair_is_refused_even_when_all_assets_exist(self):
         data = b"TEST FIXTURE ONLY: extra source\n"
@@ -199,10 +218,12 @@ class SourceGuardTest(unittest.TestCase):
         self.refused(self.check(), "only in list (first 5): fixture-extra\t1.0-1")
 
     def test_14_missing_or_non_sha256_asset_digest_is_refused(self):
-        for digest in (None, "", "md5:invalid"):
-            with self.subTest(digest=digest):
-                self.assets[0]["digest"] = digest
-                self.refused(self.check(), f"digest mismatch for {self.assets[0]['name']}")
+        for position, index in self.source_asset_positions():
+            for digest in (None, "", "md5:invalid"):
+                with self.subTest(position=position, digest=digest):
+                    assets = [item.copy() for item in self.assets]
+                    assets[index]["digest"] = digest
+                    self.refused(self.check(assets), f"digest mismatch for {assets[index]['name']}")
 
     def test_15_architecture_difference_lists_only_first_five_per_side(self):
         pairs = [(source, "99.0-1") if index < 6 else (source, version)
@@ -219,6 +240,23 @@ class SourceGuardTest(unittest.TestCase):
         pairs = [(source, f"{index}.0-1") for source, _ in self.pairs[:10] for index in range(6)]
         self.amd64.write_text(_inventory(pairs), encoding="utf-8")
         self.refused(self.check(), "has 10 distinct source packages; need at least 50")
+
+    def test_17_sources_list_filename_must_match_the_registered_asset(self):
+        renamed = self.root / "set-03.SOURCES.list"
+        renamed.write_bytes(self.sources_list.read_bytes())
+        self.sources_list = renamed
+        self.refused(self.check(),
+                     "SOURCES.list filename does not match registry list-asset: set-02.SOURCES.list")
+
+    def test_18_registry_list_asset_must_have_a_set_numbered_filename(self):
+        original = self.registry.read_text(encoding="utf-8")
+        for name in ("SOURCES.list", "set-2.SOURCES.list", "../set-02.SOURCES.list",
+                     "set-02.SOURCES.list.bak"):
+            with self.subTest(filename=name):
+                self.registry.write_text(original.replace("\tset-02.SOURCES.list\n", f"\t{name}\n", 1),
+                                         encoding="utf-8")
+                self.refused(self.check(),
+                             "registry line 2: list-asset must name a set-NN.SOURCES.list asset")
 
     def test_90_complete_mirror_passes_and_prints_the_independent_set_id(self):
         result = self.check()
@@ -237,10 +275,13 @@ class SourceGuardTest(unittest.TestCase):
     def test_91_changing_one_digest_byte_flips_the_verdict(self):
         before = self.check()
         self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
-        item = self.assets[0]
-        digest = item["digest"]
-        item["digest"] = digest[:-1] + ("0" if digest[-1] != "0" else "1")
-        self.refused(self.check(), f"digest mismatch for {item['name']}")
+        for position, index in self.source_asset_positions():
+            with self.subTest(position=position):
+                assets = [item.copy() for item in self.assets]
+                item = assets[index]
+                digest = item["digest"]
+                item["digest"] = digest[:-1] + ("0" if digest[-1] != "0" else "1")
+                self.refused(self.check(assets), f"digest mismatch for {item['name']}")
 
     def test_92_pairs_are_unique_sorted_and_hashed_with_a_final_newline(self):
         self.assertIn("gcc:amd64\t4:12.2.0-3\tgcc-defaults\t1.203\n",
@@ -354,15 +395,45 @@ class SourceNoticeTest(unittest.TestCase):
         self.assertEqual(len(runs), 1, name)
         return runs[0]
 
-    def test_each_final_runtime_writes_notice_after_every_doc_cleanup_and_label(self):
+    def cleanup_run(self, name):
+        runs = [(index, body) for index, (keyword, body) in enumerate(self.stages[name].instructions)
+                if keyword == "RUN" and "find /usr/share/doc" in body and "-delete" in body]
+        self.assertEqual(len(runs), 1,
+                         name + ": expected one copyright-preserving doc cleanup RUN")
+        return runs[0]
+
+    def run_shell(self, script, root, version="unknown"):
+        shell = shutil.which("sh", path=os.defpath)
+        self.assertIsNotNone(shell, "sh is required to exercise the real Dockerfile RUN")
+        return subprocess.run([shell, "-c", script], cwd=root,
+                              env={"PATH": os.defpath, "RELEASE_VERSION": version},
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+
+    def test_each_final_runtime_keeps_copyright_after_apt_and_before_its_notice(self):
         for name in ("release", "hpo"):
             with self.subTest(stage=name):
                 stage = self.stages[name]
                 notice_index, run = self.notice_run(name)
-                cleanups = [index for index, (keyword, body) in enumerate(stage.instructions)
-                            if keyword == "RUN" and "rm -rf" in body and "/usr/share/doc " in body]
-                self.assertTrue(cleanups, "test must see the real doc-clearing apt instruction")
-                self.assertGreater(notice_index, max(cleanups))
+                cleanup_index, cleanup = self.cleanup_run(name)
+                apt_runs = [(index, body) for index, (keyword, body) in enumerate(stage.instructions)
+                            if keyword == "RUN" and "apt-get install" in body]
+                self.assertEqual(len(apt_runs), 1, "test must see the final stage's real apt RUN")
+                apt_index, apt = apt_runs[0]
+                self.assertLess(apt_index, cleanup_index, "copyright cleanup must follow apt")
+                self.assertLess(cleanup_index, notice_index, "copyright cleanup must precede the notice")
+                self.assertEqual(apt.count("rm -rf"), 1)
+                self.assertEqual(shlex.split(apt.split("rm -rf", 1)[1]),
+                                 ["/var/lib/apt/lists/*", "/usr/share/man",
+                                  "/usr/share/locale", "/usr/share/info"],
+                                 "apt cleanup must remove only the /usr/share/doc token")
+                self.assertTrue(cleanup.startswith("set -eu;"))
+                self.assertEqual(stage.text.count("# --- sources notice (begin)\n"), 1)
+                self.assertEqual(stage.text.count("# --- sources notice (end)\n"), 1)
+                block = stage.text.split("# --- sources notice (begin)\n", 1)[1].split(
+                    "# --- sources notice (end)\n", 1)[0]
+                instructions = _dockerfile_instructions(block)
+                self.assertIn(("RUN", cleanup), instructions)
+                self.assertIn(("RUN", run), instructions)
                 other_doc_mentions = [index for index, (_, body) in enumerate(stage.instructions)
                                       if "/usr/share/doc" in body and index != notice_index]
                 self.assertGreater(notice_index, max(other_doc_mentions))
@@ -374,31 +445,104 @@ class SourceNoticeTest(unittest.TestCase):
                 copies = [body for keyword, body in stage.instructions if keyword == "COPY"]
                 self.assertIn("docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in", copies)
 
-    def test_real_sed_substitutions_render_tag_and_local_urls(self):
-        # Extract the actual sed expressions from BOTH real RUN instructions;
-        # a separate invented renderer cannot make a broken Dockerfile pass.
+    def test_real_cleanup_preserves_regular_copyright_and_both_kinds_of_symlink(self):
+        for name in ("release", "hpo"):
+            with self.subTest(stage=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                docs = root / "usr share doc"
+                keep = {"gcc-12-base/copyright": b"gcc copyright fixture\n",
+                        "fixture-package/copyright": b"another copyright fixture\n"}
+                for relative, data in keep.items():
+                    target = docs / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+                (docs / "libgcc-s1").symlink_to("gcc-12-base", target_is_directory=True)
+                (docs / "copyright-link").mkdir()
+                linked = docs / "copyright-link" / "copyright"
+                linked.symlink_to("../gcc-12-base/copyright")
+                for relative in ("gcc-12-base/changelog.gz", "fixture-package/examples/demo.txt",
+                                 "only-changelogs/changelog", "pineforge/SOURCES.txt"):
+                    target = docs / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"discard this documentation\n")
+                (docs / "empty-directory").mkdir()
+                _, run = self.cleanup_run(name)
+                script = run.replace("/usr/share/doc", shlex.quote(str(docs)))
+                done = self.run_shell(script, root)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                for relative, data in keep.items():
+                    self.assertEqual((docs / relative).read_bytes(), data)
+                self.assertTrue((docs / "libgcc-s1").is_symlink(), "package doc symlink must survive")
+                self.assertEqual((docs / "libgcc-s1").readlink(), Path("gcc-12-base"))
+                self.assertEqual((docs / "libgcc-s1" / "copyright").read_bytes(), keep["gcc-12-base/copyright"])
+                self.assertTrue(linked.is_symlink(), "copyright file symlink must survive")
+                self.assertEqual(linked.readlink(), Path("../gcc-12-base/copyright"))
+                self.assertEqual(linked.read_bytes(), keep["gcc-12-base/copyright"])
+                remaining = {str(path.relative_to(docs)) for path in docs.rglob("*")
+                             if path.is_file() and not path.is_symlink()}
+                self.assertEqual(remaining, set(keep), "non-copyright regular files must be removed")
+                for relative in ("fixture-package/examples", "only-changelogs", "pineforge", "empty-directory"):
+                    self.assertFalse((docs / relative).exists(), "empty doc directories must be removed")
+
+    def test_real_cleanup_succeeds_with_absent_or_empty_doc_paths(self):
+        for name in ("release", "hpo"):
+            for present in (False, True):
+                with self.subTest(stage=name, doc_path_present=present), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    docs = root / "docs"
+                    if present:
+                        docs.mkdir()
+                    _, run = self.cleanup_run(name)
+                    done = self.run_shell(run.replace("/usr/share/doc", shlex.quote(str(docs))), root)
+                    self.assertEqual(done.returncode, 0,
+                                     "absent or empty doc paths must not fail the build: " + done.stderr)
+
+    def assert_notice_rendered(self, run, version, expected_url):
+        # Execute the actual RUN body; only the two image paths are relocated.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notice_dir = root / "usr share doc pineforge"
+            template = root / "pineforge SOURCES.txt.in"
+            template.write_text(self.template, encoding="utf-8")
+            script = run.replace("/usr/share/doc/pineforge", shlex.quote(str(notice_dir))).replace(
+                "/tmp/pineforge-SOURCES.txt.in", shlex.quote(str(template)))
+            done = self.run_shell(script, root, version)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            notice = notice_dir / "SOURCES.txt"
+            self.assertTrue(notice.is_file(), "notice RUN must write the declared SOURCES.txt path")
+            rendered = notice.read_text(encoding="utf-8")
+            self.assertIn("  " + expected_url + "\n", rendered,
+                          "notice RUN must write the expected URL to SOURCES.txt")
+            self.assertNotIn("@RELEASE_VERSION@", rendered)
+            self.assertFalse(template.exists(), "notice RUN must remove its temporary template")
+            if version == "unknown":
+                self.assertNotIn(RELEASES_URL + "/tag/", rendered)
+                self.assertIn("Local build: use the releases page to locate mirrored Debian sources.\n", rendered)
+            else:
+                self.assertNotIn("Local build:", rendered)
+
+    def test_real_notice_run_writes_tagged_prerelease_and_local_urls(self):
         for name in ("release", "hpo"):
             _, run = self.notice_run(name)
-            self.assertIn('if [ "${RELEASE_VERSION}" = unknown ]; then', run)
-            expressions = re.findall(r"sed\s+(['\"])(s\|[^\n]*?)\1\s+/tmp/pineforge-SOURCES\.txt\.in", run)
-            self.assertEqual(len(expressions), 2, run)
-            local_expression, release_expression = [expression for _, expression in expressions]
-            for version, expression, expected_url in (
-                    ("v1.6.0", release_expression, RELEASES_URL + "/tag/v1.6.0"),
-                    ("v1.6.0-rc.1", release_expression, RELEASES_URL + "/tag/v1.6.0-rc.1"),
-                    ("unknown", local_expression, RELEASES_URL)):
+            for version, expected_url in (("v1.6.0", RELEASES_URL + "/tag/v1.6.0"),
+                                          ("v1.6.0-rc.1", RELEASES_URL + "/tag/v1.6.0-rc.1"),
+                                          ("unknown", RELEASES_URL)):
                 with self.subTest(stage=name, version=version):
-                    operation, old, new, flags = expression.split("|")
-                    self.assertEqual((operation, flags), ("s", "g"))
-                    rendered = self.template.replace(old, new.replace("${RELEASE_VERSION}", version))
-                    if version == "unknown":
-                        local_line = re.search(r"printf '%s\\n' '([^']+)' >> " + re.escape(NOTICE_PATH), run)
-                        self.assertIsNotNone(local_line, "unknown builds must add one local-build line")
-                        self.assertIn("Local build", local_line[1])
-                        rendered += local_line[1] + "\n"
-                        self.assertNotIn(RELEASES_URL + "/tag/", rendered)
-                    self.assertIn("  " + expected_url + "\n", rendered)
-                    self.assertNotIn("@RELEASE_VERSION@", rendered)
+                    self.assert_notice_rendered(run, version, expected_url)
+
+    def test_a_typo_in_either_real_notice_redirect_is_detected(self):
+        for name in ("release", "hpo"):
+            _, run = self.notice_run(name)
+            redirects = list(re.finditer(r"sed [^;]+ > (" + re.escape(NOTICE_PATH) + r")(?=;)", run))
+            self.assertEqual(len(redirects), 2, "test must find both real sed output redirects")
+            for index, version, url in ((0, "unknown", RELEASES_URL),
+                                        (1, "v1.6.0", RELEASES_URL + "/tag/v1.6.0")):
+                with self.subTest(stage=name, version=version):
+                    redirect = redirects[index]
+                    altered = run[:redirect.start(1)] + NOTICE_PATH + ".wrong" + run[redirect.end(1):]
+                    self.assertNotEqual(altered, run)
+                    with self.assertRaisesRegex(AssertionError, "notice RUN must write"):
+                        self.assert_notice_rendered(altered, version, url)
 
     def test_every_stage_that_expands_release_version_declares_the_argument(self):
         # A build ARG is local to its stage: `FROM release AS hpo` does not inherit the value
@@ -475,6 +619,22 @@ class SourceRetentionTest(unittest.TestCase):
         self.assertIn("A release's source assets are never deleted while its image remains on ghcr.", readme)
         self.assertIn(NOTICE_PATH, readme)
         self.assertIn("[BIZ licence statement placeholder:", readme)
+
+    def test_readme_documents_bootstrapping_new_source_sets_and_kept_copyright_files(self):
+        readme = " ".join((REPO / "README.md").read_text(encoding="utf-8").split())
+        self.assertIn(
+            "A new source set (an image package set not yet in docker/SOURCE-SETS.tsv) needs its "
+            "bundle attached to an earlier or dedicated release before its first publish, because "
+            "the guard looks up the holding release by tag before the new tag's GitHub Release exists.",
+            readme,
+            "README must explain how to make a new source set available before its first publish",
+        )
+        self.assertIn(
+            "The default image differs from 1.5.0 only by the source notice and the retained "
+            "Debian package copyright files.",
+            readme,
+            "README must state the notice and copyright differences from the 1.5.0 default image",
+        )
 
 
 if __name__ == "__main__":

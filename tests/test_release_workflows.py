@@ -261,6 +261,11 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         guard = self.named["Check Debian source mirror"]
         for target, publish_name in expected:
             real = self.named[publish_name]
+            scopes = [f"type=gha,scope={target}-{arch}" for arch in ("amd64", "arm64")]
+            self.assertEqual(real["with"]["cache-from"].splitlines(), scopes,
+                             "push must reuse each architecture's inspected cache")
+            self.assertEqual(real["with"]["cache-to"].splitlines(),
+                             [scope + ",mode=max" for scope in scopes])
             for arch in ("amd64", "arm64"):
                 with self.subTest(target=target, arch=arch):
                     inspection = self.named[f"Inspect {target} {arch}"]
@@ -271,14 +276,29 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                     self.assertEqual(config["load"], "true")
                     self.assertEqual(config["push"], "false")
                     self.assertEqual(config["tags"], f"pineforge-source-inspect:{arch}")
-                    for key in ("context", "file", "target", "build-args", "cache-from", "cache-to", "labels"):
+                    for key in ("context", "file", "target", "build-args", "labels"):
                         self.assertEqual(config.get(key), real["with"].get(key), key)
+                    scope = f"type=gha,scope={target}-{arch}"
+                    self.assertEqual(config["cache-from"], scope,
+                                     "inspection cache scope must name its target and architecture")
+                    self.assertEqual(config["cache-to"], scope + ",mode=max")
+                    self.assertIn(config["cache-from"], real["with"]["cache-from"].splitlines())
+                    self.assertIn(config["cache-to"], real["with"]["cache-to"].splitlines())
                     self.assertLess(self.steps.index(inspection), self.steps.index(guard))
                     self.assertNotIn("continue-on-error", inspection)
                     if target == "hpo":
                         self.assertLess(self.steps.index(self.named["Read hpo toolchain arguments"]),
                                         self.steps.index(inspection))
                         self.assertIn("${{ steps.toolchain.outputs.args }}", config["build-args"])
+
+    def test_plain_release_inspections_and_push_receive_the_pinned_version_arguments(self):
+        for name in ("Inspect release amd64", "Inspect release arm64", "Build + push (multi-arch)"):
+            with self.subTest(step=name):
+                arguments = self.named[name]["with"]["build-args"].splitlines()
+                for expected in ("ENGINE_VERSION=${{ steps.pins.outputs.engine }}",
+                                 "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
+                                 "RELEASE_VERSION=${{ github.ref_name }}"):
+                    self.assertIn(expected, arguments, name + " must receive " + expected)
 
     def test_guard_is_mandatory_before_every_push_and_release_including_prereleases(self):
         names = ("Read Debian package inventories", "Locate Debian source bundle",
@@ -299,12 +319,101 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         self.assertEqual(len(releases), 1, "test must find the existing release step")
         for step in pushes + releases:
             self.assertLess(order[-1], self.steps.index(step))
+            self.assertNotIn("continue-on-error", step)
             self.assertNotRegex(step.get("if", ""), r"\b(?:always|failure|cancelled)\s*\(")
         run = self.named["Check Debian source mirror"]["run"]
         self.assertIn("python3 scripts/release_sources.py check", run)
         for argument in ("--registry docker/SOURCE-SETS.tsv", "--amd64", "--arm64",
                          "--release-assets", "--sources-list"):
             self.assertIn(argument, run)
+
+    def check_arguments(self, name):
+        run = re.sub(r"\\\n\s*", " ", self.named[name]["run"])
+        commands = [line.strip() for line in run.splitlines()
+                    if line.strip().startswith("python3 scripts/release_sources.py check ")]
+        self.assertEqual(len(commands), 1, name + " must run the real source check once")
+        tokens = shlex.split(commands[0])
+        result = {}
+        for flag in ("--registry", "--amd64", "--arm64", "--release-assets", "--sources-list"):
+            self.assertEqual(tokens.count(flag), 1, name + " must supply " + flag + " once")
+            result[flag] = tokens[tokens.index(flag) + 1]
+        return result
+
+    def test_pre_and_post_checks_use_distinct_architecture_files_and_the_same_mirror_evidence(self):
+        before = self.check_arguments("Check Debian source mirror")
+        after = self.check_arguments("Check pushed Debian source mirror")
+        for name, arguments, prefix in (("pre-push", before, "debian"),
+                                        ("post-push", after, "pushed-debian")):
+            with self.subTest(check=name):
+                self.assertNotEqual(arguments["--amd64"], arguments["--arm64"],
+                                    "amd64 and arm64 must be read from different files")
+                for arch in ("amd64", "arm64"):
+                    self.assertEqual(arguments["--" + arch], f"$RUNNER_TEMP/{prefix}-{arch}.tsv")
+        for flag, value in (("--registry", "docker/SOURCE-SETS.tsv"),
+                            ("--release-assets", "$RUNNER_TEMP/source-assets.json"),
+                            ("--sources-list", "$RUNNER_TEMP/$SOURCE_LIST")):
+            self.assertEqual(before[flag], value)
+            self.assertEqual(after[flag], value, "post-push check must reuse pre-push mirror evidence")
+        self.assertEqual(self.named["Check pushed Debian source mirror"]["env"]["SOURCE_LIST"],
+                         self.named["Check Debian source mirror"]["env"]["SOURCE_LIST"])
+
+    def test_post_push_check_is_mandatory_after_all_pushes_before_release_and_dispatch(self):
+        self.assertIn("Check pushed Debian source mirror", self.named,
+                      "published images must be checked by digest before release creation")
+        post = self.named["Check pushed Debian source mirror"]
+        self.assertNotIn("if", post, "post-push check must use the default success condition")
+        self.assertNotIn("continue-on-error", post)
+        self.assertIn("set -euo pipefail", post["run"])
+        self.assertNotIn("|| true", post["run"])
+        pushes = [step for step in self.steps if step.get("with", {}).get("push") == "true"]
+        self.assertEqual(len(pushes), 2)
+        for push in pushes:
+            self.assertLess(self.steps.index(push), self.steps.index(post))
+            self.assertNotIn("continue-on-error", push)
+        releases = [step for step in self.steps if "gh release create" in step.get("run", "")]
+        self.assertEqual(len(releases), 1)
+        for release in releases:
+            self.assertLess(self.steps.index(post), self.steps.index(release))
+            self.assertNotIn("if", release)
+            self.assertNotIn("continue-on-error", release)
+        notify = self.workflow["jobs"]["notify-consumers"]
+        self.assertEqual(notify["needs"], "publish", "dispatch must wait for the post-push check")
+        self.assertNotIn("if", notify)
+        dispatches = [step for step in notify["steps"] if "/dispatches" in step.get("run", "")]
+        self.assertEqual(len(dispatches), 1, "test must find the existing consumer dispatch")
+
+    def test_post_push_check_pulls_both_architectures_by_the_successful_push_digest(self):
+        post = self.named["Check pushed Debian source mirror"]
+        for name, identity, digest_var, outcome_var in (
+                ("Build + push (multi-arch)", "push_release", "RELEASE_DIGEST", "RELEASE_PUSH_OUTCOME"),
+                ("Build + push hpo (multi-arch)", "push_hpo", "HPO_DIGEST", "HPO_PUSH_OUTCOME")):
+            with self.subTest(push=name):
+                self.assertEqual(self.named[name]["id"], identity)
+                self.assertEqual(post["env"][digest_var], "${{ steps." + identity + ".outputs.digest }}")
+                self.assertEqual(post["env"][outcome_var], "${{ steps." + identity + ".outcome }}")
+        run = post["run"]
+        self.assertIn('case "${RELEASE_PUSH_OUTCOME}:${HPO_PUSH_OUTCOME}" in', run)
+        self.assertIn('success:skipped) digest="$RELEASE_DIGEST" ;;', run)
+        self.assertIn('skipped:success) digest="$HPO_DIGEST" ;;', run)
+        self.assertIn('*) echo "::error::expected exactly one successful image push"; exit 1 ;;', run)
+        self.assertIn('[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]', run)
+        self.assertIn('image="${REGISTRY}/${IMAGE}@${digest}"', run)
+        logical = re.sub(r"\\\n\s*", " ", run)
+        pulls = [shlex.split(line) for line in logical.splitlines()
+                 if line.strip().startswith("docker pull ")]
+        inventories = [shlex.split(line) for line in logical.splitlines()
+                       if line.strip().startswith("docker run ")]
+        self.assertEqual(pulls, [["docker", "pull", "--platform", f"linux/{arch}", "$image"]
+                                 for arch in ("amd64", "arm64")])
+        query = r"-f=${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n"
+        self.assertEqual(inventories, [
+            ["docker", "run", "--rm", "--platform", f"linux/{arch}", "--entrypoint", "dpkg-query",
+             "$image", "-W", query, ">", f"$RUNNER_TEMP/pushed-debian-{arch}.tsv"]
+            for arch in ("amd64", "arm64")])
+        self.assertNotIn("pineforge-source-inspect:", run)
+        self.assertIn("DETECTS", run)
+        self.assertIn("tags are already pushed", run)
+        self.assertIn("sources are never deleted", run)
 
     def test_both_inventories_use_dpkg_query_with_the_source_columns(self):
         run = self.named["Read Debian package inventories"]["run"]

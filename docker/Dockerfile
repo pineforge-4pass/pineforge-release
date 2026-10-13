@@ -85,9 +85,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         g++ \
         libeigen3-dev \
         python3 \
-    && rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man /usr/share/locale /usr/share/info
+    && rm -rf /var/lib/apt/lists/* /usr/share/man /usr/share/locale /usr/share/info
 
 # --- sources notice (begin)
+# Keep copyright files and symlinks (including package doc directory aliases).
+RUN set -eu; \
+    if [ -d /usr/share/doc ]; then \
+      find /usr/share/doc -type f ! -name copyright -delete; \
+      find /usr/share/doc -depth -type d -empty -delete; \
+    fi
 COPY docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in
 LABEL io.pineforge.sources.notice="/usr/share/doc/pineforge/SOURCES.txt" \
       io.pineforge.sources.url="https://github.com/pineforge-4pass/pineforge-release/releases/tag/${RELEASE_VERSION}"
@@ -271,9 +277,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       "libgcc-12-dev=${HPO_GCC_VERSION}" "libstdc++-12-dev=${HPO_GCC_VERSION}" \
       "libgcc-s1=${HPO_GCC_VERSION}" "libstdc++6=${HPO_GCC_VERSION}" \
       "binutils=${HPO_BINUTILS_VERSION}" "libeigen3-dev=${HPO_EIGEN_VERSION}" \
-    && rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man /usr/share/locale /usr/share/info
+    && rm -rf /var/lib/apt/lists/* /usr/share/man /usr/share/locale /usr/share/info
 
 # --- sources notice (begin)
+# Keep copyright files and symlinks (including package doc directory aliases).
+RUN set -eu; \
+    if [ -d /usr/share/doc ]; then \
+      find /usr/share/doc -type f ! -name copyright -delete; \
+      find /usr/share/doc -depth -type d -empty -delete; \
+    fi
 COPY docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in
 LABEL io.pineforge.sources.notice="/usr/share/doc/pineforge/SOURCES.txt" \
       io.pineforge.sources.url="https://github.com/pineforge-4pass/pineforge-release/releases/tag/${RELEASE_VERSION}"

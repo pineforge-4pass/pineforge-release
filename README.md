@@ -258,10 +258,14 @@ stops both image publishing and release creation for every `v*` tag.
 The registry has five tab-separated columns: `set-id`, `release-tag`, `n-pairs`,
 `sources-list-sha256`, and `list-asset` (the exact `set-NN.SOURCES.list` name).
 The set id hashes sorted unique `source<TAB>version` lines with a final newline.
-The separate box run fetches the real sources; the owner attaches them to the
-earliest release using each set. Add registry rows only after those real list
+The separate box run fetches the real sources; the owner attaches them to a
+holding release. Add registry rows only after those real list
 files and their source assets are available. The registry is initially empty,
 so publishing remains refused until that evidence is recorded.
+A new source set (an image package set not yet in docker/SOURCE-SETS.tsv) needs
+its bundle attached to an earlier or dedicated release before its first publish,
+because the guard looks up the holding release by tag before the new tag's
+GitHub Release exists.
 
 ## License
 
@@ -309,8 +313,10 @@ The Dockerfile refuses to build when the harness `EXPECTED_PF_ABI` differs from
 
 ## HPO command and bundled licences
 
-`docker build` without `--target`, using `docker/Dockerfile`, builds the unchanged
-backtest image: the last `default` stage aliases the original runtime, `release`.
+`docker build` without `--target`, using `docker/Dockerfile`, builds the
+backtest image: the last `default` stage aliases the runtime, `release`.
+The default image differs from 1.5.0 only by the source notice and the retained
+Debian package copyright files.
 Only `ENGINE_VERSION` and `CODEGEN_VERSION` are required for that build, and its
 entrypoint remains `/opt/pineforge/bin/entrypoint.sh`.
 

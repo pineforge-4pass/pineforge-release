@@ -322,6 +322,17 @@ def _without_sources_notice(text: str) -> str:
     return text[:start] + text[stop:]
 
 
+def _restore_original_doc_cleanup(text: str) -> str:
+    """Undo only the single approved apt cleanup token change for the old pin."""
+    new = "    && rm -rf /var/lib/apt/lists/* /usr/share/man /usr/share/locale /usr/share/info\n"
+    old = "    && rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man /usr/share/locale /usr/share/info\n"
+    lines = text.splitlines(keepends=True)
+    if lines.count(new) != 1:
+        raise ValueError("expected exactly one apt cleanup line without /usr/share/doc")
+    lines[lines.index(new)] = old
+    return "".join(lines)
+
+
 def _pinned_packages(stage: DockerStage) -> dict[str, str]:
     packages = {}
     for instruction, body in stage.instructions:
@@ -425,15 +436,33 @@ class DockerfileTargetTest(unittest.TestCase):
 
     def test_release_stage_matches_original_runtime_without_the_marked_notice(self):
         text = _without_sources_notice(_without_stage_alias(self.named["release"]))
+        text = _restore_original_doc_cleanup(text)
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
-                         "outside the marked notice, release must remain byte for byte "
-                         "the original runtime stage (only its name may differ)")
+                         "after restoring the one /usr/share/doc token and removing the marked "
+                         "notice, release must remain byte for byte the original runtime stage")
+
+    def test_original_doc_cleanup_normalization_requires_one_exact_line(self):
+        text = _without_sources_notice(_without_stage_alias(self.named["release"]))
+        line = "    && rm -rf /var/lib/apt/lists/* /usr/share/man /usr/share/locale /usr/share/info\n"
+        self.assertEqual(text.count(line), 1)
+        restored = _restore_original_doc_cleanup(text)
+        self.assertEqual(restored, text.replace(" /usr/share/man", " /usr/share/doc /usr/share/man", 1))
+        for scenario, altered in (
+                ("missing", text.replace(line, "", 1)),
+                ("duplicate", text + line),
+                ("adjacent duplicate", text.replace(line, line + line, 1)),
+                ("different leading whitespace", text.replace(line, " " + line, 1)),
+                ("one other character changed", text.replace(line, line.replace("rm -rf", "rm  -rf"), 1))):
+            with self.subTest(scenario=scenario):
+                with self.assertRaisesRegex(ValueError, "expected exactly one apt cleanup line"):
+                    _restore_original_doc_cleanup(altered)
 
     def test_marked_notice_is_the_only_difference_and_cannot_hide_other_instructions(self):
         text = _without_stage_alias(self.named["release"])
         stripped = _without_sources_notice(text)
         self.assertNotEqual(text, stripped)
+        stripped = _restore_original_doc_cleanup(stripped)
         self.assertNotEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
         self.assertEqual(hashlib.sha256(stripped.encode("utf-8")).hexdigest(),
@@ -444,9 +473,10 @@ class DockerfileTargetTest(unittest.TestCase):
             block = stage.split("# --- sources notice (begin)\n", 1)[1].split(
                 "# --- sources notice (end)\n", 1)[0]
             instructions = _dockerfile_instructions(block)
-            self.assertEqual([keyword for keyword, _ in instructions], ["COPY", "LABEL", "RUN"])
-            self.assertEqual(instructions[0][1], "docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in")
-            labels = shlex.split(instructions[1][1])
+            self.assertEqual([keyword for keyword, _ in instructions], ["RUN", "COPY", "LABEL", "RUN"])
+            self.assertIn("find /usr/share/doc", instructions[0][1])
+            self.assertEqual(instructions[1][1], "docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in")
+            labels = shlex.split(instructions[2][1])
             self.assertEqual({label.split("=", 1)[0] for label in labels},
                              {"io.pineforge.sources.notice", "io.pineforge.sources.url"})
             self.assertNotIn("/opt/pineforge/bin", block)
@@ -455,7 +485,8 @@ class DockerfileTargetTest(unittest.TestCase):
         altered = text.replace("RUN mkdir -p /opt/pineforge/bin\n",
                                "RUN mkdir -p /opt/pineforge/bin /unexpected\n", 1)
         self.assertNotEqual(altered, text)
-        self.assertNotEqual(hashlib.sha256(_without_sources_notice(altered).encode("utf-8")).hexdigest(),
+        normalized = _restore_original_doc_cleanup(_without_sources_notice(altered))
+        self.assertNotEqual(hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
 
     def test_hpo_inherits_release_and_retains_its_runtime_contract(self):
