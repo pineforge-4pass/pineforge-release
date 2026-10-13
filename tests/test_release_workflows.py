@@ -22,8 +22,6 @@ import textwrap
 import unittest
 from pathlib import Path
 
-import yaml
-
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 REPO = WORKFLOWS.parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
@@ -52,8 +50,11 @@ def _run_block(dockerfile: str, needle: str) -> str:
 
 
 def _workflow(name: str):
+    # PyYAML is imported here, not at module level: tests/test_facts_fanout.py imports helpers from
+    # this module and facts-validate.yml runs it with only facts/requirements-validation.txt installed.
     # BaseLoader preserves the literal `on` key and keeps scalar comparisons
     # independent of YAML 1.1's surprising yes/no/on boolean conversions.
+    import yaml
     return yaml.load((WORKFLOWS / name).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
 
