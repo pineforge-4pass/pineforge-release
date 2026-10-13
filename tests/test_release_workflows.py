@@ -454,9 +454,14 @@ class HarnessSyncTest(unittest.TestCase):
         self.assertIn('[ "$listed" != "$want" ] || [ "$present" != "$want" ]', block)
         self.assertIn("exit 1;", block)
         self.assertNotIn("|| true", block)
-        # after the last harness COPY, before the user drop
-        self.assertLess(self.dockerfile.rindex("\nCOPY docker/"), self.dockerfile.index(check))
-        self.assertLess(self.dockerfile.index(check), self.dockerfile.index("\nUSER "))
+        # In release, after its last harness COPY and before its user drop.
+        # HPO inherits this checked harness and adds its own files later.
+        release = re.search(r"^FROM \S+ AS release\n.*?(?=^FROM |\Z)",
+                            self.dockerfile, re.M | re.S)
+        self.assertIsNotNone(release, "the unchanged runtime must be named release")
+        runtime = release.group(0)
+        self.assertLess(runtime.rindex("\nCOPY docker/"), runtime.index(check))
+        self.assertLess(runtime.index(check), runtime.index("\nUSER "))
 
     def test_the_default_ref_is_the_pinned_engine_tag(self):
         self.assertIn("set -euo pipefail\n", self.script)

@@ -1,0 +1,21 @@
+# The build for --target hpo must pass these exact toolchain build arguments.
+# The default target does not need them.
+# This file is read as plain NAME=VALUE lines (no shell syntax).
+
+# TO BE FILLED BY THE BOX RUN: Debian packages gcc, g++, cpp
+HPO_GCC_DEFAULTS_VERSION=
+
+# TO BE FILLED BY THE BOX RUN: Debian packages gcc-12, g++-12, cpp-12, libgcc-12-dev, libstdc++-12-dev, libgcc-s1, libstdc++6
+HPO_GCC_VERSION=
+
+# TO BE FILLED BY THE BOX RUN: Debian packages binutils
+HPO_BINUTILS_VERSION=
+
+# TO BE FILLED BY THE BOX RUN: Debian packages libeigen3-dev
+HPO_EIGEN_VERSION=
+
+# TO BE FILLED BY THE BOX RUN: Debian packages cmake
+HPO_CMAKE_VERSION=
+
+# TO BE FILLED BY THE BOX RUN: Debian packages make
+HPO_MAKE_VERSION=

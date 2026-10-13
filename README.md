@@ -278,7 +278,14 @@ The Dockerfile refuses to build when the harness `EXPECTED_PF_ABI` differs from
 
 ## HPO command and bundled licences
 
-The FULL image also accepts `docker run <image> hpo <subcommand>` for
+`docker build` without `--target`, using `docker/Dockerfile`, builds the unchanged
+backtest image: the last `default` stage aliases the original runtime, `release`.
+Only `ENGINE_VERSION` and `CODEGEN_VERSION` are required for that build, and its
+entrypoint remains `/opt/pineforge/bin/entrypoint.sh`.
+
+Use `--target hpo` to build the FULL image with the HPO command. It requires
+`ENGINE_VERSION`, `CODEGEN_VERSION`, `HPO_VERSION` and all six toolchain arguments
+listed below. That image accepts `docker run <image> hpo <subcommand>` for
 `space-info`, `compile`, `run` and `warm-encode`. For example, inspect each
 command's inputs with `docker run --rm <image> hpo compile --help`. The HPO
 command has the C++ compiler, Eigen, engine headers and static library needed
@@ -291,8 +298,9 @@ With no first argument `hpo`, the dispatcher passes every argument unchanged
 to the engine's existing `/opt/pineforge/bin/entrypoint.sh`. The eight engine
 harness files and their byte and ABI checks remain in place.
 
-`HPO_VERSION` is a required build argument with no default, recorded in the
-`io.pineforge.hpo.version` label and `PINEFORGE_HPO_VERSION`. The build fetches
+For `--target hpo`, `HPO_VERSION` is a required build argument with no default,
+recorded in the `io.pineforge.hpo.version` label and `PINEFORGE_HPO_VERSION`.
+The build fetches
 that release's wheel and native source, checks the wheel against
 `HPO_WHEEL_SHA256` when supplied, and asks pip to resolve the wheel's `transpile`
 extra against the already installed codegen. A resolution error or any planned
@@ -312,6 +320,12 @@ build arguments; no toolchain version has been guessed:
 | `HPO_EIGEN_VERSION` | `libeigen3-dev` |
 | `HPO_CMAKE_VERSION` | `cmake` (native build only) |
 | `HPO_MAKE_VERSION` | `make` (native build only) |
+
+`docker/hpo-toolchain.args` records those six pins as plain `NAME=VALUE` lines,
+with comments and blank lines allowed, and no shell syntax. The signed box run
+fills the empty values; the publish workflow reads the file and passes the
+values as build arguments for `--target hpo`. The Dockerfile uses build
+arguments only. The default target does not need this file or its arguments.
 
 The installed wheels' own `*.dist-info/licenses/` files are also copied to
 `/opt/pineforge/licenses/pineforge-hpo/` (`LICENSE`, `NOTICE` and
@@ -336,6 +350,10 @@ only one supplied it fails. `PINEFORGE_CODEGEN_WHEEL` can supply the real 1.5.0
 wheel for an offline run; otherwise the test fetches it from PyPI and verifies
 PyPI's digest. The same build helper must reject 0.13.2 because its real
 `pineforge-codegen<1.4,>=1.1.0` bound excludes 1.5.0, then resolve 0.15.0 without
-changing codegen. The test also checks dispatcher argv and exit status, the
-unchanged harness check, a forced licence mutation and the README pair-rule
-bytes against `origin/main`.
+changing codegen. The tests also compute each target's stage dependencies,
+compare `release` with the original runtime at `989a0fd9~1`, and check dispatcher
+argv and exit status, the unchanged harness check, a forced licence mutation
+and the README pair-rule bytes against `origin/main`. The args-file tests
+compare its names with the real Dockerfile's toolchain declarations and
+required guards, reject malformed or duplicate entries, and report empty
+values as a named `unfilled toolchain versions` skip until the box fills them.

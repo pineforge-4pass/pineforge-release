@@ -23,6 +23,7 @@ import unittest
 import urllib.parse
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -170,6 +171,396 @@ def _run_block(dockerfile: str, needle: str) -> str:
     return dockerfile[start:] if end < 0 else dockerfile[start:end]
 
 
+@dataclass(frozen=True)
+class DockerStage:
+    name: str
+    base: str
+    text: str
+    instructions: tuple[tuple[str, str], ...]
+
+
+def _dockerfile_instructions(text: str) -> tuple[tuple[str, str], ...]:
+    """Read logical instructions, including continued RUN and COPY lines."""
+    instructions = []
+    pending = ""
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        line = line.strip()
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        logical = pending + line
+        pending = ""
+        match = re.fullmatch(r"([A-Za-z]+)\s+(.*)", logical)
+        if match is None:
+            raise ValueError("malformed Dockerfile instruction")
+        instructions.append((match[1].upper(), match[2]))
+    if pending:
+        raise ValueError("unterminated Dockerfile continuation")
+    return tuple(instructions)
+
+
+def _dockerfile_stages(text: str) -> tuple[DockerStage, ...]:
+    """Keep each stage's original bytes as well as its parsed instructions."""
+    starts = list(re.finditer(r"^[ \t]*FROM[ \t]+([^\r\n]+)", text, re.M | re.I))
+    if not starts:
+        raise ValueError("Dockerfile has no stages")
+    stages = []
+    names = set()
+    for index, start in enumerate(starts):
+        words = shlex.split(start[1])
+        while words and words[0].startswith("--"):
+            words.pop(0)
+        if len(words) == 1:
+            base, name = words[0], str(index)
+        elif len(words) == 3 and words[1].lower() == "as":
+            base, name = words[0], words[2].lower()
+        else:
+            raise ValueError("malformed Dockerfile FROM instruction")
+        if name in names:
+            raise ValueError("duplicate Dockerfile stage: " + name)
+        names.add(name)
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+        lines = text[start.start():end].splitlines(keepends=True)
+        # Inter-stage headings are outside the preceding stage's last
+        # instruction. Internal comments and whitespace remain byte-identical.
+        while lines and (not lines[-1].strip() or lines[-1].lstrip().startswith("#")):
+            lines.pop()
+        source = "".join(lines)
+        stages.append(DockerStage(name, base, source, _dockerfile_instructions(source)))
+    return tuple(stages)
+
+
+def _stage_references(stages: tuple[DockerStage, ...]) -> dict[str, DockerStage]:
+    references = {str(index): stage for index, stage in enumerate(stages)}
+    references.update((stage.name, stage) for stage in stages)
+    return references
+
+
+def _reachable_stages(stages: tuple[DockerStage, ...], target: str | None = None) -> set[str]:
+    """Follow actual FROM and COPY --from edges, by alias or numeric index.
+
+    External images do not name a stage in this Dockerfile. No target names or
+    expected dependency sets are built into the traversal.
+    """
+    references = _stage_references(stages)
+    start = stages[-1] if target is None else references[target.lower()]
+    pending = [start]
+    reached = set()
+    while pending:
+        stage = pending.pop()
+        if stage.name in reached:
+            continue
+        reached.add(stage.name)
+        sources = [stage.base]
+        for instruction, body in stage.instructions:
+            if instruction == "COPY":
+                words = shlex.split(body)
+                for index, word in enumerate(words):
+                    if word.startswith("--from="):
+                        sources.append(word.split("=", 1)[1])
+                    elif word == "--from" and index + 1 < len(words):
+                        sources.append(words[index + 1])
+        pending.extend(references[source.lower()] for source in sources
+                       if source.lower() in references)
+    return reached
+
+
+def _build_arguments(stages: tuple[DockerStage, ...], reached: set[str], *,
+                     required: bool = False) -> set[str]:
+    arguments = set()
+    for stage in stages:
+        if stage.name not in reached:
+            continue
+        for instruction, body in stage.instructions:
+            if required and instruction == "RUN":
+                arguments.update(re.findall(
+                    r"\btest\s+-n\s+[\"']?\$\{?([A-Z_][A-Z0-9_]*)\}?[\"']?", body))
+            elif not required and instruction == "ARG":
+                arguments.add(body.split("=", 1)[0].strip())
+    return arguments
+
+
+def _hpo_arguments(stages: tuple[DockerStage, ...], reached: set[str], *,
+                   required: bool = False) -> set[str]:
+    return {name for name in _build_arguments(stages, reached, required=required)
+            if name.startswith("HPO_")}
+
+
+def _inherited_instruction(stages: tuple[DockerStage, ...], target: str,
+                           instruction: str) -> str | None:
+    references = _stage_references(stages)
+    stage = references[target.lower()]
+    seen = set()
+    while stage.name not in seen:
+        seen.add(stage.name)
+        for keyword, body in reversed(stage.instructions):
+            if keyword == instruction:
+                return body
+        if stage.base.lower() not in references:
+            break
+        stage = references[stage.base.lower()]
+    return None
+
+
+def _without_stage_alias(stage: DockerStage) -> str:
+    return re.sub(r"(^[ \t]*FROM[^\r\n]*?)[ \t]+AS[ \t]+\S+(?=\r?$)",
+                  r"\1", stage.text, count=1, flags=re.M | re.I)
+
+
+def _pinned_packages(stage: DockerStage) -> dict[str, str]:
+    packages = {}
+    for instruction, body in stage.instructions:
+        if instruction == "RUN":
+            packages.update(re.findall(
+                r"([a-z0-9][a-z0-9.+-]*)=\$\{([A-Z_][A-Z0-9_]*)\}", body))
+    return packages
+
+
+def _read_toolchain_arguments(text: str) -> dict[str, str]:
+    """Plain NAME=VALUE data only; never evaluate this file as shell code."""
+    arguments = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.startswith("#") or not line.strip():
+            continue
+        match = re.fullmatch(r"([A-Z][A-Z0-9_]*)=([A-Za-z0-9.+:~_-]*)", line)
+        if match is None:
+            raise ValueError(f"toolchain args line {number}: expected plain NAME=VALUE "
+                             "with no spaces, quotes or shell syntax")
+        name, value = match.groups()
+        if name in arguments:
+            raise ValueError("duplicate toolchain argument: " + name)
+        arguments[name] = value
+    return arguments
+
+
+def _toolchain_argument_problems(dockerfile: str, args_text: str) -> list[str]:
+    stages = _dockerfile_stages(dockerfile)
+    reached = _reachable_stages(stages, "hpo")
+    default = _reachable_stages(stages)
+    wheel_arguments = {"HPO_VERSION", "HPO_WHEEL_SHA256"}
+    declared = (_build_arguments(stages, reached) - _build_arguments(stages, default)
+                - wheel_arguments)
+    required = (_build_arguments(stages, reached, required=True)
+                - _build_arguments(stages, default, required=True) - wheel_arguments)
+    listed = set(_read_toolchain_arguments(args_text))
+    problems = []
+    if listed != declared:
+        problems.append("toolchain argument names differ from HPO-only ARG declarations: "
+                        + ", ".join(sorted(listed ^ declared)))
+    if listed != required:
+        problems.append("toolchain argument names differ from HPO-only required guards: "
+                        + ", ".join(sorted(listed ^ required)))
+    return problems
+
+
+def _require_filled_toolchain_arguments(arguments: dict[str, str]) -> None:
+    unfilled = sorted(name for name, value in arguments.items() if not value)
+    if unfilled:
+        raise unittest.SkipTest("unfilled toolchain versions: " + ", ".join(unfilled)
+                                + "; TO BE FILLED BY THE BOX RUN")
+
+
+class DockerfileTargetTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dockerfile = (REPO / "docker" / "Dockerfile").read_bytes().decode("utf-8")
+        cls.stages = _dockerfile_stages(cls.dockerfile)
+        cls.named = {stage.name: stage for stage in cls.stages}
+
+    def test_last_stage_is_a_no_op_release_alias_with_the_original_entrypoint(self):
+        last = self.stages[-1]
+        self.assertEqual(last.name, "default")
+        self.assertEqual(last.base, "release")
+        self.assertEqual(last.instructions, (("FROM", "release AS default"),))
+        self.assertNotIn("ARG HPO_", last.text)
+        self.assertNotIn("entrypoint-dispatch.sh", last.text)
+        original = 'ENTRYPOINT ["/opt/pineforge/bin/entrypoint.sh"]'
+        self.assertIn(original, self.named["release"].text)
+        self.assertEqual(_inherited_instruction(self.stages, last.name, "ENTRYPOINT"),
+                         original[len("ENTRYPOINT "):])
+        self.assertEqual(_inherited_instruction(self.stages, last.name, "USER"), "10001")
+
+    def test_default_reachability_has_no_declared_or_required_hpo_argument(self):
+        reached = _reachable_stages(self.stages)
+        self.assertEqual(reached, {"default", "release", "engine", "codegen"})
+        self.assertEqual(_hpo_arguments(self.stages, reached), set())
+        self.assertEqual(_hpo_arguments(self.stages, reached, required=True), set())
+
+    def test_hpo_reaches_its_build_stages_and_requires_all_seven_arguments(self):
+        reached = _reachable_stages(self.stages, "hpo")
+        self.assertEqual(reached, {"hpo", "hpo-wheel", "hpo-toolchain", "hpo-native",
+                                   "release", "engine", "codegen"})
+        required = {"HPO_VERSION", "HPO_GCC_DEFAULTS_VERSION", "HPO_GCC_VERSION",
+                    "HPO_BINUTILS_VERSION", "HPO_EIGEN_VERSION", "HPO_CMAKE_VERSION",
+                    "HPO_MAKE_VERSION"}
+        self.assertEqual(_hpo_arguments(self.stages, reached, required=True), required)
+        self.assertEqual(_hpo_arguments(self.stages, reached), required | {"HPO_WHEEL_SHA256"})
+        for stage in self.stages:
+            for instruction, body in stage.instructions:
+                if instruction == "ARG" and body.startswith("HPO_"):
+                    with self.subTest(stage=stage.name, argument=body.split("=", 1)[0]):
+                        self.assertNotIn("=", body, "HPO arguments must have no defaults")
+                        self.assertIn(stage.name, reached)
+
+    def test_release_stage_matches_the_round_one_parent_except_for_its_name(self):
+        git = shutil.which("git")
+        if git is None:
+            self.skipTest("git unavailable; original runtime comparison needs a git checkout")
+        checkout = subprocess.run([git, "rev-parse", "--is-inside-work-tree"], cwd=REPO,
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+        if checkout.returncode or checkout.stdout.strip() != b"true":
+            self.skipTest("not in a git checkout; cannot read 989a0fd9~1:docker/Dockerfile")
+        baseline = subprocess.run([git, "show", "989a0fd9~1:docker/Dockerfile"], cwd=REPO,
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+        self.assertEqual(baseline.returncode, 0,
+                         "git checkout must provide the round-one parent Dockerfile")
+        old_final = _dockerfile_stages(baseline.stdout.decode("utf-8"))[-1]
+        self.assertEqual(_without_stage_alias(self.named["release"]), old_final.text)
+
+    def test_hpo_inherits_release_and_retains_its_runtime_contract(self):
+        hpo = self.named["hpo"]
+        self.assertEqual(hpo.base, "release")
+        self.assertEqual([body for keyword, body in hpo.instructions if keyword == "USER"],
+                         ["root", "10001"])
+        self.assertEqual(_inherited_instruction(self.stages, "hpo", "ENTRYPOINT"),
+                         '["/opt/pineforge/entrypoint-dispatch.sh"]')
+        for text in ("PYTHONPATH=/opt/pineforge/pycodegen:/opt/pineforge/hpo",
+                     "PINEFORGE_HPO_VERSION=${HPO_VERSION}",
+                     "PINEFORGE_ENGINE_ROOT=/opt/pineforge",
+                     "PINEFORGE_HPO_NATIVE=/opt/pineforge/pineforge-hpo-native",
+                     'io.pineforge.hpo.version="${HPO_VERSION}"',
+                     "COPY --from=hpo-wheel /opt/hpo",
+                     "COPY --from=hpo-wheel /opt/hpo-licenses",
+                     "COPY --from=hpo-toolchain /opt/pineforge/licenses",
+                     "COPY --from=hpo-native /tmp/hpo-build/bin/pineforge-hpo-native",
+                     "COPY --from=hpo-native /opt/hpo-native-licenses",
+                     "sha256sum -c --strict LICENSE-SHA256SUMS",
+                     "install -d -o 10001 /home/pineforge/.cache/pineforge/hpo"):
+            with self.subTest(contract=text):
+                self.assertIn(text, hpo.text)
+        self.assertEqual(_pinned_packages(hpo), _pinned_packages(self.named["hpo-toolchain"]))
+        self.assertEqual(set(_pinned_packages(self.named["hpo-native"])), {"cmake", "make"})
+        wheel = self.named["hpo-wheel"].text
+        self.assertIn('if [ -n "${HPO_WHEEL_SHA256}" ]', wheel)
+        self.assertIn("sha256sum -c --strict /tmp/hpo-wheel.sha256", wheel)
+        self.assertIn("python3 -I /tmp/check_hpo_resolution.py", wheel)
+        self.assertIn('--target /opt/hpo "$wheel"', wheel)
+        self.assertIn("--no-deps", wheel)
+
+    def test_reachability_follows_added_copy_edges_in_the_real_dockerfile(self):
+        last_header = self.stages[-1].text.splitlines()[0] + "\n"
+        native_index = next(index for index, stage in enumerate(self.stages)
+                            if stage.name == "hpo-native")
+        for source, expected in (("hpo-wheel", {"hpo-wheel", "codegen"}),
+                                 (str(native_index), {"hpo-native", "hpo-toolchain", "engine"})):
+            with self.subTest(copy_source=source):
+                mutated = self.dockerfile.replace(
+                    last_header, last_header + f"COPY --from={source} /opt /probe\n", 1)
+                stages = _dockerfile_stages(mutated)
+                reached = _reachable_stages(stages)
+                self.assertTrue(expected <= reached)
+                self.assertIn("HPO_VERSION", _hpo_arguments(stages, reached, required=True))
+
+    def test_reachability_follows_a_changed_from_edge_in_the_real_dockerfile(self):
+        last_header = self.stages[-1].text.splitlines()[0]
+        mutated = self.dockerfile.replace(last_header, "FROM hpo AS default", 1)
+        stages = _dockerfile_stages(mutated)
+        self.assertEqual(_reachable_stages(stages), _reachable_stages(stages, "hpo") | {"default"})
+        self.assertIn("HPO_VERSION", _hpo_arguments(stages, _reachable_stages(stages), required=True))
+
+
+class ToolchainArgumentsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dockerfile = (REPO / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        cls.args_text = (REPO / "docker" / "hpo-toolchain.args").read_text(encoding="utf-8")
+
+    def test_plain_argument_file_matches_both_declared_args_and_required_guards(self):
+        self.assertEqual(_toolchain_argument_problems(self.dockerfile, self.args_text), [])
+        stages = _dockerfile_stages(self.dockerfile)
+        for stage in stages:
+            self.assertNotIn("hpo-toolchain.args", stage.text,
+                             "the workflow reads this data file; Dockerfile stays build-arg driven")
+
+    def test_argument_comments_name_the_packages_pinned_by_the_real_stages(self):
+        stages = _dockerfile_stages(self.dockerfile)
+        reached = _reachable_stages(stages, "hpo")
+        packages = {}
+        for stage in stages:
+            if stage.name in reached:
+                for package, argument in _pinned_packages(stage).items():
+                    packages.setdefault(argument, set()).add(package)
+        lines = self.args_text.splitlines()
+        prefix = "# TO BE FILLED BY THE BOX RUN: Debian packages "
+        for index, line in enumerate(lines):
+            if line.startswith("#") or not line.strip():
+                continue
+            argument = line.split("=", 1)[0]
+            with self.subTest(argument=argument):
+                self.assertGreater(index, 0)
+                self.assertTrue(lines[index - 1].startswith(prefix))
+                covered = set(lines[index - 1][len(prefix):].split(", "))
+                self.assertEqual(covered, packages[argument])
+
+    def test_adding_an_arg_only_to_the_real_dockerfile_is_rejected(self):
+        self.assertEqual(_toolchain_argument_problems(self.dockerfile, self.args_text), [])
+        hpo = next(stage for stage in _dockerfile_stages(self.dockerfile) if stage.name == "hpo")
+        header = hpo.text.splitlines()[0] + "\n"
+        # Check a bare declaration as well as one with a required guard: the
+        # data file must track new ARGs even before their RUN is added.
+        for argument in ("HPO_TEST_EXTRA_VERSION", "TOOLCHAIN_TEST_EXTRA_VERSION"):
+            for guarded in (False, True):
+                with self.subTest(argument=argument, guarded=guarded):
+                    guard = 'RUN test -n "${' + argument + '}"\n' if guarded else ""
+                    mutated = self.dockerfile.replace(
+                        header, header + "ARG " + argument + "\n" + guard, 1)
+                    problems = _toolchain_argument_problems(mutated, self.args_text)
+                    self.assertTrue(problems)
+                    self.assertIn(argument, "\n".join(problems))
+
+    def test_adding_or_removing_an_arg_only_in_the_real_args_file_is_rejected(self):
+        self.assertEqual(_toolchain_argument_problems(self.dockerfile, self.args_text), [])
+        argument = next(iter(_read_toolchain_arguments(self.args_text)))
+        missing = "\n".join(line for line in self.args_text.splitlines()
+                            if not line.startswith(argument + "=")) + "\n"
+        for mutated, changed in ((self.args_text + "HPO_TEST_EXTRA_VERSION=\n",
+                                  "HPO_TEST_EXTRA_VERSION"), (missing, argument)):
+            with self.subTest(argument=changed):
+                problems = _toolchain_argument_problems(self.dockerfile, mutated)
+                self.assertTrue(problems)
+                self.assertIn(changed, "\n".join(problems))
+
+    def test_spaces_quotes_shell_syntax_and_duplicate_names_are_rejected(self):
+        argument = next(iter(_read_toolchain_arguments(self.args_text)))
+        line = next(line for line in self.args_text.splitlines() if line.startswith(argument + "="))
+        for invalid in (argument + " =", argument + "= ", argument + '=""',
+                        argument + "=''", "export " + argument + "=",
+                        argument + "=$(command)", argument + "=value;command",
+                        argument, argument + "=value=other"):
+            with self.subTest(line=invalid):
+                mutated = self.args_text.replace(line + "\n", invalid + "\n", 1)
+                with self.assertRaisesRegex(ValueError, "plain NAME=VALUE"):
+                    _read_toolchain_arguments(mutated)
+        with self.assertRaisesRegex(ValueError, "duplicate toolchain argument"):
+            _read_toolchain_arguments(self.args_text + line + "\n")
+
+    def test_empty_value_is_detected_as_an_unfilled_skip(self):
+        arguments = _read_toolchain_arguments(self.args_text)
+        argument = next(iter(arguments))
+        arguments[argument] = ""
+        with self.assertRaisesRegex(unittest.SkipTest, "unfilled toolchain versions") as skipped:
+            _require_filled_toolchain_arguments(arguments)
+        self.assertIn(argument, str(skipped.exception))
+
+    def test_unfilled_toolchain_versions_wait_for_the_signed_box_run(self):
+        # Shape and set errors must fail before an unfilled-value skip, so an
+        # empty or malformed file can never make these schema checks green.
+        self.assertEqual(_toolchain_argument_problems(self.dockerfile, self.args_text), [])
+        _require_filled_toolchain_arguments(_read_toolchain_arguments(self.args_text))
+
+
 class DispatcherTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -262,16 +653,20 @@ class DockerfileHarnessTest(unittest.TestCase):
 
     def test_harness_copy_list_and_full_build_check_are_unchanged(self):
         dockerfile = (REPO / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        stages = _dockerfile_stages(dockerfile)
+        release = next(stage for stage in stages if stage.name == "release")
+        self.assertIn(release.name, _reachable_stages(stages, "hpo"))
+        self.assertIn(release.name, _reachable_stages(stages))
         copies = re.findall(r"^COPY docker/(\S+)\s+/opt/pineforge/bin/(\S+)\s*$",
                             dockerfile, re.M)
         self.assertEqual(sorted(copies),
                          sorted((name, name) for name in self.HARNESS + ("HARNESS-SHA256SUMS",)))
-        self.assertEqual(_run_block(dockerfile, "sha256sum -c --strict HARNESS-SHA256SUMS"),
+        self.assertEqual(_run_block(release.text, "sha256sum -c --strict HARNESS-SHA256SUMS"),
                          self.CHECK)
         sums = (REPO / "docker" / "HARNESS-SHA256SUMS").read_text(encoding="utf-8")
         self.assertEqual([line.split("  ", 1)[1] for line in sums.splitlines()], list(self.HARNESS))
         self.assertIn('ENTRYPOINT ["/opt/pineforge/entrypoint-dispatch.sh"]', dockerfile)
-        self.assertIn("PF_ABI_VERSION", _run_block(dockerfile, 'echo "harness ABI'))
+        self.assertIn("PF_ABI_VERSION", _run_block(release.text, 'echo "harness ABI'))
 
 
 class LicenceChecksumTest(unittest.TestCase):
