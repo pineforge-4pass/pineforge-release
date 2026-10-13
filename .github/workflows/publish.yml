@@ -177,6 +177,18 @@ jobs:
           python3 scripts/release_pair.py check --release="${REF#v}" --engine="$E" --codegen="$C" \
             --hpo="$H" --hpo-wheel-digest="$digest" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Read hpo toolchain arguments
+        id: toolchain
+        if: steps.pair.outputs.target == 'hpo'
+        run: |
+          set -euo pipefail
+          args="$(python3 scripts/release_sources.py toolchain-args docker/hpo-toolchain.args)"
+          {
+            echo 'args<<HPO_TOOLCHAIN_ARGS'
+            printf '%s\n' "$args"
+            echo 'HPO_TOOLCHAIN_ARGS'
+          } >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -202,6 +214,128 @@ jobs:
           # PineForge Source License 1.2 (see README, License).
           labels: |
             org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2
+
+      # Inspect the selected target on both architectures before any publish.
+      # Keep target, arguments and cache settings identical to the push steps.
+      - name: Inspect release amd64
+        if: steps.pair.outputs.target != 'hpo'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: pineforge-source-inspect:amd64
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ENGINE_VERSION=${{ steps.pins.outputs.engine }}
+            CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            RELEASE_VERSION=${{ github.ref_name }}
+            RELEASE_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Inspect release arm64
+        if: steps.pair.outputs.target != 'hpo'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          load: true
+          push: false
+          tags: pineforge-source-inspect:arm64
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ENGINE_VERSION=${{ steps.pins.outputs.engine }}
+            CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            RELEASE_VERSION=${{ github.ref_name }}
+            RELEASE_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Inspect hpo amd64
+        if: steps.pair.outputs.target == 'hpo'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: ${{ steps.pair.outputs.target }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: pineforge-source-inspect:amd64
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ENGINE_VERSION=${{ steps.pins.outputs.engine }}
+            CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            ${{ steps.pair.outputs.hpo_version_arg }}
+            ${{ steps.wheel.outputs.hpo_wheel_arg }}
+            ${{ steps.toolchain.outputs.args }}
+            RELEASE_VERSION=${{ github.ref_name }}
+            RELEASE_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Inspect hpo arm64
+        if: steps.pair.outputs.target == 'hpo'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: ${{ steps.pair.outputs.target }}
+          platforms: linux/arm64
+          load: true
+          push: false
+          tags: pineforge-source-inspect:arm64
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ENGINE_VERSION=${{ steps.pins.outputs.engine }}
+            CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            ${{ steps.pair.outputs.hpo_version_arg }}
+            ${{ steps.wheel.outputs.hpo_wheel_arg }}
+            ${{ steps.toolchain.outputs.args }}
+            RELEASE_VERSION=${{ github.ref_name }}
+            RELEASE_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Read Debian package inventories
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 --entrypoint dpkg-query pineforge-source-inspect:amd64 \
+            -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' > "$RUNNER_TEMP/debian-amd64.tsv"
+          docker run --rm --platform linux/arm64 --entrypoint dpkg-query pineforge-source-inspect:arm64 \
+            -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' > "$RUNNER_TEMP/debian-arm64.tsv"
+
+      - name: Locate Debian source bundle
+        id: source_set
+        run: |
+          set -euo pipefail
+          python3 scripts/release_sources.py locate --registry docker/SOURCE-SETS.tsv \
+            --amd64 "$RUNNER_TEMP/debian-amd64.tsv" --arm64 "$RUNNER_TEMP/debian-arm64.tsv" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Read Debian source release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_TAG: ${{ steps.source_set.outputs.release-tag }}
+          SOURCE_LIST: ${{ steps.source_set.outputs.list-asset }}
+        run: |
+          set -euo pipefail
+          gh release view "$SOURCE_TAG" --repo pineforge-4pass/pineforge-release --json assets > "$RUNNER_TEMP/source-assets.json"
+          curl -fsSL --retry 3 --max-time 120 \
+            "https://github.com/pineforge-4pass/pineforge-release/releases/download/${SOURCE_TAG}/${SOURCE_LIST}" \
+            -o "$RUNNER_TEMP/$SOURCE_LIST"
+
+      - name: Check Debian source mirror
+        env:
+          SOURCE_LIST: ${{ steps.source_set.outputs.list-asset }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_sources.py check --registry docker/SOURCE-SETS.tsv \
+            --amd64 "$RUNNER_TEMP/debian-amd64.tsv" --arm64 "$RUNNER_TEMP/debian-arm64.tsv" \
+            --release-assets "$RUNNER_TEMP/source-assets.json" --sources-list "$RUNNER_TEMP/$SOURCE_LIST"
 
       - name: Build + push (multi-arch)
         if: steps.pair.outputs.target != 'hpo'
@@ -237,6 +371,7 @@ jobs:
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             ${{ steps.pair.outputs.hpo_version_arg }}
             ${{ steps.wheel.outputs.hpo_wheel_arg }}
+            ${{ steps.toolchain.outputs.args }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
           cache-from: type=gha
@@ -249,10 +384,13 @@ jobs:
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
           PRERELEASE: ${{ steps.pair.outputs.prerelease }}
+          SOURCE_TAG: ${{ steps.source_set.outputs.release-tag }}
+          SOURCE_LIST: ${{ steps.source_set.outputs.list-asset }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2016  # backticks here are literal markdown, not command substitution
           notes="$(printf 'Combined PineScript -> backtest image.\n\nengine %s + codegen %s\n\n```\ndocker pull ghcr.io/pineforge-4pass/pineforge-release:%s\n```\n' "$E" "$C" "${TAG#v}")"
+          notes="$(printf '%s\n\nDebian sources: [SOURCES.list](https://github.com/pineforge-4pass/pineforge-release/releases/download/%s/%s) and its source assets are attached to [release %s](https://github.com/pineforge-4pass/pineforge-release/releases/tag/%s).\n' "$notes" "$SOURCE_TAG" "$SOURCE_LIST" "$SOURCE_TAG" "$SOURCE_TAG")"
           if [ "$PRERELEASE" = true ]; then
             # Never GitHub's "Latest": resolvers that read Latest keep the newest
             # stable release, and the image has no `latest` / X.Y tag either.

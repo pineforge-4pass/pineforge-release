@@ -1,0 +1,8 @@
+This image contains software from Debian GNU/Linux 12 (bookworm), including the GNU C/C++
+compiler (gcc/g++ 12.2.0) and GNU binutils 2.40, Eigen 3.4.0, and the Debian base system.
+Each package is distributed under its own license, recorded in /usr/share/doc/<package>/copyright.
+The complete corresponding source code of every Debian package in this image, at the exact
+versions installed, is available at no charge from:
+  https://github.com/pineforge-4pass/pineforge-release/releases/tag/@RELEASE_VERSION@
+(file SOURCES.list lists every package, version and SHA-256). The same packages can also be
+obtained from https://snapshot.debian.org/ under the names and versions listed.

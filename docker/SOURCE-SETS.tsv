@@ -1,0 +1,5 @@
+set-id	release-tag	n-pairs	sources-list-sha256	list-asset
+# Add rows only after the owner uploads the real source bundles and their set-NN.SOURCES.list.
+# Hash sorted unique source<TAB>version lines, including the final newline, for set-id.
+# Record the earliest release holding the bundle, distinct pair count, exact list byte hash and asset name.
+# Empty registry intentionally refuses every publish until real mirror evidence is recorded.

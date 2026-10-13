@@ -233,6 +233,36 @@ Operators may trigger events manually with their own gh login; no personal token
 example `1.0.0-rc.1`) gets `X.Y.Z-rc.N` · `engine<E>-codegen<C>` · `sha-<short>`
 only.
 
+## Debian source packages
+
+Every release carries or links the exact source packages for the Debian
+packages installed in its image, including prereleases. The notice at
+`/usr/share/doc/pineforge/SOURCES.txt` points to the image's release page,
+whose notes link to the checked source bundle and its `set-NN.SOURCES.list`.
+The `io.pineforge.sources.notice` and `io.pineforge.sources.url` image labels
+identify the notice and release page. A local build with `RELEASE_VERSION=unknown`
+uses the general releases page in its notice and adds a local-build line.
+
+[BIZ licence statement placeholder: BIZ will supply the approved licence statement.]
+
+A release's source assets are never deleted while its image remains on ghcr.
+
+Before any image is pushed, the publish job builds the selected target locally
+for both architectures, reads their Debian inventories, and requires equal
+source/version sets. `scripts/release_sources.py` checks that the set is
+registered in `docker/SOURCE-SETS.tsv`, the downloaded list matches its registered
+SHA-256, every listed asset has the recorded size and SHA-256 on the holding
+release, and the list covers exactly the image's source/version pairs. A failure
+stops both image publishing and release creation for every `v*` tag.
+
+The registry has five tab-separated columns: `set-id`, `release-tag`, `n-pairs`,
+`sources-list-sha256`, and `list-asset` (the exact `set-NN.SOURCES.list` name).
+The set id hashes sorted unique `source<TAB>version` lines with a final newline.
+The separate box run fetches the real sources; the owner attaches them to the
+earliest release using each set. Add registry rows only after those real list
+files and their source assets are available. The registry is initially empty,
+so publishing remains refused until that evidence is recorded.
+
 ## License
 
 The files in this repository (Dockerfile, entrypoint, scripts, workflows, tests)

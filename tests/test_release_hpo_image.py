@@ -28,6 +28,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 HPO_WHEEL_SHA256 = "ee09f5fd72fd43c26027c294d0e871ab6f3d856fbc5d28c53910a3bbcfa968a6"
+HPO_REJECTED_WHEEL_SHA256 = "57fff4c49cba794a9657e7882376eee294366843cf0442306195b8390dd0d073"
 
 
 def _metadata(wheel: Path):
@@ -86,6 +87,8 @@ class HpoResolutionTest(unittest.TestCase):
             self.assertEqual(red_metadata["Version"], "0.13.2")
             self.assertEqual(green_metadata["Name"], "pineforge-hpo")
             self.assertEqual(green_metadata["Version"], "0.15.0")
+            self.assertEqual(hashlib.sha256(red_wheel.read_bytes()).hexdigest(),
+                             HPO_REJECTED_WHEEL_SHA256, "the rejected wheel is not the released asset")
             self.assertEqual(hashlib.sha256(green_wheel.read_bytes()).hexdigest(),
                              HPO_WHEEL_SHA256, "the accepted wheel is not the released asset")
 
@@ -309,6 +312,16 @@ def _without_stage_alias(stage: DockerStage) -> str:
                   r"\1", stage.text, count=1, flags=re.M | re.I)
 
 
+def _without_sources_notice(text: str) -> str:
+    begin = "# --- sources notice (begin)\n"
+    end = "# --- sources notice (end)\n"
+    if text.count(begin) != 1 or text.count(end) != 1:
+        raise ValueError("expected exactly one marked sources notice block")
+    start = text.index(begin)
+    stop = text.index(end, start) + len(end)
+    return text[:start] + text[stop:]
+
+
 def _pinned_packages(stage: DockerStage) -> dict[str, str]:
     packages = {}
     for instruction, body in stage.instructions:
@@ -410,12 +423,40 @@ class DockerfileTargetTest(unittest.TestCase):
     # because a shallow CI checkout and a main reached by a squash merge do not contain that commit.
     ORIGINAL_RUNTIME_STAGE_SHA256 = "a632a13892deaeb350733b8ca8917b9889db69d0894a611498c3ab6da8c333a2"
 
-    def test_release_stage_matches_the_original_runtime_except_for_its_name(self):
-        text = _without_stage_alias(self.named["release"])
+    def test_release_stage_matches_original_runtime_without_the_marked_notice(self):
+        text = _without_sources_notice(_without_stage_alias(self.named["release"]))
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
-                         "the release stage must stay byte for byte the original runtime stage "
-                         "(only its name may differ)")
+                         "outside the marked notice, release must remain byte for byte "
+                         "the original runtime stage (only its name may differ)")
+
+    def test_marked_notice_is_the_only_difference_and_cannot_hide_other_instructions(self):
+        text = _without_stage_alias(self.named["release"])
+        stripped = _without_sources_notice(text)
+        self.assertNotEqual(text, stripped)
+        self.assertNotEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                            self.ORIGINAL_RUNTIME_STAGE_SHA256)
+        self.assertEqual(hashlib.sha256(stripped.encode("utf-8")).hexdigest(),
+                         self.ORIGINAL_RUNTIME_STAGE_SHA256)
+        for name in ("release", "hpo"):
+            stage = self.named[name].text
+            _without_sources_notice(stage)  # also rejects missing/duplicate markers
+            block = stage.split("# --- sources notice (begin)\n", 1)[1].split(
+                "# --- sources notice (end)\n", 1)[0]
+            instructions = _dockerfile_instructions(block)
+            self.assertEqual([keyword for keyword, _ in instructions], ["COPY", "LABEL", "RUN"])
+            self.assertEqual(instructions[0][1], "docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in")
+            labels = shlex.split(instructions[1][1])
+            self.assertEqual({label.split("=", 1)[0] for label in labels},
+                             {"io.pineforge.sources.notice", "io.pineforge.sources.url"})
+            self.assertNotIn("/opt/pineforge/bin", block)
+            self.assertNotIn("apt-get", block)
+        # A change outside the block must still break the old immutable pin.
+        altered = text.replace("RUN mkdir -p /opt/pineforge/bin\n",
+                               "RUN mkdir -p /opt/pineforge/bin /unexpected\n", 1)
+        self.assertNotEqual(altered, text)
+        self.assertNotEqual(hashlib.sha256(_without_sources_notice(altered).encode("utf-8")).hexdigest(),
+                            self.ORIGINAL_RUNTIME_STAGE_SHA256)
 
     def test_hpo_inherits_release_and_retains_its_runtime_contract(self):
         hpo = self.named["hpo"]
