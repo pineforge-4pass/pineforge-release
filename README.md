@@ -276,3 +276,86 @@ to 1.0.0 carry `Apache-2.0`.
 fetches the same file for the engine version it releases).
 The Dockerfile refuses to build when the harness `EXPECTED_PF_ABI` differs from
 `PF_ABI_VERSION` in the bundled engine headers.
+
+## HPO command and bundled licences
+
+`docker build` without `--target`, using `docker/Dockerfile`, builds the unchanged
+backtest image: the last `default` stage aliases the original runtime, `release`.
+Only `ENGINE_VERSION` and `CODEGEN_VERSION` are required for that build, and its
+entrypoint remains `/opt/pineforge/bin/entrypoint.sh`.
+
+Use `--target hpo` to build the FULL image with the HPO command. It requires
+`ENGINE_VERSION`, `CODEGEN_VERSION`, `HPO_VERSION` and all six toolchain arguments
+listed below. That image accepts `docker run <image> hpo <subcommand>` for
+`space-info`, `compile`, `run` and `warm-encode`. For example, inspect each
+command's inputs with `docker run --rm <image> hpo compile --help`. The HPO
+command has the C++ compiler, Eigen, engine headers and static library needed
+to compile Pine-source studies, and a built `pineforge-hpo-native` runner.
+`PINEFORGE_ENGINE_ROOT` and `PINEFORGE_HPO_NATIVE` point to those installed files.
+The artifact cache is writable by the image's existing user; use `--cache-dir`
+with a writable mount to retain compiled artifacts between containers.
+
+With no first argument `hpo`, the dispatcher passes every argument unchanged
+to the engine's existing `/opt/pineforge/bin/entrypoint.sh`. The eight engine
+harness files and their byte and ABI checks remain in place.
+
+For `--target hpo`, `HPO_VERSION` is a required build argument with no default,
+recorded in the `io.pineforge.hpo.version` label and `PINEFORGE_HPO_VERSION`.
+The build fetches
+that release's wheel and native source, checks the wheel against
+`HPO_WHEEL_SHA256` when supplied, and asks pip to resolve the wheel's `transpile`
+extra against the already installed codegen. A resolution error or any planned
+codegen replacement fails the build. The wheel is then installed separately
+without dependencies under `/opt/pineforge/hpo`, beside codegen on `PYTHONPATH`.
+This change merges without a release; the first publish carrying HPO is the
+1.6.0 lockstep. HPO 0.15.0 is the fixture for the signed box proof.
+
+The box must supply exact Debian package versions through these required
+build arguments; no toolchain version has been guessed:
+
+| Build argument | Packages |
+|---|---|
+| `HPO_GCC_DEFAULTS_VERSION` | `gcc`, `g++`, `cpp` |
+| `HPO_GCC_VERSION` | `gcc-12`, `g++-12`, `cpp-12`, `libgcc-12-dev`, `libstdc++-12-dev`, `libgcc-s1`, `libstdc++6` |
+| `HPO_BINUTILS_VERSION` | `binutils` |
+| `HPO_EIGEN_VERSION` | `libeigen3-dev` |
+| `HPO_CMAKE_VERSION` | `cmake` (native build only) |
+| `HPO_MAKE_VERSION` | `make` (native build only) |
+
+`docker/hpo-toolchain.args` records those six pins as plain `NAME=VALUE` lines,
+with comments and blank lines allowed, and no shell syntax. The values were
+recorded by a signed box run (and a value left empty is reported by the tests as
+an unfilled skip); the publish workflow reads the file and passes the
+values as build arguments for `--target hpo`. The Dockerfile uses build
+arguments only. The default target does not need this file or its arguments.
+
+The installed wheels' own `*.dist-info/licenses/` files are also copied to
+`/opt/pineforge/licenses/pineforge-hpo/` (`LICENSE`, `NOTICE` and
+`THIRD_PARTY_LICENSES/sobol_joe_kuo.txt`) and
+`/opt/pineforge/licenses/pineforge-codegen/` (`LICENSE`). The native source's
+dlib and CORE-MATH licences sit in HPO's `THIRD_PARTY_LICENSES/` as `dlib.txt`
+and `core_math.txt`. The runtime compiler packages, binutils and Eigen retain
+their package copyright files at `/opt/pineforge/licenses/<package>/copyright`,
+copied from `/usr/share/doc/<package>/copyright` before documentation cleanup.
+`docker/LICENSE-SHA256SUMS` records every copied file; the build rejects missing
+entries, remaining box-run placeholders or any `sha256sum -c` difference.
+
+**OWNER/LEGAL PLACEHOLDER:** [State how GPL toolchain sources are obtainable at
+the exact pinned Debian versions, including source-package names and the
+approved source-availability wording.]
+
+The box runs `tests/test_release_hpo_image.py` (the CI test job discovers `test_release_*.py`). Its resolution check needs
+`PINEFORGE_HPO_REJECTED_WHEEL` (the real 0.13.2 wheel) and
+`PINEFORGE_HPO_ACCEPTED_WHEEL` (the real 0.15.0 wheel), each a file path or HTTPS
+URL. With neither supplied it skips with an explicit fixture message; with
+only one supplied it fails. `PINEFORGE_CODEGEN_WHEEL` can supply the real 1.5.0
+wheel for an offline run; otherwise the test fetches it from PyPI and verifies
+PyPI's digest. The same build helper must reject 0.13.2 because its real
+`pineforge-codegen<1.4,>=1.1.0` bound excludes 1.5.0, then resolve 0.15.0 without
+changing codegen. The tests also compute each target's stage dependencies,
+compare `release` with the original runtime at `989a0fd9~1`, and check dispatcher
+argv and exit status, the unchanged harness check, a forced licence mutation
+and the README pair-rule bytes against `origin/main`. The args-file tests
+compare its names with the real Dockerfile's toolchain declarations and
+required guards, reject malformed or duplicate entries, and report empty
+values as a named `unfilled toolchain versions` skip until the box fills them.
