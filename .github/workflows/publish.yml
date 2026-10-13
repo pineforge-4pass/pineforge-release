@@ -216,7 +216,7 @@ jobs:
             org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2
 
       # Inspect the selected target on both architectures before any publish.
-      # Keep target, arguments and cache settings identical to the push steps.
+      # Keep target and arguments identical to the push steps; the cache scope is per architecture and shared with them.
       - name: Inspect release amd64
         if: steps.pair.outputs.target != 'hpo'
         uses: docker/build-push-action@v6

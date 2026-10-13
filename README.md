@@ -315,8 +315,8 @@ The Dockerfile refuses to build when the harness `EXPECTED_PF_ABI` differs from
 
 `docker build` without `--target`, using `docker/Dockerfile`, builds the
 backtest image: the last `default` stage aliases the runtime, `release`.
-The default image differs from 1.5.0 only by the source notice and the retained
-Debian package copyright files.
+The default image differs from 1.5.0 only by the source notice, the two source
+labels and the retained Debian package copyright files.
 Only `ENGINE_VERSION` and `CODEGEN_VERSION` are required for that build, and its
 entrypoint remains `/opt/pineforge/bin/entrypoint.sh`.
 
