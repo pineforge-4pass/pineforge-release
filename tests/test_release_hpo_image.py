@@ -493,14 +493,15 @@ class ToolchainArgumentsTest(unittest.TestCase):
                 for package, argument in _pinned_packages(stage).items():
                     packages.setdefault(argument, set()).add(package)
         lines = self.args_text.splitlines()
-        prefix = "# TO BE FILLED BY THE BOX RUN: Debian packages "
+        prefixes = ("# TO BE FILLED BY THE BOX RUN: Debian packages ", "# Debian packages ")
         for index, line in enumerate(lines):
             if line.startswith("#") or not line.strip():
                 continue
             argument = line.split("=", 1)[0]
             with self.subTest(argument=argument):
                 self.assertGreater(index, 0)
-                self.assertTrue(lines[index - 1].startswith(prefix))
+                prefix = next((p for p in prefixes if lines[index - 1].startswith(p)), None)
+                self.assertIsNotNone(prefix, lines[index - 1])
                 covered = set(lines[index - 1][len(prefix):].split(", "))
                 self.assertEqual(covered, packages[argument])
 
@@ -616,7 +617,7 @@ source "$dispatch"
                           ["warm-encode", "--help"]):
             with self.subTest(arguments=arguments):
                 self.assertEqual(self._dispatch(["hpo", *arguments]),
-                                 ["python3", "-m", "pineforge_hpo", *arguments])
+                                 ["python3", "-m", "pineforge_hpo.cli", *arguments])
 
     def test_no_argument_and_other_first_arguments_preserve_engine_argv(self):
         for arguments in ([], [""], ["run"], ["compile", "hpo"],
@@ -629,7 +630,7 @@ source "$dispatch"
         for arguments in ([], ["hpo", "run"]):
             for status in (1, 4, 5):
                 with self.subTest(arguments=arguments, status=status):
-                    expected = (["python3", "-m", "pineforge_hpo", "run"]
+                    expected = (["python3", "-m", "pineforge_hpo.cli", "run"]
                                 if arguments else ["entrypoint.sh"])
                     self.assertEqual(self._dispatch(arguments, status), expected)
 
@@ -772,24 +773,36 @@ class PinnedLicenceDigestsTest(unittest.TestCase):
             self.assertEqual(listed.get(path), digest, path)
 
 
+class DispatcherModuleTest(unittest.TestCase):
+    """The module the dispatcher runs must exist and be runnable in the real published wheel."""
+
+    def test_dispatcher_module_is_runnable_in_the_real_wheel(self):
+        wheel = os.environ.get("PINEFORGE_HPO_ACCEPTED_WHEEL")
+        if not wheel or not Path(wheel).is_file():
+            self.skipTest("supply PINEFORGE_HPO_ACCEPTED_WHEEL (a real hpo wheel file)")
+        script = (REPO / "docker" / "entrypoint-dispatch.sh").read_text(encoding="utf-8")
+        modules = re.findall(r"exec python3 -m (\S+)", script)
+        self.assertEqual(len(modules), 1, modules)
+        relative = modules[0].replace(".", "/")
+        import zipfile
+        with zipfile.ZipFile(wheel) as archive:
+            names = set(archive.namelist())
+            candidates = [relative + ".py", relative + "/__main__.py"]
+            found = [name for name in candidates if name in names]
+            self.assertEqual(len(found), 1, "the dispatcher's module " + modules[0] + " is not runnable in the wheel: " + str(candidates))
+            self.assertIn('if __name__ == "__main__"', archive.read(found[0]).decode("utf-8"))
+
+
 class ReadmePairRuleTest(unittest.TestCase):
-    def test_lines_196_to_225_are_byte_identical_to_origin_main(self):
-        git = shutil.which("git")
-        if git is None:
-            self.skipTest("git is unavailable; pair-rule comparison needs a git checkout")
-        checkout = subprocess.run([git, "rev-parse", "--is-inside-work-tree"], cwd=REPO,
-                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
-        if checkout.returncode or checkout.stdout.strip() != b"true":
-            self.skipTest("not in a git checkout; cannot read origin/main:README.md")
-        baseline = subprocess.run([git, "show", "origin/main:README.md"], cwd=REPO,
-                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
-        self.assertEqual(baseline.returncode, 0,
-                         "git checkout must provide origin/main for the pair-rule byte comparison")
-        before = baseline.stdout.splitlines(keepends=True)
-        after = (REPO / "README.md").read_bytes().splitlines(keepends=True)
-        self.assertGreaterEqual(len(before), 225)
-        self.assertGreaterEqual(len(after), 225)
-        self.assertEqual(after[195:225], before[195:225])
+    # SHA-256 of README.md lines 196-225 (the pair rule) as published on the hub's main when this change was made.
+    # A checkout in CI has no origin/main, so the rule is pinned by digest; a deliberate change of the rule changes
+    # this value in the same commit.
+    PAIR_RULE_SHA256 = "35b72f7f5c7466cfc212a71eaf05df98f45e92411fd34a67bfff761556c61601"
+
+    def test_lines_196_to_225_are_byte_identical_to_the_published_rule(self):
+        lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
+        self.assertGreaterEqual(len(lines), 225)
+        self.assertEqual(hashlib.sha256(b"".join(lines[195:225])).hexdigest(), self.PAIR_RULE_SHA256)
 
 
 if __name__ == "__main__":

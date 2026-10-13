@@ -322,8 +322,9 @@ build arguments; no toolchain version has been guessed:
 | `HPO_MAKE_VERSION` | `make` (native build only) |
 
 `docker/hpo-toolchain.args` records those six pins as plain `NAME=VALUE` lines,
-with comments and blank lines allowed, and no shell syntax. The signed box run
-fills the empty values; the publish workflow reads the file and passes the
+with comments and blank lines allowed, and no shell syntax. The values were
+recorded by a signed box run (and a value left empty is reported by the tests as
+an unfilled skip); the publish workflow reads the file and passes the
 values as build arguments for `--target hpo`. The Dockerfile uses build
 arguments only. The default target does not need this file or its arguments.
 
