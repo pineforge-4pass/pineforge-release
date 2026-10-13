@@ -260,8 +260,8 @@ The registry has five tab-separated columns: `set-id`, `release-tag`, `n-pairs`,
 The set id hashes sorted unique `source<TAB>version` lines with a final newline.
 The separate box run fetches the real sources; the owner attaches them to a
 holding release. Add registry rows only after those real list
-files and their source assets are available. The registry is initially empty,
-so publishing remains refused until that evidence is recorded.
+files and their source assets are available. The registry records the 11 EN-150
+source sets and the earliest release holding each bundle.
 A new source set (an image package set not yet in docker/SOURCE-SETS.tsv) needs
 its bundle attached to an earlier or dedicated release before its first publish,
 because the guard looks up the holding release by tag before the new tag's

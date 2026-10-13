@@ -309,11 +309,29 @@ class SourceGuardTest(unittest.TestCase):
         self.assertEqual(fields["release-tag"], "v1.5.0")
         self.assertEqual(fields["list-asset"], "set-02.SOURCES.list")
 
-    def test_95_repository_registry_has_the_documented_header(self):
+    def test_95_repository_registry_has_the_documented_header_and_real_source_sets(self):
         lines = (REPO / "docker" / "SOURCE-SETS.tsv").read_text(encoding="utf-8").splitlines()
         data = [line for line in lines if line and not line.startswith("#")]
-        self.assertTrue(data, "the registry must retain its header when the box adds real rows")
+        self.assertTrue(data, "the registry must retain its documented header")
         self.assertEqual(data[0], REGISTRY_HEADER.rstrip("\n"))
+        rows = [line.split("\t") for line in data[1:]]
+        self.assertEqual(len(rows), 11, "the registry must contain the 11 real EN-150 source sets")
+        expected_tags = ("v0.1.0", "v1.4.0", "v0.1.21", "v0.1.15", "v1.0.1", "v0.1.11",
+                         "v0.1.13", "v1.0.0-rc.1", "v0.1.19", "v0.1.25", "v1.3.0")
+        identities = []
+        for number, columns in enumerate(rows, 1):
+            with self.subTest(source_set=f"set-{number:02d}"):
+                self.assertEqual(len(columns), 5, "registry rows must have five tab-separated fields")
+                identity, tag, count, digest, asset = columns
+                self.assertRegex(identity, r"^[0-9a-f]{64}$")
+                self.assertRegex(digest, r"^[0-9a-f]{64}$")
+                self.assertTrue(tag.startswith("v"), "holding releases must use v-prefixed tags")
+                self.assertIn(tag, expected_tags)
+                self.assertEqual(tag, expected_tags[number - 1], "each set must use its confirmed release")
+                self.assertEqual(count, "84")
+                self.assertEqual(asset, f"set-{number:02d}.SOURCES.list")
+                identities.append(identity)
+        self.assertEqual(len(set(identities)), 11, "EN-150 set-ids must be unique")
 
     def test_96_multiple_assets_for_one_source_pair_keep_the_same_set_id(self):
         source, version = next(pair for pair in self.pairs if ":" in pair[1])
@@ -427,6 +445,14 @@ class SourceNoticeTest(unittest.TestCase):
                                   "/usr/share/locale", "/usr/share/info"],
                                  "apt cleanup must remove only the /usr/share/doc token")
                 self.assertTrue(cleanup.startswith("set -eu;"))
+                self.assertEqual(
+                    " ".join(cleanup.split()),
+                    "set -eu; if [ -d /usr/share/doc ]; then "
+                    "find /usr/share/doc -type f ! -name copyright -delete; "
+                    "find /usr/share/doc -xtype l -delete; "
+                    "find /usr/share/doc -depth -type d -empty -delete; fi",
+                    "doc cleanup must remove non-copyright files, then only broken links, then empty directories",
+                )
                 self.assertEqual(stage.text.count("# --- sources notice (begin)\n"), 1)
                 self.assertEqual(stage.text.count("# --- sources notice (end)\n"), 1)
                 block = stage.text.split("# --- sources notice (begin)\n", 1)[1].split(
@@ -445,12 +471,15 @@ class SourceNoticeTest(unittest.TestCase):
                 copies = [body for keyword, body in stage.instructions if keyword == "COPY"]
                 self.assertIn("docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in", copies)
 
-    def test_real_cleanup_preserves_regular_copyright_and_both_kinds_of_symlink(self):
+    def test_real_cleanup_removes_dangling_links_and_preserves_working_symlinks(self):
         for name in ("release", "hpo"):
             with self.subTest(stage=name), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 docs = root / "usr share doc"
                 keep = {"gcc-12-base/copyright": b"gcc copyright fixture\n",
+                        "gcc-12/copyright": b"gcc compiler copyright fixture\n",
+                        "python3.11/copyright": b"python runtime copyright fixture\n",
+                        "python3/copyright": b"python defaults copyright fixture\n",
                         "fixture-package/copyright": b"another copyright fixture\n"}
                 for relative, data in keep.items():
                     target = docs / relative
@@ -461,15 +490,29 @@ class SourceNoticeTest(unittest.TestCase):
                 linked = docs / "copyright-link" / "copyright"
                 linked.symlink_to("../gcc-12-base/copyright")
                 for relative in ("gcc-12-base/changelog.gz", "fixture-package/examples/demo.txt",
+                                 "gcc-12/README.Bugs", "python3.11/NEWS.gz",
+                                 "python3/python-policy.txt.gz",
                                  "only-changelogs/changelog", "pineforge/SOURCES.txt"):
                     target = docs / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(b"discard this documentation\n")
+                dangling = {"cpp/README.Bugs": "../gcc-12/README.Bugs",
+                            "python3.11/changelog.gz": "NEWS.gz",
+                            "python3.11/python-policy.txt.gz": "../python3/python-policy.txt.gz",
+                            "only-links/changelog.gz": "../only-changelogs/changelog"}
+                for relative, destination in dangling.items():
+                    link = docs / relative
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(destination)
+                    self.assertTrue(link.exists(), "fixture link must resolve before file cleanup")
                 (docs / "empty-directory").mkdir()
                 _, run = self.cleanup_run(name)
                 script = run.replace("/usr/share/doc", shlex.quote(str(docs)))
                 done = self.run_shell(script, root)
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                for relative in dangling:
+                    self.assertFalse((docs / relative).is_symlink(),
+                                     "broken doc symlink must be removed: " + relative)
                 for relative, data in keep.items():
                     self.assertEqual((docs / relative).read_bytes(), data)
                 self.assertTrue((docs / "libgcc-s1").is_symlink(), "package doc symlink must survive")
@@ -481,7 +524,8 @@ class SourceNoticeTest(unittest.TestCase):
                 remaining = {str(path.relative_to(docs)) for path in docs.rglob("*")
                              if path.is_file() and not path.is_symlink()}
                 self.assertEqual(remaining, set(keep), "non-copyright regular files must be removed")
-                for relative in ("fixture-package/examples", "only-changelogs", "pineforge", "empty-directory"):
+                for relative in ("fixture-package/examples", "only-changelogs", "cpp", "only-links",
+                                 "pineforge", "empty-directory"):
                     self.assertFalse((docs / relative).exists(), "empty doc directories must be removed")
 
     def test_real_cleanup_succeeds_with_absent_or_empty_doc_paths(self):

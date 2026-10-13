@@ -92,6 +92,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN set -eu; \
     if [ -d /usr/share/doc ]; then \
       find /usr/share/doc -type f ! -name copyright -delete; \
+      find /usr/share/doc -xtype l -delete; \
       find /usr/share/doc -depth -type d -empty -delete; \
     fi
 COPY docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in
@@ -284,6 +285,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN set -eu; \
     if [ -d /usr/share/doc ]; then \
       find /usr/share/doc -type f ! -name copyright -delete; \
+      find /usr/share/doc -xtype l -delete; \
       find /usr/share/doc -depth -type d -empty -delete; \
     fi
 COPY docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in

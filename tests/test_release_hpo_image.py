@@ -474,7 +474,14 @@ class DockerfileTargetTest(unittest.TestCase):
                 "# --- sources notice (end)\n", 1)[0]
             instructions = _dockerfile_instructions(block)
             self.assertEqual([keyword for keyword, _ in instructions], ["RUN", "COPY", "LABEL", "RUN"])
-            self.assertIn("find /usr/share/doc", instructions[0][1])
+            self.assertEqual(
+                " ".join(instructions[0][1].split()),
+                "set -eu; if [ -d /usr/share/doc ]; then "
+                "find /usr/share/doc -type f ! -name copyright -delete; "
+                "find /usr/share/doc -xtype l -delete; "
+                "find /usr/share/doc -depth -type d -empty -delete; fi",
+                name + ": doc cleanup must remove non-copyright files, then only broken links, then empty directories",
+            )
             self.assertEqual(instructions[1][1], "docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in")
             labels = shlex.split(instructions[2][1])
             self.assertEqual({label.split("=", 1)[0] for label in labels},
