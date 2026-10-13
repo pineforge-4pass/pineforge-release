@@ -1,21 +1,21 @@
 {
   "schema": "pineforge/facts/v1",
   "scoreboard": {
-    "source": "Registry baseline pineforge-parity-baseline-20261012-engine-9da4c984; digest-verified snapshot 81ce976cb4dd09b9d1063bc22035c7fb0861c7a91cf6d6a7347f64bd3e4a3c37; private evidence sha256:a6ccc1a2fa6f76f80df234b35bb662fe96414b559ba18b1da5ee8e0e6b1c232f.",
+    "source": "Registry baseline pineforge-parity-baseline-20261013-engine-2608ebdd; digest-verified snapshot 438ca43a511cba22413a93f0db8ec781ed90c361564633b3b2d3f4c8104f5aac; private evidence sha256:ed89f91e9f7eec3ec2fbbcde959d566c9a5ef97eed5235ac50bc156cb1e36b19.",
     "provenance": {
-      "baselineId": "pineforge-parity-baseline-20261012-engine-9da4c984",
-      "snapshotSha256": "81ce976cb4dd09b9d1063bc22035c7fb0861c7a91cf6d6a7347f64bd3e4a3c37",
+      "baselineId": "pineforge-parity-baseline-20261013-engine-2608ebdd",
+      "snapshotSha256": "438ca43a511cba22413a93f0db8ec781ed90c361564633b3b2d3f4c8104f5aac",
       "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
-      "engineCommit": "9da4c9840461fbd333b4566591b3f10fa34f8b00",
-      "codegenCommit": "e8a462914c0ab96a2a46976afcdc7ecff0100e12",
-      "promotionDate": "2026-10-12T22:56:28.000Z",
-      "privateEvidenceSha256": "a6ccc1a2fa6f76f80df234b35bb662fe96414b559ba18b1da5ee8e0e6b1c232f"
+      "engineCommit": "2608ebdd6db0e079f63d3f3e044d26c8099c8d49",
+      "codegenCommit": "1598e1cf31f8c63322ac0cfe3d6a5e9a5048dd40",
+      "promotionDate": "2026-10-13T03:12:26.000Z",
+      "privateEvidenceSha256": "ed89f91e9f7eec3ec2fbbcde959d566c9a5ef97eed5235ac50bc156cb1e36b19"
     },
-    "id": "pineforge-parity-baseline-20261012-engine-9da4c984",
-    "date": "2026-10-12",
-    "engineCommit": "9da4c9840461fbd333b4566591b3f10fa34f8b00",
-    "codegenCommit": "e8a462914c0ab96a2a46976afcdc7ecff0100e12",
-    "snapshotSha256": "81ce976cb4dd09b9d1063bc22035c7fb0861c7a91cf6d6a7347f64bd3e4a3c37",
+    "id": "pineforge-parity-baseline-20261013-engine-2608ebdd",
+    "date": "2026-10-13",
+    "engineCommit": "2608ebdd6db0e079f63d3f3e044d26c8099c8d49",
+    "codegenCommit": "1598e1cf31f8c63322ac0cfe3d6a5e9a5048dd40",
+    "snapshotSha256": "438ca43a511cba22413a93f0db8ec781ed90c361564633b3b2d3f4c8104f5aac",
     "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
     "population": 8006,
     "anomaliesExcluded": 17,
