@@ -13,16 +13,18 @@ patch-bumps its own VERSION. From 1.0.0 on they share one version, prerelease
 included: an event whose partner has not published that version yet waits,
 a partner that has released a different new version is a mismatch that fails,
 and the hub release version is the pair's. HPO_PAIRING_FROM is the single
-cutoff: by semver precedence, hpo joins at that version (its prereleases are
-below it). Then all three components must share the release version, an event
-waits for every missing partner, and the tag must carry an explicit hpo pin.
+cutoff: by semver precedence, hpo joins at that version, including that rc and
+every later version. Then all three components must share the release version,
+an event waits for every missing partner, and the tag must carry an explicit hpo pin.
+Hpo events may use either spelling; decisions and tag pins use semver, while
+its GitHub release tags, wheel assets and build argument use PEP 440.
 
 Commands print key=value lines on stdout (for $GITHUB_OUTPUT); notes and
 errors go to stderr, and a broken rule exits 1:
 
   info VERSION                bare, line (legacy | pair), prerelease, pypi
   latest-tag [--stable]       highest version tag of those on stdin
-  latest-pep440               highest PyPI (PEP 440) version on stdin, semver spelling
+  latest-pep440 [--tags]      highest PEP 440 version on stdin, semver spelling
   decide ...                  handle-upstream's action for one upstream event
   check --release R --engine E --codegen C [--hpo H] [--newest-stable TAG]
                               publish.yml's rule for the image it builds
@@ -46,7 +48,7 @@ _PEP440_RE = re.compile(
 _PRE_RANK = {"alpha": 0, "beta": 1, "rc": 2}
 _PEP440_PRE = {"alpha": "a", "beta": "b", "rc": "rc"}
 _FROM_PEP440 = {"a": "alpha", "b": "beta", "rc": "rc"}
-HPO_PAIRING_FROM = "1.6.0"
+HPO_PAIRING_FROM = "1.6.0-rc.1"
 _COMPONENTS = ("engine", "codegen", "hpo")
 
 
@@ -109,6 +111,24 @@ def parse_pep440(text: str) -> Version:
     return Version(int(major), int(minor), int(patch), _FROM_PEP440.get(pre), int(pre_num or 0))
 
 
+def hpo_version(version: str, *, to_semver: bool = False) -> str:
+    """Map a hub version to hpo's PEP 440 spelling, or normalize an hpo event.
+
+    Incoming events accept the existing semver subset or its canonical PEP 440
+    spelling, with an optional leading v. Keep the codegen mapping in Version.
+    """
+    if not to_semver:
+        return parse(version).pep440
+    try:
+        parsed = parse(version)
+    except ValueError as semver_error:
+        try:
+            parsed = parse_pep440(version.removeprefix("v") if isinstance(version, str) else version)
+        except ValueError:
+            raise semver_error from None
+    return str(parsed)
+
+
 def hpo_pairing(version: Version) -> bool:
     """One cutoff for the decision, publish check and workflow `info` output."""
     return version >= parse(HPO_PAIRING_FROM)
@@ -137,11 +157,13 @@ def _triple_pin(r: Version, e: Version, c: Version, raw_hpo: str, context: str) 
     return h
 
 
-def latest_pep440(versions: Iterable[str]) -> Optional[Version]:
+def latest_pep440(versions: Iterable[str], *, tags: bool = False) -> Optional[Version]:
+    """Order canonical PEP 440 releases; --tags also accepts a leading v."""
     best = None
     for raw in versions:
+        text = raw.strip()
         try:
-            version = parse_pep440(raw.strip())
+            version = parse_pep440(text.removeprefix("v") if tags else text)
         except ValueError:
             continue
         if best is None or version > best:
@@ -212,7 +234,7 @@ def _decide_triple(component: str, v: Version, ep: Version, cp: Version,
     for name in missing:
         if not latest.get(name):
             continue
-        partner = parse(latest[name])
+        partner = parse(hpo_version(latest[name], to_semver=True) if name == "hpo" else latest[name])
         # A pre-cutoff hpo release cannot participate; old engine/codegen
         # releases still count as mismatches if they advanced since the tag.
         participates = hpo_pairing(partner) if name == "hpo" else partner.line == "pair"
@@ -230,8 +252,9 @@ def _decide_triple(component: str, v: Version, ep: Version, cp: Version,
     for name in partners:
         if name not in missing:
             out[name] = str(v)
-    awaiting = ", ".join(f"{name} {v}" for name in missing)
-    return out, (f"mode=wait: {component} {v} recorded; waiting for {awaiting}; "
+    awaiting = ", ".join(f"{name} {hpo_version(str(v)) if name == 'hpo' else str(v)}" for name in missing)
+    event_version = hpo_version(str(v)) if component == "hpo" else str(v)
+    return out, (f"mode=wait: {component} {event_version} recorded; waiting for {awaiting}; "
                  f"landed {landed}. Nothing is built or published.")
 
 
@@ -247,7 +270,7 @@ def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
     map component names to their publication facts. The original arguments and
     outputs are unchanged below the cutoff; hpo facts there are ignored.
     """
-    v = parse(version)
+    v = parse(hpo_version(version, to_semver=True) if component == "hpo" else version)
     _component(component, v)
     if prerelease_flag not in ("", "true", "false"):
         raise RuleError(f"bad client_payload.prerelease {prerelease_flag!r} (expected true or false)")
@@ -390,7 +413,8 @@ def check(release: str, engine: str, codegen: str, pin: str = "", *, hpo: Option
     out = {"line": line, "prerelease": _flag(r.prerelease), "codegen_pypi": c.pep440,
            "moving": _flag(moving)}
     if h is not None:
-        out.update(hpo=str(h), target="hpo", hpo_version_arg=f"HPO_VERSION={h}")
+        pep440 = hpo_version(str(h))
+        out.update(hpo=str(h), hpo_pep440=pep440, target="hpo", hpo_version_arg=f"HPO_VERSION={pep440}")
         if hpo_wheel_digest:
             digest = hpo_wheel_digest.removeprefix("sha256:")
             if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
@@ -413,7 +437,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="refuse a component event that cannot participate at this version")
     p_latest = sub.add_parser("latest-tag")
     p_latest.add_argument("--stable", action="store_true", help="skip prereleases")
-    sub.add_parser("latest-pep440")
+    p_pep440 = sub.add_parser("latest-pep440")
+    p_pep440.add_argument("--tags", action="store_true", help="read PEP 440 GitHub release tags")
     p_decide = sub.add_parser("decide")
     p_decide.add_argument("--component", required=True, choices=_COMPONENTS)
     p_decide.add_argument("--version", required=True)
@@ -441,19 +466,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         if args.cmd == "info":
-            v = parse(args.version)
+            v = parse(hpo_version(args.version, to_semver=True) if args.component == "hpo" else args.version)
             if args.component:
                 _component(args.component, v)
             out = {"bare": str(v), "line": v.line, "prerelease": _flag(v.prerelease), "pypi": v.pep440}
             if hpo_pairing(v):
                 out["hpo_pairing"] = "true"
+                out["hpo_pep440"] = hpo_version(str(v))
             _emit(out)
         elif args.cmd == "latest-tag":
             tag = latest_tag(sys.stdin, stable=args.stable)
             if tag:
                 print(tag)
         elif args.cmd == "latest-pep440":
-            best = latest_pep440(sys.stdin)
+            best = latest_pep440(sys.stdin, tags=args.tags)
             if best:
                 print(best)
         elif args.cmd == "decide":

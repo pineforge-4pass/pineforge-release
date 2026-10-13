@@ -37,6 +37,8 @@ HERE = Path(__file__).resolve().parent
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(HERE))
 import wfrun  # noqa: E402
+sys.path.insert(0, str(HERE.parent.parent / "scripts"))
+import release_pair as rp  # noqa: E402
 
 REPO = "pineforge-4pass/pineforge-release"
 IMAGE = f"ghcr.io/{REPO}"
@@ -156,13 +158,14 @@ class World:
 
     def hpo_published(self, v, status=200, *, digest=None):
         """The hpo GitHub Release and its wheel; there is no package index."""
+        pep440 = rp.hpo_version(v)
         rels = self.load("releases-pineforge-hpo.json")
         self.save("releases-pineforge-hpo.json",
-                  [{"tag_name": f"v{v}", "draft": False, "prerelease": "-" in v}] + rels)
-        self.http(f"{HPO_DL}/v{v}/pineforge_hpo-{v}-py3-none-any.whl", status)
-        self.save(f"release-pineforge-hpo-v{v}.json", {
-            "tag_name": f"v{v}", "assets": [
-                {"name": f"pineforge_hpo-{v}-py3-none-any.whl", "digest": digest}]})
+                  [{"tag_name": f"v{pep440}", "draft": False, "prerelease": rp.parse(v).prerelease}] + rels)
+        self.http(f"{HPO_DL}/v{pep440}/pineforge_hpo-{pep440}-py3-none-any.whl", status)
+        self.save(f"release-pineforge-hpo-v{pep440}.json", {
+            "tag_name": f"v{pep440}", "assets": [
+                {"name": f"pineforge_hpo-{pep440}-py3-none-any.whl", "digest": digest}]})
 
     def codegen_published(self, pep440):
         """The codegen release.yml: the PyPI upload, then its dispatch."""
@@ -621,9 +624,11 @@ def _no_publication(result):
                 or result.calls(tool="gh", action="dispatch"))
 
 
-def _triple_order(w, order):
-    """One independent 1.5.9 -> 1.6.0 history, replaying the real workflows."""
-    components, version = ("engine", "codegen", "hpo"), "1.6.0"
+def _triple_order(w, order, version):
+    """One independent history from 1.5.9, replaying the real workflows."""
+    components = ("engine", "codegen", "hpo")
+    prerelease, pep440 = rp.parse(version).prerelease, rp.hpo_version(version)
+    spellings = {name: pep440 if name == "hpo" else version for name in components}
     w.engine_published("1.5.9")
     w.codegen_published("1.5.9")
     w.record_tag("1.5.9")
@@ -633,17 +638,20 @@ def _triple_order(w, order):
     for index, component in enumerate(order, 1):
         if component == "hpo":
             w.hpo_published(version, digest=f"sha256:{digest}")
+        elif component == "codegen":
+            w.codegen_published(rp.parse(version).pep440)
         else:
-            getattr(w, f"{component}_published")(version)
+            w.engine_published(version)
         published.add(component)
-        r = w.upstream(f"{component}-release", {"version": version, "prerelease": False, "run_id": 600 + index})
+        r = w.upstream(f"{component}-release", {"version": spellings[component], "prerelease": prerelease,
+                                               "run_id": 600 + index})
         d = r.step("decide")
         missing = set(components) - published
         if missing:
             w.check(f"arrival {index} {component}: wait names every missing partner",
                     r.ok and d.get("mode") == "wait" and d.get("release") == ""
                     and set(d.get("awaiting", "").split(",")) == missing
-                    and all(f"{name} {version}" in r.text() for name in missing), (r.failed_step, d))
+                    and all(f"{name} {spellings[name]}" in r.text() for name in missing), (r.failed_step, d))
             w.check(f"arrival {index}: main/tags unchanged; no build, release or dispatch",
                     w.unchanged(before, main) and _no_publication(r), w.unchanged(before, main, why=True))
         else:
@@ -662,59 +670,100 @@ def _triple_order(w, order):
                                                 cwd=w.origin, env=w.env))
     p = w.publish(tag)
     builds = p.calls(tool="docker/build-push-action")
-    expected = {f"ENGINE_VERSION={version}", f"CODEGEN_VERSION={version}", f"HPO_VERSION={version}",
+    expected = {f"ENGINE_VERSION={version}", f"CODEGEN_VERSION={version}", f"HPO_VERSION={pep440}",
                 f"HPO_WHEEL_SHA256={digest}",
                 f"RELEASE_VERSION={tag}", f"RELEASE_GIT_SHA={w.rev(tag)}"}
     w.check("publish checks all pins, selects hpo and passes its version and wheel digest",
-            p.ok and p.step("pair").get("hpo") == version and len(builds) == 1
+            p.ok and p.step("pair").get("hpo") == version and p.step("pair").get("hpo_pep440") == pep440
+            and len(builds) == 1
             and builds[0].get("target") == "hpo"
             and len(builds[0]["build_args"]) == len(expected) and set(builds[0]["build_args"]) == expected,
             (p.failed_step, builds))
     sha = w.rev(tag, short=True)
-    w.check("triple stable publish keeps the existing fixed/moving image tags and fanout",
-            w.pushed(p) == {f"{IMAGE}:{t}" for t in (version, "1.6", "latest", "engine1.6.0-codegen1.6.0", f"sha-{sha}")}
-            and w.release(p, tag).get("latest") == "true" and w.fanout_matches(p, version, False),
+    tags = (version, f"engine{version}-codegen{version}", f"sha-{sha}")
+    if not prerelease:
+        tags += ("1.6", "latest")
+    w.check("triple publish keeps the channel's image tags, GitHub release flags and fanout",
+            w.pushed(p) == {f"{IMAGE}:{t}" for t in tags}
+            and w.release(p, tag).get("prerelease") is prerelease
+            and w.release(p, tag).get("latest") == ("false" if prerelease else "true")
+            and w.fanout_matches(p, version, prerelease),
             (sorted(w.pushed(p)), w.dispatched(p)))
     before, main = w.tags(), w.rev("main")
     for component in components:
-        r = w.upstream(f"{component}-release", {"version": version, "prerelease": False})
+        r = w.upstream(f"{component}-release", {"version": spellings[component], "prerelease": prerelease})
         w.check(f"duplicate {component}: noop with the landed triple",
                 r.ok and r.step("decide").get("mode") == "noop"
                 and w.unchanged(before, main) and _no_publication(r), (r.failed_step, r.step("decide")))
 
 
 def triple(w):
-    """All six 1.6.0 arrival orders, the hpo cutoff, old tags, mismatches and uncertain probes."""
+    """All six arrival orders for rc and stable triples, old tags, mismatches and uncertain probes."""
     components = ("engine", "codegen", "hpo")
-    for order in permutations(components):
-        child = World(f"triple/{'-'.join(order)}", w.opts, w.report)
-        try:
-            _triple_order(child, order)
-        except Exception as err:
-            child.check(f"arrival order reached the end ({type(err).__name__})", False, err)
-        finally:
-            child.transcript.close()
+    for version in ("1.6.0-rc.1", "1.6.0"):
+        for order in permutations(components):
+            child = World(f"triple/{version}/{'-'.join(order)}", w.opts, w.report)
+            try:
+                _triple_order(child, order, version)
+            except Exception as err:
+                child.check(f"arrival order reached the end ({type(err).__name__})", False, err)
+            finally:
+                child.transcript.close()
+
+    child = World("triple/hpo-prerelease-lookup", w.opts, w.report)
+    try:
+        version = rp.HPO_PAIRING_FROM
+        child.engine_published("1.5.9")
+        child.codegen_published("1.5.9")
+        child.record_tag("1.5.9")
+        child.engine_published(version)
+        child.codegen_published(rp.parse(version).pep440)
+        child.hpo_published(version, status=404)
+        before, main = child.tags(), child.rev("main")
+        event = {"version": version, "prerelease": True}
+        r = child.upstream("engine-release", event)
+        child.check("hpo rc release with its wheel still uploading is pending",
+                    r.ok and r.step("partner").get("hpo_latest") == version
+                    and r.step("decide").get("mode") == "wait" and r.step("decide").get("awaiting") == "hpo"
+                    and f"waiting for hpo {rp.hpo_version(version)}" in r.text()
+                    and child.unchanged(before, main) and _no_publication(r), (r.failed_step, r.step("partner")))
+        child.hpo_published("1.6.0-rc.2", status=404)
+        child.hpo_published("1.6.0-rc.12", status=404)
+        child.save("releases-pineforge-hpo.json", [
+            {"tag_name": "v1.6.0", "draft": True, "prerelease": False},
+            *child.load("releases-pineforge-hpo.json")])
+        r = child.upstream("engine-release", event)
+        child.check("hpo prereleases remain visible: rc12 outranks rc2; drafts are ignored",
+                    r.step("partner").get("hpo_latest") == "1.6.0-rc.12"
+                    and child.refused(r, "Decide action", "hpo 1.6.0-rc.12")
+                    and child.unchanged(before, main) and _no_publication(r), (r.failed_step, r.step("partner")))
+    finally:
+        child.transcript.close()
 
     # A landed pre-cutoff tag has no hpo pin and still builds as before.
-    w.engine_published("1.5.0")
-    w.codegen_published("1.5.0")
-    w.record_tag("1.5.0")
-    p = w.publish("v1.5.0")
-    builds = p.calls(tool="docker/build-push-action")
-    w.check("landed v1.5.0 without hpo= still publishes with the old build arguments",
-            p.ok and w.pins("v1.5.0", include_hpo=True) == ("1.5.0", "1.5.0", None)
-            and "hpo" not in p.step("pair") and len(builds) == 1
-            and builds[0].get("target") is None
-            and len(builds[0]["build_args"]) == 4
-            and not any(arg.startswith("HPO_") for arg in builds[0]["build_args"]), (p.failed_step, builds))
+    for version in ("1.5.0", "1.5.9", "1.6.0-alpha.1", "1.6.0-beta.1"):
+        w.engine_published(version)
+        w.codegen_published(rp.parse(version).pep440)
+        w.record_tag(version)
+        p = w.publish(f"v{version}")
+        builds = p.calls(tool="docker/build-push-action")
+        w.check(f"landed v{version} without hpo= still publishes with the old build arguments",
+                p.ok and w.pins(f"v{version}", include_hpo=True) == (version, version, None)
+                and "hpo" not in p.step("pair") and len(builds) == 1
+                and builds[0].get("target") is None
+                and len(builds[0]["build_args"]) == 4
+                and not any(arg.startswith("HPO_") for arg in builds[0]["build_args"]), (p.failed_step, builds))
     before, main = w.tags(), w.rev("main")
-    for version in ("0.13.2", "1.5.0", "1.5.9", "1.6.0-rc.1"):
+    for version in ("0.13.2", "1.5.0", "1.5.9", "1.6.0-alpha.1", "1.6.0a1", "1.6.0-beta.1", "1.6.0b1"):
         r = w.upstream("hpo-release", {"version": version, "force": True})
         w.check(f"hpo {version} refused before any pin/tag/build changes",
-                w.refused(r, "Validate payload", "hpo joins the pairing at 1.6.0")
+                w.refused(r, "Validate payload", f"hpo joins the pairing at {rp.HPO_PAIRING_FROM}")
                 and w.unchanged(before, main) and _no_publication(r), r.failed_step)
     for payload, message in (({"version": "1.6.0;id"}, "rejected untrusted version"),
-                             ({"version": "1.6.0\n1.6.1"}, "rejected version"),
+                             ({"version": "1.6.0\n1.6.1"}, "rejected untrusted version"),
+                             ({"version": "1.6.0.rc1"}, "rejected untrusted version"),
+                             ({"version": "1.6.0RC1"}, "rejected untrusted version"),
+                             ({"version": "1.6.0rc01"}, "rejected version"),
                              ({"version": "1.6.0", "prerelease": "yes"}, "rejected untrusted prerelease"),
                              ({"version": "1.6.0", "run_id": "12\n34"}, "bad run_id")):
         r = w.upstream("hpo-release", payload)
@@ -764,15 +813,17 @@ def triple(w):
             w.refused(r, "Probe the partner release", "could not tell whether")
             and r.calls(tool="curl", status=0) and w.unchanged(before, main) and _no_publication(r), r.failed_step)
 
-    for label, hpo in (("missing", None), ("invalid", "bad"), ("mismatch", "1.6.1")):
-        child = World(f"triple/publish-{label}", w.opts, w.report)
-        try:
-            child.record_tag("1.6.0", hpo)
-            p = child.publish("v1.6.0")
-            child.check(f"v1.6.0 tag with {label} hpo fails before any build/release/dispatch",
-                        not p.ok and "hpo" in p.text() and _no_publication(p), p.failed_step)
-        finally:
-            child.transcript.close()
+    for version in ("1.6.0-rc.1", "1.6.0"):
+        for label, hpo in (("missing", None), ("invalid", "bad"), ("pep440-pin", "1.6.0rc1"),
+                           ("mismatch", "1.6.1")):
+            child = World(f"triple/publish-{version}-{label}", w.opts, w.report)
+            try:
+                child.record_tag(version, hpo)
+                p = child.publish(f"v{version}")
+                child.check(f"v{version} tag with {label} hpo fails before any build/release/dispatch",
+                            not p.ok and "hpo" in p.text() and _no_publication(p), p.failed_step)
+            finally:
+                child.transcript.close()
 
     child = World("triple/retag", w.opts, w.report)
     try:

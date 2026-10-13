@@ -412,14 +412,57 @@ class HermeticReplayTest(unittest.TestCase):
             run.assert_not_called()
 
     def test_checked_target_and_arguments_use_the_real_expression_evaluator(self):
-        for version, target in (("1.5.9", ""), (f"{rp.HPO_PAIRING_FROM}-rc.1", ""),
+        for version, target in (("1.5.9", ""), ("1.6.0-alpha.1", ""), ("1.6.0-beta.1", ""),
                                 (rp.HPO_PAIRING_FROM, "hpo"), ("1.6.1-rc.1", "hpo")):
             with self.subTest(version=version):
                 outputs = rp.check(version, version, version, hpo=version)
                 context = {"steps": {"pair": {"outputs": outputs}}}
                 self.assertEqual(wfrun.interpolate("${{ steps.pair.outputs.target }}", context), target)
                 self.assertEqual(wfrun.interpolate("${{ steps.pair.outputs.hpo_version_arg }}", context),
-                                 f"HPO_VERSION={version}" if target else "")
+                                 f"HPO_VERSION={rp.hpo_version(version)}" if target else "")
+
+    def test_hpo_release_fixtures_use_pep440_tags_assets_and_prerelease_flags(self):
+        cases = (("1.6.0-rc.1", "1.6.0rc1", True), ("1.6.0-rc.12", "1.6.0rc12", True),
+                 ("1.6.0", "1.6.0", False))
+        with tempfile.TemporaryDirectory() as tmp:
+            opts = SimpleNamespace(out=Path(tmp), checkout=Path(__file__).resolve().parents[2],
+                                   metadata_action=None, verbose=False, describe="hpo spelling fixture")
+            world = dry_run.World("hpo-spelling", opts, [])
+            self.addCleanup(world.transcript.close)
+            for semver, pep440, prerelease in cases:
+                with self.subTest(semver=semver):
+                    world.hpo_published(semver, digest="sha256:" + "a" * 64)
+                    self.assertEqual(world.load("releases-pineforge-hpo.json")[0],
+                                     {"tag_name": f"v{pep440}", "draft": False, "prerelease": prerelease})
+                    metadata = world.load(f"release-pineforge-hpo-v{pep440}.json")
+                    self.assertEqual(metadata["assets"][0]["name"], f"pineforge_hpo-{pep440}-py3-none-any.whl")
+                    url = f"{dry_run.HPO_DL}/v{pep440}/pineforge_hpo-{pep440}-py3-none-any.whl"
+                    self.assertEqual(world.load("http.json")[url]["status"], 200)
+
+    def test_hpo_shim_routes_accept_only_pep440_artifact_spellings(self):
+        cases = (("1.6.0rc1", True), ("1.6.0rc12", True), ("1.6.0", True),
+                 ("1.6.1a1", True), ("1.6.1b2", True), ("1.6.0-rc.1", False),
+                 ("1.6.0rc01", False), ("1.6.0.post1", False))
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            state.mkdir()
+            env = {"PATH": os.environ.get("PATH", os.defpath), "HARNESS_STATE": str(state),
+                   "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(state)}
+            for version, modeled in cases:
+                with self.subTest(version=version):
+                    url = f"{dry_run.HPO_DL}/v{version}/pineforge_hpo-{version}-py3-none-any.whl"
+                    result = subprocess.run([str(wfrun.SHIMS / "curl"), "-sSIL", "-o", "/dev/null",
+                                             "-w", "%{http_code}", url], env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, modeled, result.stderr)
+                    self.assertEqual(result.stdout, "404" if modeled else "000")
+                    metadata = {"tag_name": f"v{version}", "assets": []}
+                    (state / f"release-pineforge-hpo-v{version}.json").write_text(json.dumps(metadata))
+                    result = subprocess.run([str(wfrun.SHIMS / "gh"), "api",
+                                             f"repos/pineforge-4pass/pineforge-hpo/releases/tags/v{version}"],
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, modeled, result.stderr)
+                    if modeled:
+                        self.assertEqual(json.loads(result.stdout), metadata)
 
     def test_local_release_fixtures_have_real_version_trees_and_tag_messages(self):
         with tempfile.TemporaryDirectory() as tmp:

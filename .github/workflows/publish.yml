@@ -123,7 +123,7 @@ jobs:
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
           CP: ${{ steps.pair.outputs.codegen_pypi }}
-          H: ${{ steps.pair.outputs.hpo }}
+          H: ${{ steps.pair.outputs.hpo_pep440 }}
         run: |
           set -euo pipefail
           # The Dockerfile builds FROM the engine static-lib tarball (per arch),
@@ -166,12 +166,13 @@ jobs:
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
           H: ${{ steps.pair.outputs.hpo }}
+          HP: ${{ steps.pair.outputs.hpo_pep440 }}
         run: |
           set -euo pipefail
-          asset="pineforge_hpo-${H}-py3-none-any.whl"
-          digest="$(gh api "repos/pineforge-4pass/pineforge-hpo/releases/tags/v${H}" \
+          asset="pineforge_hpo-${HP}-py3-none-any.whl"
+          digest="$(gh api "repos/pineforge-4pass/pineforge-hpo/releases/tags/v${HP}" \
             -q ".assets[] | select(.name == \"${asset}\") | .digest // empty")" \
-            || { echo "::error::could not read hpo ${H} release asset metadata; re-run this job"; exit 1; }
+            || { echo "::error::could not read hpo ${HP} release asset metadata; re-run this job"; exit 1; }
           # Older assets may have no digest. A supplied digest must be a SHA256.
           python3 scripts/release_pair.py check --release="${REF#v}" --engine="$E" --codegen="$C" \
             --hpo="$H" --hpo-wheel-digest="$digest" | tee -a "$GITHUB_OUTPUT"

@@ -132,7 +132,7 @@ def artifact_method(url):
                     rf"v(?P<v>{SEMVER})/pineforge-v(?P=v)-linux-(?:x86_64|aarch64)\.tar\.gz", url):
         return "HEAD"
     if re.fullmatch(r"https://github.com/pineforge-4pass/pineforge-hpo/releases/download/"
-                    rf"v(?P<v>{SEMVER})/pineforge_hpo-(?P=v)-py3-none-any\.whl", url):
+                    rf"v(?P<v>{PEP440})/pineforge_hpo-(?P=v)-py3-none-any\.whl", url):
         return "HEAD"
     if re.fullmatch(rf"https://pypi.org/pypi/pineforge-codegen/{PEP440}/json", url):
         return "GET"
@@ -302,7 +302,7 @@ def gh(argv):
                    endpoint=endpoint, hostname=hostname)
             say("gh", f"WOULD DISPATCH to {endpoint.split('/')[2]}: {json.dumps(body, sort_keys=True)}")
             return 0
-        m = re.fullmatch(rf"repos/pineforge-4pass/pineforge-hpo/releases/tags/v({SEMVER})", endpoint)
+        m = re.fullmatch(rf"repos/pineforge-4pass/pineforge-hpo/releases/tags/v({PEP440})", endpoint)
         if m and not (set(opts) - {"-q", "--jq", "--hostname"}):
             data = load(f"release-pineforge-hpo-v{m.group(1)}.json", None)
             record(tool="gh", action="api", endpoint=endpoint, found=data is not None)

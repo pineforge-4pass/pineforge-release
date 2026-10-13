@@ -9,6 +9,7 @@ check. Stdlib only: `python3 -m unittest discover -s tests -p 'test_release_*.py
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import unittest
@@ -76,6 +77,31 @@ class VersionTest(unittest.TestCase):
         self.assertEqual(rp.parse("1.0.0").pep440, "1.0.0")
         self.assertEqual(rp.parse("0.10.4").pep440, "0.10.4")
 
+    def test_hpo_spelling_mapping_in_both_directions(self):
+        cases = (("1.6.0-rc.1", "1.6.0rc1"), ("1.6.0-rc.12", "1.6.0rc12"),
+                 ("1.6.0", "1.6.0"), ("1.6.0-alpha.1", "1.6.0a1"),
+                 ("1.6.0-beta.2", "1.6.0b2"))
+        for semver, pep440 in cases:
+            with self.subTest(semver=semver):
+                self.assertEqual(rp.hpo_version(semver), pep440)
+                self.assertEqual(rp.hpo_version(f"v{semver}"), pep440)
+                for incoming in (pep440, f"v{pep440}", semver, f"v{semver}"):
+                    self.assertEqual(rp.hpo_version(incoming, to_semver=True), semver)
+                if "-" in semver:
+                    for component in ("engine", "codegen"):
+                        proc = run("info", pep440, f"--component={component}")
+                        self.assertEqual(proc.returncode, 1)
+                        self.assertEqual(proc.stdout, "")
+
+    def test_hpo_mapping_rejects_other_spellings(self):
+        invalid = ("1.6", "01.6.0rc1", "1.6.0rc01", "1.6.0-rc1", "1.6.0-rc.01",
+                   "1.6.0RC1", "1.6.0.rc1", "1.6.0-rc.1+build", "1.6.0.post1",
+                   "1.6.0.dev1", "1.6.0c1", "1.6.0alpha1", "vv1.6.0rc1", "",
+                   "1.6.0rc1\n1.6.0", " 1.6.0rc1", "1.6.0rc1 ")
+        for raw in invalid:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                rp.hpo_version(raw, to_semver=True)
+
     def test_info_reports_line_and_channel(self):
         proc = run("info", "v1.0.0-rc.1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -116,6 +142,17 @@ class LatestTagTest(unittest.TestCase):
         proc = run("latest-pep440", stdin="0.10.4\n1.0.0rc1\n1.0.0rc2\n0.9.0\n1.0.0.post1\nfoo\n1.0.0a3\n")
         self.assertEqual((proc.returncode, proc.stdout), (0, "1.0.0-rc.2\n"))
         self.assertEqual(run("latest-pep440", stdin="0.10.4\n1.0.0\n1.0.0rc1\n").stdout, "1.0.0\n")
+
+    def test_hpo_pep440_tags_use_the_existing_ordering_helper(self):
+        cases = (("v1.5.9\nv1.6.0rc1\n", "1.6.0-rc.1"),
+                 ("v1.6.0rc2\nv1.6.0a3\nv1.6.0rc12\nv1.6.0b4\n", "1.6.0-rc.12"),
+                 ("v1.6.0rc12\nv1.6.0\nv1.6.0rc1\n", "1.6.0"),
+                 ("junk\nv1.6.0.post1\nv1.6.0-rc.99\nv1.6.0rc1\n", "1.6.0-rc.1"))
+        for tags, expected in cases:
+            with self.subTest(tags=tags):
+                self.assertEqual(str(rp.latest_pep440(tags.splitlines(), tags=True)), expected)
+                proc = run("latest-pep440", "--tags", stdin=tags)
+                self.assertEqual((proc.returncode, proc.stdout), (0, expected + "\n"))
 
     def test_no_tags_prints_nothing(self):
         proc = run("latest-tag", stdin="")
@@ -360,18 +397,33 @@ class HpoPairingTest(unittest.TestCase):
                          partners_published=published, partners_latest=latest)
 
     def test_named_cutoff_and_info_boundary(self):
-        self.assertEqual(rp.HPO_PAIRING_FROM, "1.6.0")
-        for version, required in (("1.5.9", False), ("1.6.0-rc.1", False),
+        self.assertEqual(rp.HPO_PAIRING_FROM, "1.6.0-rc.1")
+        for version, required in (("1.5.9", False), ("1.6.0-alpha.1", False),
+                                  ("1.6.0-beta.1", False), ("1.6.0-rc.0", False), ("1.6.0-rc.1", True),
                                   ("1.6.0", True), ("1.6.1-rc.1", True)):
             with self.subTest(version=version):
                 proc = run("info", version)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(outputs(proc).get("hpo_pairing") == "true", required)
+                self.assertEqual(outputs(proc).get("hpo_pep440", ""),
+                                 rp.hpo_version(version) if required else "")
+
+    def test_hpo_info_normalizes_each_allowed_event_spelling(self):
+        for semver, pep440 in (("1.6.0-rc.1", "1.6.0rc1"), ("1.6.0-rc.12", "1.6.0rc12"),
+                               ("1.6.0", "1.6.0"), ("1.6.1-alpha.1", "1.6.1a1"),
+                               ("1.6.1-beta.1", "1.6.1b1")):
+            for incoming in (semver, pep440, f"v{semver}", f"v{pep440}"):
+                with self.subTest(incoming=incoming):
+                    proc = run("info", incoming, "--component=hpo")
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(outputs(proc)["bare"], semver)
+                    self.assertEqual(outputs(proc)["hpo_pep440"], pep440)
 
     def test_existing_two_component_callers_below_cutoff_are_unchanged(self):
         for version, waiting, complete in (("1.5.0", "noop", "noop"),
                                             ("1.5.9", "wait", "bump"),
-                                            ("1.6.0-rc.1", "wait", "bump")):
+                                            ("1.6.0-alpha.1", "wait", "bump"),
+                                            ("1.6.0-beta.1", "wait", "bump")):
             for component in self.COMPONENTS[:2]:
                 for published, expected in ((False, waiting), (True, complete)):
                     with self.subTest(version=version, component=component, published=published):
@@ -388,27 +440,28 @@ class HpoPairingTest(unittest.TestCase):
 
     def test_hpo_below_cutoff_is_refused_even_forced(self):
         for version in ("0.13.2", "1.5.0", "1.5.9", "1.6.0-alpha.1",
-                        "1.6.0-beta.1", "1.6.0-rc.1"):
+                        "1.6.0a1", "1.6.0-beta.1", "1.6.0b1", "1.6.0-rc.0", "1.6.0rc0"):
             for force in (False, True):
                 with self.subTest(version=version, force=force):
-                    with self.assertRaisesRegex(rp.RuleError, "hpo joins the pairing at 1.6.0"):
+                    with self.assertRaisesRegex(rp.RuleError, "hpo joins the pairing at " + re.escape(rp.HPO_PAIRING_FROM)):
                         self.decision("hpo", version, force=force)
                     proc = run("info", version, "--component=hpo")
                     self.assertEqual(proc.returncode, 1)
-                    self.assertIn("hpo joins the pairing at 1.6.0", proc.stderr)
+                    self.assertIn(f"hpo joins the pairing at {rp.HPO_PAIRING_FROM}", proc.stderr)
                     self.assertEqual(proc.stdout, "")
 
     def test_all_six_arrival_orders_for_stable_and_prerelease(self):
-        for version in ("1.6.0", "1.6.1-rc.1"):
+        for version in ("1.6.0-rc.1", "1.6.0-rc.12", "1.6.0", "1.6.1-rc.1"):
             for order in permutations(self.COMPONENTS):
                 published = set()
                 for component in order:
                     published.add(component)
                     with self.subTest(version=version, order=order, event=component):
                         result, note = self.decision(
-                            component, version,
+                            component, rp.hpo_version(version) if component == "hpo" else version,
                             published={name: name in published for name in self.COMPONENTS},
-                            latest={name: version if name in published else "1.5.9"
+                            latest={name: (rp.hpo_version(version) if name == "hpo" else version)
+                                    if name in published else "1.5.9"
                                     for name in self.COMPONENTS})
                         missing = set(self.COMPONENTS) - published
                         self.assertEqual(result["mode"], "wait" if missing else "bump")
@@ -417,17 +470,64 @@ class HpoPairingTest(unittest.TestCase):
                         self.assertEqual(result["release"], "" if missing else version)
                         self.assertEqual(set(filter(None, result["awaiting"].split(","))), missing)
                         for name in missing:
-                            self.assertIn(f"{name} {version}", note)
+                            spelling = rp.hpo_version(version) if name == "hpo" else version
+                            self.assertIn(f"{name} {spelling}", note)
                         if not missing:
                             self.assertEqual(tuple(result[name] for name in self.COMPONENTS), (version,) * 3)
 
     def test_old_other_published_flag_cannot_complete_without_hpo(self):
-        for component, awaiting in (("engine", "hpo"), ("codegen", "hpo")):
-            with self.subTest(component=component):
-                result, _ = rp.decide(component, "1.6.0", "", "1.5.9", "1.5.9", "1.5.9",
-                                      True, True, False)
-                self.assertEqual((result["mode"], result["awaiting"], result["release"]),
-                                 ("wait", awaiting, ""))
+        for version in ("1.6.0-rc.1", "1.6.0"):
+            for component in self.COMPONENTS[:2]:
+                with self.subTest(version=version, component=component):
+                    result, _ = rp.decide(component, version, "", "1.5.9", "1.5.9", "1.5.9",
+                                          True, True, False)
+                    self.assertEqual((result["mode"], result["awaiting"], result["release"]),
+                                     ("wait", "hpo", ""))
+
+    def test_hpo_pep440_latest_is_compared_as_semver(self):
+        for incoming in ("1.6.0-rc.1", "1.6.0rc1", "v1.6.0rc1"):
+            result, _ = self.decision("engine", "1.6.0-rc.1", latest={"hpo": incoming})
+            self.assertEqual((result["mode"], result["awaiting"]), ("wait", "codegen,hpo"))
+        for incoming in ("1.6.0-rc.12", "1.6.0rc12", "v1.6.0rc12", "1.6.0"):
+            with self.subTest(incoming=incoming), self.assertRaisesRegex(rp.RuleError, "hpo 1.6.0"):
+                self.decision("engine", "1.6.0-rc.1", latest={"hpo": incoming})
+
+    def test_hpo_event_spellings_have_the_same_semver_decisions(self):
+        for semver, pep440 in (("1.6.0-rc.1", "1.6.0rc1"), ("1.6.0-rc.12", "1.6.0rc12"),
+                               ("1.6.0", "1.6.0"), ("1.6.1-alpha.1", "1.6.1a1"),
+                               ("1.6.1-beta.1", "1.6.1b1")):
+            for published in ({}, {"engine": True, "codegen": True}):
+                expected = self.decision("hpo", semver, published=published)
+                for incoming in (pep440, f"v{pep440}", f"v{semver}"):
+                    with self.subTest(incoming=incoming, published=published):
+                        self.assertEqual(self.decision("hpo", incoming, published=published), expected)
+                        self.assertEqual(expected[0]["hpo"], semver)
+            if "-" in semver:
+                with self.assertRaisesRegex(rp.RuleError, "contradicts version"):
+                    self.decision("hpo", pep440, flag="false")
+
+    def test_rc_waiting_notes_name_hpo_in_pep440_spelling(self):
+        cases = (("engine", "1.6.0-rc.1", {"codegen": True}, "hpo",
+                  "mode=wait: engine 1.6.0-rc.1 recorded; waiting for hpo 1.6.0rc1; "
+                  "landed engine 1.5.9 + codegen 1.5.9 + hpo (not paired yet). Nothing is built or published."),
+                 ("engine", "1.6.0-rc.1", {}, "codegen,hpo",
+                  "mode=wait: engine 1.6.0-rc.1 recorded; waiting for codegen 1.6.0-rc.1, hpo 1.6.0rc1; "
+                  "landed engine 1.5.9 + codegen 1.5.9 + hpo (not paired yet). Nothing is built or published."),
+                 ("hpo", "1.6.0rc1", {}, "engine,codegen",
+                  "mode=wait: hpo 1.6.0rc1 recorded; waiting for engine 1.6.0-rc.1, codegen 1.6.0-rc.1; "
+                  "landed engine 1.5.9 + codegen 1.5.9 + hpo (not paired yet). Nothing is built or published."))
+        for component, version, published, awaiting, expected in cases:
+            with self.subTest(component=component, published=published):
+                result, note = self.decision(component, version, flag="true", published=published)
+                self.assertEqual((result["mode"], result["awaiting"], result["release"]), ("wait", awaiting, ""))
+                self.assertEqual(note, expected)
+                proc = run("decide", f"--component={component}", f"--version={version}",
+                           "--prerelease-flag=true", "--prev-engine=1.5.9", "--prev-codegen=1.5.9",
+                           "--current-release=1.5.9", "--image-exists=true",
+                           *(f"--{name}-published=true" for name in published))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(outputs(proc), result)
+                self.assertEqual(proc.stderr, expected + "\n")
 
     def test_hpo_next_patch_waits_for_both_landed_partners(self):
         result, note = self.decision("hpo", "1.6.1", landed="1.6.0", prev_hpo="1.6.0",
@@ -499,9 +599,12 @@ class HpoPairingTest(unittest.TestCase):
                                   ("1.6.0", "yes"), ("1.6.0", "true\nfalse")):
                 with self.subTest(component=component, version=version, flag=flag), self.assertRaises(rp.RuleError):
                     self.decision(component, version, flag=flag)
-            for version in ("1.6", "1.6.0rc1", "1.6.0-rc1", "1.6.0+build.1", "1.6.0;id", "1.6.0\n1.6.1"):
+            for version in ("1.6", "1.6.0rc01", "1.6.0-rc1", "1.6.0+build.1", "1.6.0;id", "1.6.0\n1.6.1"):
                 with self.subTest(component=component, version=version), self.assertRaises(ValueError):
                     self.decision(component, version)
+            if component != "hpo":
+                with self.assertRaises(ValueError):
+                    self.decision(component, "1.6.0rc1")
             for version, flag in (("v1.6.0", "false"), ("1.6.1-rc.1", "true"), ("1.6.1-rc.1", "")):
                 with self.subTest(component=component, version=version, flag=flag):
                     result, _ = self.decision(component, version, flag=flag,
@@ -525,7 +628,8 @@ class CheckHpoTest(unittest.TestCase):
         cases = (("0.1.26", "0.13.1", "0.10.4", "true"),
                  ("1.5.0", "1.5.0", "1.5.0", "true"),
                  ("1.5.9", "1.5.9", "1.5.9", "true"),
-                 ("1.6.0-rc.1", "1.6.0-rc.1", "1.6.0-rc.1", "false"))
+                 ("1.6.0-alpha.1", "1.6.0-alpha.1", "1.6.0-alpha.1", "false"),
+                 ("1.6.0-beta.1", "1.6.0-beta.1", "1.6.0-beta.1", "false"))
         for version, engine, codegen, moving in cases:
             with self.subTest(version=version):
                 old_call = rp.check(version, engine, codegen, f"v{version}")
@@ -534,7 +638,7 @@ class CheckHpoTest(unittest.TestCase):
                 self.assertEqual(old_call["moving"], moving)
 
     def test_hpo_is_ignored_without_parsing_below_cutoff(self):
-        for version in ("1.5.0", "1.5.9", "1.6.0-rc.1"):
+        for version in ("1.5.0", "1.5.9", "1.6.0-alpha.1", "1.6.0-beta.1"):
             for hpo in ("", "invalid", "1.6.99", "1.6.0\n1.6.1"):
                 with self.subTest(version=version, hpo=hpo):
                     expected = rp.check(version, version, version, newest_stable=f"v{version}")
@@ -543,7 +647,8 @@ class CheckHpoTest(unittest.TestCase):
                     self.assertNotIn("hpo", actual)
 
     def test_check_requires_all_four_versions_to_match(self):
-        for version, different in (("1.6.0", "1.6.1"), ("1.6.1-rc.1", "1.6.1-rc.2")):
+        for version, different in (("1.6.0-rc.1", "1.6.0-rc.2"), ("1.6.0", "1.6.1"),
+                                   ("1.6.1-rc.1", "1.6.1-rc.2")):
             for odd in ("release", "engine", "codegen", "hpo"):
                 versions = {name: version for name in ("release", "engine", "codegen", "hpo")}
                 versions[odd] = different
@@ -553,7 +658,7 @@ class CheckHpoTest(unittest.TestCase):
                     self.assertIn(f"{name} {value}", str(caught.exception))
 
     def test_missing_and_invalid_hpo_fail_loudly(self):
-        for version in ("1.6.0", "1.6.1-rc.1"):
+        for version in ("1.6.0-rc.1", "1.6.0", "1.6.1-rc.1"):
             for hpo in ("", "bad", "1.6.0rc1", "1.6.0-foo.1", "1.6.0\n1.6.1"):
                 with self.subTest(version=version, hpo=hpo), self.assertRaises(rp.RuleError) as caught:
                     rp.check(version, version, version, hpo)
@@ -561,12 +666,14 @@ class CheckHpoTest(unittest.TestCase):
                 self.assertIn(f"release {version}", str(caught.exception))
 
     def test_matching_triple_channel_build_pin_and_cli(self):
-        for version, prerelease, moving, pypi in (("1.6.0", "false", "true", "1.6.0"),
+        for version, prerelease, moving, pypi in (("1.6.0-rc.1", "true", "false", "1.6.0rc1"),
+                                                ("1.6.0-rc.12", "true", "false", "1.6.0rc12"),
+                                                ("1.6.0", "false", "true", "1.6.0"),
                                                 ("1.6.1-rc.1", "true", "false", "1.6.1rc1")):
             with self.subTest(version=version):
                 expected = {"line": "pair", "prerelease": prerelease, "moving": moving,
                             "codegen_pypi": pypi, "hpo": version, "target": "hpo",
-                            "hpo_version_arg": f"HPO_VERSION={version}"}
+                            "hpo_pep440": pypi, "hpo_version_arg": f"HPO_VERSION={pypi}"}
                 self.assertEqual(rp.check(version, version, version, f"v{version}", newest_stable="v1.6.0"), expected)
                 proc = run("check", f"--release={version}", f"--engine={version}", f"--codegen={version}",
                            f"--hpo={version}", "--newest-stable=v1.6.0")

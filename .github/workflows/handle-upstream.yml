@@ -70,8 +70,14 @@ jobs:
             hpo-release)     component=hpo ;;
             *) echo "::error::unexpected event '$EVENT'"; exit 1 ;;
           esac
-          if ! printf '%s' "${RAW_VERSION:-}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'; then
-            echo "::error::rejected untrusted version '${RAW_VERSION:-}'"; exit 1
+          if [ "$component" = hpo ]; then
+            if ! [[ "${RAW_VERSION:-}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+|(a|b|rc)[0-9]+)?$ ]]; then
+              echo "::error::rejected untrusted version '${RAW_VERSION:-}'"; exit 1
+            fi
+          else
+            if ! printf '%s' "${RAW_VERSION:-}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'; then
+              echo "::error::rejected untrusted version '${RAW_VERSION:-}'"; exit 1
+            fi
           fi
           case "${RAW_PRERELEASE:-}" in
             ''|true|false) ;;
@@ -81,8 +87,9 @@ jobs:
           if [ -n "${RUN_ID:-}" ] && ! [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then
             echo "::error::bad run_id"; exit 1
           fi
-          # The release rules take X.Y.Z or X.Y.Z-{alpha,beta,rc}.N (one PyPI
-          # spelling each); anything else fails here. Emits bare/line/prerelease/pypi.
+          # The release rules keep engine/codegen semver-only and normalize
+          # either hpo spelling. The emitted bare version is always semver;
+          # hpo_pep440 supplies the wheel's version without workflow conversion.
           facts="$(python3 scripts/release_pair.py info "$RAW_VERSION" --component="$component")"
           VER="$(printf '%s\n' "$facts" | sed -n 's/^bare=//p')"
           {
@@ -144,6 +151,7 @@ jobs:
           VER:       ${{ steps.in.outputs.version }}
           PYPI:      ${{ steps.in.outputs.pypi }}
           HPO_PAIRING: ${{ steps.in.outputs.hpo_pairing }}
+          HPO_VERSION: ${{ steps.in.outputs.hpo_pep440 }}
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -165,9 +173,9 @@ jobs:
                 base="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${VER}"
                 codes="$(http HEAD "${base}/pineforge-v${VER}-linux-x86_64.tar.gz") $(http HEAD "${base}/pineforge-v${VER}-linux-aarch64.tar.gz")" ;;
               hpo)
-                partner="hpo ${VER} wheel"
-                base="https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v${VER}"
-                codes="$(http HEAD "${base}/pineforge_hpo-${VER}-py3-none-any.whl")" ;;
+                partner="hpo ${HPO_VERSION} wheel"
+                base="https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v${HPO_VERSION}"
+                codes="$(http HEAD "${base}/pineforge_hpo-${HPO_VERSION}-py3-none-any.whl")" ;;
               *) echo "::error::unexpected partner '$kind'"; exit 1 ;;
             esac
             [ -n "${codes// /}" ] || { echo "::error::no HTTP status for ${partner}; re-run this job"; exit 1; }
@@ -193,8 +201,14 @@ jobs:
                 esac
                 tags="$(gh api "$endpoint" -q '.[] | select(.draft | not) | .tag_name')" \
                   || { echo "::error::could not read ${kind}'s releases; re-run this job"; exit 1; }
-                latest="$(printf '%s\n' "$tags" | python3 scripts/release_pair.py latest-tag)"
-                latest="${latest#v}"
+                if [ "$kind" = hpo ]; then
+                  # Drafts alone are filtered above: hpo rc wheels are GitHub
+                  # prereleases, so they must participate in newest-version checks.
+                  latest="$(printf '%s\n' "$tags" | python3 scripts/release_pair.py latest-pep440 --tags)"
+                else
+                  latest="$(printf '%s\n' "$tags" | python3 scripts/release_pair.py latest-tag)"
+                  latest="${latest#v}"
+                fi
               fi
             fi
             { echo "${kind}_published=$published"; echo "${kind}_latest=$latest"; } >> "$GITHUB_OUTPUT"
@@ -253,6 +267,7 @@ jobs:
           COMPONENT: ${{ steps.in.outputs.component }}
           VER:       ${{ steps.in.outputs.version }}
           AWAITING:  ${{ steps.decide.outputs.awaiting }}
+          HPO_VERSION: ${{ steps.in.outputs.hpo_pep440 }}
           EPREV:     ${{ steps.pins.outputs.eprev }}
           CPREV:     ${{ steps.pins.outputs.cprev }}
           HPREV:     ${{ steps.pins.outputs.hprev }}
@@ -260,8 +275,14 @@ jobs:
           set -euo pipefail
           waiting=""
           IFS=, read -r -a partners <<< "$AWAITING"
-          for partner in "${partners[@]}"; do waiting="${waiting:+${waiting} + }${partner} ${VER}"; done
-          line="pair pending: ${COMPONENT} ${VER} recorded, waiting for ${waiting}; the landed pair stays engine ${EPREV} + codegen ${CPREV}${HPREV:+ + hpo ${HPREV}} and nothing is built or published"
+          for partner in "${partners[@]}"; do
+            partner_version="$VER"
+            [ "$partner" != hpo ] || partner_version="$HPO_VERSION"
+            waiting="${waiting:+${waiting} + }${partner} ${partner_version}"
+          done
+          event_version="$VER"
+          [ "$COMPONENT" != hpo ] || event_version="$HPO_VERSION"
+          line="pair pending: ${COMPONENT} ${event_version} recorded, waiting for ${waiting}; the landed pair stays engine ${EPREV} + codegen ${CPREV}${HPREV:+ + hpo ${HPREV}} and nothing is built or published"
           echo "::notice title=pineforge pair pending::${line}"
           printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
 

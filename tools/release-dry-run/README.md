@@ -3,10 +3,17 @@
 `dry_run.py` replays this repo's real `handle-upstream.yml` and `publish.yml`
 on a Linux test host and checks what each run would tag, build, release and send
 downstream. It covers the 0.x line, the 1.0 pair line, and the three-component
-`triple` world: all six engine/codegen/hpo arrival orders at `1.6.0`, plus
+`triple` world: all six engine/codegen/hpo arrival orders at `1.6.0-rc.1` and `1.6.0`, plus
 the cutoff, refusals, mismatches and recoveries. The cutoff is defined only by
-`HPO_PAIRING_FROM` in `scripts/release_pair.py`, compared by semver precedence;
-`1.6.0-rc.1` still uses two-component pairing and refuses an hpo event.
+`HPO_PAIRING_FROM` in `scripts/release_pair.py`, compared by semver precedence.
+The first rc and every later version require hpo; earlier alpha/beta versions
+keep two-component pairing. Hpo events accept canonical semver or PEP 440,
+while its release tags and wheel assets use PEP 440 (`v1.6.0rc1` and
+`pineforge_hpo-1.6.0rc1-py3-none-any.whl`). The annotated hub tag retains
+`hpo=1.6.0-rc.1`; the image's `HPO_VERSION` is `1.6.0rc1`. Fixtures reuse
+`hpo_version()` and the existing PEP 440 ordering helper in `release_pair.py`.
+The triple replay also checks a pending rc wheel and a newer rc mismatch using
+the real release-list probe, including prereleases, numeric rc ordering and draft exclusion.
 
 Workflow execution is dummy-only: no production credential or real App token
 is read, minted or needed. It sends nothing to a real service. Dependencies
@@ -97,7 +104,7 @@ GitHub deployment or Pages publication.
 | `lost-partner` | The partner's dispatch never arrives. Re-running the waiting run (same event) completes the pair. |
 | `retag` | The release commit reached `main` but its tag push failed. The next event tags that commit. |
 | `legacy` | 0.x as before: a patch bump, `latest` and GitHub Latest. A failing `gh release list` fails the step instead of creating the release. A hand-made tag with a mismatched 1.0 pair fails before any build. |
-| `triple` | Six independent 1.5.9 -> 1.6.0 histories cover every engine/codegen/hpo arrival order. The first two events wait and name every missing partner without moving main, tagging, building or dispatching; the third records three adjacent pins. Publish checks the triple, selects the explicit `hpo` target and supplies the matching `HPO_VERSION` and available `HPO_WHEEL_SHA256`, with the existing stable image tags and fanout. A landed v1.5.0 tag without `hpo=` still publishes with the old build arguments and no target. Hpo events below the cutoff (including 1.6.0-rc.1) and malformed payloads are refused. Hpo 1.6.1 with landed engine/codegen 1.6.0 waits for both; different new partner versions fail naming all odd versions. Uncertain HTTP statuses and an unmodeled hpo URL fail; missing, invalid or mismatched hpo tag pins fail before any build/release/dispatch. Duplicate triples are no-ops, and half-done triples tag the existing release commit. |
+| `triple` | Twelve independent histories from 1.5.9 cover every engine/codegen/hpo arrival order for 1.6.0-rc.1 and 1.6.0. The first two events wait and name every missing partner, using PEP 440 for hpo, without moving main, tagging, building or dispatching; the third records three adjacent semver pins. Publish checks the triple, selects the explicit `hpo` target and supplies the PEP 440 `HPO_VERSION` and available `HPO_WHEEL_SHA256`. The rc image keeps fixed tags only, a GitHub prerelease with Latest disabled and prerelease fanout; stable keeps the existing moving tags and fanout. Landed v1.5.0, v1.5.9 and earlier alpha/beta tags without `hpo=` still publish with the old build arguments and no target. Hpo events below the cutoff and malformed payloads are refused. Hpo 1.6.1 with landed engine/codegen 1.6.0 waits for both; different new partner versions fail naming all odd versions. Uncertain HTTP statuses and an unmodeled hpo URL fail; missing, invalid, PEP 440 or mismatched hpo tag pins fail before any build/release/dispatch for both rc and stable. Duplicate triples are no-ops, and half-done triples tag the existing release commit. |
 
 The pair world also runs the real consumer job, for the rc.1 prerelease and for
 1.0.0, with missing, empty, owner/path and multiline target configuration for
