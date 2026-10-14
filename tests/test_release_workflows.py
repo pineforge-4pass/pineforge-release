@@ -5,7 +5,7 @@ notify-consumers decision (no dispatch to the application for a prerelease) is
 run under bash, and the engine's runtime harness (eight files) is synced from
 the pinned engine tag by one script and checked against recorded sha256 values
 when the image is built (the Dockerfile's check is run under bash on temporary
-directories). Stdlib only."""
+directories). The source mirror wiring checks use PyYAML to parse the workflows."""
 from __future__ import annotations
 
 import ast
@@ -47,6 +47,15 @@ def _run_block(dockerfile: str, needle: str) -> str:
     start = dockerfile.rindex("\nRUN ", 0, at) + 1
     end = dockerfile.find("\n\n", at)
     return dockerfile[start:] if end < 0 else dockerfile[start:end]
+
+
+def _workflow(name: str):
+    # PyYAML is imported here, not at module level: tests/test_facts_fanout.py imports helpers from
+    # this module and facts-validate.yml runs it with only facts/requirements-validation.txt installed.
+    # BaseLoader preserves the literal `on` key and keeps scalar comparisons
+    # independent of YAML 1.1's surprising yes/no/on boolean conversions.
+    import yaml
+    return yaml.load((WORKFLOWS / name).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
 
 class HandleUpstreamTest(unittest.TestCase):
@@ -212,6 +221,268 @@ class PublishTest(unittest.TestCase):
         self.assertIn('-F "client_payload[prerelease]=${PRERELEASE}"', body)
         self.assertIn("consumer: [offline, hosted, application]",
                       self.text)
+
+
+class SourceMirrorWorkflowTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = _workflow("publish.yml")
+        cls.job = cls.workflow["jobs"]["publish"]
+        cls.steps = cls.job["steps"]
+        cls.named = {step["name"]: step for step in cls.steps if "name" in step}
+
+    def test_toolchain_file_is_validated_and_exported_to_the_hpo_build(self):
+        reader = self.named["Read hpo toolchain arguments"]
+        self.assertEqual(reader["id"], "toolchain")
+        self.assertEqual(reader["if"], "steps.pair.outputs.target == 'hpo'")
+        run = reader["run"]
+        self.assertIn("set -euo pipefail", run)
+        self.assertIn("python3 scripts/release_sources.py toolchain-args docker/hpo-toolchain.args", run)
+        self.assertIn("args<<HPO_TOOLCHAIN_ARGS", run)
+        self.assertIn('"$GITHUB_OUTPUT"', run)
+        self.assertNotRegex(run, r"\b(?:source|eval)\b")
+        self.assertNotIn("|| true", run)
+        build = self.named["Build + push hpo (multi-arch)"]
+        self.assertIn("${{ steps.toolchain.outputs.args }}\n", build["with"]["build-args"])
+        for existing in ("ENGINE_VERSION=${{ steps.pins.outputs.engine }}",
+                         "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
+                         "${{ steps.pair.outputs.hpo_version_arg }}",
+                         "${{ steps.wheel.outputs.hpo_wheel_arg }}",
+                         "RELEASE_VERSION=${{ github.ref_name }}",
+                         "RELEASE_GIT_SHA=${{ github.sha }}"):
+            self.assertIn(existing, build["with"]["build-args"])
+        self.assertLess(self.steps.index(reader), self.steps.index(build))
+
+    def test_local_inspections_match_each_real_build_on_each_architecture(self):
+        expected = (
+            ("release", "Build + push (multi-arch)"),
+            ("hpo", "Build + push hpo (multi-arch)"),
+        )
+        guard = self.named["Check Debian source mirror"]
+        for target, publish_name in expected:
+            real = self.named[publish_name]
+            scopes = [f"type=gha,scope={target}-{arch}" for arch in ("amd64", "arm64")]
+            self.assertEqual(real["with"]["cache-from"].splitlines(), scopes,
+                             "push must reuse each architecture's inspected cache")
+            self.assertEqual(real["with"]["cache-to"].splitlines(),
+                             [scope + ",mode=max" for scope in scopes])
+            for arch in ("amd64", "arm64"):
+                with self.subTest(target=target, arch=arch):
+                    inspection = self.named[f"Inspect {target} {arch}"]
+                    self.assertEqual(inspection["uses"], real["uses"])
+                    self.assertEqual(inspection["if"], real["if"])
+                    config = inspection["with"]
+                    self.assertEqual(config["platforms"], f"linux/{arch}")
+                    self.assertEqual(config["load"], "true")
+                    self.assertEqual(config["push"], "false")
+                    self.assertEqual(config["tags"], f"pineforge-source-inspect:{arch}")
+                    for key in ("context", "file", "target", "build-args", "labels"):
+                        self.assertEqual(config.get(key), real["with"].get(key), key)
+                    scope = f"type=gha,scope={target}-{arch}"
+                    self.assertEqual(config["cache-from"], scope,
+                                     "inspection cache scope must name its target and architecture")
+                    self.assertEqual(config["cache-to"], scope + ",mode=max")
+                    self.assertIn(config["cache-from"], real["with"]["cache-from"].splitlines())
+                    self.assertIn(config["cache-to"], real["with"]["cache-to"].splitlines())
+                    self.assertLess(self.steps.index(inspection), self.steps.index(guard))
+                    self.assertNotIn("continue-on-error", inspection)
+                    if target == "hpo":
+                        self.assertLess(self.steps.index(self.named["Read hpo toolchain arguments"]),
+                                        self.steps.index(inspection))
+                        self.assertIn("${{ steps.toolchain.outputs.args }}", config["build-args"])
+
+    def test_plain_release_inspections_and_push_receive_the_pinned_version_arguments(self):
+        for name in ("Inspect release amd64", "Inspect release arm64", "Build + push (multi-arch)"):
+            with self.subTest(step=name):
+                arguments = self.named[name]["with"]["build-args"].splitlines()
+                for expected in ("ENGINE_VERSION=${{ steps.pins.outputs.engine }}",
+                                 "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
+                                 "RELEASE_VERSION=${{ github.ref_name }}"):
+                    self.assertIn(expected, arguments, name + " must receive " + expected)
+
+    def test_guard_is_mandatory_before_every_push_and_release_including_prereleases(self):
+        names = ("Read Debian package inventories", "Locate Debian source bundle",
+                 "Read Debian source release assets", "Check Debian source mirror")
+        order = [self.steps.index(self.named[name]) for name in names]
+        self.assertEqual(order, sorted(order))
+        for name in names:
+            step = self.named[name]
+            self.assertNotIn("if", step, f"{name} must apply to every v* tag")
+            self.assertNotIn("continue-on-error", step)
+            self.assertIn("set -euo pipefail", step["run"])
+            self.assertNotIn("|| true", step["run"])
+        self.assertNotIn("continue-on-error", self.job)
+        self.assertEqual(self.workflow["on"]["push"]["tags"], ["v*"])
+        pushes = [step for step in self.steps if step.get("with", {}).get("push") == "true"]
+        self.assertEqual(len(pushes), 2, "test must find both actual publishing actions")
+        releases = [step for step in self.steps if "gh release create" in step.get("run", "")]
+        self.assertEqual(len(releases), 1, "test must find the existing release step")
+        for step in pushes + releases:
+            self.assertLess(order[-1], self.steps.index(step))
+            self.assertNotIn("continue-on-error", step)
+            self.assertNotRegex(step.get("if", ""), r"\b(?:always|failure|cancelled)\s*\(")
+        run = self.named["Check Debian source mirror"]["run"]
+        self.assertIn("python3 scripts/release_sources.py check", run)
+        for argument in ("--registry docker/SOURCE-SETS.tsv", "--amd64", "--arm64",
+                         "--release-assets", "--sources-list"):
+            self.assertIn(argument, run)
+
+    def check_arguments(self, name):
+        run = re.sub(r"\\\n\s*", " ", self.named[name]["run"])
+        commands = [line.strip() for line in run.splitlines()
+                    if line.strip().startswith("python3 scripts/release_sources.py check ")]
+        self.assertEqual(len(commands), 1, name + " must run the real source check once")
+        tokens = shlex.split(commands[0])
+        result = {}
+        for flag in ("--registry", "--amd64", "--arm64", "--release-assets", "--sources-list"):
+            self.assertEqual(tokens.count(flag), 1, name + " must supply " + flag + " once")
+            result[flag] = tokens[tokens.index(flag) + 1]
+        return result
+
+    def test_pre_and_post_checks_use_distinct_architecture_files_and_the_same_mirror_evidence(self):
+        before = self.check_arguments("Check Debian source mirror")
+        after = self.check_arguments("Check pushed Debian source mirror")
+        for name, arguments, prefix in (("pre-push", before, "debian"),
+                                        ("post-push", after, "pushed-debian")):
+            with self.subTest(check=name):
+                self.assertNotEqual(arguments["--amd64"], arguments["--arm64"],
+                                    "amd64 and arm64 must be read from different files")
+                for arch in ("amd64", "arm64"):
+                    self.assertEqual(arguments["--" + arch], f"$RUNNER_TEMP/{prefix}-{arch}.tsv")
+        for flag, value in (("--registry", "docker/SOURCE-SETS.tsv"),
+                            ("--release-assets", "$RUNNER_TEMP/source-assets.json"),
+                            ("--sources-list", "$RUNNER_TEMP/$SOURCE_LIST")):
+            self.assertEqual(before[flag], value)
+            self.assertEqual(after[flag], value, "post-push check must reuse pre-push mirror evidence")
+        self.assertEqual(self.named["Check pushed Debian source mirror"]["env"]["SOURCE_LIST"],
+                         self.named["Check Debian source mirror"]["env"]["SOURCE_LIST"])
+
+    def test_post_push_check_is_mandatory_after_all_pushes_before_release_and_dispatch(self):
+        self.assertIn("Check pushed Debian source mirror", self.named,
+                      "published images must be checked by digest before release creation")
+        post = self.named["Check pushed Debian source mirror"]
+        self.assertNotIn("if", post, "post-push check must use the default success condition")
+        self.assertNotIn("continue-on-error", post)
+        self.assertIn("set -euo pipefail", post["run"])
+        self.assertNotIn("|| true", post["run"])
+        pushes = [step for step in self.steps if step.get("with", {}).get("push") == "true"]
+        self.assertEqual(len(pushes), 2)
+        for push in pushes:
+            self.assertLess(self.steps.index(push), self.steps.index(post))
+            self.assertNotIn("continue-on-error", push)
+        releases = [step for step in self.steps if "gh release create" in step.get("run", "")]
+        self.assertEqual(len(releases), 1)
+        for release in releases:
+            self.assertLess(self.steps.index(post), self.steps.index(release))
+            self.assertNotIn("if", release)
+            self.assertNotIn("continue-on-error", release)
+        notify = self.workflow["jobs"]["notify-consumers"]
+        self.assertEqual(notify["needs"], "publish", "dispatch must wait for the post-push check")
+        self.assertNotIn("if", notify)
+        dispatches = [step for step in notify["steps"] if "/dispatches" in step.get("run", "")]
+        self.assertEqual(len(dispatches), 1, "test must find the existing consumer dispatch")
+
+    def test_post_push_check_pulls_both_architectures_by_the_successful_push_digest(self):
+        post = self.named["Check pushed Debian source mirror"]
+        for name, identity, digest_var, outcome_var in (
+                ("Build + push (multi-arch)", "push_release", "RELEASE_DIGEST", "RELEASE_PUSH_OUTCOME"),
+                ("Build + push hpo (multi-arch)", "push_hpo", "HPO_DIGEST", "HPO_PUSH_OUTCOME")):
+            with self.subTest(push=name):
+                self.assertEqual(self.named[name]["id"], identity)
+                self.assertEqual(post["env"][digest_var], "${{ steps." + identity + ".outputs.digest }}")
+                self.assertEqual(post["env"][outcome_var], "${{ steps." + identity + ".outcome }}")
+        run = post["run"]
+        self.assertIn('case "${RELEASE_PUSH_OUTCOME}:${HPO_PUSH_OUTCOME}" in', run)
+        self.assertIn('success:skipped) digest="$RELEASE_DIGEST" ;;', run)
+        self.assertIn('skipped:success) digest="$HPO_DIGEST" ;;', run)
+        self.assertIn('*) echo "::error::expected exactly one successful image push"; exit 1 ;;', run)
+        self.assertIn('[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]', run)
+        self.assertIn('image="${REGISTRY}/${IMAGE}@${digest}"', run)
+        logical = re.sub(r"\\\n\s*", " ", run)
+        pulls = [shlex.split(line) for line in logical.splitlines()
+                 if line.strip().startswith("docker pull ")]
+        inventories = [shlex.split(line) for line in logical.splitlines()
+                       if line.strip().startswith("docker run ")]
+        self.assertEqual(pulls, [["docker", "pull", "--platform", f"linux/{arch}", "$image"]
+                                 for arch in ("amd64", "arm64")])
+        query = r"-f=${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n"
+        self.assertEqual(inventories, [
+            ["docker", "run", "--rm", "--platform", f"linux/{arch}", "--entrypoint", "dpkg-query",
+             "$image", "-W", query, ">", f"$RUNNER_TEMP/pushed-debian-{arch}.tsv"]
+            for arch in ("amd64", "arm64")])
+        self.assertNotIn("pineforge-source-inspect:", run)
+        self.assertIn("DETECTS", run)
+        self.assertIn("tags are already pushed", run)
+        self.assertIn("sources are never deleted", run)
+
+    def test_both_inventories_use_dpkg_query_with_the_source_columns(self):
+        run = self.named["Read Debian package inventories"]["run"]
+        for arch in ("amd64", "arm64"):
+            self.assertIn(f"docker run --rm --platform linux/{arch} --entrypoint dpkg-query", run)
+            self.assertIn(f"pineforge-source-inspect:{arch}", run)
+            self.assertIn(f'"$RUNNER_TEMP/debian-{arch}.tsv"', run)
+        self.assertEqual(run.count("${binary:Package}\\t${Version}\\t${source:Package}\\t${source:Version}\\n"), 2)
+
+    def test_bundle_location_and_metadata_come_from_the_registry_and_get_requests(self):
+        locate = self.named["Locate Debian source bundle"]
+        self.assertEqual(locate["id"], "source_set")
+        self.assertIn("python3 scripts/release_sources.py locate", locate["run"])
+        self.assertIn("--registry docker/SOURCE-SETS.tsv", locate["run"])
+        for argument in ("--amd64", "--arm64"):
+            self.assertIn(argument, locate["run"])
+        read = self.named["Read Debian source release assets"]
+        self.assertEqual(read["env"]["GH_TOKEN"], "${{ secrets.GITHUB_TOKEN }}")
+        self.assertEqual(read["env"]["SOURCE_TAG"], "${{ steps.source_set.outputs.release-tag }}")
+        self.assertEqual(read["env"]["SOURCE_LIST"], "${{ steps.source_set.outputs.list-asset }}")
+        self.assertIn('gh release view "$SOURCE_TAG"', read["run"])
+        self.assertIn("--json assets", read["run"])
+        self.assertIn('"$RUNNER_TEMP/source-assets.json"', read["run"])
+        self.assertIn("releases/download/${SOURCE_TAG}/${SOURCE_LIST}", read["run"])
+        self.assertIn('"$RUNNER_TEMP/$SOURCE_LIST"', read["run"])
+        self.assertIn(self.job["permissions"]["contents"], ("read", "write"))
+
+    def test_release_notes_link_to_the_checked_bundle_even_on_another_release(self):
+        release = self.named["GitHub Release"]
+        self.assertEqual(release["env"]["SOURCE_TAG"], "${{ steps.source_set.outputs.release-tag }}")
+        self.assertEqual(release["env"]["SOURCE_LIST"], "${{ steps.source_set.outputs.list-asset }}")
+        self.assertIn("Debian sources:", release["run"])
+        self.assertIn("releases/download/%s/%s", release["run"])
+        self.assertIn("releases/tag/%s", release["run"])
+        self.assertLess(release["run"].index("Debian sources:"),
+                        release["run"].index('if [ "$PRERELEASE" = true ]'))
+
+
+class PublishedHpoWheelCiTest(unittest.TestCase):
+    def test_release_rules_downloads_both_real_wheels_checks_pins_and_exports_paths(self):
+        from test_release_hpo_image import HPO_REJECTED_WHEEL_SHA256, HPO_WHEEL_SHA256
+        workflow = _workflow("python-test.yml")
+        steps = workflow["jobs"]["release-rules"]["steps"]
+        download = next(step for step in steps if step.get("name") == "Download published hpo wheels")
+        tests = next(step for step in steps if "unittest discover" in step.get("run", ""))
+        self.assertLess(steps.index(download), steps.index(tests))
+        self.assertNotIn("if", download)
+        self.assertNotIn("continue-on-error", download)
+        run = download["run"]
+        self.assertIn("set -euo pipefail", run)
+        self.assertNotIn("|| true", run)
+        expected = (("0.15.0", HPO_WHEEL_SHA256, "PINEFORGE_HPO_ACCEPTED_WHEEL"),
+                    ("0.13.2", HPO_REJECTED_WHEEL_SHA256, "PINEFORGE_HPO_REJECTED_WHEEL"))
+        pinned = re.findall(r"([0-9a-f]{64})  (pineforge_hpo-[0-9.]+-py3-none-any\.whl)", run)
+        self.assertEqual(set(pinned), {(digest, f"pineforge_hpo-{version}-py3-none-any.whl")
+                                      for version, digest, _ in expected})
+        self.assertEqual(run.count("sha256sum -c --strict"), 2)
+        hpo_test = (REPO / "tests" / "test_release_hpo_image.py").read_text()
+        exported = set(re.findall(r"echo ['\"]?(PINEFORGE_HPO_[A-Z_]+)=", run))
+        consumed = set(re.findall(r'os\.environ\.get\("(PINEFORGE_HPO_[A-Z_]+)"\)', hpo_test))
+        self.assertEqual(exported, consumed)
+        for version, _, variable in expected:
+            name = f"pineforge_hpo-{version}-py3-none-any.whl"
+            self.assertIn(f"https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v{version}/{name}", run)
+            self.assertIn(f'{variable}=$RUNNER_TEMP/{name}', run)
+        self.assertIn('"$GITHUB_ENV"', run)
+        parser = next(step for step in steps if "pip install" in step.get("run", ""))
+        self.assertIn("PyYAML==", parser["run"])
+        self.assertLess(steps.index(parser), steps.index(tests))
 
 
 class HpoWorkflowTest(unittest.TestCase):

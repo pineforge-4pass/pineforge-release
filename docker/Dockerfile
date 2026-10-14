@@ -85,8 +85,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         g++ \
         libeigen3-dev \
         python3 \
-    && rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man /usr/share/locale /usr/share/info
+    && rm -rf /var/lib/apt/lists/* /usr/share/man /usr/share/locale /usr/share/info
 
+# --- sources notice (begin)
+# Keep copyright files and symlinks (including package doc directory aliases).
+RUN set -eu; \
+    if [ -d /usr/share/doc ]; then \
+      find /usr/share/doc -type f ! -name copyright -delete; \
+      find /usr/share/doc -xtype l -delete; \
+      find /usr/share/doc -depth -type d -empty -delete; \
+    fi
+COPY docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in
+LABEL io.pineforge.sources.notice="/usr/share/doc/pineforge/SOURCES.txt" \
+      io.pineforge.sources.url="https://github.com/pineforge-4pass/pineforge-release/releases/tag/${RELEASE_VERSION}"
+RUN set -eu; \
+    mkdir -p /usr/share/doc/pineforge; \
+    if [ "${RELEASE_VERSION}" = unknown ]; then \
+      sed 's|/releases/tag/@RELEASE_VERSION@|/releases|g' /tmp/pineforge-SOURCES.txt.in > /usr/share/doc/pineforge/SOURCES.txt; \
+      printf '%s\n' 'Local build: use the releases page to locate mirrored Debian sources.' >> /usr/share/doc/pineforge/SOURCES.txt; \
+    else \
+      sed "s|@RELEASE_VERSION@|${RELEASE_VERSION}|g" /tmp/pineforge-SOURCES.txt.in > /usr/share/doc/pineforge/SOURCES.txt; \
+    fi; \
+    rm /tmp/pineforge-SOURCES.txt.in
+# --- sources notice (end)
 RUN mkdir -p /opt/pineforge/bin
 COPY --from=engine  /opt/pineforge/lib       /opt/pineforge/lib
 COPY --from=engine  /opt/pineforge/include   /opt/pineforge/include
@@ -235,6 +256,7 @@ RUN set -eu; \
 # --- FULL runtime: HPO layers + unchanged engine harness ---------------------
 FROM release AS hpo
 USER root
+ARG RELEASE_VERSION=unknown
 ARG HPO_VERSION
 ARG HPO_GCC_DEFAULTS_VERSION
 ARG HPO_GCC_VERSION
@@ -256,8 +278,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       "libgcc-12-dev=${HPO_GCC_VERSION}" "libstdc++-12-dev=${HPO_GCC_VERSION}" \
       "libgcc-s1=${HPO_GCC_VERSION}" "libstdc++6=${HPO_GCC_VERSION}" \
       "binutils=${HPO_BINUTILS_VERSION}" "libeigen3-dev=${HPO_EIGEN_VERSION}" \
-    && rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man /usr/share/locale /usr/share/info
+    && rm -rf /var/lib/apt/lists/* /usr/share/man /usr/share/locale /usr/share/info
 
+# --- sources notice (begin)
+# Keep copyright files and symlinks (including package doc directory aliases).
+RUN set -eu; \
+    if [ -d /usr/share/doc ]; then \
+      find /usr/share/doc -type f ! -name copyright -delete; \
+      find /usr/share/doc -xtype l -delete; \
+      find /usr/share/doc -depth -type d -empty -delete; \
+    fi
+COPY docker/SOURCES.txt.in /tmp/pineforge-SOURCES.txt.in
+LABEL io.pineforge.sources.notice="/usr/share/doc/pineforge/SOURCES.txt" \
+      io.pineforge.sources.url="https://github.com/pineforge-4pass/pineforge-release/releases/tag/${RELEASE_VERSION}"
+RUN set -eu; \
+    mkdir -p /usr/share/doc/pineforge; \
+    if [ "${RELEASE_VERSION}" = unknown ]; then \
+      sed 's|/releases/tag/@RELEASE_VERSION@|/releases|g' /tmp/pineforge-SOURCES.txt.in > /usr/share/doc/pineforge/SOURCES.txt; \
+      printf '%s\n' 'Local build: use the releases page to locate mirrored Debian sources.' >> /usr/share/doc/pineforge/SOURCES.txt; \
+    else \
+      sed "s|@RELEASE_VERSION@|${RELEASE_VERSION}|g" /tmp/pineforge-SOURCES.txt.in > /usr/share/doc/pineforge/SOURCES.txt; \
+    fi; \
+    rm /tmp/pineforge-SOURCES.txt.in
+# --- sources notice (end)
 COPY --from=hpo-toolchain /opt/pineforge/licenses /opt/pineforge/licenses
 COPY --from=hpo-wheel /opt/hpo              /opt/pineforge/hpo
 COPY --from=hpo-wheel /opt/hpo-licenses     /opt/pineforge/licenses

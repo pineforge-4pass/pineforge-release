@@ -40,6 +40,28 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install workflow YAML parser
+        run: python3 -m pip install 'PyYAML==6.0.3'
+
+      - name: Download published hpo wheels
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 --max-time 120 \
+            'https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v0.15.0/pineforge_hpo-0.15.0-py3-none-any.whl' \
+            -o pineforge_hpo-0.15.0-py3-none-any.whl
+          printf '%s\n' 'ee09f5fd72fd43c26027c294d0e871ab6f3d856fbc5d28c53910a3bbcfa968a6  pineforge_hpo-0.15.0-py3-none-any.whl' > hpo-accepted.sha256
+          sha256sum -c --strict hpo-accepted.sha256
+          curl -fsSL --retry 3 --max-time 120 \
+            'https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v0.13.2/pineforge_hpo-0.13.2-py3-none-any.whl' \
+            -o pineforge_hpo-0.13.2-py3-none-any.whl
+          printf '%s\n' '57fff4c49cba794a9657e7882376eee294366843cf0442306195b8390dd0d073  pineforge_hpo-0.13.2-py3-none-any.whl' > hpo-rejected.sha256
+          sha256sum -c --strict hpo-rejected.sha256
+          {
+            echo "PINEFORGE_HPO_ACCEPTED_WHEEL=$RUNNER_TEMP/pineforge_hpo-0.15.0-py3-none-any.whl"
+            echo "PINEFORGE_HPO_REJECTED_WHEEL=$RUNNER_TEMP/pineforge_hpo-0.13.2-py3-none-any.whl"
+          } >> "$GITHUB_ENV"
+
       - name: Release rules (version order, prerelease channel, 1.0 pairing)
         run: |
           python3 -m py_compile scripts/release_pair.py
