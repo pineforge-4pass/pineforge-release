@@ -382,7 +382,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         dispatches = [step for step in notify["steps"] if "/dispatches" in step.get("run", "")]
         self.assertEqual(len(dispatches), 1, "test must find the existing consumer dispatch")
 
-    def test_post_push_check_pulls_both_architectures_by_the_successful_push_digest(self):
+    def test_post_push_check_pulls_each_architecture_by_its_own_child_digest(self):
         post = self.named["Check pushed Debian source mirror"]
         for name, identity, digest_var, outcome_var in (
                 ("Build + push (multi-arch)", "push_release", "RELEASE_DIGEST", "RELEASE_PUSH_OUTCOME"),
@@ -403,17 +403,59 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                  if line.strip().startswith("docker pull ")]
         inventories = [shlex.split(line) for line in logical.splitlines()
                        if line.strip().startswith("docker run ")]
-        self.assertEqual(pulls, [["docker", "pull", "--platform", f"linux/{arch}", "$image"]
-                                 for arch in ("amd64", "arm64")])
+        self.assertEqual(len(pulls), 2)
+        self.assertNotEqual(pulls[0][-1], pulls[1][-1],
+                            "pulling both platforms by the same index digest conflicts in the local image store")
+        references = {arch: "${REGISTRY}/${IMAGE}@${" + arch + "_child}"
+                      for arch in ("amd64", "arm64")}
+        self.assertEqual(pulls, [["docker", "pull", references[arch]] for arch in ("amd64", "arm64")])
         query = r"-f=${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n"
         self.assertEqual(inventories, [
             ["docker", "run", "--rm", "--platform", f"linux/{arch}", "--entrypoint", "dpkg-query",
-             "$image", "-W", query, ">", f"$RUNNER_TEMP/pushed-debian-{arch}.tsv"]
+             references[arch], "-W", query, ">", f"$RUNNER_TEMP/pushed-debian-{arch}.tsv"]
             for arch in ("amd64", "arm64")])
+        self.assertTrue(run.endswith(
+            "python3 scripts/release_sources.py check --registry docker/SOURCE-SETS.tsv \\\n"
+            '  --amd64 "$RUNNER_TEMP/pushed-debian-amd64.tsv" --arm64 "$RUNNER_TEMP/pushed-debian-arm64.tsv" \\\n'
+            '  --release-assets "$RUNNER_TEMP/source-assets.json" --sources-list "$RUNNER_TEMP/$SOURCE_LIST"\n'
+        ), "the final source check must stay byte for byte identical")
         self.assertNotIn("pineforge-source-inspect:", run)
         self.assertIn("DETECTS", run)
         self.assertIn("tags are already pushed", run)
         self.assertIn("sources are never deleted", run)
+
+    def test_post_push_check_resolves_unique_non_attestation_linux_child_digests(self):
+        run = self.named["Check pushed Debian source mirror"]["run"]
+        inspect = 'docker buildx imagetools inspect --raw "$image"'
+        self.assertEqual(run.count("docker buildx imagetools inspect --raw "), 1,
+                         "read the pushed index once instead of pulling it for both platforms")
+        self.assertIn('index="$(' + inspect + ')"', run)
+        self.assertIn('|| { echo "::error::could not read pushed image index"; exit 1; }', run)
+        resolver = re.search(r"^child_digest\(\) \{\n(.*?)^\}", run, re.M | re.S)
+        self.assertIsNotNone(resolver, "both architectures must use the same validated child resolver")
+        body = resolver.group(1)
+        self.assertIn('local arch="$1" child', body)
+        self.assertIn('child="$(jq -er --arg arch "$arch" \'', body)
+        self.assertIn('[.manifests[]', body)
+        self.assertIn('select(.platform.os == "linux" and .platform.architecture == $arch)', body)
+        self.assertIn('select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")', body)
+        self.assertIn('if length == 1 then .[0].digest', body)
+        self.assertIn('else error("expected exactly one linux/" + $arch + " image manifest") end', body)
+        self.assertIn('\' <<< "$index")"', body)
+        self.assertIn('|| { echo "::error::expected exactly one linux/${arch} image manifest in pushed index"'
+                      ' >&2; return 1; }', body)
+        self.assertIn('[[ "$child" =~ ^sha256:[0-9a-f]{64}$ ]]', body)
+        self.assertIn('|| { echo "::error::missing or malformed linux/${arch} child digest" >&2; return 1; }',
+                      body)
+        self.assertIn('printf \'%s\\n\' "$child"', body)
+        for arch in ("amd64", "arm64"):
+            with self.subTest(arch=arch):
+                assignment = f'{arch}_child="$(child_digest {arch})"'
+                self.assertEqual(run.count(assignment), 1)
+                self.assertLess(run.index(assignment), run.index("docker pull "),
+                                "resolve and validate both child digests before either pull")
+        self.assertIn('[[ "$amd64_child" != "$arm64_child" ]]', run)
+        self.assertIn('|| { echo "::error::amd64 and arm64 image manifests share a child digest"; exit 1; }', run)
 
     def test_both_inventories_use_dpkg_query_with_the_source_columns(self):
         run = self.named["Read Debian package inventories"]["run"]
@@ -827,6 +869,30 @@ class HpoWorkflowTest(unittest.TestCase):
                             "the landed pair stays engine 1.5.9 + codegen 1.5.9 and nothing is built or published")
                 self.assertEqual((root / "summary").read_text(), expected + "\n")
                 self.assertEqual(done.stdout, f"::notice title=pineforge pair pending::{expected}\n")
+
+    def test_github_release_notes_name_hpo_only_when_paired(self):
+        # GitHub Release is the publish job's last step; exclude the next job
+        # before extracting its run block with the existing shell helper.
+        step = _step(self.publisher.split("\n  notify-consumers:\n", 1)[0], "GitHub Release")
+        version = rp.HPO_PAIRING_FROM
+        cases = ((version, version, f"engine {version} + codegen {version} + hpo {version}"),
+                 ("1.5.9", "", "engine 1.5.9 + codegen 1.5.9"))
+        for version, hpo, expected in cases:
+            with self.subTest(version=version, hpo=hpo), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                checked = rp.check(version, version, version, hpo=hpo)
+                done, _ = self.shell(root, step, "GitHub Release",
+                                     {"TAG": f"v{version}", "E": version, "C": version,
+                                      "H": checked.get("hpo", ""), "PRERELEASE": checked["prerelease"],
+                                      "SOURCE_TAG": "source-bundle", "SOURCE_LIST": "SOURCES.list"})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                calls = [json.loads(line) for line in (root / "state" / "actions.jsonl").read_text().splitlines()]
+                created = [call for call in calls if call["tool"] == "gh" and call["action"] == "release create"]
+                self.assertEqual(len(created), 1, calls)
+                self.assertEqual(created[0]["notes"].splitlines()[2], expected)
+                if hpo:
+                    self.assertIn("H: ${{ steps.pins.outputs.hpo }}", step)
 
     def test_real_artifact_wait_uses_hpo_pep440_urls(self):
         for version in ("1.6.0-rc.1", "1.6.0-rc.12", "1.6.0"):
