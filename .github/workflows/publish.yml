@@ -443,13 +443,15 @@ jobs:
           TAG: ${{ github.ref_name }}
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
+          H: ${{ steps.pins.outputs.hpo }}
           PRERELEASE: ${{ steps.pair.outputs.prerelease }}
           SOURCE_TAG: ${{ steps.source_set.outputs.release-tag }}
           SOURCE_LIST: ${{ steps.source_set.outputs.list-asset }}
         run: |
           set -euo pipefail
+          components="engine ${E} + codegen ${C}${H:+ + hpo ${H}}"
           # shellcheck disable=SC2016  # backticks here are literal markdown, not command substitution
-          notes="$(printf 'Combined PineScript -> backtest image.\n\nengine %s + codegen %s\n\n```\ndocker pull ghcr.io/pineforge-4pass/pineforge-release:%s\n```\n' "$E" "$C" "${TAG#v}")"
+          notes="$(printf 'Combined PineScript -> backtest image.\n\n%s\n\n```\ndocker pull ghcr.io/pineforge-4pass/pineforge-release:%s\n```\n' "$components" "${TAG#v}")"
           notes="$(printf '%s\n\nDebian sources: [SOURCES.list](https://github.com/pineforge-4pass/pineforge-release/releases/download/%s/%s) and its source assets are attached to [release %s](https://github.com/pineforge-4pass/pineforge-release/releases/tag/%s).\n' "$notes" "$SOURCE_TAG" "$SOURCE_LIST" "$SOURCE_TAG" "$SOURCE_TAG")"
           if [ "$PRERELEASE" = true ]; then
             # Never GitHub's "Latest": resolvers that read Latest keep the newest

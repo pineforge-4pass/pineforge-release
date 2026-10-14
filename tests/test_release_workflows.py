@@ -870,6 +870,30 @@ class HpoWorkflowTest(unittest.TestCase):
                 self.assertEqual((root / "summary").read_text(), expected + "\n")
                 self.assertEqual(done.stdout, f"::notice title=pineforge pair pending::{expected}\n")
 
+    def test_github_release_notes_name_hpo_only_when_paired(self):
+        # GitHub Release is the publish job's last step; exclude the next job
+        # before extracting its run block with the existing shell helper.
+        step = _step(self.publisher.split("\n  notify-consumers:\n", 1)[0], "GitHub Release")
+        version = rp.HPO_PAIRING_FROM
+        cases = ((version, version, f"engine {version} + codegen {version} + hpo {version}"),
+                 ("1.5.9", "", "engine 1.5.9 + codegen 1.5.9"))
+        for version, hpo, expected in cases:
+            with self.subTest(version=version, hpo=hpo), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                checked = rp.check(version, version, version, hpo=hpo)
+                done, _ = self.shell(root, step, "GitHub Release",
+                                     {"TAG": f"v{version}", "E": version, "C": version,
+                                      "H": checked.get("hpo", ""), "PRERELEASE": checked["prerelease"],
+                                      "SOURCE_TAG": "source-bundle", "SOURCE_LIST": "SOURCES.list"})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                calls = [json.loads(line) for line in (root / "state" / "actions.jsonl").read_text().splitlines()]
+                created = [call for call in calls if call["tool"] == "gh" and call["action"] == "release create"]
+                self.assertEqual(len(created), 1, calls)
+                self.assertEqual(created[0]["notes"].splitlines()[2], expected)
+                if hpo:
+                    self.assertIn("H: ${{ steps.pins.outputs.hpo }}", step)
+
     def test_real_artifact_wait_uses_hpo_pep440_urls(self):
         for version in ("1.6.0-rc.1", "1.6.0-rc.12", "1.6.0"):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
