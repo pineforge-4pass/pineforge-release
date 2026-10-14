@@ -406,11 +406,32 @@ jobs:
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
             || { echo "::error::missing or malformed pushed image digest"; exit 1; }
           image="${REGISTRY}/${IMAGE}@${digest}"
-          docker pull --platform linux/amd64 "$image"
-          docker run --rm --platform linux/amd64 --entrypoint dpkg-query "$image" \
+          # The local image store cannot hold both platforms under one index digest.
+          index="$(docker buildx imagetools inspect --raw "$image")" \
+            || { echo "::error::could not read pushed image index"; exit 1; }
+          child_digest() {
+            local arch="$1" child
+            child="$(jq -er --arg arch "$arch" '
+              [.manifests[]
+               | select(.platform.os == "linux" and .platform.architecture == $arch)
+               | select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")]
+              | if length == 1 then .[0].digest
+                else error("expected exactly one linux/" + $arch + " image manifest") end
+            ' <<< "$index")" \
+              || { echo "::error::expected exactly one linux/${arch} image manifest in pushed index" >&2; return 1; }
+            [[ "$child" =~ ^sha256:[0-9a-f]{64}$ ]] \
+              || { echo "::error::missing or malformed linux/${arch} child digest" >&2; return 1; }
+            printf '%s\n' "$child"
+          }
+          amd64_child="$(child_digest amd64)"
+          arm64_child="$(child_digest arm64)"
+          [[ "$amd64_child" != "$arm64_child" ]] \
+            || { echo "::error::amd64 and arm64 image manifests share a child digest"; exit 1; }
+          docker pull "${REGISTRY}/${IMAGE}@${amd64_child}"
+          docker run --rm --platform linux/amd64 --entrypoint dpkg-query "${REGISTRY}/${IMAGE}@${amd64_child}" \
             -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' > "$RUNNER_TEMP/pushed-debian-amd64.tsv"
-          docker pull --platform linux/arm64 "$image"
-          docker run --rm --platform linux/arm64 --entrypoint dpkg-query "$image" \
+          docker pull "${REGISTRY}/${IMAGE}@${arm64_child}"
+          docker run --rm --platform linux/arm64 --entrypoint dpkg-query "${REGISTRY}/${IMAGE}@${arm64_child}" \
             -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' > "$RUNNER_TEMP/pushed-debian-arm64.tsv"
           python3 scripts/release_sources.py check --registry docker/SOURCE-SETS.tsv \
             --amd64 "$RUNNER_TEMP/pushed-debian-amd64.tsv" --arm64 "$RUNNER_TEMP/pushed-debian-arm64.tsv" \
