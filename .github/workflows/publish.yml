@@ -199,17 +199,19 @@ jobs:
           H: ${{ steps.pins.outputs.hpo }}
           HUB_COMMIT: ${{ github.sha }}
         run: |
+          set -euo pipefail
           python3 scripts/release_pipeline.py bindings --release-version="${TAG#v}" \
             --engine="$E" --codegen="$C" --hpo="$H" --hub-commit="$HUB_COMMIT" \
             --output "$RUNNER_TEMP/release-bindings.json"
           python3 - <<'PYBIND' >> "$GITHUB_OUTPUT"
           import json, os
           from pathlib import Path
+          from scripts.release_sources import hpo_artifact_args
           obj = json.loads(Path(os.environ['RUNNER_TEMP'], 'release-bindings.json').read_bytes())
           hpo = obj['versions']['hpo']
           if hpo:
-              print('hpo_wheel_arg=HPO_WHEEL_SHA256=' + hpo['wheel_sha256'])
-              print('hpo_sdist_arg=HPO_SDIST_SHA256=' + hpo['sdist_sha256'])
+              for output, argument in hpo_artifact_args(hpo).items():
+                  print(output + '=' + argument)
           PYBIND
 
       - name: Read hpo wheel digest
@@ -451,6 +453,8 @@ jobs:
           SOURCE_LIST: ${{ steps.source_set.outputs.list-asset }}
         run: |
           set -euo pipefail
+          # This DETECTS drift; candidate tags are already pushed
+          # and sources are never deleted.
           # Only a candidate tag exists. Fixed versions and moving aliases
           # remain untouched until the finalizer has all readiness evidence.
           case "${RELEASE_PUSH_OUTCOME}:${HPO_PUSH_OUTCOME}" in

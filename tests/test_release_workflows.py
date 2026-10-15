@@ -247,6 +247,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                          "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
                          "${{ steps.pair.outputs.hpo_version_arg }}",
                          "${{ steps.binding.outputs.hpo_wheel_arg }}",
+                         "${{ steps.binding.outputs.hpo_sdist_arg }}",
                          "RELEASE_VERSION=${{ github.ref_name }}",
                          "RELEASE_GIT_SHA=${{ github.sha }}"):
             self.assertIn(existing, build["with"]["build-args"])

@@ -1,10 +1,5 @@
 # pineforge-release
 
-The automatic release chain's candidate/readiness gates, immutable event
-contract, consumer completion adapter and supervisor setup are documented in
-[docs/release-chain.md](docs/release-chain.md). Releases fan out only after the
-combined image, package identities and measured release facts are ready.
-
 The **full PineScript v6 → deterministic backtest** product image: the
 [`pineforge-engine`](https://github.com/pineforge-4pass/pineforge-engine) pure
 runtime **plus** the bundled [`pineforge-codegen`](https://pypi.org/project/pineforge-codegen/)
@@ -230,6 +225,11 @@ Credentials are a single org GitHub App (`PINEFORGE_APP_ID` /
 `PINEFORGE_APP_PRIVATE_KEY`); no personal access tokens.
 Operators may trigger events manually with their own gh login; no personal token is stored in this repository.
 
+The automatic release chain's candidate/readiness gates, immutable event
+contract, consumer completion adapter and supervisor setup are documented in
+[docs/release-chain.md](docs/release-chain.md). Releases fan out only after the
+combined image, package identities and measured release facts are ready.
+
 ## Image tags
 
 `X.Y.Z` · `X.Y` · `latest` · `engine<E>-codegen<C>` · `sha-<short>`
@@ -348,6 +348,11 @@ that release's wheel and native source, checks the wheel against
 extra against the already installed codegen. A resolution error or any planned
 codegen replacement fails the build. The wheel is then installed separately
 without dependencies under `/opt/pineforge/hpo`, beside codegen on `PYTHONPATH`.
+Publishing validates both bound artifact digests before passing
+`HPO_WHEEL_SHA256` and `HPO_SDIST_SHA256` to every HPO build. The native source
+is checked against the sdist digest before extraction and compilation. These
+per-release artifact pins are declared in `scripts/release_sources.py`, separate
+from the six Debian toolchain versions below.
 This change merges without a release; the first publish carrying HPO is the
 1.6.0 lockstep. HPO 0.15.0 is the fixture for the signed box proof.
 

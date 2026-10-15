@@ -19,6 +19,7 @@
 # --target hpo additionally requires HPO_VERSION (no source default) and the
 # six toolchain package version build-args chosen on the signed box.
 # HPO_WHEEL_SHA256 checks the downloaded wheel when supplied to that target.
+# HPO_SDIST_SHA256 checks the native sdist before extraction when supplied.
 #
 # Published as ghcr.io/pineforge-4pass/pineforge-release:<own-semver>.
 
