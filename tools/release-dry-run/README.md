@@ -1,5 +1,42 @@
 # Release dry run
 
+## Current candidate/readiness replay (2026-10-16)
+
+The default entry point now runs the candidate → finalizer → completion graph:
+
+```bash
+# Run in CI or on the approved cloud host, never on the Mac.
+python3 tools/release-dry-run/dry_run.py --ready -v
+python3 tools/release-dry-run/dry_run.py --ready -k ArrivalReplay
+```
+
+It executes the current handler's real validation/probe/decision shell for all
+six stable and prerelease component arrival orders, and the production package,
+manifest, finalizer and receipt validators against nonempty external-service
+fixtures. Unknown fixture routes fail. It covers missing npm/sdist/facts,
+corruption, auth errors, duplicate/lost delivery, older completion, rollback,
+missing/failed/skipped E2E jobs and a stale facts-file clock. Mutation controls
+must detect removal of the runtime gate, early latest tags and bypassed finalizer
+dependencies. The CI aggregate `release/ready` requires this replay as well as
+the existing release/source/harness and fingerprint jobs.
+
+No token is minted, no registry is written and no real HTTP is allowed. This
+replay does not claim a real image passed E2E: `publish.yml` separately runs
+`release_smoke.py` on both pushed child digests in CI before storing a verified
+candidate. It also does not claim live App permission, branch protection or
+consumer deployment proof.
+
+The pre-binding runner and worlds below are preserved for historical audit.
+They describe the old version-only sender, not current acceptance criteria.
+Use `--historical --checkout <pre-binding-checkout> --metadata-action <prepared>`
+to replay those workflow snapshots. Current replay needs Python, PyYAML, the
+pinned facts validator dependencies, bash, git, jq and the existing local shims;
+it does not need a metadata-action checkout. `-k` selects current test-name text.
+
+See [release-chain.md](../../docs/release-chain.md) for setup and receipt protocol.
+
+## Historical workflow replay
+
 `dry_run.py` replays this repo's real `handle-upstream.yml` and `publish.yml`
 on a Linux test host and checks what each run would tag, build, release and send
 downstream. It covers the 0.x line, the 1.0 pair line, and the three-component

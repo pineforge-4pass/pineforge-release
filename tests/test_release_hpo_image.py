@@ -363,7 +363,7 @@ def _toolchain_argument_problems(dockerfile: str, args_text: str) -> list[str]:
     stages = _dockerfile_stages(dockerfile)
     reached = _reachable_stages(stages, "hpo")
     default = _reachable_stages(stages)
-    wheel_arguments = {"HPO_VERSION", "HPO_WHEEL_SHA256"}
+    wheel_arguments = {"HPO_VERSION", "HPO_WHEEL_SHA256", "HPO_SDIST_SHA256"}
     declared = (_build_arguments(stages, reached) - _build_arguments(stages, default)
                 - wheel_arguments)
     required = (_build_arguments(stages, reached, required=True)
@@ -420,7 +420,7 @@ class DockerfileTargetTest(unittest.TestCase):
                     "HPO_BINUTILS_VERSION", "HPO_EIGEN_VERSION", "HPO_CMAKE_VERSION",
                     "HPO_MAKE_VERSION"}
         self.assertEqual(_hpo_arguments(self.stages, reached, required=True), required)
-        self.assertEqual(_hpo_arguments(self.stages, reached), required | {"HPO_WHEEL_SHA256"})
+        self.assertEqual(_hpo_arguments(self.stages, reached), required | {"HPO_WHEEL_SHA256", "HPO_SDIST_SHA256"})
         for stage in self.stages:
             for instruction, body in stage.instructions:
                 if instruction == "ARG" and body.startswith("HPO_"):

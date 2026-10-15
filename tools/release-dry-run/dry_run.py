@@ -994,6 +994,12 @@ def metadata_action(arg, checkout):
 
 
 def main():
+    if "--ready" in sys.argv or "--historical" not in sys.argv:
+        # The old worlds below remain available for audit of pre-binding
+        # workflow snapshots. Current CI uses the ready/candidate graph.
+        import ready_replay
+        sys.exit(ready_replay.main([arg for arg in sys.argv[1:] if arg != "--ready"]))
+    sys.argv.remove("--historical")
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("-k", dest="only", action="append", default=[], help=f"run only these worlds: {', '.join(WORLDS)}")
     ap.add_argument("-v", dest="verbose", action="store_true", help="print every run's transcript")

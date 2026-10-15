@@ -19,6 +19,7 @@
 # --target hpo additionally requires HPO_VERSION (no source default) and the
 # six toolchain package version build-args chosen on the signed box.
 # HPO_WHEEL_SHA256 checks the downloaded wheel when supplied to that target.
+# HPO_SDIST_SHA256 checks the native sdist before extraction when supplied.
 #
 # Published as ghcr.io/pineforge-4pass/pineforge-release:<own-semver>.
 
@@ -229,6 +230,7 @@ RUN set -eu; \
 # --- HPO native build: public + generated engine headers and Eigen -----------
 FROM hpo-toolchain AS hpo-native
 ARG HPO_VERSION
+ARG HPO_SDIST_SHA256
 ARG HPO_CMAKE_VERSION
 ARG HPO_MAKE_VERSION
 RUN test -n "${HPO_VERSION}" && test -n "${HPO_CMAKE_VERSION}" && test -n "${HPO_MAKE_VERSION}" \
@@ -241,6 +243,10 @@ COPY --from=engine /opt/pineforge/include /opt/pineforge/include
 # wheel pin. Upstream CMake pins and SHA256-checks its dlib FetchContent archive.
 RUN set -eu; \
     curl -fsSL "https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v${HPO_VERSION}/pineforge_hpo-${HPO_VERSION}.tar.gz" -o /tmp/hpo-source.tar.gz; \
+    if [ -n "${HPO_SDIST_SHA256}" ]; then \
+      printf '%s  /tmp/hpo-source.tar.gz\n' "${HPO_SDIST_SHA256}" > /tmp/hpo-source.sha256; \
+      sha256sum -c --strict /tmp/hpo-source.sha256; \
+    fi; \
     mkdir -p /tmp/hpo-source; \
     tar -xzf /tmp/hpo-source.tar.gz -C /tmp/hpo-source --strip-components=1; \
     test "$(cat /tmp/hpo-source/VERSION)" = "${HPO_VERSION}"; \

@@ -28,7 +28,8 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read   # GITHUB_TOKEN stays read-only; the App token does the push.
+  contents: read   # the App token does the push
+  issues: write    # neutral failure incidents only
 
 jobs:
   bump:
@@ -44,6 +45,7 @@ jobs:
           owner: pineforge-4pass
           repositories: pineforge-release
           permission-contents: write
+          permission-actions: write   # explicit replay on an existing tag
           github-api-url: https://api.github.com
 
       - name: Checkout main (App token bypasses the ruleset + re-fires publish.yml)
@@ -99,6 +101,26 @@ jobs:
             printf '%s\n' "$facts"
           } >> "$GITHUB_OUTPUT"
           echo "dispatched ${component}=${VER} (event ${EVENT}, prerelease ${RAW_PRERELEASE:-unset}, upstream run ${RUN_ID:-n/a})"
+
+      - name: Validate producer event JSON types
+        run: |
+          python3 - <<'PYEVENT'
+          import json, os
+          e = json.load(open(os.environ['GITHUB_EVENT_PATH']))['client_payload']
+          if type(e.get('version')) is not str:
+              raise SystemExit('version must be a JSON string')
+          if 'prerelease' in e and type(e['prerelease']) is not bool:
+              raise SystemExit('prerelease must be a JSON boolean')
+          if 'run_id' in e and (type(e['run_id']) is not int or e['run_id'] <= 0):
+              raise SystemExit('run_id must be a positive JSON integer')
+          PYEVENT
+
+      - name: Verify the dispatched producer artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPONENT: ${{ steps.in.outputs.component }}
+          VER: ${{ steps.in.outputs.version }}
+        run: python3 scripts/release_pipeline.py producer "$COMPONENT" "$VER"
 
       - name: Configure git identity
         run: |
@@ -221,6 +243,7 @@ jobs:
       - name: Decide action (pairing rule + idempotent + recover half-failed release + downgrade guard)
         id: decide
         env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}  # must be able to list hub drafts
           COMPONENT: ${{ steps.in.outputs.component }}
           VER:       ${{ steps.in.outputs.version }}
           PAYLOAD_PRERELEASE: ${{ steps.in.outputs.payload_prerelease }}
@@ -241,8 +264,11 @@ jobs:
         run: |
           set -euo pipefail
           ver="$(tr -d '[:space:]' < VERSION)"
+          candidate="$(gh api --paginate --slurp repos/pineforge-4pass/pineforge-release/releases \
+            --jq "any(.[][]; .tag_name == \"v${ver}\" and any(.assets[]; .name == \"release-candidate.json\"))")"
           img="ghcr.io/pineforge-4pass/pineforge-release:${ver}"
-          if docker manifest inspect "$img" >/dev/null 2>&1; then image=true; else image=false; fi
+          image=false
+          if [ "$candidate" != true ] && docker manifest inspect "$img" >/dev/null 2>&1; then image=true; fi
           # Monotonicity (downgrade) guard on the DISPATCHED component, the 1.0
           # pairing rule, and noop / republish / bump / wait: see the script.
           echo "cur_ver=$ver" >> "$GITHUB_OUTPUT"
@@ -254,12 +280,12 @@ jobs:
           python3 scripts/release_pair.py decide \
             --component="$COMPONENT" --version="$VER" --prerelease-flag="${PAYLOAD_PRERELEASE:-}" \
             --prev-engine="$EPREV" --prev-codegen="$CPREV" --current-release="$ver" \
-            --other-published="${PUBLISHED:-false}" --image-exists="$image" --force="${FORCE:-}" \
+            --other-published="${PUBLISHED:-false}" --image-exists="$image" --candidate-exists="$candidate" --force="${FORCE:-}" \
             --partner-latest="${PARTNER_LATEST:-}" --prev-hpo="${HPREV:-}" "${partners[@]}" | tee -a "$GITHUB_OUTPUT"
 
       - name: No-op
         if: steps.decide.outputs.mode == 'noop'
-        run: echo "engine+codegen unchanged and image exists — nothing to do."
+        run: echo "Component pins unchanged; image or verified candidate already exists."
 
       - name: Wait for the partner release (1.0 pair incomplete)
         if: steps.decide.outputs.mode == 'wait'
@@ -290,10 +316,11 @@ jobs:
         if: steps.decide.outputs.mode == 'republish'
         env:
           TAG: v${{ steps.decide.outputs.cur_ver }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
-          echo "versions unchanged but image missing — re-pushing ${TAG} to re-fire publish.yml"
-          git push origin "refs/tags/${TAG}" --force
+          echo "versions unchanged but image missing — explicitly replaying publish.yml on ${TAG}"
+          gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref "$TAG"
 
       - name: Bump VERSION, commit, tag (fires publish.yml)
         if: steps.decide.outputs.mode == 'bump'
@@ -349,6 +376,7 @@ jobs:
           # is not used here).
           bash scripts/sync-harness.sh "${E}"
           harness="$(bash scripts/sync-harness.sh --files)"
+          # shellcheck disable=SC2086  # trusted sync-harness --files manifest
           git add VERSION ${harness}
           git diff --cached --quiet && { echo "::error::nothing staged — refusing empty release"; exit 1; }
           git commit -m "chore(release): v${next} — ${components}"
@@ -356,3 +384,10 @@ jobs:
           git push origin HEAD:main
           git push origin "v${next}"
           echo "pushed v${next} (${components}); publish.yml will build + fan out."
+
+      - name: Report failed upstream handling
+        if: ${{ failure() && !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
+        run: python3 scripts/release_pipeline.py alert --stage producer

@@ -24,6 +24,9 @@ from test_release_hpo_image import (
 )
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "scripts"))
+import release_sources as sources  # noqa: E402
+
 SCRIPT = REPO / "scripts" / "release_sources.py"
 FIXTURES = REPO / "tests" / "fixtures"
 REGISTRY_HEADER = "set-id\trelease-tag\tn-pairs\tsources-list-sha256\tlist-asset\n"
@@ -363,10 +366,12 @@ class ToolchainCliTest(unittest.TestCase):
         stages = _dockerfile_stages((REPO / "docker" / "Dockerfile").read_text())
         hpo = _reachable_stages(stages, "hpo")
         ordinary = _reachable_stages(stages)
+        artifact_names = set(sources.HPO_ARTIFACT_ARGS)
+        self.assertLessEqual(artifact_names, _build_arguments(stages, hpo))
         for required in (False, True):
             required_names = (_build_arguments(stages, hpo, required=required)
                               - _build_arguments(stages, ordinary, required=required)
-                              - {"HPO_VERSION", "HPO_WHEEL_SHA256"})
+                              - {"HPO_VERSION"} - artifact_names)
             self.assertEqual(names, required_names)
 
     def test_mutated_argument_files_are_refused_with_line_numbers(self):
@@ -392,6 +397,70 @@ class ToolchainCliTest(unittest.TestCase):
                     self.assertEqual(result.stdout, "")
                     self.assertIn(message, result.stderr)
                     self.assertIn(f"toolchain args line {expected_line}:", result.stderr)
+
+
+class HpoArtifactArgumentsTest(unittest.TestCase):
+    def test_verified_binding_fields_are_required_for_both_artifact_arguments(self):
+        self.assertEqual(sources.HPO_ARTIFACT_ARGS, {
+            "HPO_WHEEL_SHA256": ("hpo_wheel_arg", "wheel_sha256"),
+            "HPO_SDIST_SHA256": ("hpo_sdist_arg", "sdist_sha256"),
+        })
+        pin = {"wheel_sha256": "a" * 64, "sdist_sha256": "b" * 64}
+        self.assertEqual(sources.hpo_artifact_args(pin), {
+            "hpo_wheel_arg": "HPO_WHEEL_SHA256=" + "a" * 64,
+            "hpo_sdist_arg": "HPO_SDIST_SHA256=" + "b" * 64,
+        })
+        for field in pin:
+            for invalid in (None, "", 0, "a" * 63, "A" * 64, "sha256:" + "a" * 64,
+                            "a" * 64 + "\n", "$(command)"):
+                with self.subTest(field=field, invalid=invalid):
+                    mutated = {**pin, field: invalid}
+                    with self.assertRaises(sources.SourcesError):
+                        sources.hpo_artifact_args(mutated)
+            with self.subTest(missing=field), self.assertRaises(sources.SourcesError):
+                sources.hpo_artifact_args({key: value for key, value in pin.items() if key != field})
+
+    def test_each_declared_digest_guard_rejects_changed_bytes_before_consumption(self):
+        stages = {stage.name: stage for stage in
+                  _dockerfile_stages((REPO / "docker" / "Dockerfile").read_text())}
+        shell = shutil.which("sh", path=os.defpath)
+        self.assertIsNotNone(shell, "sh is required to exercise the real checksum guards")
+        guards = {
+            "HPO_WHEEL_SHA256": ("hpo-wheel", "hpo-wheel.whl", "pip3 install"),
+            "HPO_SDIST_SHA256": ("hpo-native", "hpo-source.tar.gz", "tar -xzf"),
+        }
+        self.assertEqual(set(guards), set(sources.HPO_ARTIFACT_ARGS))
+        for argument, (stage, filename, consume) in guards.items():
+            with self.subTest(argument=argument), tempfile.TemporaryDirectory() as tmp:
+                text = stages[stage].text
+                self.assertIn("ARG " + argument + "\n", text)
+                start = text.index('if [ -n "${' + argument + '}" ]; then')
+                end = text.index("fi;", start) + len("fi;")
+                guard = text[start:end]
+                self.assertIn("sha256sum -c --strict", guard)
+                self.assertLess(text.index("curl -fsSL"), start)
+                self.assertLess(end, text.index(consume))
+                # Run only the real checksum guard, on explicit fixture bytes;
+                # downloads, extraction and installation remain outside it.
+                script = "set -eu; " + guard.replace("\\\n", "").replace("/tmp/", "")
+                root = Path(tmp)
+                artifact = root / filename
+                data = b"TEST FIXTURE ONLY: bound artifact bytes\n"
+                artifact.write_bytes(data)
+                env = {"PATH": os.environ.get("PATH", os.defpath), "wheel": filename,
+                       argument: hashlib.sha256(data).hexdigest()}
+
+                def run_guard():
+                    return subprocess.run([shell, "-c", script], cwd=root, env=env,
+                                          stdin=subprocess.DEVNULL, capture_output=True,
+                                          text=True, timeout=10)
+
+                good = run_guard()
+                self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
+                artifact.write_bytes(data + b"tampered\n")
+                bad = run_guard()
+                self.assertNotEqual(bad.returncode, 0, bad.stdout + bad.stderr)
+                self.assertIn("FAILED", bad.stdout + bad.stderr)
 
 
 class SourceNoticeTest(unittest.TestCase):

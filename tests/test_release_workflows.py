@@ -168,14 +168,11 @@ class PublishTest(unittest.TestCase):
         self.assertIn("pypi.org/pypi/pineforge-codegen/${CP}/json", body)
 
     def test_prerelease_never_gets_latest_or_the_moving_minor_tag(self):
-        # moving = stable AND the newest stable tag: latest / X.Y never go back.
-        stable = "enable=${{ steps.pair.outputs.moving == 'true' }}"
         body = _step(self.text, "Image metadata")
         self.assertIn("latest=false", body)
-        self.assertIn(f"type=raw,value=latest,{stable}", body)
-        self.assertIn("type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }},"
-                      + stable, body)
-        self.assertEqual(body.count("value=latest"), 1)
+        self.assertIn("type=raw,value=candidate-", body)
+        self.assertNotIn("type=semver", body)
+        self.assertNotIn("value=latest", body)
 
     def test_moving_tags_need_the_newest_stable_tag(self):
         body = _step(self.text, "Pairing rule")
@@ -183,19 +180,20 @@ class PublishTest(unittest.TestCase):
         self.assertIn('--newest-stable="$newest"', body)
 
     def test_github_release_list_failure_is_not_a_latest(self):
-        body = _step(self.text, "GitHub Release")
-        self.assertIn('releases="$(gh release list --exclude-drafts --limit 100 --json tagName -q \'.[].tagName\')"',
-                      body)
+        import release_pipeline as pipeline
+        class FailedStore:
+            def releases(self):
+                raise pipeline.Invalid("HTTP 503")
+        with self.assertRaises(pipeline.Invalid):
+            pipeline.finalized_version(FailedStore())
 
     def test_draft_releases_never_hold_latest(self):
-        # GitHub never marks a draft Latest; counting one (say a hand-made
-        # v9.9.9) would keep a new stable release off Latest.
-        body = _step(self.text, "GitHub Release")
-        calls = [ln for ln in body.splitlines()
-                 if "gh release list" in ln and not ln.lstrip().startswith("#")]
-        self.assertTrue(calls)
-        for ln in calls:
-            self.assertIn("--exclude-drafts", ln)
+        import release_pipeline as pipeline
+        class DraftStore:
+            def releases(self):
+                return [{"tag_name": "v9.9.9", "draft": True,
+                         "assets": [{"name": "release-manifest.json"}]}]
+        self.assertIsNone(pipeline.finalized_version(DraftStore()))
 
     def test_licences_label_covers_the_bundled_transpiler(self):
         # docker/metadata-action's labels override the Dockerfile's, and it
@@ -210,17 +208,18 @@ class PublishTest(unittest.TestCase):
 
     def test_github_release_channel(self):
         body = _step(self.text, "GitHub Release")
-        self.assertIn("PRERELEASE: ${{ steps.pair.outputs.prerelease }}", body)
-        self.assertIn("--prerelease --latest=false", body)
-        self.assertIn("python3 scripts/release_pair.py latest-tag --stable", body)
+        self.assertIn("scripts/release_pipeline.py candidate", body)
+        self.assertNotIn("gh release create", body)
+        call = _workflow("publish.yml")["jobs"]["notify-consumers"]
+        self.assertEqual(call["uses"], "./.github/workflows/release-finalize.yml")
 
     def test_prerelease_flag_is_in_every_dispatch_payload(self):
-        self.assertIn("prerelease: ${{ steps.pair.outputs.prerelease }}", self.text)
-        body = _step(self.text, "Dispatch pineforge-release")
-        self.assertIn("PRERELEASE: ${{ needs.publish.outputs.prerelease }}", body)
-        self.assertIn('-F "client_payload[prerelease]=${PRERELEASE}"', body)
-        self.assertIn("consumer: [offline, hosted, application]",
-                      self.text)
+        finalizer = _workflow("release-finalize.yml")
+        steps = finalizer["jobs"]["notify-consumers"]["steps"]
+        send = next(step for step in steps if step.get("name", "").startswith("Dispatch pineforge-release"))
+        self.assertIn("scripts/release_pipeline.py dispatch", send["run"])
+        self.assertNotIn("client_payload[", send["run"])
+        self.assertEqual(finalizer["jobs"]["notify-consumers"]["strategy"]["fail-fast"], "false")
 
 
 class SourceMirrorWorkflowTest(unittest.TestCase):
@@ -247,7 +246,8 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         for existing in ("ENGINE_VERSION=${{ steps.pins.outputs.engine }}",
                          "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
                          "${{ steps.pair.outputs.hpo_version_arg }}",
-                         "${{ steps.wheel.outputs.hpo_wheel_arg }}",
+                         "${{ steps.binding.outputs.hpo_wheel_arg }}",
+                         "${{ steps.binding.outputs.hpo_sdist_arg }}",
                          "RELEASE_VERSION=${{ github.ref_name }}",
                          "RELEASE_GIT_SHA=${{ github.sha }}"):
             self.assertIn(existing, build["with"]["build-args"])
@@ -315,7 +315,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         self.assertEqual(self.workflow["on"]["push"]["tags"], ["v*"])
         pushes = [step for step in self.steps if step.get("with", {}).get("push") == "true"]
         self.assertEqual(len(pushes), 2, "test must find both actual publishing actions")
-        releases = [step for step in self.steps if "gh release create" in step.get("run", "")]
+        releases = [step for step in self.steps if "scripts/release_pipeline.py candidate --file" in step.get("run", "")]
         self.assertEqual(len(releases), 1, "test must find the existing release step")
         for step in pushes + releases:
             self.assertLess(order[-1], self.steps.index(step))
@@ -370,17 +370,15 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         for push in pushes:
             self.assertLess(self.steps.index(push), self.steps.index(post))
             self.assertNotIn("continue-on-error", push)
-        releases = [step for step in self.steps if "gh release create" in step.get("run", "")]
+        releases = [step for step in self.steps if "scripts/release_pipeline.py candidate --file" in step.get("run", "")]
         self.assertEqual(len(releases), 1)
         for release in releases:
             self.assertLess(self.steps.index(post), self.steps.index(release))
             self.assertNotIn("if", release)
             self.assertNotIn("continue-on-error", release)
         notify = self.workflow["jobs"]["notify-consumers"]
-        self.assertEqual(notify["needs"], "publish", "dispatch must wait for the post-push check")
-        self.assertNotIn("if", notify)
-        dispatches = [step for step in notify["steps"] if "/dispatches" in step.get("run", "")]
-        self.assertEqual(len(dispatches), 1, "test must find the existing consumer dispatch")
+        self.assertIn("publish", notify["needs"], "finalization must wait for the post-push check")
+        self.assertEqual(notify["uses"], "./.github/workflows/release-finalize.yml")
 
     def test_post_push_check_pulls_each_architecture_by_its_own_child_digest(self):
         post = self.named["Check pushed Debian source mirror"]
@@ -491,7 +489,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         self.assertIn("releases/download/%s/%s", release["run"])
         self.assertIn("releases/tag/%s", release["run"])
         self.assertLess(release["run"].index("Debian sources:"),
-                        release["run"].index('if [ "$PRERELEASE" = true ]'))
+                        release["run"].index('python3 scripts/release_pipeline.py candidate'))
 
 
 class PublishedHpoWheelCiTest(unittest.TestCase):
@@ -568,12 +566,12 @@ class HpoWorkflowTest(unittest.TestCase):
         return done, written
 
     def test_only_existing_release_triggers_can_reach_the_jobs(self):
-        self.assertIn("types: [engine-release, codegen-release, hpo-release]", self.handler)
-        self.assertIn('tags: ["v*"]', self.publisher)
-        for text in (self.handler, self.publisher):
-            triggers = text[text.index("\non:\n"):text.index("\npermissions:\n")]
-            for forbidden in ("workflow_dispatch:", "workflow_run:", "pull_request:", "schedule:"):
-                self.assertNotIn(forbidden, triggers)
+        handler = _workflow("handle-upstream.yml")
+        self.assertEqual(handler["on"]["repository_dispatch"]["types"],
+                         ["engine-release", "codegen-release", "hpo-release"])
+        publish = _workflow("publish.yml")
+        self.assertEqual(set(publish["on"]), {"push", "workflow_dispatch"})
+        self.assertIn("refs/tags/v", publish["jobs"]["prepare"]["if"])
 
     def test_hpo_payload_boundary_and_whole_value_allowlist(self):
         cutoff_note = f"hpo joins the pairing at {rp.HPO_PAIRING_FROM}"
@@ -871,28 +869,20 @@ class HpoWorkflowTest(unittest.TestCase):
                 self.assertEqual(done.stdout, f"::notice title=pineforge pair pending::{expected}\n")
 
     def test_github_release_notes_name_hpo_only_when_paired(self):
-        # GitHub Release is the publish job's last step; exclude the next job
-        # before extracting its run block with the existing shell helper.
         step = _step(self.publisher.split("\n  notify-consumers:\n", 1)[0], "GitHub Release")
-        version = rp.HPO_PAIRING_FROM
-        cases = ((version, version, f"engine {version} + codegen {version} + hpo {version}"),
-                 ("1.5.9", "", "engine 1.5.9 + codegen 1.5.9"))
-        for version, hpo, expected in cases:
-            with self.subTest(version=version, hpo=hpo), tempfile.TemporaryDirectory() as tmp:
+        script = _run_script(step).split("python3 scripts/release_pipeline.py candidate", 1)[0]
+        for version, hpo in ((rp.HPO_PAIRING_FROM, rp.HPO_PAIRING_FROM), ("1.5.9", "")):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                self.fixture(root)
-                checked = rp.check(version, version, version, hpo=hpo)
-                done, _ = self.shell(root, step, "GitHub Release",
-                                     {"TAG": f"v{version}", "E": version, "C": version,
-                                      "H": checked.get("hpo", ""), "PRERELEASE": checked["prerelease"],
-                                      "SOURCE_TAG": "source-bundle", "SOURCE_LIST": "SOURCES.list"})
-                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-                calls = [json.loads(line) for line in (root / "state" / "actions.jsonl").read_text().splitlines()]
-                created = [call for call in calls if call["tool"] == "gh" and call["action"] == "release create"]
-                self.assertEqual(len(created), 1, calls)
-                self.assertEqual(created[0]["notes"].splitlines()[2], expected)
-                if hpo:
-                    self.assertIn("H: ${{ steps.pins.outputs.hpo }}", step)
+                env = {**self.environment(root), "RUNNER_TEMP": tmp,
+                       "E": version, "C": version, "H": hpo,
+                       "SOURCE_TAG": "source-bundle", "SOURCE_LIST": "SOURCES.list"}
+                done = subprocess.run(["bash", "--noprofile", "--norc", "-c", script],
+                                      cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                notes = (root / "release-notes.md").read_text()
+                expected = f"engine {version} + codegen {version}" + (f" + hpo {hpo}" if hpo else "")
+                self.assertEqual(notes.splitlines()[2], expected)
 
     def test_real_artifact_wait_uses_hpo_pep440_urls(self):
         for version in ("1.6.0-rc.1", "1.6.0-rc.12", "1.6.0"):
@@ -954,8 +944,8 @@ class HpoWorkflowTest(unittest.TestCase):
 
 
 class AppScopeTest(unittest.TestCase):
-    def test_release_jobs_use_protected_environment_and_contents_only_tokens(self):
-        for name in ("publish.yml", "handle-upstream.yml"):
+    def test_release_jobs_use_protected_environment_and_scoped_tokens(self):
+        for name in ("release-finalize.yml", "handle-upstream.yml"):
             text = (WORKFLOWS / name).read_text()
             self.assertIn("environment: release-automation", text)
             self.assertNotIn("permission-administration", text)
@@ -964,123 +954,40 @@ class AppScopeTest(unittest.TestCase):
             self.assertIn("github-api-url: https://api.github.com", text)
         handler = (WORKFLOWS / "handle-upstream.yml").read_text()
         self.assertIn("repositories: pineforge-release", handler)
-        publish = (WORKFLOWS / "publish.yml").read_text()
-        self.assertIn("repositories: ${{ env.TARGET_REPOSITORY }}", publish)
-        self.assertIn("repository_secret: RELEASE_HOSTED_MCP_REPOSITORY", publish)
-        self.assertIn("repository_secret: RELEASE_APPLICATION_REPOSITORY", publish)
-        self.assertIn("secrets[matrix.repository_secret]", publish)
-        self.assertLess(publish.index("Require one configured consumer"), publish.index("Mint App token"))
-        self.assertNotIn("echo \"dispatched pineforge-release -> ${REPO}", publish)
-        notify = publish[publish.index("  notify-consumers:"):]
-        self.assertIn("permissions:\n      contents: read", notify)
-        self.assertNotIn("packages: write", notify)
+        self.assertIn("permission-actions: write", handler)
+        self.assertNotIn('git push origin "refs/tags/${TAG}" --force', handler)
+        finalizer = (WORKFLOWS / "release-finalize.yml").read_text()
+        self.assertIn("repositories: ${{ env.TARGET_REPOSITORY }}", finalizer)
+        self.assertLess(finalizer.index("Require one configured consumer"), finalizer.index("Mint App token"))
+        job = _workflow("release-finalize.yml")["jobs"]["notify-consumers"]
+        self.assertNotIn("packages", job["permissions"])
 
 
 class NotifyConsumersTest(unittest.TestCase):
-    """A prerelease is not dispatched to the application; the other five
-    consumer/channel combinations still are. The decision step's own shell runs
-    here, so the test follows the workflow rather than a copy of its rule."""
+    """Dispatch is a finalizer-only operation, with independent role jobs."""
+    def test_publication_delegates_to_the_ready_finalizer(self):
+        publish = _workflow("publish.yml")["jobs"]["notify-consumers"]
+        self.assertEqual(publish["uses"], "./.github/workflows/release-finalize.yml")
+        self.assertIn("needs.publish.result == 'success'", publish["if"])
 
-    CONSUMERS = ("offline", "hosted", "application")
-    HANDOFF = "Application is not notified for a prerelease; it receives the release by hand-off."
-    GATE = "\n        if: steps.notify.outputs.dispatch == 'true'\n"
-    GATED = ("Require one configured consumer repository",
-             "Mint App token",
-             "Dispatch pineforge-release")
+    def test_dispatch_requires_finalized_manifest_plan(self):
+        wf = _workflow("release-finalize.yml")
+        job = wf["jobs"]["notify-consumers"]
+        self.assertEqual(job["needs"], "finalize")
+        self.assertEqual(job["strategy"]["fail-fast"], "false")
+        self.assertEqual(job["strategy"]["matrix"]["include"], "${{ fromJSON(needs.finalize.outputs.deliveries) }}")
+        send = next(s for s in job["steps"] if s.get("name", "").startswith("Dispatch pineforge-release"))
+        self.assertIn("release_pipeline.py dispatch", send["run"])
+        self.assertNotIn("client_payload[", send["run"])
 
-    @classmethod
-    def setUpClass(cls):
-        text = (WORKFLOWS / "publish.yml").read_text(encoding="utf-8")
-        cls.notify = text[text.index("\n  notify-consumers:\n"):]
-        at = cls.notify.index("\n    steps:\n") + 1
-        cls.job_head, cls.job_steps = cls.notify[:at], cls.notify[at:]
-        cls.decide = _step(cls.notify, "Decide consumer notification")
-        cls.script = _run_script(cls.decide)
-        cls.bash = shutil.which("bash")
-        if cls.bash is None:
-            raise AssertionError("bash is needed to run the notify-consumers decision step")
-
-    def _decide(self, consumer, flag):
-        """Run the decision script the way the runner does: its two inputs and a
-        GITHUB_OUTPUT file, nothing else. PATH is an empty directory, so only
-        shell builtins can run (no gh, curl or token). A flag of None leaves
-        PRERELEASE unset. Returns (completed process, GITHUB_OUTPUT text)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "no-programs").mkdir()
-            script = root / "decide.sh"
-            script.write_text(self.script, encoding="utf-8")
-            out = root / "github_output"
-            out.write_text("", encoding="utf-8")
-            env = {"PATH": str(root / "no-programs"), "GITHUB_OUTPUT": str(out), "CONSUMER": consumer}
-            if flag is not None:
-                env["PRERELEASE"] = flag
-            done = subprocess.run([self.bash, "--noprofile", "--norc", str(script)], cwd=root, env=env,
-                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
-            return done, out.read_text(encoding="utf-8")
-
-    def test_all_three_consumers_stay_visible_legs(self):
-        # The application's prerelease leg is decided by steps, not by a
-        # job-level condition (the matrix context is not available there) or a
-        # matrix edit, so all three legs still appear and end green.
-        self.assertIn("\n        consumer: [offline, hosted, application]\n", self.job_head)
-        self.assertIn("\n      fail-fast: false\n", self.job_head)
-        self.assertNotIn("exclude:", self.job_head)
-        self.assertNotIn("\n    if:", self.job_head)
-        self.assertIn("\n      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp'"
-                      " || secrets[matrix.repository_secret] }}\n", self.job_head)
-
-    def test_the_decision_is_the_first_step_and_always_runs(self):
-        first = self.job_steps.split("\n      - ", 1)[1]
-        self.assertTrue(first.startswith("name: Decide consumer notification\n        id: notify\n"), first[:80])
-        self.assertNotIn("\n        if:", self.decide)
-
-    def test_the_decision_reads_the_consumer_and_the_publish_flag(self):
-        self.assertIn("\n        env:\n          CONSUMER: ${{ matrix.consumer }}\n"
-                      "          PRERELEASE: ${{ needs.publish.outputs.prerelease }}\n"
-                      "        run: |\n", self.decide)
-
-    def test_the_decision_uses_no_secret_token_or_network(self):
-        self.assertNotIn("uses:", self.decide)
-        for word in ("secrets.", "GH_TOKEN", "TARGET_REPOSITORY", "steps.app"):
-            self.assertNotIn(word, self.decide)
-        self.assertIsNone(re.search(r"\b(gh|curl|wget)\b", self.script))
-
-    def test_every_dispatch_step_is_gated_on_the_decision(self):
-        # Dropping the condition from any one of them lets a prerelease reach
-        # that step for the application: the repository check, the token mint
-        # or the dispatch itself.
-        for name in self.GATED:
-            with self.subTest(step=name):
-                self.assertEqual(_step(self.notify, name).count(self.GATE), 1)
-        self.assertEqual(self.notify.count("steps.notify.outputs.dispatch"), len(self.GATED))
-        order = [self.job_steps.index("- name: " + name) for name in ("Decide consumer notification",) + self.GATED]
-        self.assertEqual(order, sorted(order))
-
-    def test_the_dispatch_still_checks_the_flag_and_sends_the_same_payload(self):
-        body = _step(self.notify, "Dispatch pineforge-release")
-        self.assertIn('*) echo "::error::publish job gave no prerelease flag (\'${PRERELEASE}\')"; exit 1 ;;', body)
-        self.assertIn('-F "client_payload[prerelease]=${PRERELEASE}"', body)
-
-    def test_only_the_application_on_a_prerelease_is_withheld(self):
-        for consumer in self.CONSUMERS:
-            for flag in ("true", "false"):
-                withheld = consumer == "application" and flag == "true"
-                with self.subTest(consumer=consumer, prerelease=flag):
-                    done, written = self._decide(consumer, flag)
-                    self.assertEqual(done.returncode, 0, done.stderr)
-                    self.assertEqual(written, "dispatch=false\n" if withheld else "dispatch=true\n")
-                    self.assertEqual(done.stdout.splitlines(), [self.HANDOFF] if withheld else [])
-
-    def test_a_missing_or_malformed_flag_fails_every_consumer_before_any_output(self):
-        for consumer in self.CONSUMERS:
-            for flag in (None, "", "True", "TRUE", "yes", "null", " true", "false ", "false\n", "true\nfalse"):
-                with self.subTest(consumer=consumer, prerelease=flag):
-                    done, written = self._decide(consumer, flag)
-                    self.assertNotEqual(done.returncode, 0)
-                    self.assertEqual(written, "")
-                    if flag is not None:
-                        self.assertIn("::error::publish job gave no prerelease flag ('" + flag + "')", done.stdout)
+    def test_all_consumer_roles_have_explicit_registry_and_policy(self):
+        import release_pipeline as pipeline
+        expected = {"offline", "hosted", "application", "web", "data", "license"}
+        self.assertEqual(set(pipeline.configured_roles(",".join(sorted(expected)))), expected)
+        self.assertEqual(pipeline.configured_roles(""), [])
+        for bad in ("unknown", "offline,offline", "offline, hosted", "offline\nhosted"):
+            with self.subTest(bad=bad), self.assertRaises(pipeline.Invalid):
+                pipeline.configured_roles(bad)
 
 
 class HarnessSyncTest(unittest.TestCase):

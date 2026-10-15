@@ -77,7 +77,9 @@ def authorized_context():
 
 
 def public_receipt(command):
-    return {"schema": "pineforge/facts-fanout-receipt/v1", "consumer": "web",
+    role = os.environ.get("FACTS_CONSUMER_ROLE", "web")
+    require(role in ("web", "license"), "invalid facts consumer role")
+    return {"schema": "pineforge/facts-fanout-receipt/v1", "consumer": role,
             "command": command, "status": "error", "category": "validation",
             "diagnostic": "invalid-input", "http_status": None, "mint_allowed": False,
             "permission_unavailable_proven": False, "installed": False,

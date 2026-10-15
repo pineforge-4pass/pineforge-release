@@ -19,6 +19,12 @@ TOOLCHAIN_NAMES = frozenset({
     "HPO_GCC_DEFAULTS_VERSION", "HPO_GCC_VERSION", "HPO_BINUTILS_VERSION",
     "HPO_EIGEN_VERSION", "HPO_CMAKE_VERSION", "HPO_MAKE_VERSION",
 })
+# Per-release artifact pins come from verified producer bindings, not the
+# signed-box Debian toolchain file: argument -> (workflow output, binding field).
+HPO_ARTIFACT_ARGS = {
+    "HPO_WHEEL_SHA256": ("hpo_wheel_arg", "wheel_sha256"),
+    "HPO_SDIST_SHA256": ("hpo_sdist_arg", "sdist_sha256"),
+}
 REGISTRY_HEADER = "set-id\trelease-tag\tn-pairs\tsources-list-sha256\tlist-asset"
 SHA256 = re.compile(r"[0-9a-f]{64}")
 SOURCE_NAME = re.compile(r"[a-z0-9][a-z0-9.+-]*")
@@ -31,6 +37,17 @@ Pair = tuple[str, str]
 
 class SourcesError(ValueError):
     """An invalid input or an incomplete source mirror; never a success."""
+
+
+def hpo_artifact_args(pin: dict[str, str]) -> dict[str, str]:
+    """Validate both bound digests before exposing any Docker build arguments."""
+    outputs = {}
+    for argument, (output, field) in HPO_ARTIFACT_ARGS.items():
+        value = pin.get(field)
+        if not isinstance(value, str) or not SHA256.fullmatch(value):
+            raise SourcesError("HPO artifact pin requires lowercase SHA-256 for " + argument)
+        outputs[output] = f"{argument}={value}"
+    return outputs
 
 
 def toolchain_args(path: Path) -> list[str]:

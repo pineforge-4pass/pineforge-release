@@ -1,7 +1,8 @@
 name: publish
 
-# Build + push the combined pineforge-release image, then fan out to the MCPs
-# and the app. Fires on the v* tag that handle-upstream.yml pushes with the App
+# Build and verify a candidate; the separate finalizer binds measured facts
+# and all package identities before moving aliases and dispatching consumers.
+# Fires on the v* tag that handle-upstream.yml pushes with the App
 # token (or a manual tag). The tag value equals VERSION (asserted below).
 # From 1.0.0 on the image pairs engine and codegen at the release version
 # (scripts/release_pair.py check). The hpo cutoff also lives in that script:
@@ -14,6 +15,8 @@ name: publish
 on:
   push:
     tags: ["v*"]
+  # Explicit replay runs on the existing tag; no tag rewrite is required.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,12 +25,36 @@ env:
   REGISTRY: ghcr.io
   IMAGE: ${{ github.repository }}   # pineforge-4pass/pineforge-release
 
+concurrency:
+  group: release-candidate-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  prepare:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # GitHub lists draft candidates only with push access
+    outputs:
+      exists: ${{ steps.candidate.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Reuse an already verified candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: python3 scripts/release_pipeline.py candidate-exists "$TAG" >> "$GITHUB_OUTPUT"
+
   publish:
+    needs: prepare
+    if: needs.prepare.outputs.exists == 'false'
     runs-on: ubuntu-latest
     environment: release-automation
     permissions:
-      contents: write   # gh release create
+      contents: write   # append verified candidate to its draft release
       packages: write   # push to GHCR
     outputs:
       prerelease: ${{ steps.pair.outputs.prerelease }}
@@ -35,6 +62,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install -r facts/requirements-validation.txt
 
       - name: Assert tag matches VERSION
         env:
@@ -76,9 +108,9 @@ jobs:
               e="${REF#v}"; c="${REF#v}"
             else
               echo "::warning::tag ${REF} lacks valid engine=/codegen= in its message — resolving latest (manual-tag path)"
-              for i in 1 2 3 4 5; do e="$(gh release view -R pineforge-4pass/pineforge-engine --json tagName -q .tagName 2>/dev/null || true)"; [ -n "$e" ] && break; sleep 5; done
+              for _attempt in 1 2 3 4 5; do e="$(gh release view -R pineforge-4pass/pineforge-engine --json tagName -q .tagName 2>/dev/null || true)"; [ -n "$e" ] && break; sleep 5; done
               e="${e#v}"
-              for i in 1 2 3 4 5; do c="$(curl -fsSL https://pypi.org/pypi/pineforge-codegen/json 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || true)"; [ -n "$c" ] && break; sleep 5; done
+              for _attempt in 1 2 3 4 5; do c="$(curl -fsSL https://pypi.org/pypi/pineforge-codegen/json 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || true)"; [ -n "$c" ] && break; sleep 5; done
             fi
           fi
           semver "$e" || { echo "::error::bad engine version '$e'"; exit 1; }
@@ -157,6 +189,31 @@ jobs:
           done
           [ -n "$ok" ] || { echo "::error::engine ${E} tarballs or codegen ${C}${H:+ or hpo ${H}} not available after wait"; exit 1; }
 
+      - name: Bind producer source and package bytes
+        id: binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          E: ${{ steps.pins.outputs.engine }}
+          C: ${{ steps.pins.outputs.codegen }}
+          H: ${{ steps.pins.outputs.hpo }}
+          HUB_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_pipeline.py bindings --release-version="${TAG#v}" \
+            --engine="$E" --codegen="$C" --hpo="$H" --hub-commit="$HUB_COMMIT" \
+            --output "$RUNNER_TEMP/release-bindings.json"
+          python3 - <<'PYBIND' >> "$GITHUB_OUTPUT"
+          import json, os
+          from pathlib import Path
+          from scripts.release_sources import hpo_artifact_args
+          obj = json.loads(Path(os.environ['RUNNER_TEMP'], 'release-bindings.json').read_bytes())
+          hpo = obj['versions']['hpo']
+          if hpo:
+              for output, argument in hpo_artifact_args(hpo).items():
+                  print(output + '=' + argument)
+          PYBIND
+
       - name: Read hpo wheel digest
         id: wheel
         if: steps.pair.outputs.target == 'hpo'
@@ -197,23 +254,20 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
-          # `latest` and the moving X.Y only for the newest stable release (never
-          # a prerelease). The action's own automatic `latest` is off; the raw
-          # one below is the only source.
+          # Candidate only. The finalizer assigns fixed/moving release tags
+          # after both architectures, packages and measured facts are verified.
           flavor: |
             latest=false
           tags: |
-            type=semver,pattern={{version}},value=${{ github.ref_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }},enable=${{ steps.pair.outputs.moving == 'true' }}
-            type=raw,value=latest,enable=${{ steps.pair.outputs.moving == 'true' }}
-            type=raw,value=engine${{ steps.pins.outputs.engine }}-codegen${{ steps.pins.outputs.codegen }}
-            type=sha,format=short
+            type=raw,value=candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           # The action derives the licences label from this repository's
           # Apache-2.0, and its labels override the Dockerfile's. The image also
           # bundles the transpiler, whose LICENSE from codegen 1.3.0 is the
           # PineForge Source License 1.2 (see README, License).
           labels: |
             org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
       # Inspect the selected target on both architectures before any publish.
       # Keep target and arguments identical to the push steps; the cache scope is per architecture and shared with them.
@@ -271,7 +325,8 @@ jobs:
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             ${{ steps.pair.outputs.hpo_version_arg }}
-            ${{ steps.wheel.outputs.hpo_wheel_arg }}
+            ${{ steps.binding.outputs.hpo_wheel_arg }}
+            ${{ steps.binding.outputs.hpo_sdist_arg }}
             ${{ steps.toolchain.outputs.args }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
@@ -294,7 +349,8 @@ jobs:
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             ${{ steps.pair.outputs.hpo_version_arg }}
-            ${{ steps.wheel.outputs.hpo_wheel_arg }}
+            ${{ steps.binding.outputs.hpo_wheel_arg }}
+            ${{ steps.binding.outputs.hpo_sdist_arg }}
             ${{ steps.toolchain.outputs.args }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
@@ -376,7 +432,8 @@ jobs:
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             ${{ steps.pair.outputs.hpo_version_arg }}
-            ${{ steps.wheel.outputs.hpo_wheel_arg }}
+            ${{ steps.binding.outputs.hpo_wheel_arg }}
+            ${{ steps.binding.outputs.hpo_sdist_arg }}
             ${{ steps.toolchain.outputs.args }}
             RELEASE_VERSION=${{ github.ref_name }}
             RELEASE_GIT_SHA=${{ github.sha }}
@@ -396,8 +453,10 @@ jobs:
           SOURCE_LIST: ${{ steps.source_set.outputs.list-asset }}
         run: |
           set -euo pipefail
-          # This DETECTS drift; it does not prevent it: tags are already pushed
+          # This DETECTS drift; candidate tags are already pushed
           # and sources are never deleted.
+          # Only a candidate tag exists. Fixed versions and moving aliases
+          # remain untouched until the finalizer has all readiness evidence.
           case "${RELEASE_PUSH_OUTCOME}:${HPO_PUSH_OUTCOME}" in
             success:skipped) digest="$RELEASE_DIGEST" ;;
             skipped:success) digest="$HPO_DIGEST" ;;
@@ -437,6 +496,14 @@ jobs:
             --amd64 "$RUNNER_TEMP/pushed-debian-amd64.tsv" --arm64 "$RUNNER_TEMP/pushed-debian-arm64.tsv" \
             --release-assets "$RUNNER_TEMP/source-assets.json" --sources-list "$RUNNER_TEMP/$SOURCE_LIST"
 
+      - name: Verify real candidate runtime on both architectures
+        env:
+          DIGEST: ${{ steps.push_release.outputs.digest || steps.push_hpo.outputs.digest }}
+        run: |
+          python3 scripts/release_smoke.py --bindings "$RUNNER_TEMP/release-bindings.json" \
+            --digest "$DIGEST" --output "$RUNNER_TEMP/release-verified.json"
+
+      # Store the verified candidate as a draft; only the finalizer publishes it.
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -450,106 +517,39 @@ jobs:
         run: |
           set -euo pipefail
           components="engine ${E} + codegen ${C}${H:+ + hpo ${H}}"
-          # shellcheck disable=SC2016  # backticks here are literal markdown, not command substitution
-          notes="$(printf 'Combined PineScript -> backtest image.\n\n%s\n\n```\ndocker pull ghcr.io/pineforge-4pass/pineforge-release:%s\n```\n' "$components" "${TAG#v}")"
-          notes="$(printf '%s\n\nDebian sources: [SOURCES.list](https://github.com/pineforge-4pass/pineforge-release/releases/download/%s/%s) and its source assets are attached to [release %s](https://github.com/pineforge-4pass/pineforge-release/releases/tag/%s).\n' "$notes" "$SOURCE_TAG" "$SOURCE_LIST" "$SOURCE_TAG" "$SOURCE_TAG")"
-          if [ "$PRERELEASE" = true ]; then
-            # Never GitHub's "Latest": resolvers that read Latest keep the newest
-            # stable release, and the image has no `latest` / X.Y tag either.
-            # shellcheck disable=SC2016  # literal markdown backticks
-            notes="$(printf '%s\n\nPrerelease: the image has only its fixed tags (this version, engine+codegen, sha); `latest` and X.Y stay on the newest stable release.\n' "$notes")"
-            gh release create "$TAG" --title "$TAG" --verify-tag --notes "$notes" --prerelease --latest=false
-            exit 0
-          fi
-          # Semver-aware "Latest": two near-simultaneous upstream releases run
-          # handle-upstream serially, but their publish jobs can CREATE the
-          # GitHub Releases out of version order, and GitHub's default Latest
-          # is creation-ordered (observed 2026-07-12: v0.1.13 created 9s after
-          # v0.1.14 stole Latest and downstream resolvers deployed the stale
-          # bundle). Mark Latest explicitly iff TAG is the highest STABLE release
-          # by semver precedence (coreutils' version sort ranks v1.0.0-rc.1 above v1.0.0).
-          # Drafts never hold Latest, so a draft (say a hand-made v9.9.9) must not count.
-          # A failing `gh release list` fails the step (it must not make TAG the max).
-          releases="$(gh release list --exclude-drafts --limit 100 --json tagName -q '.[].tagName')"
-          max_tag="$(printf '%s\n%s\n' "$TAG" "$releases" | python3 scripts/release_pair.py latest-tag --stable)"
-          if [ "$max_tag" = "$TAG" ]; then latest_flag=true; else latest_flag=false; fi
-          gh release create "$TAG" --title "$TAG" --verify-tag --notes "$notes" --latest=$latest_flag
+          printf 'Combined PineScript -> backtest image.\n\n%s\n\nReadiness requires the immutable release-manifest.json.\n\nDebian sources: [SOURCES.list](https://github.com/pineforge-4pass/pineforge-release/releases/download/%s/%s) and source assets at [release %s](https://github.com/pineforge-4pass/pineforge-release/releases/tag/%s).\n' \
+            "$components" "$SOURCE_TAG" "$SOURCE_LIST" "$SOURCE_TAG" "$SOURCE_TAG" > "$RUNNER_TEMP/release-notes.md"
+          python3 scripts/release_pipeline.py candidate --file "$RUNNER_TEMP/release-verified.json" \
+            --tag "$TAG" --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --source-tag "$SOURCE_TAG" --source-list "$RUNNER_TEMP/$SOURCE_LIST" \
+            --amd64 "$RUNNER_TEMP/pushed-debian-amd64.tsv" --arm64 "$RUNNER_TEMP/pushed-debian-arm64.tsv"
 
   notify-consumers:
-    needs: publish
+    needs: [prepare, publish]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    uses: ./.github/workflows/release-finalize.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
+    permissions:
+      contents: write
+      packages: write
+      issues: write
+
+  failure-report:
+    needs: [prepare, publish, notify-consumers]
+    if: ${{ failure() && !cancelled() }}
     runs-on: ubuntu-latest
-    environment: release-automation
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        consumer: [offline, hosted, application]
-        include:
-          - consumer: hosted
-            repository_secret: RELEASE_HOSTED_MCP_REPOSITORY
-          - consumer: application
-            repository_secret: RELEASE_APPLICATION_REPOSITORY
-    env:
-      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || secrets[matrix.repository_secret] }}
+      issues: write
     steps:
-      # A prerelease reaches the application by hand-off, so its leg sends nothing
-      # for one and still ends green. The three steps after this one run only when
-      # it decides to dispatch; a missing or malformed flag fails here, for every
-      # consumer, before any repository check or token.
-      - name: Decide consumer notification
-        id: notify
-        env:
-          CONSUMER: ${{ matrix.consumer }}
-          PRERELEASE: ${{ needs.publish.outputs.prerelease }}
-        run: |
-          set -euo pipefail
-          case "$PRERELEASE" in
-            true|false) ;;
-            *) echo "::error::publish job gave no prerelease flag ('${PRERELEASE}')"; exit 1 ;;
-          esac
-          if [ "$CONSUMER" = application ] && [ "$PRERELEASE" = true ]; then
-            echo 'dispatch=false' >> "$GITHUB_OUTPUT"
-            echo 'Application is not notified for a prerelease; it receives the release by hand-off.'
-          else
-            echo 'dispatch=true' >> "$GITHUB_OUTPUT"
-          fi
-      - name: Require one configured consumer repository
-        if: steps.notify.outputs.dispatch == 'true'
-        run: |
-          if ! [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
-            echo '::error::Missing or malformed consumer repository setup'; exit 1
-          fi
-      - name: Mint App token (scoped to one target)
-        id: app
-        if: steps.notify.outputs.dispatch == 'true'
-        uses: actions/create-github-app-token@v2
+      - uses: actions/checkout@v4
         with:
-          app-id: ${{ secrets.PINEFORGE_APP_ID }}
-          private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
-          owner: pineforge-4pass
-          repositories: ${{ env.TARGET_REPOSITORY }}
-          permission-contents: write
-          github-api-url: https://api.github.com
-
-      - name: Dispatch pineforge-release to consumer
-        if: steps.notify.outputs.dispatch == 'true'
+          ref: main
+          persist-credentials: false
+      - name: Report failed publication
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-          REPO: ${{ env.TARGET_REPOSITORY }}
-          TAG: ${{ github.ref_name }}
-          PRERELEASE: ${{ needs.publish.outputs.prerelease }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          # Consumers keep a prerelease off their production / latest channels.
-          case "$PRERELEASE" in
-            true|false) ;;
-            *) echo "::error::publish job gave no prerelease flag ('${PRERELEASE}')"; exit 1 ;;
-          esac
-          gh api --hostname github.com repos/pineforge-4pass/"${REPO}"/dispatches \
-            -f event_type=pineforge-release \
-            -F "client_payload[release_version]=${TAG#v}" \
-            -F "client_payload[prerelease]=${PRERELEASE}" \
-            -F "client_payload[run_id]=${RUN_ID}"
-          echo "dispatched pineforge-release (${TAG#v}, prerelease=${PRERELEASE})"
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
+        run: python3 scripts/release_pipeline.py alert --stage publish

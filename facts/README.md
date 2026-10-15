@@ -65,9 +65,11 @@ this hub, website, READMEs, hosted MCP. Never replace release metrics with main'
 Use `code` or `short-code` formats to put backticks inside marker bounds. Table
 format separators are escaped by the renderer so GitHub keeps every column.
 
-The hub's `publish` workflow triggers only on `v*` tags; `handle-upstream` only
-on upstream release dispatches. A facts-only branch or main change triggers
-neither. The ordinary test workflow may still run.
+The hub's `publish` workflow builds candidates on `v*` tags or explicit replay
+on an existing tag; `handle-upstream` receives upstream release dispatches.
+A facts-only change builds or tags nothing. It wakes the readiness finalizer
+so an already verified candidate can finish once its measured release mapping
+exists. See [the release-chain contract](../docs/release-chain.md).
 
 ## Public repository descriptions
 

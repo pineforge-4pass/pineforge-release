@@ -1,0 +1,146 @@
+name: release-finalize
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag, or empty to reconcile all candidates
+        type: string
+        default: ''
+  push:
+    branches: [main]
+    paths: ['facts/facts.json']
+  schedule:
+    - cron: '3,18,33,48 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  finalize:
+    # Job-level concurrency also applies when invoked through workflow_call.
+    # Serialize alias decisions and persistent delivery reservations together.
+    concurrency:
+      group: release-finalize
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    environment: release-automation
+    permissions:
+      contents: write
+      packages: write
+      issues: write
+    outputs:
+      deliveries: ${{ steps.ready.outputs.deliveries }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install -r facts/requirements-validation.txt
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Finalize or record missing prerequisites
+        id: ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
+          FACTS_LICENSE_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}
+          RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
+          RELEASE_READY_MAX_AGE_MINUTES: ${{ vars.RELEASE_READY_MAX_AGE_MINUTES || '60' }}
+          RELEASE_CONSUMER_MAX_AGE_MINUTES: ${{ vars.RELEASE_CONSUMER_MAX_AGE_MINUTES || '180' }}
+          RELEASE_APPLICATION_MAX_AGE_MINUTES: ${{ vars.RELEASE_APPLICATION_MAX_AGE_MINUTES || '1440' }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_pipeline.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"
+          echo "deliveries=$(cat "$RUNNER_TEMP/deliveries.json")" >> "$GITHUB_OUTPUT"
+      - name: Report finalizer failure
+        if: ${{ failure() && !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
+        run: python3 scripts/release_pipeline.py alert --stage finalize
+
+  notify-consumers:
+    needs: finalize
+    if: needs.finalize.outputs.deliveries != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-automation
+    concurrency:
+      group: release-delivery-${{ matrix.consumer }}-${{ matrix.tag }}
+      cancel-in-progress: false
+    permissions:
+      contents: write  # append neutral delivery audit assets in this hub only
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.finalize.outputs.deliveries) }}
+    env:
+      # Private targets never enter matrix outputs, log messages or public receipts.
+      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Require one configured consumer repository
+        shell: bash
+        run: |
+          if ! [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+            echo '::error::Missing or malformed consumer repository setup'; exit 1
+          fi
+      - name: Mint App token (scoped to one target)
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.PINEFORGE_APP_ID }}
+          private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
+          owner: pineforge-4pass
+          repositories: ${{ env.TARGET_REPOSITORY }}
+          permission-contents: write
+          github-api-url: https://api.github.com
+      - name: Dispatch pineforge-release from immutable bytes
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ matrix.tag }}
+          CONSUMER: ${{ matrix.consumer }}
+          DELIVERY_ATTEMPT: ${{ matrix.attempt }}
+        run: |
+          python3 scripts/release_pipeline.py dispatch --tag "$TAG" --consumer "$CONSUMER" \
+            --attempt "$DELIVERY_ATTEMPT" --output "$RUNNER_TEMP/delivery.json"
+      - name: Preserve delivery receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ matrix.tag }}
+          CONSUMER: ${{ matrix.consumer }}
+        run: |
+          python3 scripts/release_receipts.py delivery --tag "$TAG" --consumer "$CONSUMER" \
+            --file "$RUNNER_TEMP/delivery.json"
+      - name: Preserve this delivery attempt
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-delivery-${{ matrix.consumer }}-${{ matrix.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/delivery.json
+          if-no-files-found: warn
+      - name: Report failed dispatch
+        if: ${{ failure() && !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
+        run: python3 scripts/release_pipeline.py alert --stage dispatch

@@ -1,0 +1,46 @@
+name: release-reconcile
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '11,26,41,56 * * * *'
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: release-reconcile-producers
+  cancel-in-progress: false
+
+jobs:
+  producers:
+    runs-on: ubuntu-latest
+    environment: release-automation
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Mint hub-only dispatch token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.PINEFORGE_APP_ID }}
+          private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
+          owner: pineforge-4pass
+          repositories: pineforge-release
+          permission-contents: write
+          github-api-url: https://api.github.com
+      - name: Verify artifacts and replay missed stable producer events
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
+          RELEASE_REPORT_TOKEN: ${{ github.token }}
+        run: python3 scripts/release_pipeline.py reconcile
+      - name: Report reconciliation failure
+        if: ${{ failure() && !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
+        run: python3 scripts/release_pipeline.py alert --stage producer
