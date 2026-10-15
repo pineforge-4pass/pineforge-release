@@ -8,6 +8,7 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
@@ -41,7 +42,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install workflow YAML parser
-        run: python3 -m pip install 'PyYAML==6.0.3'
+        run: python3 -m pip install 'PyYAML==6.0.3' -r facts/requirements-validation.txt
 
       - name: Download published hpo wheels
         run: |
@@ -80,3 +81,34 @@ jobs:
       - run: python3 -m pip install -r facts/requirements-validation.txt
       - name: Existing description renderer acceptance regressions
         run: python3 -m unittest discover -s tests -p 'test_repo_descriptions.py' -v
+
+  release-ready-replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install 'PyYAML==6.0.3' -r facts/requirements-validation.txt
+      - name: Replay ready release and failure recovery without production credentials
+        run: python3 tools/release-dry-run/dry_run.py --ready
+
+  release-ready:
+    name: release/ready
+    if: ${{ always() }}
+    needs: [fingerprint-canonical, release-rules, description-renderer, release-ready-replay]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the complete expected inventory
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          expected = {'fingerprint-canonical', 'release-rules', 'description-renderer', 'release-ready-replay'}
+          if set(results) != expected or any(job['result'] != 'success' for job in results.values()):
+              raise SystemExit('release/ready: a required job failed, was cancelled, skipped or missing')
+          PY

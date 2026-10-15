@@ -1,5 +1,10 @@
 # pineforge-release
 
+The automatic release chain's candidate/readiness gates, immutable event
+contract, consumer completion adapter and supervisor setup are documented in
+[docs/release-chain.md](docs/release-chain.md). Releases fan out only after the
+combined image, package identities and measured release facts are ready.
+
 The **full PineScript v6 → deterministic backtest** product image: the
 [`pineforge-engine`](https://github.com/pineforge-4pass/pineforge-engine) pure
 runtime **plus** the bundled [`pineforge-codegen`](https://pypi.org/project/pineforge-codegen/)
@@ -157,40 +162,40 @@ is the release tag, with its `v`: `v1.0.0`).
 ## Automated release flow
 
 ```
-pineforge-codegen-oss release ─(codegen-release)─┐
-                                                 ├─► handle-upstream.yml
-pineforge-engine release ───────(engine-release)─┘    bump pin → set VERSION
-                                                      → tag (App) → publish.yml
-                                                          build+push image
-                                                          → dispatch (pineforge-release)
-                                                            → offline MCP (pineforge-backtest-mcp)
-                                                            → hosted MCP (configured private target)
-                                                            → application (configured private target)
+{engine, codegen, HPO} releases → existing producer events → handle-upstream.yml
+  → lockstep VERSION + tag (App) → publish.yml: build and verify candidate
+  → release-finalize.yml: packages + measured release facts + immutable manifest
+  → pineforge-release → consumer PR → own CI + E2E → merge/deploy → served receipt
+  → release-receipts.yml → neutral aggregate status and owner issue
 ```
 
-- `handle-upstream.yml` — receives `repository_dispatch` from engine / codegen-oss
+- `handle-upstream.yml` — receives `repository_dispatch` from engine / codegen-oss / HPO
   (`{version, prerelease, run_id}`), applies the pairing rule, sets `VERSION`,
   commits + tags (idempotent, with half-failed-release recovery and a downgrade
   guard).
-- `publish.yml` — on the pushed tag: checks the pair, waits for the upstream
-  artifacts to be available, builds + pushes the multi-arch image to GHCR, cuts a
-  GitHub Release, then dispatches `pineforge-release`
-  (`{release_version, prerelease, run_id}`) to the offline MCP, hosted MCP and
-  application roles. Private target repository names are configured in the
+- `publish.yml` — on the pushed tag or explicit replay: checks the pair, waits
+  for upstream artifacts, builds a multi-arch candidate and verifies both child
+  digests. `release-finalize.yml` binds package identities and measured release
+  facts before publishing the immutable manifest, fixed/moving tags and
+  `pineforge-release` with the [release-ready/v1 payload](docs/release-chain.md).
+  It supports offline, hosted, application, web, data and license roles; only
+  explicitly upgraded receivers are enabled. Private targets are configured in the
   protected `release-automation` environment, not published in the workflow or
   this diagram; each consumer gets an App token scoped to its configured target.
   A prerelease reaches the application by hand-off, with no repository dispatch
-  and no App token; stable releases still notify it, and the offline and hosted
-  MCP roles are notified for every release.
+  and no App token. Stable consumers without verified completion stay pending.
+- `release-reconcile.yml` validates and repairs missed stable producer events;
+  `release-receipts.yml` validates consumer evidence and repairs dropped callbacks.
 
 The rules live in `scripts/release_pair.py` (unit-tested in `tests/`).
-`tools/release-dry-run/` replays both workflows offline through the 0.x and 1.0
-lines and checks every tag, image tag, release and dispatch they would make; run
-it after changing either workflow:
+`tools/release-dry-run/` replays the current handler and readiness graph offline,
+including all three-component arrival orders, duplicate/lost delivery, missing
+prerequisites and negative controls. Run in CI or on the approved cloud host,
+never on the Mac:
 
 ```
 python3 -m unittest discover -s tests -p 'test_release_*.py'   # the release rules
-python3 tools/release-dry-run/dry_run.py                       # needs bash >= 4.4, jq, node, PyYAML: see its README
+python3 tools/release-dry-run/dry_run.py --ready               # see its README for dependencies
 ```
 
 ## Pairing and prereleases

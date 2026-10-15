@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "mode": "single_strategy",
+  "strategies": [{
+    "id": "release",
+    "source": "strategy.pine",
+    "datasets": ["fixture"],
+    "fixed_inputs": {},
+    "strategy_overrides": {},
+    "search_space": {
+      "Entry Level": {"kind": "real", "low": 101, "high": 103, "step": 1},
+      "Exit Level": {"kind": "real", "low": 98, "high": 100, "step": 1}
+    }
+  }],
+  "datasets": [{"id": "fixture", "ohlcv": "ohlcv.csv", "input_tf": "1", "script_tf": "1", "chart_timezone": "UTC"}],
+  "objective": {
+    "kind": "expression", "direction": "maximize", "expression": "metrics.all.net_profit",
+    "constraints": ["metrics.all.num_trades >= 1"], "nan_policy": "fail_trial", "division_by_zero": "fail_trial"
+  },
+  "sampler": {"kind": "grid", "seed": 20261016, "trials": 9},
+  "execution": {"workers": 2, "isolation": "threads"}
+}

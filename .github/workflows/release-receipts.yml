@@ -1,0 +1,90 @@
+name: release-receipts
+
+on:
+  repository_dispatch:
+    types: [pineforge-release-status]
+  workflow_dispatch:
+  schedule:
+    - cron: '1,16,31,46 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-consumer-receipts
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      consumers: ${{ steps.plan.outputs.consumers }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - id: plan
+        env:
+          RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_receipts.py signal --output "$RUNNER_TEMP/consumers.json"
+          echo "consumers=$(cat "$RUNNER_TEMP/consumers.json")" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: plan
+    if: needs.plan.outputs.consumers != '[]'
+    runs-on: ubuntu-latest
+    environment: release-automation
+    permissions:
+      contents: write
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.consumers) }}
+    env:
+      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install -r facts/requirements-validation.txt
+      - name: Require one configured consumer repository
+        shell: bash
+        run: |
+          if ! [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+            echo '::error::Missing or malformed consumer repository setup'; exit 1
+          fi
+      - name: Mint one consumer evidence token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.PINEFORGE_APP_ID }}
+          private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
+          owner: pineforge-4pass
+          repositories: ${{ env.TARGET_REPOSITORY }}
+          permission-contents: read
+          permission-actions: read
+          permission-pull-requests: read
+          github-api-url: https://api.github.com
+      - name: Verify consumer-owned receipt and expected CI/E2E inventory
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          HUB_TOKEN: ${{ github.token }}
+          RELEASE_RECEIPT_POLICY: ${{ secrets.RELEASE_RECEIPT_POLICY }}
+          RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
+          CONSUMER: ${{ matrix.consumer }}
+          RUN_ID: ${{ matrix.run_id }}
+        run: python3 scripts/release_receipts.py collect --consumer "$CONSUMER" --run-id "$RUN_ID"
+      - name: Report invalid or missing completion evidence
+        if: ${{ failure() && !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
+        run: python3 scripts/release_pipeline.py alert --stage receipt
