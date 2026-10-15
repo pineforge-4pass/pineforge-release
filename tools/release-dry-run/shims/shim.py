@@ -283,7 +283,7 @@ def gh(argv):
         hostname = (opts.get("--hostname") or ["github.com"])[-1]
         supported = {"-f", "-F", "--field", "--raw-field", "-q", "--jq", "-X", "--method",
                      "-H", "--header", "--hostname"}
-        if hostname != "github.com" or flags or len(pos) != 1 or set(opts) - supported:
+        if hostname != "github.com" or set(flags) - {"--paginate", "--slurp"} or len(pos) != 1 or set(opts) - supported:
             record(tool="gh", unsupported=argv)
             say("gh", "unsupported api hostname or arguments")
             return 1
@@ -313,12 +313,16 @@ def gh(argv):
         m = re.fullmatch(r"repos/[^/]+/([^/?]+)/releases(\?.*)?", endpoint)
         if m and not (set(opts) - {"-q", "--jq", "--hostname"}):
             data = load(f"releases-{m.group(1)}.json", None)
+            if data is None and m.group(1) in (SELF_REPO, "pineforge-release"):
+                data = [{"tag_name": row["tagName"], "draft": row["isDraft"], "assets": row.get("assets", [])}
+                        for row in load("gh-releases.json", [])]
             record(tool="gh", action="api", endpoint=endpoint, found=data is not None)
             if data is None:
                 say("gh", f"api {endpoint} -> HTTP 404")
                 return 1
             say("gh", f"api {endpoint} -> {len(data)} releases")
-            return emit_json(data, (opts.get("-q") or opts.get("--jq") or [None])[-1])
+            return emit_json([data] if "--slurp" in flags else data,
+                             (opts.get("-q") or opts.get("--jq") or [None])[-1])
     record(tool="gh", unsupported=argv)
     say("gh", f"unsupported call: gh {' '.join(argv)}")
     return 1

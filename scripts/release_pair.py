@@ -261,7 +261,8 @@ def _decide_triple(component: str, v: Version, ep: Version, cp: Version,
 def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
            prev_codegen: str, current_release: str, other_published: bool,
            image_exists: bool, force: bool, partner_latest: str = "", *, prev_hpo: str = "",
-           partners_published: Optional[dict] = None, partners_latest: Optional[dict] = None) -> tuple:
+           partners_published: Optional[dict] = None, partners_latest: Optional[dict] = None,
+           candidate_exists: bool = False) -> tuple:
     """Return (outputs, note) for one upstream event; raise RuleError to refuse it.
 
     partner_latest is the other component's newest published version (semver,
@@ -281,6 +282,9 @@ def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
                         f"codegen={prev_codegen!r})")
     ep, cp = parse(prev_engine), parse(prev_codegen)
     cur = parse(current_release)
+    # A stored verified candidate owns completion even before fixed image tags
+    # exist. The scheduled finalizer, rather than another build, finishes it.
+    image_exists = image_exists or candidate_exists
     landed_pair = ep.line == "pair" or cp.line == "pair"
     hp = _triple_pin(ep, ep, cp, prev_hpo, "landed pins") \
         if hpo_pairing(ep) or hpo_pairing(cp) else None
@@ -449,6 +453,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_decide.add_argument("--current-release", required=True)
     p_decide.add_argument("--other-published", choices=["true", "false"], default="false")
     p_decide.add_argument("--image-exists", choices=["true", "false"], default="false")
+    p_decide.add_argument("--candidate-exists", choices=["true", "false"], default="false")
     p_decide.add_argument("--force", default="false", help="only the literal 'true' forces")
     p_decide.add_argument("--partner-latest", default="",
                           help="the other component's newest published version, if known")
@@ -491,7 +496,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                args.prev_engine, args.prev_codegen, args.current_release,
                                args.other_published == "true", args.image_exists == "true",
                                args.force == "true", args.partner_latest, prev_hpo=args.prev_hpo,
-                               partners_published=published, partners_latest=latest)
+                               partners_published=published, partners_latest=latest,
+                               candidate_exists=args.candidate_exists == "true")
             _emit(out)
             print(note, file=sys.stderr)
         else:

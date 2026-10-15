@@ -21,14 +21,13 @@ on:
 permissions:
   contents: read
 
-# Includes the alias decision, publication, fan-out and receipts. A fresh
-# semver check inside this lock prevents an old completion taking latest.
-concurrency:
-  group: release-finalize
-  cancel-in-progress: false
-
 jobs:
   finalize:
+    # Job-level concurrency also applies when invoked through workflow_call.
+    # Serialize alias decisions and persistent delivery reservations together.
+    concurrency:
+      group: release-finalize
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     environment: release-automation
     permissions:
@@ -58,6 +57,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
+          FACTS_LICENSE_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}
           RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
           RELEASE_READY_MAX_AGE_MINUTES: ${{ vars.RELEASE_READY_MAX_AGE_MINUTES || '60' }}
           RELEASE_CONSUMER_MAX_AGE_MINUTES: ${{ vars.RELEASE_CONSUMER_MAX_AGE_MINUTES || '180' }}
@@ -77,7 +78,11 @@ jobs:
     needs: finalize
     if: needs.finalize.outputs.deliveries != '[]'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: release-automation
+    concurrency:
+      group: release-delivery-${{ matrix.consumer }}-${{ matrix.tag }}
+      cancel-in-progress: false
     permissions:
       contents: write  # append neutral delivery audit assets in this hub only
       issues: write
@@ -114,9 +119,10 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ matrix.tag }}
           CONSUMER: ${{ matrix.consumer }}
+          DELIVERY_ATTEMPT: ${{ matrix.attempt }}
         run: |
           python3 scripts/release_pipeline.py dispatch --tag "$TAG" --consumer "$CONSUMER" \
-            --output "$RUNNER_TEMP/delivery.json"
+            --attempt "$DELIVERY_ATTEMPT" --output "$RUNNER_TEMP/delivery.json"
       - name: Preserve delivery receipt
         env:
           GH_TOKEN: ${{ github.token }}

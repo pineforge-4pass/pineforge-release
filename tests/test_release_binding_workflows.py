@@ -17,11 +17,12 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "tests"))
-import release_pair as pair
-import release_pipeline as pipeline
-import release_contract as contract
-import test_release_workflows as wiring
-from test_release_binding import (FinalizeClient, MemoryRegistry, MemoryStore,
+# These imports use the repository paths established above.
+import release_pair as pair  # noqa: E402
+import release_pipeline as pipeline  # noqa: E402
+import release_contract as contract  # noqa: E402
+import test_release_workflows as wiring  # noqa: E402
+from test_release_binding import (FinalizeClient, MemoryRegistry, MemoryStore,  # noqa: E402
                                   ProducerFixture, fixture_manifest)
 
 
@@ -51,12 +52,32 @@ def assert_ready_wiring(case, publish, finalizer):
     case.assertEqual(dispatch["needs"], "finalize")
     case.assertEqual(dispatch["strategy"]["fail-fast"], "false")
     case.assertEqual(dispatch["strategy"]["matrix"]["include"], "${{ fromJSON(needs.finalize.outputs.deliveries) }}")
-    case.assertEqual(finalizer["concurrency"]["group"], "release-finalize")
+    case.assertNotIn("concurrency", finalizer)
+    case.assertEqual(finalize["concurrency"]["group"], "release-finalize")
+    case.assertEqual(publish["jobs"]["prepare"]["permissions"]["contents"], "write")
 
 
 class ReadyWiringTests(unittest.TestCase):
     def test_actual_workflows_require_verified_candidate_before_ready_fanout(self):
         assert_ready_wiring(self, workflow("publish.yml"), workflow("release-finalize.yml"))
+
+    def test_real_decide_shell_reuses_a_draft_candidate_without_an_image_probe(self):
+        handler = (ROOT / ".github/workflows/handle-upstream.yml").read_text()
+        runner = wiring.HpoWorkflowTest()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner.fixture(root)
+            (root / "VERSION").write_text("1.6.0\n")
+            (root / "state/releases-pineforge-release.json").write_text(json.dumps([
+                {"tag_name": "v1.6.0", "draft": True, "assets": [{"name": "release-candidate.json"}]}]))
+            for _ in range(2):
+                done, decision = runner.shell(root, handler, "Decide action", {
+                    "COMPONENT": "hpo", "VER": "1.6.0", "PAYLOAD_PRERELEASE": "false", "EPREV": "1.6.0",
+                    "CPREV": "1.6.0", "HPREV": "1.6.0", "HPO_PAIRING": "true", "PUBLISHED": "true"})
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(decision["mode"], "noop")
+            actions = [json.loads(line) for line in (root / "state/actions.jsonl").read_text().splitlines()]
+            self.assertFalse(any(row["tool"] == "docker" for row in actions))
 
     def test_negative_controls_detect_removed_runtime_gate_early_latest_and_skipped_fanout(self):
         original = workflow("publish.yml")

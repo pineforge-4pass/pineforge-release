@@ -18,11 +18,16 @@ rate limits and transport failures fail visibly.
 
 `release-reconcile.yml` wakes every 15 minutes or manually. It paginates the
 three fixed producer repositories, excludes drafts/prereleases/non-product tags
-and versions older than hub VERSION, verifies the desired stable version's
-artifacts, then sends the **same producer events** back to the existing handler.
+and versions older than hub VERSION. It checks whether the desired stable
+version already has a hub Git tag before downloading any artifacts. Only a
+version without that tag has its artifacts verified and the **same producer
+events** sent back to the existing handler. A hub tag hands completion to
+publish/finalize, even while the release is a draft awaiting prerequisites.
 Older missed versions are superseded by the newest desired stable version;
 they are never replayed as downgrades after it. Duplicate notifications reuse
-the handler's existing decision. Nothing calls a producer's version-bump job.
+the handler's existing decision. A stored candidate makes an unchanged-version
+decision a no-op even while the fixed image tag is absent. Nothing calls a
+producer's version-bump job.
 
 Recovery of an existing hub tag explicitly dispatches `publish.yml` **on that
 tag**. It never force-pushes or rewrites it. Manual replay is also available
@@ -42,7 +47,11 @@ network. Installed codegen/HPO bytes and HPO catalogs must match checked package
 bytes. HPO wheel and native sdist digests are supplied to the Docker builds.
 The sdist's CMake/native and Python files must agree with the HPO source tag.
 
-The checked candidate is attached to a draft GitHub release. The finalizer runs
+The checked candidate is attached to a draft GitHub release. Candidate lookup
+uses the paginated releases list matched by `tag_name`, with a token that has
+Contents write/push access to see drafts. GitHub's `releases/tags/{tag}` endpoint
+exposes published releases only. Prepare, replay and finalization reuse the same
+draft and never create a second candidate for its version. The finalizer runs
 as a reusable job after publication, on facts-file changes, every 15 minutes,
 and on manual replay. It never rebuilds a stored verified candidate. It requires:
 
@@ -52,9 +61,18 @@ and on manual replay. It never rebuilds a stored verified candidate. It requires
   archive digest, and source agreement across npm/PyPI/tagged source.
 - When HPO is included: wheel, sdist and both failure catalogs, with matching
   versions, hashes, package/native sources and tagged commits.
-- A schema/semantically valid `facts.releases[release_version]` with nonempty
+- For stable releases, a schema/semantically valid `facts.releases[release_version]` with nonempty
   measured evidence and engine/codegen commits equal to the candidate's sources.
-  The active scoreboard is never substituted for the release mapping.
+  The active scoreboard is never substituted for the stable release mapping.
+
+**Prerelease rule:** prereleases skip the per-release measured facts requirement.
+They bind the SHA-256 and commit of schema/semantically validated `main` facts;
+they do not wait for `facts.releases["X.Y.Z-rc.N"]`. The ready event still carries
+`facts.release_key = release_version`; for a prerelease that key may be absent.
+When absent, consumers must use the pinned snapshot's exact bytes; newer facts
+retention is allowed only when a measured target entry exists and is identical.
+All package, source, digest and architecture/runtime gates still apply. Stable
+releases still require their measured, source-matching immutable release entry.
 
 A real missing artifact (404), missing sdist/npm or absent release facts stays
 pending and creates/updates a neutral incident. All other failures are errors.
@@ -64,7 +82,8 @@ receives private registry credentials.
 
 Only then does finalization attach `release-manifest.json`, assign the fixed
 version image tag, move eligible aliases, publish the GitHub release, and fan
-out. Alias decisions and fan-out share `release-finalize` concurrency. Each
+out. Alias decisions and delivery reservations share job-level `release-finalize`
+concurrency, including reusable calls. Delivery jobs serialize per role/tag. Each
 decision re-reads ready releases by semver. Late completion/replay of an older
 release cannot move aliases backward. Prereleases receive no stable aliases.
 The previous alias digests are preserved before the first promotion.
@@ -96,22 +115,391 @@ release entry agrees exactly. Record the actually consumed commit and digest.
 
 `facts-update` remains exactly `{commit, sha256, dry_run}`. The existing guarded
 web sender is retained and an independently gated license job uses the same
-validator and transport. A facts-only change does not create a product release;
-it only wakes already stored candidates awaiting release evidence.
+validator and transport. A facts-only change sends `facts-update` to enabled
+facts consumers and wakes stored candidates awaiting release evidence; it does
+not create a product release.
 
 ## Consumer completion adapter
 
-Dispatch is enabled only for roles in repository variable
-`RELEASE_READY_CONSUMERS` (comma-separated, no spaces): `offline`, `hosted`,
-`application`, `web`, `data`, `license`. Leave roles absent until their default
-branch receivers create PRs and gate merge/deployment on their own full CI/E2E.
-This prevents the old direct-deploy receivers from being activated by a new
-payload. Absent stable consumers remain **pending**, never installed or verified.
-The existing prerelease hand-off policy is retained: application/web/data/license
-are explicitly skipped; offline/hosted receivers must enforce dev/next policy.
+Product dispatch is enabled only for roles in repository variable
+`RELEASE_READY_CONSUMERS` (comma-separated, no spaces). Enable `offline`,
+`hosted`, `application`, `web` or `data` only after the default-branch receiver
+creates PRs and gates merge/deployment on its full CI/E2E. Keep `license` out of
+product dispatch: its facts receiver is independently selected by
+`FACTS_LICENSE_DISPATCH_ENABLED=true`. Web facts polling is similarly selected
+by `FACTS_WEB_DISPATCH_ENABLED=true`. Each selected role needs a receipt policy.
+Disabled product roles are omitted from aggregate consumers, completion and
+staleness calculations; an empty product set completes with no deliveries.
+Prerelease application/web/data/license roles, if configured, are explicitly
+`skipped_by_policy`; offline/hosted must enforce their dev/next policy.
 
-After uploading its evidence artifact, the consumer can wake the hub using a
-**hub-only App installation token**, `Contents: write`, with:
+Delivery acceptance is recorded once as `delivery-<consumer>.json`, independently
+of consumer progress. Its presence stops further dispatch even if the consumer
+has not yet reported completion. A missing receipt becomes pending/overdue; it
+never triggers another build or an endless product event retry. Before each
+send the finalizer reserves an append-only `delivery-attempt-<consumer>-N.json`.
+It permits **three total attempts**: the first immediately, a second at least
+15 minutes after the first, and a third at least 60 minutes after the second.
+After a further 15-minute acknowledgement grace period without delivery
+acceptance, it appends `delivery-failed-<consumer>.json`, changes that role to
+failed, updates the release incident once, and stops. Failed/cancelled jobs also
+consume their reserved attempt. Each delivery job rechecks acceptance and retry
+exhaustion before sending, so a late queued job also stops. Later valid consumer
+evidence can still advance progress; scheduled runs do not clear the retry
+history. Investigate and use an explicit reviewed
+recovery for an exhausted delivery.
+
+`release-receipts.yml` polls selected consumers every 15 minutes and accepts the
+callback below to repair dropped notifications. It mints a target-only read
+token, verifies the artifact and full GitHub CI/E2E/deploy evidence, then appends
+a neutral receipt. Acceptance of a dispatch or callback never means verified.
+
+## Consumer receipt contract v1
+
+This is the single consumer-to-hub contract for all six lanes. Implement the
+artifact and callback in the consumer's trusted default-branch coordinator.
+No Python knowledge is required. The hub validates both complete examples below
+and the [example builder](../scripts/consumer_receipt_example.py) in CI.
+
+**Transport and policy.** The artifact naming convention is
+`release-receipt-<consumer>`, for example `release-receipt-offline`,
+`release-receipt-hosted`, `release-receipt-application`, `release-receipt-web`,
+`release-receipt-data`, or `release-receipt-license`. The hub owner must set
+`RELEASE_RECEIPT_POLICY[consumer].artifact` to that **exact literal name**; the
+adapter matches the configured name exactly, with no glob, version or run-ID
+suffix expansion. A legacy owner-selected name is also accepted if configured
+exactly; its allowed characters are `[A-Za-z0-9_.-]+`. Use one non-expired,
+immutable snapshot artifact with that name per reporting workflow run. Publish
+subsequent snapshots from subsequent trusted reporting runs. Artifact names are
+already scoped to their Actions run. An Actions rerun must not leave two live
+artifacts with the configured name.
+
+The ZIP must contain exactly one root file named **`release-receipt.json`**,
+with no directories or other files. Its UTF-8 JSON object must be at most 2 MiB,
+with no duplicate keys, extra fields or non-finite numbers. Keep the artifact
+available until hub collection; send the callback only after upload succeeds.
+The hub checks GitHub's archive SHA-256 when supplied. Use sorted keys, compact
+separators and a final LF for reproducible canonical evidence hashes. The
+examples are pretty-printed for reading; JSON whitespace is not identity.
+
+The owner policy also names `workflow` (trusted reporting workflow filename),
+`base` (`main` or `dev`), and `ci`, `e2e`, `deploy`. Each check policy has exactly
+`workflow` (a `.yml` filename), `expected` (the complete nonempty, unique list of
+actual job names, including matrix expansions), and `approved_skips` (a subset
+of `expected`, never the whole list). Workflow filenames match
+`[A-Za-z0-9_.-]+\.yml`; do not put paths or private repository identities in the
+callback. Reporting runs must use that configured workflow and an event of
+`push`, `workflow_dispatch`, `workflow_run`, or `repository_dispatch`.
+
+**Types and product receipt fields.** An integer below is a JSON integer from
+1 through 9007199254740991, never a boolean or numeric string. A commit is
+exactly 40 lowercase hexadecimal characters. A SHA-256 is exactly 64 lowercase
+hexadecimal characters; a digest is `sha256:` followed by a SHA-256. Every field
+in this table is required. Evidence fields can be `null` until their stage
+requires them. Objects have exactly the fields defined here.
+
+| Field | Type and allowed value |
+|---|---|
+| `schema` | String, exactly `pineforge/consumer-receipt/v1`. |
+| `event_id` | Digest string, exactly the verified hub manifest's event ID. |
+| `consumer` | String: `offline`, `hosted`, `application`, `web`, `data`, or `license`; must match the hub's scoped target/policy. License implements the facts-only variant below. |
+| `release_version` | Bare canonical semver string `X.Y.Z` or `X.Y.Z-{alpha,beta,rc}.N`, exactly the hub event's version; no leading `v` or leading-zero integers. |
+| `attempt` | Integer identifying an automation attempt, increasing per consumer/target; use the coordinator's GitHub run ID, not `GITHUB_RUN_ATTEMPT` alone. |
+| `sequence` | Integer, strictly increasing for new snapshots within that attempt. It may restart at 1 for a larger attempt. |
+| `state` | One of the ten strings in the state table below. |
+| `timestamp` | Real UTC timestamp string `YYYY-MM-DDTHH:MM:SSZ`, at most five minutes in the future; for verified, at/after the final deploy check completion. |
+| `pr` | PR object below, or `null` before PR evidence exists. |
+| `ci`, `e2e`, `deploy` | Each a check-evidence object below, or `null` before that evidence exists. |
+| `preview`, `deployed`, `previous` | Each a served-identity object below, or `null` before that evidence exists. `previous` records the rollback identity. |
+
+The PR object has exactly these fields:
+
+| Field | Type and allowed value |
+|---|---|
+| `number` | Integer, a PR in the configured consumer repository; forks are refused. |
+| `base` | String `main` or `dev`, equal to policy. |
+| `base_sha` | Commit, the base tested with this PR head. |
+| `head` | Commit, the actual PR head. |
+| `merge` | `null` before merge, then the actual merge/squash commit. |
+
+A check-evidence object has exactly these fields, for each of `ci`, `e2e`,
+`deploy`:
+
+| Field | Type and allowed value |
+|---|---|
+| `run_id` | Integer, GitHub Actions run in the configured consumer repository. |
+| `run_attempt` | Integer, the particular GitHub attempt whose jobs are checked. |
+| `sha` | Commit; `pr.head` for CI/E2E, `pr.merge` for deploy. |
+| `expected` | Array of unique job-name strings, exactly the corresponding policy list, in the same order. |
+| `approved_skips` | Array of job-name strings, exactly the corresponding policy list, in the same order. |
+| `results` | Object with exactly one key per expected job; values `success`, or `skipped` only for owner-approved skips. Must equal actual GitHub jobs. |
+
+The referenced run must have completed successfully. Every expected job must
+exist exactly once and finish successfully or have its explicit approved skip;
+at least one must succeed. CI/E2E must finish before the PR's actual merge time.
+The merge commit's first parent must be `base_sha`, proving the tested base
+landed. An unmerged PR must still have the tested base. Rebase/merge-queue source
+graphs need an approved adapter before enablement.
+
+A served-identity object has exactly these fields:
+
+| Field | Type and allowed value |
+|---|---|
+| `source` | Commit; `pr.head` for preview, `pr.merge` for deployed, previous deployed source for previous. |
+| `image_digest` | Digest string; preview and deployed equal the product manifest's index digest. Facts-only may use `null` when no product image is consumed. |
+| `facts_commit` | Commit, actually consumed canonical hub facts source. |
+| `facts_sha256` | SHA-256 of the exact facts bytes consumed. |
+| `deployment_id_sha256` | SHA-256 of the consumer's raw deployment/distribution identity; no raw private deployment ID or URL. |
+
+For product receipts, the hub fetches facts from its fixed repository, verifies
+bytes and schema, checks equal/newer Git ancestry, and requires an unchanged
+immutable release entry. The prerelease pinned-snapshot rule above applies when
+that release entry is absent. The consumer's deploy inventory must include real
+served/distribution identity verification and previous/rollback identity
+recording. A successful deploy command alone is insufficient. For npm/PyPI,
+served state means verified distribution/channel identity. The verified
+reporting run itself must be at `pr.merge`.
+
+**State machine.** Ordered progress is
+`pending → pr_open → testing → ready → merged → deploying → verified`.
+Intermediate snapshots may be omitted: the hub checks all prerequisites of the
+reported state even if earlier snapshots were never collected.
+
+| State | Required evidence and meaning |
+|---|---|
+| `pending` | Target accepted by coordinator; evidence fields may all be null. |
+| `pr_open` | Current same-repository PR with tested base/head recorded. |
+| `testing` | Same PR evidence; tests are in progress, not yet sufficient for ready. |
+| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. |
+| `merged` | Ready evidence plus actual merge commit, tested first parent and CI/E2E completion before merge. |
+| `deploying` | Same evidence as merged; serving has not yet been verified. |
+| `verified` | All prior gates + successful complete deploy inventory + deployed and previous identities; report source is the merge commit. |
+| `failed` | Terminal failure in this attempt; evidence may be null, details stay in the consumer report. |
+| `superseded` | Terminal obsolete target in this attempt; evidence may be null. |
+| `skipped_by_policy` | Terminal policy skip, accepted only for product prereleases, never stable or facts-only. |
+
+For one consumer/target, compare `(attempt, sequence)` lexicographically. Older
+snapshots are ignored. Equal identities are no-ops only for the same entire
+canonical receipt and reporting run; reusing them for different evidence is an
+error. Within one attempt ordered progress cannot go backward. Failed,
+superseded and policy-skipped states require a **larger attempt** to restart;
+verified can only remain verified, even across attempts. A later target has its
+own state machine. A product target is its event ID; a facts target is the pair
+`(facts.commit, facts.sha256)`. Neither delivery attempts nor callback run IDs
+advance consumer progress on their own.
+
+**Facts-only variant.** Web and license use exactly the common product fields
+above with these changes: set `schema` to
+`pineforge/facts-consumer-receipt/v1`; **omit `event_id` and `release_version`
+entirely**; add the required `facts` object with exactly `commit` (commit string)
+and `sha256` (SHA-256 string) from the validated `facts-update` request. No
+product event, manifest, version, image or ready release is needed. Keep the
+`image_digest` key in identities, using `null` if irrelevant, or an observed
+installed image digest if available. Preview/deployed facts commit and hash must
+both equal the target. Previous records the prior served identity. The same PR,
+full CI/E2E-before-merge, deploy and reporting-source gates apply.
+
+The hub fetches `facts/facts.json` at that exact commit, checks its SHA-256 and
+schema/semantics, and requires the commit to be on canonical main history.
+Facts receipts are appended separately under the hub's never-published draft
+`facts-receipts`, keyed by role + facts commit + hash + attempt + sequence. The
+serialized receipt planner creates this audit bucket before parallel collectors;
+it is not a product candidate and creates no product signal. Facts flags select
+receipt polling independently of `RELEASE_READY_CONSUMERS`, so license need not
+receive `pineforge-release`. Audit readers need authenticated draft access.
+
+**Complete product receipt example.** All identities and job names here are
+synthetic. The matching example policy uses reporting `release.yml`, base
+`main`, and `ci.yml` / `e2e.yml` / `deploy.yml`, each with its two listed jobs and
+no approved skips. The PR merges at `2020-01-01T00:05:00Z`; checks finish at
+`2020-01-01T00:04:00Z`; reporting run 90 is a push at the merge commit.
+
+```json
+{
+  "schema": "pineforge/consumer-receipt/v1",
+  "consumer": "offline",
+  "attempt": 90,
+  "sequence": 7,
+  "state": "verified",
+  "timestamp": "2020-01-01T00:07:00Z",
+  "pr": {
+    "number": 9,
+    "base": "main",
+    "base_sha": "3333333333333333333333333333333333333333",
+    "head": "1111111111111111111111111111111111111111",
+    "merge": "2222222222222222222222222222222222222222"
+  },
+  "event_id": "sha256:12a79d3776c447b1caf9513c96db3407b1d3cd2d71a510081e6763e994c2288e",
+  "release_version": "1.6.0",
+  "ci": {
+    "run_id": 1,
+    "run_attempt": 1,
+    "sha": "1111111111111111111111111111111111111111",
+    "expected": [
+      "ci/one",
+      "ci/two"
+    ],
+    "approved_skips": [],
+    "results": {
+      "ci/one": "success",
+      "ci/two": "success"
+    }
+  },
+  "e2e": {
+    "run_id": 2,
+    "run_attempt": 1,
+    "sha": "1111111111111111111111111111111111111111",
+    "expected": [
+      "e2e/one",
+      "e2e/two"
+    ],
+    "approved_skips": [],
+    "results": {
+      "e2e/one": "success",
+      "e2e/two": "success"
+    }
+  },
+  "deploy": {
+    "run_id": 3,
+    "run_attempt": 1,
+    "sha": "2222222222222222222222222222222222222222",
+    "expected": [
+      "deploy/one",
+      "deploy/two"
+    ],
+    "approved_skips": [],
+    "results": {
+      "deploy/one": "success",
+      "deploy/two": "success"
+    }
+  },
+  "preview": {
+    "source": "1111111111111111111111111111111111111111",
+    "image_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "facts_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "facts_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+    "deployment_id_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "deployed": {
+    "source": "2222222222222222222222222222222222222222",
+    "image_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "facts_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "facts_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+    "deployment_id_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "previous": {
+    "source": "4444444444444444444444444444444444444444",
+    "image_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "facts_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "facts_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+    "deployment_id_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  }
+}
+```
+
+**Complete facts-only receipt example.** The policy is the same structure with
+artifact `release-receipt-license`. The facts target below is synthetic; a real
+consumer must copy and verify the requested canonical commit/hash.
+
+```json
+{
+  "schema": "pineforge/facts-consumer-receipt/v1",
+  "consumer": "license",
+  "attempt": 90,
+  "sequence": 7,
+  "state": "verified",
+  "timestamp": "2020-01-01T00:07:00Z",
+  "pr": {
+    "number": 9,
+    "base": "main",
+    "base_sha": "3333333333333333333333333333333333333333",
+    "head": "1111111111111111111111111111111111111111",
+    "merge": "2222222222222222222222222222222222222222"
+  },
+  "ci": {
+    "run_id": 1,
+    "run_attempt": 1,
+    "sha": "1111111111111111111111111111111111111111",
+    "expected": [
+      "ci/one",
+      "ci/two"
+    ],
+    "approved_skips": [],
+    "results": {
+      "ci/one": "success",
+      "ci/two": "success"
+    }
+  },
+  "e2e": {
+    "run_id": 2,
+    "run_attempt": 1,
+    "sha": "1111111111111111111111111111111111111111",
+    "expected": [
+      "e2e/one",
+      "e2e/two"
+    ],
+    "approved_skips": [],
+    "results": {
+      "e2e/one": "success",
+      "e2e/two": "success"
+    }
+  },
+  "deploy": {
+    "run_id": 3,
+    "run_attempt": 1,
+    "sha": "2222222222222222222222222222222222222222",
+    "expected": [
+      "deploy/one",
+      "deploy/two"
+    ],
+    "approved_skips": [],
+    "results": {
+      "deploy/one": "success",
+      "deploy/two": "success"
+    }
+  },
+  "preview": {
+    "source": "1111111111111111111111111111111111111111",
+    "image_digest": null,
+    "facts_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "facts_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "deployment_id_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "deployed": {
+    "source": "2222222222222222222222222222222222222222",
+    "image_digest": null,
+    "facts_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "facts_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "deployment_id_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "previous": {
+    "source": "4444444444444444444444444444444444444444",
+    "image_digest": null,
+    "facts_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "facts_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "deployment_id_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "facts": {
+    "commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  }
+}
+```
+
+**Callback.** After artifact upload, use a hub-only App installation token with
+Contents write to POST `repos/pineforge-4pass/pineforge-release/dispatches`.
+The repository_dispatch event type is exactly **`pineforge-release-status`**.
+`client_payload` has exactly four keys, with no receipt, state, facts, repository
+name, URL or extra identity fields:
+
+| Key | Type and allowed value |
+|---|---|
+| `schema` | String, exactly `pineforge/consumer-signal/v1`. |
+| `consumer` | One of the six role strings; must be selected by the product or facts flags. |
+| `release_version` | Product version string as above; JSON `null` for a facts-only callback. The key is always present. |
+| `run_id` | Integer, the trusted **reporting workflow run containing the uploaded receipt artifact**, not the CI/E2E/deploy run or a hub run. |
+
+Complete product callback request:
 
 ```json
 {
@@ -120,84 +508,45 @@ After uploading its evidence artifact, the consumer can wake the hub using a
     "schema": "pineforge/consumer-signal/v1",
     "consumer": "offline",
     "release_version": "1.6.0",
-    "run_id": 123456
+    "run_id": 90
   }
 }
 ```
 
-This is a completion wakeup, not a replacement product event. Repository names,
-URLs or claims of success are not accepted in it. `release-receipts.yml` also
-polls the configured consumer workflow histories every 15 minutes, repairing
-dropped callbacks. Each job mints one target-only **read** token. It downloads a
-single configured Actions artifact, containing exactly `release-receipt.json`.
-All stages use the following full private receipt shape:
+Complete facts-only callback request (the facts commit/hash live in the artifact):
 
 ```json
 {
-  "schema": "pineforge/consumer-receipt/v1",
-  "event_id": "sha256:<manifest hash>",
-  "consumer": "offline",
-  "release_version": "1.6.0",
-  "attempt": 123456,
-  "sequence": 7,
-  "state": "verified",
-  "timestamp": "2026-10-16T12:00:00Z",
-  "pr": {"number": 42, "base": "main", "base_sha": "<40 hex>", "head": "<40 hex>", "merge": "<40 hex>"},
-  "ci": {"run_id": 100, "run_attempt": 1, "sha": "<PR head>", "expected": ["check"], "approved_skips": [], "results": {"check": "success"}},
-  "e2e": {"run_id": 101, "run_attempt": 1, "sha": "<PR head>", "expected": ["candidate-e2e"], "approved_skips": [], "results": {"candidate-e2e": "success"}},
-  "deploy": {"run_id": 102, "run_attempt": 1, "sha": "<merge commit>", "expected": ["deploy", "served-identity"], "approved_skips": [], "results": {"deploy": "success", "served-identity": "success"}},
-  "preview": {"source": "<PR head>", "image_digest": "sha256:<index>", "facts_commit": "<40 hex>", "facts_sha256": "<64 hex>", "deployment_id_sha256": "<64 hex>"},
-  "deployed": {"source": "<merge commit>", "image_digest": "sha256:<index>", "facts_commit": "<40 hex>", "facts_sha256": "<64 hex>", "deployment_id_sha256": "<64 hex>"},
-  "previous": {"source": "<previous source>", "image_digest": "sha256:<previous image>", "facts_commit": "<40 hex>", "facts_sha256": "<64 hex>", "deployment_id_sha256": "<64 hex>"}
+  "event_type": "pineforge-release-status",
+  "client_payload": {
+    "schema": "pineforge/consumer-signal/v1",
+    "consumer": "license",
+    "release_version": null,
+    "run_id": 90
+  }
 }
 ```
 
-The allowed states are pending, pr_open, testing, ready, merged, deploying,
-verified, failed, superseded, skipped_by_policy. All fields are present; evidence
-not available at an early stage can be null. Use a globally increasing attempt
-identity per event (for example the coordinator's GitHub run ID), with increasing
-sequence within an attempt. Do not use `GITHUB_RUN_ATTEMPT` alone: it restarts at
-1 for another run. Reused identities must have identical bytes. Late/duplicate
-receipts cannot regress a verified state.
+The callback is only a wakeup. Its version is a routing hint, never evidence;
+the validated artifact/manifest or facts target is authoritative. Polling can
+collect the same artifact after a lost callback. Never dispatch the full
+receipt as `client_payload` or use issue comments/issues as receipt transport.
 
-The owner-configured expected inventories and workflow paths are checked against
-GitHub Actions, not trusted from the receipt. Missing, failed, cancelled or
-unexpectedly skipped jobs fail. CI/E2E must match the PR head and finish before
-merge; deployed source must be the actual PR merge. Preview and served image
-digests must match the manifest, facts must come from the hub and be equal or
-newer by Git ancestry with the same release entry. Each consumer's deployment
-inventory **must include its real served/distribution identity verification and
-rollback identity recording**, not just its deploy command. Hub checks cannot
-replace that consumer-owned runtime proof. For npm/PyPI consumers, “deployed”
-means verified distribution/channel identity, not installation on external hosts.
+Run `python3 scripts/consumer_receipt_example.py` to print the synthetic product
+example, or `python3 scripts/consumer_receipt_example.py --facts-only` for the
+license example. Real consumer builders must supply actual evidence, target
+identities and their owner-approved inventories. The hub test validates these
+examples against its own validator, including the documented JSON.
 
-The current receipt adapter uses the strict up-to-date branch path from section
-3.6: record the tested base SHA and use merge or squash, so the landed commit's
-first parent can be checked against that base. Rebase or merge-queue adapters
-with another source graph must add corresponding candidate evidence before
-being enabled; the hub refuses mismatched merge inputs.
-
-For a facts-only web/license PR, use `pineforge/facts-consumer-receipt/v1` with
-the same fields plus `facts: {commit, sha256}` for the requested canonical target.
-Keep the installed product's manifest event/version/image identity. It is stored
-separately from product progress and never initiates a product release. The same
-wakeup/poller and CI/E2E checks apply.
-
-Public receipt assets contain neutral roles, numeric IDs, commit/image/facts
-identities, hashes of the private evidence and expected inventory. Private
-repository names, job labels, deployment URLs and raw deployment IDs stay in the
-consumer's report. Aggregate status has every expected role; delivery acceptance
-is a separate first-delivery asset and an artifact for each delivery attempt.
-Aggregate assets are appended only when state changes. One issue per release is reused through
-pending/failure/recovery/completion and assigned/mentioned to the configured
-owner. Only verified served-state evidence can produce a success state.
-
-Facts freshness uses the latest **facts-file change** (the commits API filtered
-by `facts/facts.json`), never an unrelated main commit. Missing current served
-facts evidence becomes overdue after 30 minutes. Release readiness and consumer
-stage age have separate configurable thresholds; app stages have a longer
-default. The dashboard lane should monitor the neutral assets/issues rather than
-count green dispatcher runs as deployments.
+Neutral hub assets retain numeric IDs, commit/image/facts identities and hashes
+of private evidence/inventories. Private repository names, job labels, deployment
+URLs and raw deployment IDs stay in the consumer artifact. Aggregate assets are
+appended only when state changes; one release incident tracks progress and is
+assigned/mentioned to the configured owner. Only verified served-state evidence
+produces consumer success. Facts freshness uses the latest facts-file change,
+not unrelated main commits; current served facts evidence becomes overdue after
+30 minutes. Product readiness and consumer-stage ages have separate thresholds,
+with a longer app default. Monitor these assets/issues, not green dispatch runs.
 
 ## Supervisor configuration
 
@@ -213,12 +562,12 @@ rejects missing/skipped/cancelled jobs and covers merge-group events too.
 | App installation permissions | Hub: Contents write + Actions write; enabled consumers: Contents read/write, Actions read, Pull requests read | Hub tag/dispatch and explicit publish replay; consumer dispatch and completion evidence reads. Each mint asks only for the permissions needed by that job. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
 | `RELEASE_HOSTED_MCP_REPOSITORY`, `RELEASE_APPLICATION_REPOSITORY`, `FACTS_WEB_REPOSITORY` (existing) | Hub `release-automation` environment secrets | Private short repository names for neutral hosted/application/web targets. Public offline/data/license names are fixed in workflows. |
 | `RELEASE_RECEIPT_POLICY` (new secret) | Hub `release-automation` environment | JSON map of each enabled role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories. Keep private workflow/job details out of public source. |
-| `RELEASE_READY_CONSUMERS` (new variable) | Hub repository | Explicit comma-separated upgraded receiver roles; also selects receipt polling/facts freshness monitoring. Empty sends nothing and leaves stable roles pending. |
+| `RELEASE_READY_CONSUMERS` (new variable) | Hub repository | Explicit comma-separated upgraded product receiver roles. Empty sends nothing; disabled roles do not block aggregate completion or become overdue. Facts flags independently select web/license receipt polling and freshness. |
 | `RELEASE_REPORT_OWNER` (new variable) | Hub repository | GitHub login to assign/mention on release and failure issues. |
 | `RELEASE_READY_MAX_AGE_MINUTES` (optional variable; 60) | Hub repository | Missing readiness prerequisite alert threshold. |
 | `RELEASE_CONSUMER_MAX_AGE_MINUTES` (optional variable; 180) | Hub repository | Non-app missing/stalled completion threshold. |
 | `RELEASE_APPLICATION_MAX_AGE_MINUTES` (optional variable; 1440) | Hub repository | App stage freshness, separate from per-test time limits. |
-| `FACTS_LICENSE_DISPATCH_ENABLED` (new variable) | Hub repository or `release-automation` environment | Set true after the license facts receiver is on its default branch. Existing `FACTS_WEB_DISPATCH_ENABLED` remains independent. |
+| `FACTS_LICENSE_DISPATCH_ENABLED` (new variable) | Hub repository | Set true after the license facts receiver and receipt policy are ready; also selects license receipt polling without product dispatch. Existing repository `FACTS_WEB_DISPATCH_ENABLED` independently selects web facts dispatch/polling. |
 | Actions permissions, Issues, GHCR visibility | Hub repository | Permit workflow contents/packages/issues writes; enable Issues and public pulls of the existing GHCR package. |
 | `release-automation` environment (existing) | Hub repository | Permit protected main and release `v*` tags and the intended automatic jobs. Required human reviewers would pause full automation. |
 | Release asset setting | Hub repository | These releases keep append-only audit/receipt assets after publication; GitHub's repository-wide immutable-release setting must permit these appends. The scripts enforce manifest/fixed-tag byte immutability and never overwrite/delete them. |
@@ -229,7 +578,7 @@ Example **structure**, not a production policy:
 ```json
 {
   "offline": {
-    "workflow": "release.yml", "artifact": "release-receipt", "base": "main",
+    "workflow": "release.yml", "artifact": "release-receipt-offline", "base": "main",
     "ci": {"workflow": "ci.yml", "expected": ["check", "unit"], "approved_skips": []},
     "e2e": {"workflow": "e2e.yml", "expected": ["stdio-parity", "syminfo", "negative"], "approved_skips": []},
     "deploy": {"workflow": "publish.yml", "expected": ["publish", "served-identity"], "approved_skips": []}
@@ -248,8 +597,11 @@ a rejection marker, stops future fan-out, restores only aliases still pointing
 to that rejected image from the previously recorded good digests, and verifies
 readback. Newer aliases are left alone. Fixed tags, images, source assets and
 manifests are preserved. If no previous good alias exists, it reports incomplete
-repair rather than deleting an alias or inventing a good target. Consumer
-rollback remains the responsibility of that consumer's lane.
+repair rather than deleting an alias or inventing a good target. **A hub rollback
+sends no consumer signal.** Consumers may keep the rejected release while hub
+aliases revert, so mixed versions are possible. Each consumer lane owns its
+explicit rollback and served-state verification; coordinate those rollbacks
+separately.
 
 CI runs the existing release/source/harness tests plus the ready replay and
 negative controls. See [the current replay entry point](../tools/release-dry-run/README.md).

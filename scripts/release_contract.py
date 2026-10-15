@@ -145,6 +145,11 @@ def bind_facts(raw, commit, release, versions):
     from facts_validate import validate_facts
     facts = decode(raw)
     validate_facts(facts)
+    match(COMMIT, commit)
+    # Prerelease measurements are not exported under releases[rc]. Bind the
+    # validated main snapshot bytes, without substituting them for stable proof.
+    if version(release).prerelease:
+        return {"commit": commit, "path": "facts/facts.json", "sha256": sha256(raw), "release_key": release}
     entry = facts["releases"].get(release)
     if entry is None:
         raise Pending("measured immutable release facts unavailable")
@@ -152,7 +157,6 @@ def bind_facts(raw, commit, release, versions):
     for role in ("engine", "codegen"):
         require(scoreboard[role + "Commit"] == versions[role]["commit"], "release facts source commit differs")
     require(scoreboard["graded"] > 0, "release facts have no graded evidence")
-    match(COMMIT, commit)
     return {"commit": commit, "path": "facts/facts.json", "sha256": sha256(raw), "release_key": release}
 
 
@@ -161,7 +165,10 @@ def retain_facts(manifest, manifest_raw, installed_raw):
     a, b = decode(manifest_raw), decode(installed_raw)
     key = manifest["facts"]["release_key"]
     require(sha256(manifest_raw) == manifest["facts"]["sha256"], "release facts digest differs")
-    require(key in a["releases"] and a["releases"][key] == b["releases"].get(key), "release facts entry changed")
+    if manifest["prerelease"] and key not in a["releases"]:
+        require(installed_raw == manifest_raw, "prerelease without measured entry requires pinned facts bytes")
+    else:
+        require(key in a["releases"] and a["releases"][key] == b["releases"].get(key), "release facts entry changed")
     from facts_validate import validate_facts
     validate_facts(b)
     return sha256(installed_raw)

@@ -20,6 +20,10 @@ from release_contract import (ASSET, COMMIT, HUB, IMAGE, ROLES, SCHEMA, SHA, Inv
                               payload, positive, require, sha256, validate, version)
 
 CANDIDATE = "release-candidate.json"
+FACTS_RECEIPTS_TAG = "facts-receipts"
+# Delay after each reserved attempt: two retries, then an acknowledgement grace
+# period before a terminal failure. Reservations survive failed/cancelled jobs.
+DELIVERY_BACKOFF_MINUTES = (15, 60, 15)
 
 
 def now():
@@ -36,10 +40,28 @@ class Store:
 
     def get(self, tag):
         version(tag.removeprefix("v"))
-        return self.client.api(f"repos/{HUB}/releases/tags/{tag}")
+        # GitHub's tags endpoint exposes only published releases. The caller
+        # needs Contents: write so the paginated list includes candidate drafts.
+        found = [row for row in self.releases() if row["tag_name"] == tag]
+        require(len(found) <= 1, "ambiguous hub release tag")
+        if not found:
+            raise Pending("hub release unavailable")
+        return found[0]
 
     def releases(self):
         return self.client.pages(f"repos/{HUB}/releases")
+
+    def facts(self):
+        """Private audit bucket, independent of any product version or event."""
+        found = [row for row in self.releases() if row["tag_name"] == FACTS_RECEIPTS_TAG]
+        require(len(found) <= 1, "ambiguous facts receipt storage")
+        if found:
+            require(found[0]["draft"], "facts receipt storage must remain draft")
+            return found[0]
+        return self.client.api(f"repos/{HUB}/releases", method="POST", data={
+            "tag_name": FACTS_RECEIPTS_TAG, "target_commitish": "main", "name": "Facts consumer receipts",
+            "body": "Append-only facts consumer audit storage; never publish as a product release.",
+            "draft": True, "prerelease": False, "make_latest": "false"})
 
     def read(self, release, name):
         # Refresh every read; another job may have appended an asset.
@@ -244,6 +266,21 @@ def configured_roles(raw):
     return roles
 
 
+def receipt_roles():
+    roles = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+    for role, flag in (("web", "FACTS_WEB_DISPATCH_ENABLED"), ("license", "FACTS_LICENSE_DISPATCH_ENABLED")):
+        if os.environ.get(flag) == "true" and role not in roles:
+            roles.append(role)
+    return roles
+
+
+def candidate_exists(store, tag):
+    try:
+        return store.read(store.get(tag), CANDIDATE) is not None
+    except Pending:
+        return False
+
+
 def receipts(store, row, event_id):
     result = {}
     fresh = store.get(row["tag_name"])
@@ -261,6 +298,8 @@ def aggregate(store, row, event, *, enabled=(), newest=None):
     by_role = receipts(store, row, event["event_id"])
     states = {}
     for role in ROLES:
+        if role not in enabled:
+            continue
         obj = by_role.get(role)
         if newest is not None and version(event["release_version"]) < newest and (not obj or obj["state"] != "verified"):
             states[role] = "superseded"
@@ -273,6 +312,36 @@ def aggregate(store, row, event, *, enabled=(), newest=None):
     return {"schema": "pineforge/release-status/v1", "event_id": event["event_id"],
             "release_version": event["release_version"], "consumers": states,
             "complete": all(value in ("verified", "skipped_by_policy", "superseded") for value in states.values())}
+
+
+def plan_delivery(store, row, event, role):
+    """Reserve at most three deliveries; accepted transport never retries."""
+    if store.read(row, f"delivery-{role}.json") is not None:
+        return None, False
+    failed_name = f"delivery-failed-{role}.json"
+    if store.read(row, failed_name) is not None:
+        return None, True
+    attempts = []
+    prefix = f"delivery-attempt-{role}-"
+    for asset in store.get(row["tag_name"])["assets"]:
+        if asset["name"].startswith(prefix):
+            obj = decode(store.read(row, asset["name"]))
+            require(obj["event_id"] == event["event_id"] and obj["consumer"] == role, "delivery attempt identity differs")
+            positive(obj["attempt"])
+            attempts.append(obj)
+    attempts.sort(key=lambda obj: obj["attempt"])
+    require([obj["attempt"] for obj in attempts] == list(range(1, len(attempts) + 1))
+            and len(attempts) <= len(DELIVERY_BACKOFF_MINUTES), "invalid delivery attempt history")
+    if attempts and age_minutes(attempts[-1]["timestamp"]) < DELIVERY_BACKOFF_MINUTES[len(attempts) - 1]:
+        return None, False
+    if len(attempts) == len(DELIVERY_BACKOFF_MINUTES):
+        store.put(row, failed_name, canonical({"event_id": event["event_id"], "consumer": role,
+                                             "state": "failed", "attempts": len(attempts), "timestamp": now()}))
+        return None, True
+    attempt = len(attempts) + 1
+    store.put(row, f"{prefix}{attempt}.json", canonical({"event_id": event["event_id"], "consumer": role,
+              "attempt": attempt, "run_id": int(os.environ["GITHUB_RUN_ID"]), "timestamp": now()}))
+    return {"consumer": role, "tag": row["tag_name"], "attempt": attempt}, False
 
 
 def facts_freshness(client, store, roles):
@@ -326,8 +395,14 @@ def finalize_all(client, store, registry, tag, output):
             newest = finalized_version(store)
             status = aggregate(store, row, event, enabled=enabled, newest=newest)
             for role, state in status["consumers"].items():
-                if role in enabled and state == "pending":
-                    deliveries.append({"consumer": role, "tag": row["tag_name"]})
+                if state == "pending":
+                    delivery, failed = plan_delivery(store, row, event, role)
+                    if delivery:
+                        deliveries.append(delivery)
+                    if failed:
+                        status["consumers"][role] = "failed"
+            status["complete"] = all(state in ("verified", "skipped_by_policy", "superseded")
+                                     for state in status["consumers"].values())
             pending = [role for role, state in status["consumers"].items()
                        if state in ("pending", "pr_open", "testing", "ready", "merged", "deploying")]
             by_role = receipts(store, row, event["event_id"])
@@ -339,13 +414,13 @@ def finalize_all(client, store, registry, tag, output):
             body = "Event: `" + event["event_id"] + "`\n\n" + "\n".join(
                 f"- {role}: {state}" + (" (completion overdue)" if role in stale else "") for role, state in status["consumers"].items())
             body += "\n\nDispatch acceptance is transport only. Verified means checked consumer receipt and served-state evidence."
-            report_issue(client, row["tag_name"], f"Release {event['release_version']}: " + ("complete" if status["complete"] else "pending/failed"),
-                         body, complete=status["complete"])
             previous_status = None
             for asset in sorted(store.get(row["tag_name"])["assets"], key=lambda item: item["id"]):
                 if asset["name"].startswith("release-status-"):
                     previous_status = store.read(row, asset["name"])
             if previous_status != canonical(status):
+                report_issue(client, row["tag_name"], f"Release {event['release_version']}: " + ("complete" if status["complete"] else "pending/failed"),
+                             body, complete=status["complete"])
                 store.put(row, f"release-status-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}.json", canonical(status))
         except Pending as error:
             limit = int(os.environ.get("RELEASE_READY_MAX_AGE_MINUTES", "60"))
@@ -358,7 +433,7 @@ def finalize_all(client, store, registry, tag, output):
             report_issue(client, row["tag_name"], f"Release {row['tag_name']}: readiness failed",
                          "Readiness verification failed. No new aliases or consumer delivery authorized.\n\n" + run_link())
     Path(output).write_bytes(canonical(deliveries))
-    facts_freshness(client, store, enabled)
+    facts_freshness(client, store, receipt_roles())
     require(not failures, "release finalization failed; inspect release incidents")
 
 
@@ -385,6 +460,16 @@ def reconcile(client, store):
     # releases after a newer dispatch would manufacture downgrade incidents;
     # the handler still owns lockstep, mismatch and duplicate decisions.
     desired = max((v for v, _ in candidates), default=None)
+    if desired is None:
+        return
+    try:
+        client.tag_commit(HUB, "v" + str(desired))
+    except Pending:
+        pass
+    else:
+        # A hub tag hands responsibility to publish/finalize, including drafts
+        # awaiting facts. Do not re-download producer artifacts or re-dispatch.
+        return
     for v, component in sorted(set(candidates), key=lambda item: (item[0], item[1])):
         if v != desired:
             continue
@@ -424,6 +509,7 @@ def main():
     p.add_argument("--tag", required=True)
     p.add_argument("--consumer", choices=ROLES, required=True)
     p.add_argument("--output", required=True)
+    p.add_argument("--attempt", type=int, default=1)
     p = sub.add_parser("alert")
     p.add_argument("--stage", required=True, choices=("publish", "producer", "finalize", "dispatch", "receipt"))
     args = parser.parse_args()
@@ -436,11 +522,7 @@ def main():
             Path(args.output).write_bytes(canonical(bindings(client, args.release_version, args.engine,
                                                           args.codegen, args.hpo, args.hub_commit)))
         elif args.cmd == "candidate-exists":
-            try:
-                row = store.get(args.tag)
-                print("exists=" + ("true" if store.read(row, CANDIDATE) is not None else "false"))
-            except Pending:
-                print("exists=false")
+            print("exists=" + ("true" if candidate_exists(store, args.tag) else "false"))
         elif args.cmd == "candidate":
             obj = decode(Path(args.file).read_bytes())
             obj.update(sources={"release_tag": args.source_tag, "list_asset": Path(args.source_list).name,
@@ -458,12 +540,23 @@ def main():
         elif args.cmd == "reconcile":
             reconcile(client, store)
         elif args.cmd == "dispatch":
+            require(1 <= args.attempt <= len(DELIVERY_BACKOFF_MINUTES), "invalid delivery attempt")
             # The App token here is scoped ONLY to the target. Read the public
             # immutable hub via an uncredentialed client/gh environment.
             public = Client(token="")
             row = public.api(f"repos/{HUB}/releases/tags/{args.tag}")
             require(not row["draft"], "cannot dispatch a draft candidate")
             require(not any(a["name"] == "release-rejected.json" for a in row["assets"]), "release rejected")
+            accepted = Store(public).read(row, f"delivery-{args.consumer}.json")
+            if accepted is not None:
+                Path(args.output).write_bytes(accepted)
+                return 0
+            exhausted = Store(public).read(row, f"delivery-failed-{args.consumer}.json")
+            if exhausted is not None:
+                # A previously queued job can start after the planner exhausted
+                # the bound. Preserve an audit outcome without sending again.
+                Path(args.output).write_bytes(canonical({**decode(exhausted), "state": "dispatch_stopped"}))
+                return 0
             raw = public.download(f"https://github.com/{HUB}/releases/download/{args.tag}/{ASSET}", {"github.com"})
             event = payload(raw)
             require(args.tag == "v" + event["release_version"], "dispatch release differs")
@@ -477,7 +570,7 @@ def main():
             client.api(f"repos/pineforge-4pass/{target}/dispatches", method="POST",
                        data={"event_type": "pineforge-release", "client_payload": event})
             Path(args.output).write_bytes(canonical({"schema": "pineforge/release-delivery/v1", "event_id": event["event_id"],
-                "consumer": args.consumer, "state": "dispatch_accepted", "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+                "consumer": args.consumer, "state": "dispatch_accepted", "attempt": args.attempt,
                 "run_id": int(os.environ["GITHUB_RUN_ID"]), "timestamp": now()}))
         else:
             report_issue(client, args.stage + "-failure", "Release chain: " + args.stage + " failed", run_link())

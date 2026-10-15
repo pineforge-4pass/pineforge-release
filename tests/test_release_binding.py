@@ -13,8 +13,10 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import tarfile
+import tempfile
 import unittest
 import urllib.error
 import zipfile
@@ -24,12 +26,14 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-import release_artifacts as artifacts
-import release_contract as contract
-import release_pair as pair
-import release_pipeline as pipeline
-import release_receipts as receipts
-import release_rollback as rollback
+# These imports use the repository scripts path established above.
+import release_artifacts as artifacts  # noqa: E402
+import release_contract as contract  # noqa: E402
+import release_pair as pair  # noqa: E402
+import release_pipeline as pipeline  # noqa: E402
+import release_receipts as receipts  # noqa: E402
+import release_rollback as rollback  # noqa: E402
+import consumer_receipt_example as receipt_example  # noqa: E402
 
 
 def fixture_manifest(v="1.6.0"):
@@ -91,7 +95,42 @@ class MemoryStore:
         self.operations.clear()
 
     def get(self, tag):
-        return self.rows[tag]
+        return pipeline.Store(self).get(tag)
+
+    def pages(self, route):
+        if route != f"repos/{contract.HUB}/releases":
+            raise AssertionError("unmodeled paginated hub route " + route)
+        return self.releases()
+
+    def api(self, route, *, method="GET", data=None):
+        prefix = f"repos/{contract.HUB}/releases"
+        if route == prefix and method == "POST":
+            row = {**data, "id": len(self.rows) + 1, "assets": [], "created_at": "2026-10-16T00:00:00Z"}
+            self.rows[row["tag_name"]] = row
+            self.operations.append(("create", row["tag_name"]))
+            return row
+        if route.startswith(prefix + "/tags/"):
+            row = self.rows.get(route.removeprefix(prefix + "/tags/"))
+            # Match GitHub: a draft exists in releases(), but not releases/tags.
+            if row is None or row["draft"]:
+                raise contract.Pending("published release unavailable")
+            return row
+        if route.startswith(prefix + "/"):
+            return next(row for row in self.rows.values() if str(row["id"]) == route.removeprefix(prefix + "/"))
+        raise AssertionError("unmodeled hub route " + route)
+
+    def request(self, url, **kwargs):
+        prefix = f"https://api.github.com/repos/{contract.HUB}/releases/assets/"
+        if url.startswith(prefix):
+            asset_id = int(url.removeprefix(prefix))
+            for row in self.rows.values():
+                for asset in row["assets"]:
+                    if asset["id"] == asset_id:
+                        return self.read(row, asset["name"])
+        raise AssertionError("unmodeled hub asset request " + url)
+
+    def facts(self):
+        return pipeline.Store(self).facts()
 
     def releases(self):
         return list(self.rows.values())
@@ -105,7 +144,8 @@ class MemoryStore:
             contract.require(self.assets[key] == raw, "immutable asset changed")
         else:
             self.assets[key] = raw
-            row["assets"].append({"name": name, "id": len(self.assets)})
+            row["assets"].append({"name": name, "id": len(self.assets), "state": "uploaded",
+                                  "digest": "sha256:" + contract.sha256(raw)})
             self.operations.append(("asset", name))
 
     def publish(self, row, latest):
@@ -213,6 +253,27 @@ class FinalizerTests(unittest.TestCase):
     def finish(self):
         return pipeline.finalize(self.client, self.store, self.registry, self.row)
 
+    def test_draft_is_invisible_by_tag_but_found_by_real_store_and_candidate_probe(self):
+        with self.assertRaises(contract.Pending):
+            self.store.api(f"repos/{contract.HUB}/releases/tags/v1.6.0")
+        store = pipeline.Store(self.store)
+        self.assertTrue(store.get("v1.6.0")["draft"])
+        self.assertTrue(pipeline.candidate_exists(store, "v1.6.0"))
+        self.assertFalse(pipeline.candidate_exists(store, "v1.6.1"))
+        event = pipeline.finalize(self.client, self.store, self.registry, store.get("v1.6.0"))
+        self.assertEqual(event["release_version"], "1.6.0")
+
+    def test_existing_draft_never_creates_a_second_candidate_or_requests_a_rebuild(self):
+        store = pipeline.Store(self.store)
+        for _ in range(2):
+            row = store.ensure_candidate_release("v1.6.0", "replay")
+            self.assertEqual(row["id"], self.row["id"])
+            decision, _ = pair.decide("hpo", "1.6.0", "false", "1.6.0", "1.6.0", "1.6.0",
+                                      True, False, False, prev_hpo="1.6.0", candidate_exists=pipeline.candidate_exists(store, "v1.6.0"))
+            self.assertEqual(decision["mode"], "noop")
+        self.assertEqual(len(store.releases()), 1)
+        self.assertNotIn("create", [op[0] for op in self.store.operations])
+
     def test_missing_npm_and_missing_facts_leave_all_aliases_and_release_unpublished(self):
         for missing in ("npm", "facts"):
             with self.subTest(missing=missing):
@@ -264,24 +325,93 @@ class FinalizerTests(unittest.TestCase):
         pipeline.finalize(self.client, self.store, self.registry, self.store.get("v1.6.1"))
         old = self.finish()
         self.assertEqual(self.registry.tags["latest"], newer["image"]["digest"])
-        status = pipeline.aggregate(self.store, self.row, old, newest=pair.parse("1.6.1"))
+        status = pipeline.aggregate(self.store, self.row, old, enabled=contract.ROLES, newest=pair.parse("1.6.1"))
         self.assertEqual(set(status["consumers"].values()), {"superseded"})
 
     def test_dispatch_and_missing_receipt_never_mean_verified(self):
         event = self.finish()
         self.store.put(self.row, "delivery-offline-42-1.json", contract.canonical({"state": "dispatch_accepted"}))
-        status = pipeline.aggregate(self.store, self.row, event)
+        status = pipeline.aggregate(self.store, self.row, event, enabled=contract.ROLES)
         self.assertEqual(set(status["consumers"].values()), {"pending"})
         self.assertFalse(status["complete"])
 
     def test_prerelease_never_moves_latest_and_has_explicit_policy_inventory(self):
         m = fixture_manifest("1.6.0-rc.1")
         self.client, self.store = FinalizeClient(m), MemoryStore(m)
+        self.client.facts["releases"].pop("1.6.0-rc.1")
         event = pipeline.finalize(self.client, self.store, self.registry, self.store.get("v1.6.0-rc.1"))
         self.assertEqual(self.registry.tags["latest"], "sha256:" + "0" * 64)
-        status = pipeline.aggregate(self.store, self.store.get("v1.6.0-rc.1"), event)
+        status = pipeline.aggregate(self.store, self.store.get("v1.6.0-rc.1"), event, enabled=contract.ROLES)
         self.assertEqual(status["consumers"]["application"], "skipped_by_policy")
         self.assertEqual(status["consumers"]["offline"], "pending")
+        facts = contract.canonical(self.client.facts)
+        self.assertEqual(contract.retain_facts(event, facts, facts), event["facts"]["sha256"])
+        with self.assertRaises(contract.Invalid):
+            contract.retain_facts(event, facts, facts + b"\n")
+
+    def test_aggregate_ignores_disabled_roles_for_completion_and_overdue_inventory(self):
+        event = self.finish()
+        empty = pipeline.aggregate(self.store, self.row, event)
+        self.assertEqual(empty["consumers"], {})
+        self.assertTrue(empty["complete"])
+        status = pipeline.aggregate(self.store, self.row, event, enabled=("offline",))
+        self.assertEqual(status["consumers"], {"offline": "pending"})
+
+    def test_finalize_all_never_redispatches_after_delivery_acceptance(self):
+        event = self.finish()
+        self.store.put(self.row, "delivery-offline.json", contract.canonical({"event_id": event["event_id"], "state": "dispatch_accepted"}))
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "offline", "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "report_issue"):
+            output = Path(tmp) / "deliveries.json"
+            for _ in range(3):
+                pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0", output)
+                self.assertEqual(contract.decode(output.read_bytes()), [])
+        self.assertFalse(any(a["name"].startswith("delivery-attempt-") for a in self.row["assets"]))
+
+    def test_finalize_all_delivery_retries_back_off_then_fail_once_and_stop(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "offline", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "report_issue") as report:
+            output = Path(tmp) / "deliveries.json"
+
+            def tick(run_id, elapsed):
+                os.environ["GITHUB_RUN_ID"] = str(run_id)
+                with patch.object(pipeline, "age_minutes", return_value=elapsed):
+                    pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0", output)
+                return contract.decode(output.read_bytes())
+
+            self.assertEqual(tick(100, 0), [{"consumer": "offline", "tag": "v1.6.0", "attempt": 1}])
+            self.assertEqual(tick(101, 14), [])
+            self.assertEqual(tick(102, 15)[0]["attempt"], 2)
+            self.assertEqual(tick(103, 59), [])
+            self.assertEqual(tick(104, 60)[0]["attempt"], 3)
+            self.assertEqual(tick(105, 14), [])
+            self.assertEqual(tick(106, 15), [])
+            failed = self.store.read(self.row, "delivery-failed-offline.json")
+            self.assertEqual(contract.decode(failed)["attempts"], 3)
+            report.reset_mock()
+            before = len(self.store.assets)
+            self.assertEqual(tick(107, 1000), [])
+            self.assertEqual(len(self.store.assets), before)
+            self.assertEqual(self.store.read(self.row, "delivery-failed-offline.json"), failed)
+            report.assert_not_called()
+
+    def test_queued_delivery_rechecks_acceptance_and_exhaustion_before_sending(self):
+        self.finish()
+        for asset, state in (("delivery-offline.json", "dispatch_accepted"), ("delivery-failed-hosted.json", "failed")):
+            role = "offline" if state == "dispatch_accepted" else "hosted"
+            self.store.put(self.row, asset, contract.canonical({"consumer": role, "state": state}))
+            with tempfile.TemporaryDirectory() as tmp, patch.object(pipeline, "Client", return_value=self.store):
+                output = Path(tmp) / "delivery.json"
+                with patch.object(sys, "argv", ["release_pipeline.py", "dispatch", "--tag", "v1.6.0", "--consumer", role,
+                                               "--attempt", "3", "--output", str(output)]):
+                    self.assertEqual(pipeline.main(), 0)
+                self.assertEqual(contract.decode(output.read_bytes())["state"],
+                                 "dispatch_accepted" if state == "dispatch_accepted" else "dispatch_stopped")
+        # The fake has no consumer dispatch endpoint; any send would fail above.
 
     def test_rollback_preserves_fixed_identity_and_stops_finalizer(self):
         event = self.finish()
@@ -468,6 +598,14 @@ class ReconciliationTests(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.dispatched = []
+                self.hub_tag = False
+
+            def tag_commit(self, repo, tag):
+                if repo == contract.HUB:
+                    if not self.hub_tag:
+                        raise contract.Pending("hub tag unavailable")
+                    return "d" * 40
+                return super().tag_commit(repo, tag)
 
             def pages(self, route):
                 role = next(role for role, repo in artifacts.PRODUCERS.items() if route == f"repos/{repo}/releases")
@@ -508,6 +646,22 @@ class ReconciliationTests(unittest.TestCase):
                 self.assertTrue(alert.called)
             blocked = "hpo-release" if failure == "upload" else "codegen-release"
             self.assertNotIn(blocked, {row["event_type"] for row in client.dispatched})
+
+    def test_existing_hub_tag_skips_all_producer_downloads_and_redispatches(self):
+        client = self.client()
+        client.hub_tag = True
+        with patch.object(pipeline.Path, "read_text", return_value="1.5.9\n"), \
+                patch.object(client, "download", side_effect=AssertionError("handled version must not download artifacts")):
+            for _ in range(3):
+                pipeline.reconcile(client, None)
+        self.assertEqual(client.dispatched, [])
+
+    def test_unknown_hub_tag_probe_errors_do_not_authorize_replay(self):
+        client = self.client()
+        with patch.object(pipeline.Path, "read_text", return_value="1.5.9\n"), \
+                patch.object(client, "tag_commit", side_effect=contract.Invalid("HTTP 403")), self.assertRaises(contract.Invalid):
+            pipeline.reconcile(client, None)
+        self.assertEqual(client.dispatched, [])
 
 
 class FactsFreshnessTests(unittest.TestCase):
@@ -580,6 +734,102 @@ class ReceiptTests(unittest.TestCase):
         self.assertNotIn(b"e2e/one", raw)
         self.assertEqual(public["deployed"]["image_digest"], self.event["image"]["digest"])
 
+    def test_example_builder_and_documented_examples_use_the_hub_validator(self):
+        self.receipt = receipt_example.build_receipt(self.event)
+        self.assertEqual(self.verify()["state"], "verified")
+        facts = {"commit": "e" * 40, "sha256": "f" * 64}
+        for role in ("web", "license"):
+            obj = receipt_example.build_receipt(consumer=role, facts=facts)
+            public = receipts.validate_receipt(self, self.repo, obj, None, receipt_example.example_policy(role), self.run)
+            self.assertEqual(public["facts"], facts)
+            self.assertNotIn("event_id", obj)
+            self.assertNotIn("release_version", obj)
+            self.assertIsNone(public["deployed"]["image_digest"])
+        doc = (ROOT / "docs/release-chain.md").read_text().split("## Consumer receipt contract v1\n", 1)[1].split("## Supervisor configuration", 1)[0]
+        examples = [json.loads(raw) for raw in re.findall(r"```json\n(.*?)\n```", doc, re.S)]
+        reports = [obj for obj in examples if obj.get("schema") in (receipts.PRODUCT_SCHEMA, receipts.FACTS_SCHEMA)]
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(reports[0], receipt_example.build_receipt(self.event))
+        self.assertEqual(reports[1], receipt_example.build_receipt(consumer="license", facts=facts))
+        for obj in reports:
+            event = self.event if obj["schema"] == receipts.PRODUCT_SCHEMA else None
+            self.assertEqual(receipts.validate_receipt(self, self.repo, obj, event, self.policy, self.run)["state"], "verified")
+
+    def test_facts_only_signal_has_exact_four_keys_and_needs_no_product_role(self):
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "", "FACTS_LICENSE_DISPATCH_ENABLED": "true",
+                                    "FACTS_WEB_DISPATCH_ENABLED": "false"}):
+            enabled = pipeline.receipt_roles()
+        self.assertEqual(enabled, ["license"])
+        signal = {"schema": "pineforge/consumer-signal/v1", "consumer": "license", "release_version": None, "run_id": 90}
+        self.assertEqual(receipts.signal_targets(signal, enabled), [{"consumer": "license", "run_id": "90"}])
+        for bad in ({**signal, "state": "verified"}, {**signal, "consumer": "offline"}, {**signal, "run_id": True}):
+            with self.assertRaises(contract.Invalid):
+                receipts.signal_targets(bad, enabled)
+
+    def test_policy_named_artifact_requires_the_single_contract_file_and_matching_digest(self):
+        route = f"repos/{self.repo}/actions/runs/90/artifacts?per_page=100&page=1"
+        policy = receipt_example.example_policy()
+        for names in (("release-receipt.json",), ("receipt.json",), ("release-receipt.json", "extra.json")):
+            packed = io.BytesIO()
+            with zipfile.ZipFile(packed, "w") as zipped:
+                for name in names:
+                    zipped.writestr(name, contract.canonical(self.receipt))
+            raw = packed.getvalue()
+            metadata = {"id": 9, "name": policy["artifact"], "expired": False, "digest": "sha256:" + contract.sha256(raw)}
+            self.api_data[route] = {"artifacts": [metadata]}
+            with patch.object(self, "request", return_value=raw, create=True):
+                if names == ("release-receipt.json",):
+                    self.assertEqual(receipts.fetch_artifact(self, self.repo, self.run, policy), self.receipt)
+                else:
+                    with self.assertRaises(contract.Invalid):
+                        receipts.fetch_artifact(self, self.repo, self.run, policy)
+                metadata["digest"] = "sha256:" + "0" * 64
+                with self.assertRaises(contract.Invalid):
+                    receipts.fetch_artifact(self, self.repo, self.run, policy)
+            metadata["name"] += "-90"
+            self.assertIsNone(receipts.fetch_artifact(self, self.repo, self.run, policy))
+
+    def test_facts_only_collector_needs_no_product_release_and_keeps_full_evidence_gates(self):
+        facts_raw = contract.canonical(facts_for(self.manifest))
+        facts = {"commit": "e" * 40, "sha256": contract.sha256(facts_raw)}
+        store = MemoryStore()
+        self.api_data[f"repos/{self.repo}"] = {"full_name": self.repo}
+        self.api_data[f"repos/{self.repo}/actions/runs/90"] = self.run
+        self.api_data[f"repos/{contract.HUB}/git/ref/heads/main"] = {"object": {"sha": "f" * 40}}
+        self.api_data[f"repos/{contract.HUB}/compare/{facts['commit']}...{'f' * 40}"] = {"status": "ahead"}
+        with patch.dict(os.environ, {"TARGET_REPOSITORY": "fixture"}), \
+                patch.object(receipts, "profile", return_value=self.policy), \
+                patch.object(self, "file", return_value=facts_raw, create=True), \
+                patch.object(receipts, "fetch_artifact") as fetch:
+            for role in ("license", "web"):
+                obj = receipt_example.build_receipt(consumer=role, facts=facts)
+                fetch.return_value = obj
+                receipts.collect(self, self, store, role, 90)
+                receipts.collect(self, self, store, role, 90)
+            self.assertEqual(set(store.rows), {pipeline.FACTS_RECEIPTS_TAG})
+            self.assertEqual(len(store.assets), 2)
+            self.assertTrue(store.rows[pipeline.FACTS_RECEIPTS_TAG]["draft"])
+            for raw in store.assets.values():
+                self.assertNotIn("event_id", contract.decode(raw))
+            obj = receipt_example.build_receipt(consumer="license", facts=facts)
+            obj["deployed"]["facts_sha256"] = "0" * 64
+            fetch.return_value = obj
+            with self.assertRaises(contract.Invalid):
+                receipts.collect(self, self, store, "license", 90)
+            obj = receipt_example.build_receipt(consumer="license", facts={**facts, "sha256": "0" * 64})
+            fetch.return_value = obj
+            with self.assertRaises(contract.Invalid):
+                receipts.collect(self, self, store, "license", 90)
+            fetch.return_value = receipt_example.build_receipt(consumer="license", facts=facts)
+            comparison = f"repos/{contract.HUB}/compare/{facts['commit']}...{'f' * 40}"
+            self.api_data[comparison] = {"status": "diverged"}
+            with self.assertRaises(contract.Invalid):
+                receipts.collect(self, self, store, "license", 90)
+            self.api_data[comparison] = {"status": "ahead"}
+            self.api_data[f"repos/{self.repo}/actions/runs/2/attempts/1/jobs?per_page=100&page=1"]["jobs"].pop()
+            with self.assertRaises(contract.Invalid):
+                receipts.collect(self, self, store, "license", 90)
+
     def test_red_missing_failed_cancelled_and_skipped_e2e_job_cannot_report_verified(self):
         route = f"repos/{self.repo}/actions/runs/2/attempts/1/jobs?per_page=100&page=1"
         original = copy.deepcopy(self.api_data[route])
@@ -630,6 +880,8 @@ class ReceiptTests(unittest.TestCase):
         newer = (json.dumps(facts, indent=2) + "\n").encode()
         class Hub:
             def api(self, route, **kwargs):
+                if route == f"repos/{contract.HUB}/git/ref/heads/main":
+                    return {"object": {"sha": "f" * 40}}
                 prefix = f"repos/{contract.HUB}/compare/"
                 if not route.startswith(prefix):
                     raise AssertionError("unexpected hub request")
@@ -645,10 +897,12 @@ class ReceiptTests(unittest.TestCase):
             self.assertEqual(pipeline.receipts(store, row, self.event["event_id"])["offline"], first)
             self.receipt.update(schema="pineforge/facts-consumer-receipt/v1", consumer="web",
                                 facts={"commit": "f" * 40, "sha256": contract.sha256(newer)})
+            self.receipt.pop("event_id")
+            self.receipt.pop("release_version")
             for name in ("preview", "deployed"):
                 self.receipt[name].update(facts_commit="f" * 40, facts_sha256=contract.sha256(newer))
             receipts.collect(self, Hub(), store, "web")
-        self.assertTrue(any(asset["name"].startswith("facts-consumer-web-") for asset in row["assets"]))
+        self.assertTrue(any(asset["name"].startswith("facts-consumer-web-") for asset in store.facts()["assets"]))
         self.assertNotIn("web", pipeline.receipts(store, row, self.event["event_id"]))
 
 

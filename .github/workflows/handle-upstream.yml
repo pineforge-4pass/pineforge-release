@@ -243,6 +243,7 @@ jobs:
       - name: Decide action (pairing rule + idempotent + recover half-failed release + downgrade guard)
         id: decide
         env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}  # must be able to list hub drafts
           COMPONENT: ${{ steps.in.outputs.component }}
           VER:       ${{ steps.in.outputs.version }}
           PAYLOAD_PRERELEASE: ${{ steps.in.outputs.payload_prerelease }}
@@ -263,8 +264,11 @@ jobs:
         run: |
           set -euo pipefail
           ver="$(tr -d '[:space:]' < VERSION)"
+          candidate="$(gh api --paginate --slurp repos/pineforge-4pass/pineforge-release/releases \
+            --jq "any(.[][]; .tag_name == \"v${ver}\" and any(.assets[]; .name == \"release-candidate.json\"))")"
           img="ghcr.io/pineforge-4pass/pineforge-release:${ver}"
-          if docker manifest inspect "$img" >/dev/null 2>&1; then image=true; else image=false; fi
+          image=false
+          if [ "$candidate" != true ] && docker manifest inspect "$img" >/dev/null 2>&1; then image=true; fi
           # Monotonicity (downgrade) guard on the DISPATCHED component, the 1.0
           # pairing rule, and noop / republish / bump / wait: see the script.
           echo "cur_ver=$ver" >> "$GITHUB_OUTPUT"
@@ -276,12 +280,12 @@ jobs:
           python3 scripts/release_pair.py decide \
             --component="$COMPONENT" --version="$VER" --prerelease-flag="${PAYLOAD_PRERELEASE:-}" \
             --prev-engine="$EPREV" --prev-codegen="$CPREV" --current-release="$ver" \
-            --other-published="${PUBLISHED:-false}" --image-exists="$image" --force="${FORCE:-}" \
+            --other-published="${PUBLISHED:-false}" --image-exists="$image" --candidate-exists="$candidate" --force="${FORCE:-}" \
             --partner-latest="${PARTNER_LATEST:-}" --prev-hpo="${HPREV:-}" "${partners[@]}" | tee -a "$GITHUB_OUTPUT"
 
       - name: No-op
         if: steps.decide.outputs.mode == 'noop'
-        run: echo "engine+codegen unchanged and image exists — nothing to do."
+        run: echo "Component pins unchanged; image or verified candidate already exists."
 
       - name: Wait for the partner release (1.0 pair incomplete)
         if: steps.decide.outputs.mode == 'wait'

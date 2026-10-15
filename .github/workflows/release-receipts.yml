@@ -17,6 +17,8 @@ concurrency:
 jobs:
   plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # prepare the one facts audit draft before parallel reads
     outputs:
       consumers: ${{ steps.plan.outputs.consumers }}
     steps:
@@ -26,7 +28,10 @@ jobs:
           persist-credentials: false
       - id: plan
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
+          FACTS_LICENSE_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}
         run: |
           set -euo pipefail
           python3 scripts/release_receipts.py signal --output "$RUNNER_TEMP/consumers.json"
