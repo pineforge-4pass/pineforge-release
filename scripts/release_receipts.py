@@ -109,6 +109,7 @@ def check_coordinator(client, repo, evidence, policy, pr, ci):
     name = f"coordinator-binding-{run['id']}-{run['run_attempt']}"
     found = [a for a in artifacts if a["name"] == name and not a["expired"]]
     require(len(found) == 1, "missing/ambiguous coordinator binding")
+    positive(found[0]["id"])
     archive = client.request(f"https://api.github.com/repos/{repo}/actions/artifacts/{found[0]['id']}/zip",
                              github=True, accept="application/octet-stream")
     require(len(archive) <= 2 * 1024 * 1024, "binding archive too large")
