@@ -1,0 +1,159 @@
+name: verify-rc1-hpo
+
+# One-off, read-only verification of the already pushed v1.6.0-rc.1 hpo image
+# (publish run 38622097808 built it with target=hpo; its post-push check then
+# crashed on the double-pull bug that #51 fixed). Nothing is built, tagged,
+# pushed or dispatched here. Runs only on pushes to its own branch.
+on:
+  push:
+    branches: [core/verify-rc1-hpo]
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  REF_BASE: ghcr.io/pineforge-4pass/pineforge-release
+  DIGEST: sha256:e055a629f9adf769ffe334c7a08aa8993581842533d14f5ca7a86e046c865402
+  HUB_COMMIT: b7de43ca64d3b96cee0472dd79da1d1a283ee24a
+  ENGINE: 1.6.0-rc.1
+  CODEGEN: 1.6.0-rc.1
+  HPO_PEP440: 1.6.0rc1
+  EXPECT_SOURCE_TAG: v1.4.0
+  EXPECT_SOURCE_LIST: set-02.SOURCES.list
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Index and per-architecture child digests (the #51 rule)
+        id: idx
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/ev"; mkdir -p "$out"
+          docker buildx imagetools inspect --raw "${REF_BASE}@${DIGEST}" > "$out/index.json"
+          got="sha256:$(sha256sum "$out/index.json" | cut -d' ' -f1)"
+          [ "$got" = "$DIGEST" ] || { echo "::error::index bytes differ from digest ($got)"; exit 1; }
+          child() {
+            jq -er --arg arch "$1" '
+              [.manifests[]
+               | select(.platform.os == "linux" and .platform.architecture == $arch)
+               | select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")]
+              | if length == 1 then .[0].digest else error("expected exactly one linux/" + $arch) end
+            ' "$out/index.json"
+          }
+          a="$(child amd64)"; r="$(child arm64)"
+          [[ "$a" =~ ^sha256:[0-9a-f]{64}$ && "$r" =~ ^sha256:[0-9a-f]{64}$ && "$a" != "$r" ]] \
+            || { echo "::error::bad child digests $a $r"; exit 1; }
+          echo "amd64=$a" >> "$GITHUB_OUTPUT"; echo "arm64=$r" >> "$GITHUB_OUTPUT"
+          printf 'index %s\namd64 %s\narm64 %s\n' "$DIGEST" "$a" "$r" | tee "$out/digests.txt"
+
+      - name: Per architecture, offline (--network=none) contents and runtime smoke
+        env:
+          AMD64: ${{ steps.idx.outputs.amd64 }}
+          ARM64: ${{ steps.idx.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/ev"
+          fx="$GITHUB_WORKSPACE/tests/fixtures/release-smoke"
+          for arch in amd64 arm64; do
+            if [ "$arch" = amd64 ]; then d="$AMD64"; else d="$ARM64"; fi
+            ref="${REF_BASE}@${d}"
+            docker pull --platform "linux/$arch" "$ref"
+            docker image inspect "$ref" | jq '.[0].Config | {Labels, Entrypoint, Cmd, Env, User}' > "$out/config-$arch.json"
+            jq -e --arg c "$HUB_COMMIT" --arg e "$ENGINE" --arg g "$CODEGEN" --arg h "$HPO_PEP440" '
+              .Labels["org.opencontainers.image.revision"] == $c
+              and .Labels["io.pineforge.engine.version"] == $e
+              and .Labels["io.pineforge.codegen.version"] == $g
+              and .Labels["io.pineforge.hpo.version"] == $h' "$out/config-$arch.json" \
+              || { echo "::error::$arch labels differ"; jq .Labels "$out/config-$arch.json"; exit 1; }
+            base=(docker run --rm --network=none --platform "linux/$arch" -v "$fx:/in:ro")
+            "${base[@]}" --entrypoint dpkg-query "$ref" \
+              -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' > "$out/pushed-debian-$arch.tsv"
+            "${base[@]}" --entrypoint bash "$ref" -euc \
+              'cd /opt/pineforge/bin && sha256sum -c --strict HARNESS-SHA256SUMS && cd /opt/pineforge/licenses && sha256sum -c --strict LICENSE-SHA256SUMS' \
+              > "$out/sums-$arch.txt"
+            "${base[@]}" --entrypoint bash "$ref" -euc \
+              'ls -la /opt/pineforge; test -x /opt/pineforge/pineforge-hpo-native; test -x /opt/pineforge/entrypoint-dispatch.sh; cat /opt/pineforge/entrypoint-dispatch.sh; python3 -c "import pineforge_hpo,sys; print(\"pineforge_hpo\", getattr(pineforge_hpo, \"__version__\", \"(no __version__)\"), pineforge_hpo.__file__)"; ls /opt/pineforge/hpo' \
+              > "$out/layout-$arch.txt"
+            "${base[@]}" "$ref" hpo --help > "$out/hpo-help-$arch.txt"
+            "${base[@]}" "$ref" > "$out/backtest-$arch.json"
+            jq -e '.engine == "pineforge" and (.error | not) and (.trades | length > 0) and .metrics.all.num_trades > 0' \
+              "$out/backtest-$arch.json" > /dev/null || { echo "::error::$arch backtest smoke failed"; exit 1; }
+            "${base[@]}" "$ref" hpo run /in/study.json --engine-root /opt/pineforge > "$out/hpo-$arch.json"
+            jq -e '.ok == true and .trials_completed == 9 and .full_parameter_coverage == true' \
+              "$out/hpo-$arch.json" > /dev/null || { echo "::error::$arch HPO study smoke failed"; exit 1; }
+            echo "$arch: labels, sums, layout, backtest ($(jq '.trades|length' "$out/backtest-$arch.json") trades), HPO 9 trials: OK"
+          done
+
+      - name: Installed HPO bytes equal the published wheel
+        env:
+          AMD64: ${{ steps.idx.outputs.amd64 }}
+          ARM64: ${{ steps.idx.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/ev"
+          whl="pineforge_hpo-${HPO_PEP440}-py3-none-any.whl"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$whl" \
+            "https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v${HPO_PEP440}/${whl}"
+          sha256sum "$RUNNER_TEMP/$whl" | tee "$out/wheel-sha256.txt"
+          python3 - "$RUNNER_TEMP/$whl" > "$out/wheel-inventory.json" <<'PY'
+          import hashlib, json, sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          inv = {n: hashlib.sha256(z.read(n)).hexdigest() for n in z.namelist()
+                 if n.startswith("pineforge_hpo/") and not n.endswith("/")
+                 and (n.endswith(".py") or n.split("/")[-1].startswith("hpo_failure_codes"))}
+          assert inv, "empty wheel inventory"
+          print(json.dumps(inv, sort_keys=True))
+          PY
+          for arch in amd64 arm64; do
+            if [ "$arch" = amd64 ]; then d="$AMD64"; else d="$ARM64"; fi
+            docker run --rm -i --network=none --platform "linux/$arch" --entrypoint python3 \
+              "${REF_BASE}@${d}" -c '
+          import hashlib, json, pathlib, sys
+          want = json.load(sys.stdin)
+          root = pathlib.Path("/opt/pineforge/hpo")
+          got = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in (root / "pineforge_hpo").rglob("*")
+                 if p.is_file() and (p.suffix == ".py" or p.name.startswith("hpo_failure_codes"))}
+          if got != want:
+              raise SystemExit("installed pineforge_hpo bytes differ from the wheel")
+          print(len(got), "files equal")' < "$out/wheel-inventory.json" | sed "s/^/$arch: /"
+          done
+
+      - name: Debian source mirror check on the pushed image (the #51 check)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/ev"
+          python3 scripts/release_sources.py locate --registry docker/SOURCE-SETS.tsv \
+            --amd64 "$out/pushed-debian-amd64.tsv" --arm64 "$out/pushed-debian-arm64.tsv" | tee "$out/source-set.txt"
+          tag="$(sed -n 's/^release-tag=//p' "$out/source-set.txt")"
+          list="$(sed -n 's/^list-asset=//p' "$out/source-set.txt")"
+          [ "$tag" = "$EXPECT_SOURCE_TAG" ] && [ "$list" = "$EXPECT_SOURCE_LIST" ] \
+            || { echo "::error::source set $tag/$list differs from the rc.1 run ($EXPECT_SOURCE_TAG/$EXPECT_SOURCE_LIST)"; exit 1; }
+          gh release view "$tag" --repo pineforge-4pass/pineforge-release --json assets > "$RUNNER_TEMP/source-assets.json"
+          curl -fsSL --retry 3 --max-time 120 \
+            "https://github.com/pineforge-4pass/pineforge-release/releases/download/${tag}/${list}" -o "$RUNNER_TEMP/$list"
+          python3 scripts/release_sources.py check --registry docker/SOURCE-SETS.tsv \
+            --amd64 "$out/pushed-debian-amd64.tsv" --arm64 "$out/pushed-debian-arm64.tsv" \
+            --release-assets "$RUNNER_TEMP/source-assets.json" --sources-list "$RUNNER_TEMP/$list" | tee "$out/source-check.txt"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-rc1-hpo-evidence
+          path: ${{ runner.temp }}/ev
