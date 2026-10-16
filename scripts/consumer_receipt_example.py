@@ -14,6 +14,13 @@ from release_contract import ROLES, canonical, payload, require
 
 
 def example_policy(consumer="offline"):
+    if consumer == "hosted":
+        return {
+            "workflow": "release-report.yml", "artifact": "release-receipt-hosted", "base": "main",
+            "ci": {"workflow": "release-pr.yml", "expected": ["validate", "checks", "container", "candidate"], "approved_skips": []},
+            "e2e": {"workflow": "release-coordinator.yml", "expected": ["candidate", "release/ready"], "approved_skips": []},
+            "deploy": {"workflow": "release.yml", "expected": ["deploy"], "approved_skips": []},
+        }
     policy = {"workflow": "release.yml", "artifact": "release-receipt-" + consumer, "base": "main"}
     for name in ("ci", "e2e", "deploy"):
         policy[name] = {"workflow": name + ".yml", "expected": [name + "/one", name + "/two"], "approved_skips": []}
@@ -38,7 +45,10 @@ def build_receipt(event=None, *, consumer="offline", facts=None):
         facts_commit, facts_sha = event["facts"]["commit"], event["facts"]["sha256"]
     for run_id, name in enumerate(("ci", "e2e", "deploy"), 1):
         expected = example_policy(consumer)[name]["expected"]
-        receipt[name] = {"run_id": run_id, "run_attempt": 1, "sha": merge if name == "deploy" else head,
+        sha = merge if name == "deploy" else head
+        if consumer == "hosted" and name == "e2e":
+            sha = receipt["pr"]["base_sha"]
+        receipt[name] = {"run_id": run_id, "run_attempt": 1, "sha": sha,
                          "expected": expected, "approved_skips": [], "results": {item: "success" for item in expected}}
     identity = {"source": head, "image_digest": image_digest, "facts_commit": facts_commit,
                 "facts_sha256": facts_sha, "deployment_id_sha256": "d" * 64}

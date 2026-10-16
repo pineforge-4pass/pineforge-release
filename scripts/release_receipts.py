@@ -86,6 +86,64 @@ def check_run(client, repo, evidence, policy, expected_sha):
     return run
 
 
+def check_coordinator(client, repo, evidence, policy, pr, ci):
+    """Hosted base-code E2E bound to an exact PR-head build attempt/artifact.
+
+    The caller restricts this adapter to hosted. Keep check_run's exact SHA
+    equality for every other workflow, including hosted CI and deployment.
+    """
+    require(policy["workflow"] == "release-coordinator.yml", "unapproved coordinator workflow")
+    require(policy["expected"] == ["candidate", "release/ready"] and policy["approved_skips"] == [],
+            "coordinator inventory differs")
+    run = check_run(client, repo, evidence, policy, pr["base_sha"])
+    require(run["id"] == evidence["run_id"] and run["run_attempt"] == evidence["run_attempt"],
+            "coordinator run identity differs")
+    metadata = client.api(f"repos/{repo}")
+    require(metadata["full_name"].lower() == repo.lower()
+            and run["repository"]["full_name"].lower() == repo.lower()
+            and run["head_repository"]["full_name"].lower() == repo.lower(),
+            "coordinator repository differs")
+    require(run["event"] == "workflow_run" and pr["base"] == metadata["default_branch"] == "main"
+            and run["head_branch"] == metadata["default_branch"], "untrusted coordinator source")
+    artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
+    name = f"coordinator-binding-{run['id']}-{run['run_attempt']}"
+    found = [a for a in artifacts if a["name"] == name and not a["expired"]]
+    require(len(found) == 1, "missing/ambiguous coordinator binding")
+    archive = client.request(f"https://api.github.com/repos/{repo}/actions/artifacts/{found[0]['id']}/zip",
+                             github=True, accept="application/octet-stream")
+    require(len(archive) <= 2 * 1024 * 1024, "binding archive too large")
+    require(found[0].get("digest") == "sha256:" + sha256(archive), "binding archive digest missing or differs")
+    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+        require(zipped.namelist() == ["binding.json"], "unexpected binding archive inventory")
+        require(zipped.getinfo("binding.json").file_size <= 2 * 1024 * 1024, "binding too large")
+        binding = decode(zipped.read("binding.json"))
+    keys(binding, ("schema", "pr", "head", "base", "source", "coordinator", "artifact"))
+    require(binding["schema"] == "pineforge/mcp-coordinator-binding/v1", "unknown coordinator binding")
+    positive(binding["pr"])
+    keys(binding["source"], ("run_id", "attempt"))
+    keys(binding["coordinator"], ("run_id", "attempt", "sha"))
+    for bound_run in (binding["source"], binding["coordinator"]):
+        positive(bound_run["run_id"])
+        positive(bound_run["attempt"])
+    require(binding["pr"] == pr["number"] and binding["head"] == pr["head"] and binding["base"] == pr["base_sha"],
+            "coordinator verified another PR head/base")
+    require(binding["source"] == {"run_id": ci["run_id"], "attempt": ci["run_attempt"]}, "coordinator verified another CI attempt")
+    require(binding["coordinator"] == {"run_id": run["id"], "attempt": run["run_attempt"], "sha": pr["base_sha"]},
+            "coordinator binding source differs")
+    artifact = binding["artifact"]
+    keys(artifact, ("id", "name", "digest", "manifest_sha256", "worker_sha256", "container_sha256"))
+    positive(artifact["id"])
+    require(artifact["name"] == f"candidate-{ci['run_id']}-{ci['run_attempt']}", "candidate attempt differs")
+    match("sha256:" + SHA, artifact["digest"])
+    for key in ("manifest_sha256", "worker_sha256", "container_sha256"):
+        match(SHA, artifact[key])
+    candidates = object_pages(client, f"repos/{repo}/actions/runs/{ci['run_id']}/artifacts", "artifacts")
+    matched = [a for a in candidates if a["name"] == artifact["name"] and not a["expired"]]
+    require(len(matched) == 1 and matched[0]["id"] == artifact["id"] and matched[0].get("digest") == artifact["digest"],
+            "verified candidate artifact missing or replaced")
+    return run
+
+
 def identity(obj, *, facts_only=False):
     keys(obj, ("source", "image_digest", "facts_commit", "facts_sha256", "deployment_id_sha256"))
     match(COMMIT, obj["source"])
@@ -142,7 +200,11 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     public["pr"] = pr
     if state in ("ready", "merged", "deploying", "verified"):
         ci_run = check_run(client, repo, receipt["ci"], policy["ci"], pr["head"])
-        e2e_run = check_run(client, repo, receipt["e2e"], policy["e2e"], pr["head"])
+        if policy["e2e"]["workflow"] == "release-coordinator.yml":
+            require(receipt["consumer"] == "hosted" and policy["ci"]["workflow"] == "release-pr.yml", "unexpected coordinator consumer")
+            e2e_run = check_coordinator(client, repo, receipt["e2e"], policy["e2e"], pr, receipt["ci"])
+        else:
+            e2e_run = check_run(client, repo, receipt["e2e"], policy["e2e"], pr["head"])
         identity(receipt["preview"], facts_only=facts_only)
         require(receipt["preview"]["source"] == pr["head"]
                 and (facts_only or receipt["preview"]["image_digest"] == event["image"]["digest"]),
