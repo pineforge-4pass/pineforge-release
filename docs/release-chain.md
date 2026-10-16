@@ -229,7 +229,7 @@ A check-evidence object has exactly these fields, for each of `ci`, `e2e`,
 |---|---|
 | `run_id` | Integer, GitHub Actions run in the configured consumer repository. |
 | `run_attempt` | Integer, the particular GitHub attempt whose jobs are checked. |
-| `sha` | Commit; `pr.head` for CI/E2E, `pr.merge` for deploy. |
+| `sha` | Commit; `pr.head` for CI/E2E, `pr.merge` for deploy. Hosted `release-coordinator.yml` E2E alone uses `pr.base_sha`, subject to the binding checks below. |
 | `expected` | Array of unique job-name strings, exactly the corresponding policy list, in the same order. |
 | `approved_skips` | Array of job-name strings, exactly the corresponding policy list, in the same order. |
 | `results` | Object with exactly one key per expected job; values `success`, or `skipped` only for owner-approved skips. Must equal actual GitHub jobs. |
@@ -240,6 +240,48 @@ at least one must succeed. CI/E2E must finish before the PR's actual merge time.
 The merge commit's first parent must be `base_sha`, proving the tested base
 landed. An unmerged PR must still have the tested base. Rebase/merge-queue source
 graphs need an approved adapter before enablement.
+
+**Hosted coordinator binding.** Only consumer `hosted`, with CI workflow
+`release-pr.yml` and E2E workflow `release-coordinator.yml`, can use the base-code
+adapter in [`check_coordinator`](../scripts/release_receipts.py). Its E2E
+inventory is exactly `["candidate", "release/ready"]` in that order, with no
+approved skips. CI still runs at `pr.head`; deploy still runs at `pr.merge`.
+All other E2E workflows retain the exact PR-head check in `check_run`.
+
+The coordinator run must be completed successfully at the recorded E2E run ID
+and attempt, with `head_sha == pr.base_sha`. Its event must be `workflow_run`;
+both its repository and head repository must equal the scoped consumer
+repository. The repository's configured default branch, PR base and run's
+`head_branch` must all be `main`. This checks the recorded tested base rather
+than requiring today's moving main SHA after the PR has merged. The existing
+unmerged-base, merge-first-parent and CI/E2E-before-merge gates still apply.
+
+From that coordinator run, the hub requires exactly one nonexpired artifact
+named `coordinator-binding-<run_id>-<run_attempt>`. Its ZIP SHA-256 must be
+present in GitHub metadata and match the downloaded bytes **before parsing**.
+The ZIP and expanded JSON each have a 2 MiB limit; the ZIP contains only one
+root `binding.json`. That JSON has exactly `schema`, `pr`, `head`, `base`,
+`source`, `coordinator`, and `artifact`, with schema
+`pineforge/mcp-coordinator-binding/v1` and these bindings:
+
+- `pr`, `head`, `base` equal the receipt PR number, PR head and tested base.
+- `source` equals `{"run_id": ci.run_id, "attempt": ci.run_attempt}`.
+- `coordinator` equals the checked E2E run ID, attempt and tested-base `sha`.
+- `artifact` has exactly `id`, `name`, `digest`, `manifest_sha256`,
+  `worker_sha256`, and `container_sha256`. The ID is a positive integer, the
+  name is `candidate-<ci.run_id>-<ci.run_attempt>`, the digest is a SHA-256
+  digest, and the other hashes are SHA-256 strings. Exactly one nonexpired
+  artifact of that name must remain in the source CI run, with the same ID
+  and digest; missing, duplicate or replaced candidates fail closed.
+
+Binding PR/run/artifact IDs and attempts must be positive JSON integers;
+booleans, numeric strings and floats are refused.
+
+Only `candidate` and `release/ready` are the required hosted E2E jobs.
+`pending`, `policy` and `merge` are orchestration jobs, not additions to that
+inventory. Hosted CI requires `validate`, `checks`, `container`, `candidate`;
+hosted deploy requires `deploy`. Neither inventory permits skips. The public
+receipt and callback schemas remain v1; the binding stays consumer-side.
 
 A served-identity object has exactly these fields:
 
@@ -537,6 +579,9 @@ example, or `python3 scripts/consumer_receipt_example.py --facts-only` for the
 license example. Real consumer builders must supply actual evidence, target
 identities and their owner-approved inventories. The hub test validates these
 examples against its own validator, including the documented JSON.
+Use `--consumer hosted` for a synthetic hosted receipt with CI at the PR head
+and coordinator E2E at the tested base. Its example policy is the exact hosted
+entry below; a real coordinator must also publish its verified binding artifact.
 
 Neutral hub assets retain numeric IDs, commit/image/facts identities and hashes
 of private evidence/inventories. Private repository names, job labels, deployment
@@ -573,7 +618,12 @@ rejects missing/skipped/cancelled jobs and covers merge-group events too.
 | Release asset setting | Hub repository | These releases keep append-only audit/receipt assets after publication; GitHub's repository-wide immutable-release setting must permit these appends. The scripts enforce manifest/fixed-tag byte immutability and never overwrite/delete them. |
 | Receivers and callback credentials | Each enabled consumer | Receiver on default branch; own CI + E2E aggregate required; scoped hub Contents-write callback token; artifact upload/read access. |
 
-Example **structure**, not a production policy:
+Policy example: the `offline` entry remains a synthetic structure, not a
+production inventory. The `hosted` entry is the exact policy from the reviewed
+hosted credential-isolation contract. Merge that hosted entry into the existing
+`RELEASE_RECEIPT_POLICY` only after installing this hub adapter, preserving every
+other consumer entry. The supervisor applies the live policy; this change does
+not alter GitHub settings.
 
 ```json
 {
@@ -582,6 +632,26 @@ Example **structure**, not a production policy:
     "ci": {"workflow": "ci.yml", "expected": ["check", "unit"], "approved_skips": []},
     "e2e": {"workflow": "e2e.yml", "expected": ["stdio-parity", "syminfo", "negative"], "approved_skips": []},
     "deploy": {"workflow": "publish.yml", "expected": ["publish", "served-identity"], "approved_skips": []}
+  },
+  "hosted": {
+    "workflow": "release-report.yml",
+    "artifact": "release-receipt-hosted",
+    "base": "main",
+    "ci": {
+      "workflow": "release-pr.yml",
+      "expected": ["validate", "checks", "container", "candidate"],
+      "approved_skips": []
+    },
+    "e2e": {
+      "workflow": "release-coordinator.yml",
+      "expected": ["candidate", "release/ready"],
+      "approved_skips": []
+    },
+    "deploy": {
+      "workflow": "release.yml",
+      "expected": ["deploy"],
+      "approved_skips": []
+    }
   }
 }
 ```
@@ -605,5 +675,13 @@ separately.
 
 CI runs the existing release/source/harness tests plus the ready replay and
 negative controls. See [the current replay entry point](../tools/release-dry-run/README.md).
+`tests/test_release_coordinator_receipts.py` adds local API/ZIP fixtures for
+truthful hosted receipts and red cases for source trust, binding and candidate
+replacement, archive digests, PR/head/base/attempt mismatches and inventory
+changes, plus regressions for the original exact-SHA path. The existing
+`test_release_*.py` discovery includes it in CI. These tests are written for
+CI/cloud execution and are not run on the Mac; local validation is limited to
+Python compilation and `git diff --check` (plus YAML parsing if a workflow
+changes).
 No test suite, Docker runtime/build, live dispatch, publication, token mint,
 credential read or deployment is needed on the Mac to implement this lane.
