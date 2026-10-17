@@ -273,7 +273,7 @@ jobs:
       # Keep target and arguments identical to the push steps; the cache scope is per architecture and shared with them.
       - name: Inspect release amd64
         if: steps.pair.outputs.target != 'hpo'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -292,7 +292,7 @@ jobs:
 
       - name: Inspect release arm64
         if: steps.pair.outputs.target != 'hpo'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -311,7 +311,7 @@ jobs:
 
       - name: Inspect hpo amd64
         if: steps.pair.outputs.target == 'hpo'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -335,7 +335,7 @@ jobs:
 
       - name: Inspect hpo arm64
         if: steps.pair.outputs.target == 'hpo'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -396,7 +396,7 @@ jobs:
       - name: Build + push (multi-arch)
         id: push_release
         if: steps.pair.outputs.target != 'hpo'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -419,7 +419,7 @@ jobs:
       - name: Build + push hpo (multi-arch)
         id: push_hpo
         if: steps.pair.outputs.target == 'hpo'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
