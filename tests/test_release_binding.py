@@ -591,6 +591,59 @@ class ProducerTests(unittest.TestCase):
         with self.assertRaises(contract.Invalid):
             artifacts.npm(client, pin, inventory)
 
+    def test_package_metadata_normalizes_pep440_prerelease_spellings_and_rejects_mismatches(self):
+        for ver, accepted in (("1.6.1-rc.1", True), ("1.6.1rc1", True), ("1.6.1.rc1", True),
+                              ("1.6.1rc2", False), ("1.6.1-rc.2", False),
+                              ("1.6.2rc1", False), ("1.6.1", False)):
+            with self.subTest(kind="codegen-sdist", version=ver):
+                client = ProducerFixture("1.6.1-rc.1")
+                sdist_url = "https://files.pythonhosted.org/fixture.tar.gz"
+                pypi_url = "https://pypi.org/pypi/pineforge-codegen/1.6.1rc1/json"
+                sdist_files = artifacts.tar_files(client.downloads[sdist_url])
+                sdist_files["pineforge_codegen-fixture/PKG-INFO"] = (
+                    f"Name: pineforge-codegen\nVersion: {ver}\n\n".encode()
+                )
+                sdist = archive(sdist_files)
+                client.downloads[sdist_url] = sdist
+                meta = contract.decode(client.downloads[pypi_url])
+                meta["urls"][0]["digests"]["sha256"] = contract.sha256(sdist)
+                client.downloads[pypi_url] = contract.canonical(meta)
+                if accepted:
+                    artifacts.package_metadata(sdist_files, "pineforge-codegen", "1.6.1rc1")
+                    pin, _ = artifacts.producer(client, "codegen", "1.6.1-rc.1")
+                    self.assertEqual(pin["pypi_version"], "1.6.1rc1")
+                else:
+                    with self.assertRaisesRegex(contract.Invalid, "^package metadata identity differs$"):
+                        artifacts.package_metadata(sdist_files, "pineforge-codegen", "1.6.1rc1")
+                    with self.assertRaisesRegex(contract.Invalid, "^package metadata identity differs$"):
+                        artifacts.producer(client, "codegen", "1.6.1-rc.1")
+            with self.subTest(kind="hpo-wheel", version=ver):
+                client = ProducerFixture("1.6.1-rc.1")
+                wheel_name = "pineforge_hpo-1.6.1rc1-py3-none-any.whl"
+                wheel_url = f"https://github.com/{artifacts.PRODUCERS['hpo']}/releases/download/v1.6.1rc1/{wheel_name}"
+                with zipfile.ZipFile(io.BytesIO(client.downloads[wheel_url])) as zf:
+                    wheel_files = {name: zf.read(name) for name in zf.namelist()}
+                wheel_files["pineforge_hpo-1.6.1rc1.dist-info/METADATA"] = (
+                    f"Name: pineforge-hpo\nVersion: {ver}\n\n".encode()
+                )
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w") as zf:
+                    for name, raw in wheel_files.items():
+                        zf.writestr(name, raw)
+                wheel_raw = buf.getvalue()
+                client.downloads[wheel_url] = wheel_raw
+                wheel_asset = next(a for a in client.releases["hpo"]["assets"] if a["name"] == wheel_name)
+                wheel_asset["digest"] = "sha256:" + contract.sha256(wheel_raw)
+                if accepted:
+                    artifacts.package_metadata(wheel_files, "pineforge-hpo", "1.6.1rc1", wheel=True)
+                    pin, _ = artifacts.producer(client, "hpo", "1.6.1-rc.1")
+                    self.assertEqual(pin["package_version"], "1.6.1rc1")
+                else:
+                    with self.assertRaisesRegex(contract.Invalid, "^package metadata identity differs$"):
+                        artifacts.package_metadata(wheel_files, "pineforge-hpo", "1.6.1rc1", wheel=True)
+                    with self.assertRaisesRegex(contract.Invalid, "^package metadata identity differs$"):
+                        artifacts.producer(client, "hpo", "1.6.1-rc.1")
+
 
 class ReconciliationTests(unittest.TestCase):
     def client(self):
