@@ -133,7 +133,7 @@ jobs:
             --file "$RUNNER_TEMP/delivery.json"
       - name: Preserve this delivery attempt
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-delivery-${{ matrix.consumer }}-${{ matrix.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/delivery.json

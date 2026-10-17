@@ -94,7 +94,7 @@ jobs:
             --receipt "$RUNNER_TEMP/descriptions-audit/receipt.json"
       - name: Preserve the public receipt even when reconciliation fails
         if: ${{ !cancelled() && steps.source.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: descriptions-audit-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/descriptions-audit/receipt.json

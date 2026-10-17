@@ -83,7 +83,7 @@ jobs:
             --mint-outcome "$MINT_OUTCOME" --receipt "$RUNNER_TEMP/fanout-audit/dispatch.json"
       - name: Preserve neutral consumer receipts
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fanout-audit-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fanout-audit/*.json
@@ -152,7 +152,7 @@ jobs:
             --mint-outcome "$MINT_OUTCOME" --receipt "$RUNNER_TEMP/fanout-audit/dispatch.json"
       - name: Preserve neutral consumer receipts
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fanout-audit-license-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fanout-audit/*.json
