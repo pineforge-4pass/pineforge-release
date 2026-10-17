@@ -264,8 +264,9 @@ jobs:
         run: |
           set -euo pipefail
           ver="$(tr -d '[:space:]' < VERSION)"
+          # gh refuses --slurp together with --jq, so jq reads the slurped pages.
           candidate="$(gh api --paginate --slurp repos/pineforge-4pass/pineforge-release/releases \
-            --jq "any(.[][]; .tag_name == \"v${ver}\" and any(.assets[]; .name == \"release-candidate.json\"))")"
+            | jq -r --arg tag "v${ver}" 'any(.[][]; .tag_name == $tag and any(.assets[]; .name == "release-candidate.json"))')"
           img="ghcr.io/pineforge-4pass/pineforge-release:${ver}"
           image=false
           if [ "$candidate" != true ] && docker manifest inspect "$img" >/dev/null 2>&1; then image=true; fi
