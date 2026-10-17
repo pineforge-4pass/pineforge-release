@@ -283,6 +283,11 @@ def gh(argv):
         hostname = (opts.get("--hostname") or ["github.com"])[-1]
         supported = {"-f", "-F", "--field", "--raw-field", "-q", "--jq", "-X", "--method",
                      "-H", "--header", "--hostname"}
+        if "--slurp" in flags and (opts.get("-q") or opts.get("--jq")):
+            # Real gh: "the `--slurp` option is not supported with `--jq` or `--template`".
+            record(tool="gh", unsupported=argv)
+            say("gh", "the `--slurp` option is not supported with `--jq` or `--template`")
+            return 1
         if hostname != "github.com" or set(flags) - {"--paginate", "--slurp"} or len(pos) != 1 or set(opts) - supported:
             record(tool="gh", unsupported=argv)
             say("gh", "unsupported api hostname or arguments")
