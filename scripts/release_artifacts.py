@@ -83,7 +83,9 @@ class Client:
         require(parsed.scheme == "https" and parsed.netloc in origins and not parsed.username,
                 "unexpected artifact origin")
         # Downloads never receive the GitHub credential, including redirects.
-        return self.request(url)
+        # Nor GitHub's media type: registry.npmjs.org answers 406 to
+        # `Accept: application/vnd.github+json` (hub v1.6.0 readiness, run 38995200706).
+        return self.request(url, accept="*/*")
 
     def tag_commit(self, repo, tag):
         match(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc)\.[0-9]+|(?:a|b|rc)[0-9]+)?", tag)
