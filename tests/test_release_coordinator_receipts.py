@@ -121,6 +121,34 @@ class ReceiptFixture:
 
 
 class HostedCoordinatorReceiptTests(unittest.TestCase):
+    def test_artifact_zip_downloads_use_default_github_accept_not_octet_stream(self):
+        f = ReceiptFixture()
+        packed = io.BytesIO()
+        with zipfile.ZipFile(packed, "w") as zipped:
+            zipped.writestr("release-receipt.json", contract.canonical(f.receipt))
+        receipt_zip = packed.getvalue()
+        receipt_url = f"https://api.github.com/repos/{f.repo}/actions/artifacts/701/zip"
+        f.responses[f"repos/{f.repo}/actions/runs/{f.reporting_run['id']}/artifacts?per_page=100&page=1"] = {
+            "artifacts": [{"id": 701, "name": f.policy["artifact"], "expired": False,
+                           "digest": "sha256:" + contract.sha256(receipt_zip)}]}
+        zips = {receipt_url: receipt_zip, f.binding_url: f.archive}
+
+        def request(url, *, github=False, accept=None, **kwargs):
+            if not re.search(r"/actions/artifacts/\d+/zip$", url) or not github or kwargs:
+                raise AssertionError("unexpected fixture download")
+            if accept == "application/octet-stream":
+                raise contract.Invalid("artifact request failed (HTTP 415)")
+            f.downloads.append(url)
+            return zips[url]
+
+        f.request = request
+        with self.subTest(call="fetch_artifact"):
+            self.assertEqual(receipts.fetch_artifact(f, f.repo, f.reporting_run, f.policy), f.receipt)
+        with self.subTest(call="check_coordinator"):
+            run = receipts.check_coordinator(f, f.repo, f.receipt["e2e"], f.policy["e2e"], f.pr, f.receipt["ci"])
+            self.assertEqual(run["id"], f.runs["e2e"]["id"])
+        self.assertEqual(f.downloads, [receipt_url, f.binding_url])
+
     def test_truthful_hosted_receipt_at_each_gated_state_is_accepted(self):
         for state in ("ready", "merged", "deploying", "verified"):
             with self.subTest(state=state):
