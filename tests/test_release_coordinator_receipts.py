@@ -111,7 +111,7 @@ class ReceiptFixture:
         return copy.deepcopy(self.responses[route])
 
     def request(self, url, **kwargs):
-        if url != self.binding_url or kwargs != {"github": True, "accept": "application/octet-stream"}:
+        if url != self.binding_url or kwargs != {"github": True}:
             raise AssertionError("unexpected fixture download")
         self.downloads.append(url)
         return self.archive
