@@ -110,8 +110,9 @@ def check_coordinator(client, repo, evidence, policy, pr, ci):
     found = [a for a in artifacts if a["name"] == name and not a["expired"]]
     require(len(found) == 1, "missing/ambiguous coordinator binding")
     positive(found[0]["id"])
+    # GitHub 415s application/octet-stream on the artifact zip endpoint; release assets need it, artifacts must not use it (incident #61).
     archive = client.request(f"https://api.github.com/repos/{repo}/actions/artifacts/{found[0]['id']}/zip",
-                             github=True, accept="application/octet-stream")
+                             github=True)
     require(len(archive) <= 2 * 1024 * 1024, "binding archive too large")
     require(found[0].get("digest") == "sha256:" + sha256(archive), "binding archive digest missing or differs")
     with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
@@ -271,8 +272,9 @@ def fetch_artifact(client, repo, run, policy):
     if not found:
         return None
     require(len(found) == 1, "ambiguous consumer receipt artifact")
+    # GitHub 415s application/octet-stream on the artifact zip endpoint; release assets need it, artifacts must not use it (incident #61).
     archive = client.request(f"https://api.github.com/repos/{repo}/actions/artifacts/{found[0]['id']}/zip",
-                             github=True, accept="application/octet-stream")
+                             github=True)
     if found[0].get("digest"):
         require(found[0]["digest"] == "sha256:" + sha256(archive), "receipt archive digest differs")
     with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
