@@ -38,11 +38,11 @@ jobs:
       FACTS_DESCRIPTIONS_APPLY_ENABLED: ${{ vars.FACTS_DESCRIPTIONS_APPLY_ENABLED }}
       DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || vars.FACTS_DESCRIPTIONS_APPLY_ENABLED != 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: python3 -m pip install -r facts/requirements-validation.txt
@@ -73,7 +73,7 @@ jobs:
           steps.setup.outputs.state == 'ready'
         # Preserve the failed outcome for a report; reconcile must return failure for any mint failure.
         continue-on-error: true
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.DESCRIPTIONS_APP_ID }}
           private-key: ${{ secrets.DESCRIPTIONS_APP_PRIVATE_KEY }}
@@ -94,7 +94,7 @@ jobs:
             --receipt "$RUNNER_TEMP/descriptions-audit/receipt.json"
       - name: Preserve the public receipt even when reconciliation fails
         if: ${{ !cancelled() && steps.source.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: descriptions-audit-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/descriptions-audit/receipt.json
