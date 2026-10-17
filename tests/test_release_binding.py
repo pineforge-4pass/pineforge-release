@@ -593,6 +593,7 @@ class ProducerTests(unittest.TestCase):
 
     def test_package_metadata_normalizes_pep440_prerelease_spellings_and_rejects_mismatches(self):
         for ver, accepted in (("1.6.1-rc.1", True), ("1.6.1rc1", True), ("1.6.1.rc1", True),
+                              ("1.6.1rc2", False), ("1.6.1-rc.2", False),
                               ("1.6.2rc1", False), ("1.6.1", False)):
             with self.subTest(kind="codegen-sdist", version=ver):
                 client = ProducerFixture("1.6.1-rc.1")
