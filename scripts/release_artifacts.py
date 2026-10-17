@@ -7,6 +7,7 @@ from email.parser import BytesParser
 import hashlib
 import io
 import os
+import re
 import subprocess
 import tarfile
 import urllib.error
@@ -167,6 +168,20 @@ def package_sources(files, package):
     return result
 
 
+def _pep440(version):
+    if not isinstance(version, str) or version.startswith("v"):
+        return None
+    normalized = re.sub(
+        r"[._-]?(alpha|beta|rc|a|b)[._-]?(0|[1-9][0-9]*)\Z",
+        lambda m: f"{pair._PEP440_PRE.get(m.group(1), m.group(1))}{m.group(2)}",
+        version,
+    )
+    try:
+        return pair.parse(pair.hpo_version(normalized, to_semver=True)).pep440
+    except ValueError:
+        return None
+
+
 def package_metadata(files, name, version, *, wheel=False):
     if wheel:
         metadata = [raw for path, raw in files.items() if path.endswith(".dist-info/METADATA")]
@@ -174,8 +189,12 @@ def package_metadata(files, name, version, *, wheel=False):
         metadata = [raw for path, raw in files.items() if path.count("/") == 1 and path.endswith("/PKG-INFO")]
     require(len(metadata) == 1, "ambiguous package metadata")
     parsed = BytesParser().parsebytes(metadata[0])
+    actual = parsed["Version"]
+    expected = _pep440(version)
     require(isinstance(parsed["Name"], str) and parsed["Name"].replace("_", "-").lower() == name
-            and parsed["Version"] == version, "package metadata identity differs")
+            and isinstance(actual, str)
+            and (actual == version or (expected is not None and _pep440(actual) == expected)),
+            "package metadata identity differs")
 
 
 def source_matches(client, component, commit, sources, native=None):
