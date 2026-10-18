@@ -71,3 +71,32 @@ The report and `DONE` marker form a separate documentation commit.
 Verification was limited to reading files, comparing text, and inspecting Git diffs and history. The 13 expressions were compared against the source fragment after removing the four spaces required by job nesting; all matched. All 13 `PF_CI_LABELS` values matched, no duplicate job `env` blocks were found, and six original `ubuntu-latest` jobs remained. Git comparison confirmed that both Dependabot workflows and `.github/dependabot.yml` are unchanged. `git diff --check ee31da1342f594cb565c1a86fe604cbef8514757 HEAD` passed for the workflow commits. Each workflow commit contains exactly one workflow file.
 
 No builds, tests, workflow executions, repository scripts, dependency installs, or commit hooks were run. Nothing was pushed.
+
+## Fix round 1
+
+Re-read `git -C ~/code/pf-ci-spot show origin/main:workflows/public.yml` with `origin/main` at `1fe46216757d3f2733272f61320981f9fb215e42`, following bulletins #614/#615. This section supersedes the initial report's fragment version; the job inventory and hosted exceptions above remain unchanged.
+
+Every one of the 13 previously migrated `runs-on` expressions now matches that fragment verbatim, apart from the indentation required to nest it under a job. Before -> after: public fragment `908569dc` -> public fragment `1fe46216`. Each expression gained exactly this line immediately after the `pull_request_target` condition:
+
+```yaml
+      github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+```
+
+Either actor being Dependabot now selects the existing `ubuntu-latest` fallback.
+
+| Workflow | Jobs updated |
+| --- | --- |
+| `facts-descriptions.yml` | `descriptions` |
+| `facts-fanout.yml` | `web`, `license` |
+| `handle-upstream.yml` | `bump` |
+| `publish.yml` | `prepare`, `publish`, `failure-report` |
+| `release-finalize.yml` | `finalize`, `notify-consumers` |
+| `release-receipts.yml` | `plan`, `verify` |
+| `release-reconcile.yml` | `producers` |
+| `release-rollback.yml` | `restore` |
+
+All 13 job-level `PF_CI_LABELS` values remain unchanged and match the fragment. Both Dependabot workflows and their six hosted jobs remain unchanged. Steps, timeouts, matrices, triggers, and other workflow settings are unchanged. No files were deleted.
+
+Read-only text comparison confirmed 13 exact fragment matches, 13 exact label values, six unchanged hosted jobs, and no duplicate job `env` blocks. The workflow diff consists of exactly 13 added guard lines. `git diff --check` passed. No builds, tests, workflow executions, repository scripts, dependency installs, or commit hooks were run. Nothing was pushed.
+
+The fix is recorded in one commit with subject `ci: track pf-ci-spot fragment 1fe46216 (dependabot stays hosted)`. The lane had no file named `REPORT.md`, so `releaseRTDIR/REPORT.md` was added alongside this preserved report, and `releaseRTDIR/DONE2` marks completion of this round.

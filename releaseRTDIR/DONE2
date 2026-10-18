@@ -1,0 +1,3 @@
+Fix round 1 complete: all 13 migrated runs-on expressions match pf-ci-spot public.yml at 1fe46216.
+Reports: REPORT.md and releaseRT.md.
+No builds, tests, or workflow runs. Nothing pushed.
