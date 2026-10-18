@@ -101,7 +101,11 @@ class Client:
             if error.code == 404:
                 raise Pending("published artifact unavailable") from None
             if registry_read:
-                codes = registry_error_codes(error.read(64 * 1024))
+                try:
+                    body = error.read(64 * 1024)
+                except Exception:
+                    body = b""  # The known HTTP status still determines failure classification.
+                codes = registry_error_codes(body)
                 if error.code in (401, 403) or codes:
                     raise RegistryReadError(status=error.code, codes=codes) from None
             raise Invalid(f"artifact request failed (HTTP {error.code})") from None

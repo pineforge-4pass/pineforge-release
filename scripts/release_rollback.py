@@ -30,7 +30,7 @@ def rollback(client, store, registry, tag):
                 failures.append(label + ": no prior good identity; operator repair required (deletion is forbidden)")
         except (Invalid, Pending) as error:
             failures.append(label + ": " + str(error))
-        except (ValueError, KeyError, TypeError, OSError):
+        except Exception:
             failures.append(label + ": alias restoration failed; inspect workflow evidence")
     report_issue(client, row["tag_name"], release_incident_title(event["release_version"], "rejected / rollback"),
                  "Fan-out stopped. Restoration of recorded moving aliases was attempted on both image names; "

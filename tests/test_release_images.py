@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import base64
+import http.client
 import io
 import json
 import os
@@ -67,6 +68,17 @@ class RegistryTransport(pipeline.Registry):
         return b""
 
 
+class UnreadableBody(io.BytesIO):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+        self.read_calls = 0
+
+    def read(self, *args):
+        self.read_calls += 1
+        raise self.error
+
+
 class RegistryHTTPTransport:
     """HTTP and copy boundaries only; Client.request/Registry.raw remain real."""
 
@@ -94,9 +106,10 @@ class RegistryHTTPTransport:
         fault = (self.after if copied else self.before).get((repository, endpoint))
         if fault is not None:
             status, body = fault
+            stream = body if hasattr(body, "read") else io.BytesIO(body)
             if status == 200:
-                return io.BytesIO(body)
-            raise urllib.error.HTTPError(request.full_url, status, "registry response", {}, io.BytesIO(body))
+                return stream
+            raise urllib.error.HTTPError(request.full_url, status, "registry response", {}, stream)
         if endpoint == "token":
             return io.BytesIO(contract.canonical({} if repository in self.tokenless else {"token": "test-pull"}))
         try:
@@ -120,6 +133,71 @@ class FirstRegistryCopyTests(unittest.TestCase):
 
     def denied(self, status=403, code="DENIED"):
         return status, contract.canonical({"errors": [{"code": code}]})
+
+    def test_error_body_read_failures_preserve_http_status_classification(self):
+        for status in (401, 403, 500):
+            for error in (TimeoutError("error body timeout"), ConnectionResetError("error body reset"),
+                          http.client.IncompleteRead(b"partial error body")):
+                with self.subTest(status=status, error=type(error).__name__):
+                    body = UnreadableBody(error)
+                    self.transport.before[contract.IMAGE, "manifest"] = status, body
+                    expected = artifacts.RegistryReadError if status in (401, 403) else contract.Invalid
+                    with self.assertRaises(expected) as caught:
+                        self.registry.digest(self.tag)
+                    self.assertEqual(body.read_calls, 1)
+                    if status in (401, 403):
+                        self.assertEqual(caught.exception.status, status)
+                    else:
+                        self.assertIs(type(caught.exception), contract.Invalid)
+                        self.assertIn("HTTP 500", str(caught.exception))
+                    self.assertEqual(self.transport.storage.calls, [])
+
+    def test_incomplete_denial_body_before_copy_does_not_weaken_post_copy_reads(self):
+        before = UnreadableBody(http.client.IncompleteRead(b"before"))
+        after = UnreadableBody(http.client.IncompleteRead(b"after"))
+        self.transport.before[self.new, "manifest"] = 403, before
+        self.transport.after[self.new, "manifest"] = 403, after
+        with self.assertRaises(artifacts.RegistryReadError):
+            self.registry.mirror_candidate(self.tag, self.digest)
+        self.assertEqual(before.read_calls, 1)
+        self.assertEqual(after.read_calls, 1)
+        self.assertEqual(len(self.transport.storage.calls), 1)
+
+    def test_rollback_files_incident_and_exits_nonzero_when_body_reads_raise_incomplete_read(self):
+        for status in (500, 200):
+            with self.subTest(status=status):
+                manifest = fixture_manifest()
+                manifest["image"]["digest"] = self.digest
+                client, store = FinalizeClient(manifest), MemoryStore(manifest)
+                row = store.get("v1.6.0")
+                store.put(row, contract.ASSET, contract.canonical(manifest))
+                previous_raw = contract.canonical({"release": "previous body-read test target"})
+                previous = self.transport.storage.seed(contract.IMAGE, "previous", previous_raw)
+                for alias in ("latest", "1.6"):
+                    self.transport.storage.seed(contract.IMAGE, alias, self.raw)
+                store.put(row, "release-aliases-before.json",
+                          contract.canonical({"latest": previous, "1.6": previous}))
+                body = UnreadableBody(http.client.IncompleteRead(b"partial response"))
+                self.transport.before[contract.IMAGE, "manifest"] = status, body
+                reports = []
+
+                def report(client, key, title, text):
+                    reports.append(text)
+
+                # A 500 exercises the guarded error-body read; a broken 200
+                # exercises the alias loop's catch for an unexpected Exception.
+                with patch.dict(os.environ, {"GITHUB_RUN_ID": "99"}), \
+                        patch.object(rollback, "Client", return_value=client), \
+                        patch.object(rollback, "Store", return_value=store), \
+                        patch.object(rollback, "Registry", return_value=self.registry), \
+                        patch.object(rollback, "report_issue", side_effect=report), \
+                        patch.object(sys, "argv", ["release_rollback.py", "--tag", "v1.6.0"]):
+                    self.assertEqual(rollback.main(), 1)
+                self.assertEqual(body.read_calls, 2)
+                self.assertEqual(len(reports), 1)
+                for alias in ("latest", "1.6"):
+                    self.assertIn("- " + alias + ":", reports[0])
+                self.assertEqual(self.transport.storage.calls, [])
 
     def test_new_name_denied_before_copy_is_absent_only_after_old_tag_read_succeeds(self):
         for endpoint, status in (("token", 401), ("token", 403), ("manifest", 403)):
