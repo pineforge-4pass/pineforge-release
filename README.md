@@ -266,7 +266,8 @@ The set id hashes sorted unique `source<TAB>version` lines with a final newline.
 The separate box run fetches the real sources; the owner attaches them to a
 holding release. Add registry rows only after those real list
 files and their source assets are available. The registry records the 11 EN-150
-source sets and the earliest release holding each bundle.
+source sets, set-12 (`linux` 6.1.190-1 from bookworm-security, first in 1.6.1; its
+other 83 sources are set-02's) and the earliest release holding each bundle.
 A new source set (an image package set not yet in docker/SOURCE-SETS.tsv) needs
 its bundle attached to an earlier or dedicated release before its first publish,
 because the guard looks up the holding release by tag before the new tag's
