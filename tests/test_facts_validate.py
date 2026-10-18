@@ -31,10 +31,17 @@ class FactsValidationCLI(unittest.TestCase):
         repository_schema = schema["$defs"]["image"]["properties"]["repository"]
         repository_validator = Draft202012Validator(repository_schema)
         self.assertEqual(repository_schema["enum"], list(contract.IMAGES))
+        names_schema = schema["$defs"]["image"]["properties"]["repositories"]
+        names_validator = Draft202012Validator(names_schema)
+        self.assertEqual(names_schema["items"]["enum"], list(contract.IMAGES))
+        names_validator.validate(list(contract.IMAGES))
         for repository in contract.IMAGES:
             repository_validator.validate(repository)
+            names_validator.validate([repository])
         with self.assertRaises(ValidationError):
             repository_validator.validate("ghcr.io/unrelated/image")
+        with self.assertRaises(ValidationError):
+            names_validator.validate([contract.IMAGE, "ghcr.io/unrelated/image"])
         manifest_raw = (ROOT / "tests/fixtures/release-manifest.json").read_bytes()
         paths = [FACTS, *sorted((ROOT / "tests/fixtures").glob("*.json"))]
         for path in paths:
@@ -54,6 +61,8 @@ class FactsValidationCLI(unittest.TestCase):
                     else:
                         contract.payload(raw)
                     repository_validator.validate(document["image"]["repository"])
+                    if "repositories" in document["image"]:
+                        names_validator.validate(document["image"]["repositories"])
                 else:
                     self.fail("committed fixture has no applicable schema validator")
                 self.assertEqual(path.read_bytes(), raw)

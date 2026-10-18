@@ -121,7 +121,13 @@
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": {"type": "string"}
+          "items": {
+            "type": "string",
+            "enum": [
+              "ghcr.io/pineforge-4pass/pineforge-release",
+              "ghcr.io/pineforge-4pass/tunaxis-release"
+            ]
+          }
         },
         "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
       }
