@@ -499,13 +499,51 @@ class DescriptionWorkflows(unittest.TestCase):
         self.assertIn("failure() && !cancelled()", text)
         self.assertNotIn("gh repo edit", text)
 
+    def _assert_pr_validation_triggers(self, text):
+        import yaml
+
+        # BaseLoader preserves the literal `on` key instead of treating it as a YAML 1.1 boolean.
+        triggers = yaml.load(text, Loader=yaml.BaseLoader)["on"]
+        if isinstance(triggers, dict):
+            triggers = triggers.keys()
+        elif isinstance(triggers, str):
+            triggers = [triggers]
+        self.assertNotIn("pull_request_target", triggers)
+        self.assertIn("pull_request", triggers)
+
+    def test_pr_trigger_guard_ignores_runner_conditions_in_all_on_forms(self):
+        runner = (
+            "jobs:\n"
+            "  validate:\n"
+            "    runs-on: >-\n"
+            "      ${{ github.event_name != 'pull_request_target' && 'ubuntu-latest' }}\n"
+        )
+        for declaration in (
+            "on:\n  pull_request:\n  push:\n",
+            "on:\n  pull_request:\n    paths: [pull_request_target]\n",
+            "on: [pull_request, push]\n",
+            "on: pull_request\n",
+        ):
+            with self.subTest(on=declaration):
+                self._assert_pr_validation_triggers(declaration + runner)
+
+    def test_pr_trigger_guard_rejects_pull_request_target_in_all_on_forms(self):
+        for declaration in (
+            "on:\n  pull_request:\n  pull_request_target:\n    types: [opened]\n",
+            "on: [pull_request, pull_request_target]\n",
+            "on: pull_request_target\n",
+        ):
+            with self.subTest(on=declaration):
+                with self.assertRaisesRegex(AssertionError, "pull_request_target"):
+                    self._assert_pr_validation_triggers(declaration + "jobs: {}\n")
+
     def test_pr_validation_has_no_credentials_and_runs_actual_render_acceptance(self):
         workflows = REPO / ".github/workflows"
         for name in ("facts-validate.yml", "python-test.yml"):
             text = (workflows / name).read_text()
-            self.assertIn("pull_request:", text)
+            self._assert_pr_validation_triggers(text)
             self.assertIn("contents: read", text)
-            for forbidden in ("pull_request_target", "secrets.", "create-github-app-token", ": write"):
+            for forbidden in ("secrets.", "create-github-app-token", ": write"):
                 self.assertNotIn(forbidden, text)
         text = (workflows / "facts-validate.yml").read_text()
         for needed in ("facts/**", "scripts/facts_*.py", "tests/test_facts_*.py", ".github/workflows/**",
