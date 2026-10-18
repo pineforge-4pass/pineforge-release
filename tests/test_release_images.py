@@ -69,14 +69,29 @@ class RegistryTransport(pipeline.Registry):
 
 
 class UnreadableBody(io.BytesIO):
-    def __init__(self, error):
+    def __init__(self, error, tracker=None):
         super().__init__()
         self.error = error
         self.read_calls = 0
+        self.tracker = tracker
 
     def read(self, *args):
         self.read_calls += 1
+        if self.tracker is not None:
+            self.tracker.read_calls += 1
         raise self.error
+
+
+class UnreadableBodyFactory:
+    def __init__(self, error_factory):
+        self.error_factory = error_factory
+        self.read_calls = 0
+        self.bodies = []
+
+    def __call__(self):
+        body = UnreadableBody(self.error_factory(), tracker=self)
+        self.bodies.append(body)
+        return body
 
 
 class RegistryHTTPTransport:
@@ -106,6 +121,8 @@ class RegistryHTTPTransport:
         fault = (self.after if copied else self.before).get((repository, endpoint))
         if fault is not None:
             status, body = fault
+            if callable(body):
+                body = body()
             stream = body if hasattr(body, "read") else io.BytesIO(body)
             if status == 200:
                 return stream
@@ -177,7 +194,7 @@ class FirstRegistryCopyTests(unittest.TestCase):
                     self.transport.storage.seed(contract.IMAGE, alias, self.raw)
                 store.put(row, "release-aliases-before.json",
                           contract.canonical({"latest": previous, "1.6": previous}))
-                body = UnreadableBody(http.client.IncompleteRead(b"partial response"))
+                body = UnreadableBodyFactory(lambda: http.client.IncompleteRead(b"partial response"))
                 self.transport.before[contract.IMAGE, "manifest"] = status, body
                 reports = []
 
@@ -194,9 +211,13 @@ class FirstRegistryCopyTests(unittest.TestCase):
                         patch.object(sys, "argv", ["release_rollback.py", "--tag", "v1.6.0"]):
                     self.assertEqual(rollback.main(), 1)
                 self.assertEqual(body.read_calls, 2)
+                self.assertEqual(len(body.bodies), 2)
+                self.assertIsNot(body.bodies[0], body.bodies[1])
                 self.assertEqual(len(reports), 1)
                 for alias in ("latest", "1.6"):
                     self.assertIn("- " + alias + ":", reports[0])
+                    if status == 500:
+                        self.assertIn("- " + alias + ": artifact request failed (HTTP 500)", reports[0])
                 self.assertEqual(self.transport.storage.calls, [])
 
     def test_new_name_denied_before_copy_is_absent_only_after_old_tag_read_succeeds(self):
