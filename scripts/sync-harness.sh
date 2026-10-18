@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Sync the engine's runtime harness into docker/ from the pineforge-engine tag that this release
-# pins, and record the sha256 of every synced file in docker/HARNESS-SHA256SUMS (the image build
+# Sync the engine's seven runtime Python files into docker/ from its pinned tag.
+# Retain the hub entrypoint (Tunaxis messages and codegen import compatibility),
+# and record the sha256 of all eight files in docker/HARNESS-SHA256SUMS (the image build
 # checks the installed files against it).
 # usage: scripts/sync-harness.sh <engine-version e.g. 1.5.0>
 #        scripts/sync-harness.sh --files    print the files a sync writes, one per line (no network)
@@ -10,7 +11,7 @@
 # release workflows never set it, so a release always syncs from its pinned tag.
 set -euo pipefail
 
-# The ONE list of the harness files, sorted: the entrypoint and every file it runs or imports.
+# The ONE list of installed harness files, sorted: hub entrypoint and engine Python files.
 # The Dockerfile installs exactly these; tests/test_release_workflows.py holds the two together.
 FILES=(
   bind_compiled_inventory.py
@@ -38,6 +39,10 @@ BASE="https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/${REF}/
   || { echo "ERROR: FILES must be sorted and without repeats" >&2; exit 1; }
 
 for f in "${FILES[@]}"; do
+  if [ "$f" = entrypoint.sh ]; then
+    [ -s "docker/${f}" ] || { echo "ERROR: hub entrypoint is missing" >&2; exit 1; }
+    continue
+  fi
   curl -fsSL "${BASE}/${f}" -o "docker/${f}"
   [ -s "docker/${f}" ] || { echo "ERROR: docker/${f} came back empty from pineforge-engine ${REF}" >&2; exit 1; }
 done

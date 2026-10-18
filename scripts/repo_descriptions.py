@@ -250,7 +250,7 @@ def main(argv=None):
             print(json.dumps(document, indent=2, ensure_ascii=True, sort_keys=True))
         return exit_code
     except (InputError, OSError, ValueError, KeyError, TypeError, RecursionError, OverflowError) as error:
-        print(f"repo-descriptions: {error}", file=sys.stderr)
+        print(f"Tunaxis repo-descriptions: {error}", file=sys.stderr)
         return 2
 
 

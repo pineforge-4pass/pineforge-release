@@ -333,6 +333,35 @@ def _restore_original_doc_cleanup(text: str) -> str:
     return "".join(lines)
 
 
+def _restore_pre_tunaxis_runtime(text: str) -> str:
+    """Normalize only approved OCI branding and comments for the historical pin.
+
+    Runtime instructions still compare against the original immutable hash;
+    this cannot hide a new COPY, RUN, environment variable or changed argument.
+    """
+    replacements = (
+        ('LABEL org.opencontainers.image.title="Tunaxis" \\\n'
+         '      org.opencontainers.image.description="Tunaxis (formerly PineForge): PineScript v6 -> deterministic backtest (engine static lib + bundled codegen transpiler)" \\\n'
+         '      org.opencontainers.image.vendor="Tunaxis" \\\n',
+         'LABEL org.opencontainers.image.title="pineforge-release" \\\n'
+         '      org.opencontainers.image.description="Full PineScript v6 -> deterministic backtest (engine static lib + bundled codegen transpiler)" \\\n'),
+        ("# The harness is seven engine Python files plus the hub entrypoint, all eight and nothing\n"
+         "# else: scripts/sync-harness.sh refreshes the Python files and records every sha256 in\n",
+         "# The harness is the engine's runtime files for the pinned engine tag, all eight and nothing\n"
+         "# else: scripts/sync-harness.sh writes them into docker/ and records their sha256 in\n"),
+        ("# Every harness file in the image must match the hub's recorded bytes after\n"
+         "# scripts/sync-harness.sh refreshed the engine files and retained the hub entrypoint.\n"
+         "# The script recorded the sha256 of every installed file in\n",
+         "# Every harness file in the image must be byte for byte the engine's file at the ref that\n"
+         "# scripts/sync-harness.sh synced from: the script recorded the sha256 of each fetched file in\n"),
+    )
+    for current, previous in replacements:
+        if text.count(current) != 1:
+            raise ValueError("expected exactly one approved Tunaxis runtime change")
+        text = text.replace(current, previous, 1)
+    return text
+
+
 def _pinned_packages(stage: DockerStage) -> dict[str, str]:
     packages = {}
     for instruction, body in stage.instructions:
@@ -437,10 +466,11 @@ class DockerfileTargetTest(unittest.TestCase):
     def test_release_stage_matches_original_runtime_without_the_marked_notice(self):
         text = _without_sources_notice(_without_stage_alias(self.named["release"]))
         text = _restore_original_doc_cleanup(text)
+        text = _restore_pre_tunaxis_runtime(text)
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
-                         "after restoring the one /usr/share/doc token and removing the marked "
-                         "notice, release must remain byte for byte the original runtime stage")
+                         "after normalizing approved OCI branding/comments, the doc token and marked "
+                         "notice, runtime instructions must match the original stage")
 
     def test_original_doc_cleanup_normalization_requires_one_exact_line(self):
         text = _without_sources_notice(_without_stage_alias(self.named["release"]))
@@ -463,6 +493,7 @@ class DockerfileTargetTest(unittest.TestCase):
         stripped = _without_sources_notice(text)
         self.assertNotEqual(text, stripped)
         stripped = _restore_original_doc_cleanup(stripped)
+        stripped = _restore_pre_tunaxis_runtime(stripped)
         self.assertNotEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
         self.assertEqual(hashlib.sha256(stripped.encode("utf-8")).hexdigest(),
@@ -493,6 +524,7 @@ class DockerfileTargetTest(unittest.TestCase):
                                "RUN mkdir -p /opt/pineforge/bin /unexpected\n", 1)
         self.assertNotEqual(altered, text)
         normalized = _restore_original_doc_cleanup(_without_sources_notice(altered))
+        normalized = _restore_pre_tunaxis_runtime(normalized)
         self.assertNotEqual(hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
 

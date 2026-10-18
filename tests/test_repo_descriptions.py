@@ -110,6 +110,9 @@ class DescriptionCLI(unittest.TestCase):
         self.assertIn("scoreboard.graded", rows["engine"]["tokens"])
         self.assertIn("inventory.closedScripts", rows["engine"]["tokens"])
         for row in rows.values():
+            self.assertTrue(row["expected"].startswith("Tunaxis (formerly PineForge): "))
+            self.assertEqual(row["expected"].count("formerly PineForge"), 1)
+            self.assertLessEqual(len(row["expected"]), 350)
             for source in row["license_sources"]:
                 self.assertIn("/" + source["commit"] + "/LICENSE", source["url"])
         self.assertEqual(self.invoke("render").stdout, self.invoke("render").stdout)
@@ -118,12 +121,12 @@ class DescriptionCLI(unittest.TestCase):
         # This file is deliberately frozen; canonical promotions must not refresh it.
         rows = {row["role"]: row for row in self.render(facts=FROZEN_FACTS)["repositories"]}
         self.assertEqual(rows["engine"]["expected"],
-                         "Open-source C++17 engine for backtesting and forward execution, with a versioned C ABI; "
-                         "Pine Script v6 runs through code generation. Against TradingView's own trade lists, "
+                         "Tunaxis (formerly PineForge): open-source C++17 backtesting and forward-execution engine; "
+                         "versioned C ABI, Pine Script v6 via codegen. Against TradingView's trade lists, "
                          "all 7,989 graded probes (309 open-corpus strategies, 741 closed-test scripts) grade "
                          "excellent or strong: 7,983 excellent, 6 strong. Apache-2.0.")
         self.assertEqual(rows["corpus"]["expected"],
-                         "Open Pine Script reference corpus and TradingView trade traces. Current graded corpus: "
+                         "Tunaxis (formerly PineForge): open Pine Script reference corpus and TradingView trade traces. Current graded corpus: "
                          "309/309 excellent probes. Historical script inventory (1.0.1): 309 scripts. Apache-2.0.")
         policy = self.policy(lambda value: value["repositories"][0].update(
             template="Release probes: {{facts:releases.1.0.1.scoreboard.graded|int}}; "
@@ -329,7 +332,7 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(hpo["disposition"], "managed")
         self.assertEqual(hpo["tokens"], [])
         self.assertEqual(hpo["expected"],
-                         "Native C++ hyperparameter optimization for PineForge strategies. Source-available under "
+                         "Tunaxis (formerly PineForge): native C++ hyperparameter optimization for strategies. Source-available under "
                          "the PineForge Source License 1.2: free for personal trading and noncommercial use; "
                          "commercial use requires a license shared with codegen.")
         source = hpo["public_source"]

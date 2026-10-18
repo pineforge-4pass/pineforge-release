@@ -15,9 +15,9 @@ from urllib.parse import quote
 
 import release_pair as pair
 from release_artifacts import Client, PRODUCERS, command, npm, producer
-from release_contract import (ASSET, COMMIT, HUB, IMAGE, ROLES, SCHEMA, SHA, Invalid,
+from release_contract import (ASSET, COMMIT, HUB, IMAGE, IMAGES, ROLES, SCHEMA, SHA, Invalid,
                               Pending, bind_facts, canonical, decode, keys, match,
-                              payload, positive, require, sha256, validate, version)
+                              payload, positive, require, same_image, sha256, validate, validate_image, version)
 
 CANDIDATE = "release-candidate.json"
 FACTS_RECEIPTS_TAG = "facts-receipts"
@@ -59,8 +59,8 @@ class Store:
             require(found[0]["draft"], "facts receipt storage must remain draft")
             return found[0]
         return self.client.api(f"repos/{HUB}/releases", method="POST", data={
-            "tag_name": FACTS_RECEIPTS_TAG, "target_commitish": "main", "name": "Facts consumer receipts",
-            "body": "Append-only facts consumer audit storage; never publish as a product release.",
+            "tag_name": FACTS_RECEIPTS_TAG, "target_commitish": "main", "name": "Tunaxis facts consumer receipts",
+            "body": "Tunaxis (formerly PineForge) append-only facts consumer audit storage; never publish as a product release.",
             "draft": True, "prerelease": False, "make_latest": "false"})
 
     def read(self, release, name):
@@ -93,44 +93,103 @@ class Store:
         except Pending:
             self.client.tag_commit(HUB, tag)  # never silently create a tag
             return self.client.api(f"repos/{HUB}/releases", method="POST", data={
-                "tag_name": tag, "name": tag, "body": notes, "draft": True,
+                "tag_name": tag, "name": "Tunaxis " + tag, "body": notes, "draft": True,
                 "prerelease": pair.parse(tag).prerelease, "make_latest": "false"})
 
     def publish(self, release, latest):
         return self.client.api(f"repos/{HUB}/releases/{release['id']}", method="PATCH", data={
+            "name": "Tunaxis " + release["tag_name"],
             "draft": False, "prerelease": pair.parse(release["tag_name"]).prerelease,
             "make_latest": "true" if latest else "false"})
 
 
 class Registry:
-    def raw(self, ref):
+    def __init__(self, runner=None):
+        self.command = runner or command
+
+    def raw(self, ref, *, repository=IMAGE):
         match(r"(?:sha256:[0-9a-f]{64}|[A-Za-z0-9_.-]+)", ref)
-        # Public pull token, never a GitHub credential. Reading the actual OCI
-        # response bytes avoids CLI pretty-printing/newline changes to digests.
-        client = Client(token="")
-        token = decode(client.request("https://ghcr.io/token?service=ghcr.io&scope=repository:" + HUB + ":pull"))["token"]
-        return client.request("https://ghcr.io/v2/" + HUB + "/manifests/" + ref,
+        require(repository in IMAGES, "unexpected image repository")
+        path = repository.removeprefix("ghcr.io/")
+        # Hash the actual OCI response bytes, avoiding CLI newline changes.
+        client = Client()
+        token = client.registry_token(repository)
+        return client.request("https://ghcr.io/v2/" + path + "/manifests/" + ref,
                               accept="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
                               extra_headers={"Authorization": "Bearer " + token})
 
-    def digest(self, tag):
+    def digest(self, tag, *, repository=IMAGE):
         match(r"[A-Za-z0-9_.-]+", tag)
         try:
-            raw = self.raw(tag)
+            raw = self.raw(tag, repository=repository)
         except Pending:
             return None
         decode(raw)
         return "sha256:" + sha256(raw)
 
-    def point(self, tag, digest, *, fixed=False):
+    def digests(self, tag):
+        return {repository: self.digest(tag, repository=repository) for repository in IMAGES}
+
+    def assert_equal(self, tag, expected):
+        match("sha256:" + SHA, expected)
+        require(all(value == expected for value in self.digests(tag).values()),
+                "product image repository digests differ or are missing")
+
+    def alias_digest(self, tag):
+        # Legacy aliases may exist only under the old name. Preserve that one
+        # identity for rollback, but never accept conflicting prior identities.
+        existing = {value for value in self.digests(tag).values() if value is not None}
+        require(len(existing) <= 1, "prior image alias digests differ")
+        return next(iter(existing), None)
+
+    def point(self, tag, digest, *, fixed=False, source=IMAGE):
         match("sha256:" + SHA, digest)
-        current = self.digest(tag)
-        if current == digest:
+        require(source in IMAGES, "unexpected source image repository")
+        current = self.digests(tag)
+        # Preflight BOTH fixed tags before making any registry mutation.
+        require(not fixed or all(value in (None, digest) for value in current.values()),
+                "fixed image identity already exists with a different digest")
+        if all(value == digest for value in current.values()):
             return
-        require(not fixed or current is None, "fixed image identity already exists with a different digest")
-        command("docker", "buildx", "imagetools", "create", "--prefer-index=false", "--tag", IMAGE + ":" + tag,
-                IMAGE + "@" + digest)
-        require(self.digest(tag) == digest, "image alias readback differs")
+        require("sha256:" + sha256(self.raw(digest, repository=source)) == digest,
+                "source image manifest bytes differ")
+        targets = [part for repository in IMAGES for part in ("--tag", repository + ":" + tag)]
+        self.command("docker", "buildx", "imagetools", "create", "--prefer-index=false",
+                     *targets, source + "@" + digest)
+        self.assert_equal(tag, digest)
+
+    def mirror_candidate(self, tag, digest):
+        require(tag.startswith("candidate-"), "expected unique candidate tag")
+        require(self.digest(tag) == digest, "original candidate tag differs from verified digest")
+        self.point(tag, digest, fixed=True)
+        self.assert_equal(tag, digest)
+
+    def restore(self, tag, rejected, previous):
+        match("sha256:" + SHA, rejected)
+        if previous is not None:
+            match("sha256:" + SHA, previous)
+        current = set(self.digests(tag).values())
+        if any(value not in (None, rejected, previous) for value in current):
+            require(rejected not in current and len(current - {None}) <= 1,
+                    "rollback alias partly superseded; operator repair required")
+            return True  # newer release owns it; never move it backward
+        if previous is None:
+            return rejected not in current  # deletion is forbidden
+        source = IMAGE
+        # Historical good manifests may exist only under one name. Verify the
+        # original bytes before selecting a source for restoration.
+        for repository in IMAGES:
+            try:
+                raw = self.raw(previous, repository=repository)
+            except Pending:
+                continue
+            require("sha256:" + sha256(raw) == previous, "rollback source manifest bytes differ")
+            source = repository
+            break
+        else:
+            raise Pending("previous good image manifest unavailable")
+        self.point(tag, previous, source=source)
+        return True
 
 
 def bindings(client, release_version, engine, codegen, hpo, hub_commit):
@@ -154,6 +213,7 @@ def validate_candidate(obj):
     v = version(obj["release_version"])
     match(COMMIT, obj["hub_commit"])
     positive(obj["run_id"])
+    validate_image(obj["image"])
     pins = obj["versions"]
     pair.check(str(v), pins["engine"]["version"], pins["codegen"]["version"], hpo=pins["hpo"]["version"] if pins["hpo"] else "")
     keys(obj["verification"], ("amd64", "arm64"))
@@ -225,12 +285,13 @@ def finalize(client, store, registry, row):
         facts_raw = client.file(HUB, facts_commit, "facts/facts.json")
         facts = bind_facts(facts_raw, facts_commit, str(v), pins)
         manifest = validate({"schema": SCHEMA, "release_version": str(v), "prerelease": v.prerelease,
-                             "hub_commit": candidate["hub_commit"], "versions": pins, "image": candidate["image"],
+                             "hub_commit": candidate["hub_commit"], "versions": pins,
+                             "image": {**candidate["image"], "repositories": list(IMAGES)},
                              "facts": facts, "run_id": candidate["run_id"]})
         raw = canonical(manifest)
         store.put(row, ASSET, raw)
     event = payload(raw)
-    require(event["image"] == candidate["image"] and event["hub_commit"] == candidate["hub_commit"],
+    require(same_image(event["image"], candidate["image"]) and event["hub_commit"] == candidate["hub_commit"],
             "manifest does not bind this candidate")
     for role in ("engine", "codegen", "hpo"):
         expected = candidate["versions"][role]
@@ -239,7 +300,7 @@ def finalize(client, store, registry, row):
             actual = {key: value for key, value in actual.items() if key not in ("npm_version", "npm_integrity")}
         require(actual == expected, "manifest producer identity differs from candidate")
     # An immutable manifest is the commit point. Every step below can replay.
-    registry.point(str(v), event["image"]["digest"], fixed=True)
+    registry.point(str(v), event["image"]["digest"], fixed=True, source=event["image"]["repository"])
     # Preserve the existing fixed alias formats, but only after readiness.
     component_tag = "engine" + event["versions"]["engine"]["version"] + "-codegen" + event["versions"]["codegen"]["version"]
     registry.point(component_tag, event["image"]["digest"], fixed=True)
@@ -251,7 +312,7 @@ def finalize(client, store, registry, row):
     aliases = ("latest", f"{v.major}.{v.minor}") if moving else ()
     before = store.read(row, "release-aliases-before.json")
     if before is None:
-        store.put(row, "release-aliases-before.json", canonical({name: registry.digest(name) for name in aliases}))
+        store.put(row, "release-aliases-before.json", canonical({name: registry.alias_digest(name) for name in aliases}))
     for name in aliases:
         registry.point(name, event["image"]["digest"])
     store.publish(row, moving)
@@ -498,6 +559,10 @@ def main():
     p.add_argument("--hpo", default="")
     p = sub.add_parser("candidate-exists")
     p.add_argument("tag")
+    sub.add_parser("image-config")
+    p = sub.add_parser("mirror-candidate")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--digest", required=True)
     p = sub.add_parser("candidate")
     for field in ("file", "tag", "notes-file", "source-tag", "source-list", "amd64", "arm64"):
         p.add_argument("--" + field, required=True)
@@ -516,7 +581,11 @@ def main():
     client = Client()
     store = Store(client)
     try:
-        if args.cmd == "producer":
+        if args.cmd == "image-config":
+            print("IMAGE=" + IMAGE.removeprefix("ghcr.io/"))
+        elif args.cmd == "mirror-candidate":
+            Registry().mirror_candidate(args.tag, args.digest)
+        elif args.cmd == "producer":
             producer(client, args.component, args.version)
         elif args.cmd == "bindings":
             Path(args.output).write_bytes(canonical(bindings(client, args.release_version, args.engine,
@@ -575,11 +644,11 @@ def main():
         else:
             report_issue(client, args.stage + "-failure", "Release chain: " + args.stage + " failed", run_link())
     except Pending as error:
-        print("::notice::" + str(error), file=sys.stderr)
+        print("::notice::Tunaxis: " + str(error), file=sys.stderr)
         return 3
     except (Invalid, ValueError, OSError, KeyError, TypeError, pair.RuleError):
         # No untrusted API bodies, private target names, paths or credentials.
-        print("::error::release chain operation failed; inspect the neutral incident and workflow run", file=sys.stderr)
+        print("::error::Tunaxis release chain operation failed; inspect the neutral incident and workflow run", file=sys.stderr)
         return 1
     return 0
 

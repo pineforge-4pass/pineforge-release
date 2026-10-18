@@ -267,7 +267,7 @@ jobs:
           # gh refuses --slurp together with --jq, so jq reads the slurped pages.
           candidate="$(gh api --paginate --slurp repos/pineforge-4pass/pineforge-release/releases \
             | jq -r --arg tag "v${ver}" 'any(.[][]; .tag_name == $tag and any(.assets[]; .name == "release-candidate.json"))')"
-          img="ghcr.io/pineforge-4pass/pineforge-release:${ver}"
+          img="$(PYTHONPATH=scripts python3 -c 'from release_contract import IMAGE; print(IMAGE)'):${ver}"
           image=false
           if [ "$candidate" != true ] && docker manifest inspect "$img" >/dev/null 2>&1; then image=true; fi
           # Monotonicity (downgrade) guard on the DISPATCHED component, the 1.0
@@ -310,7 +310,7 @@ jobs:
           event_version="$VER"
           [ "$COMPONENT" != hpo ] || event_version="$HPO_VERSION"
           line="pair pending: ${COMPONENT} ${event_version} recorded, waiting for ${waiting}; the landed pair stays engine ${EPREV} + codegen ${CPREV}${HPREV:+ + hpo ${HPREV}} and nothing is built or published"
-          echo "::notice title=pineforge pair pending::${line}"
+          echo "::notice title=Tunaxis pair pending::${line}"
           printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Re-publish (recover a half-failed prior release)
@@ -337,7 +337,7 @@ jobs:
           git fetch --tags --quiet
           components="engine ${E} + codegen ${C}${H:+ + hpo ${H}}"
           tag_message() {
-            printf 'pineforge-release v%s\n\nengine=%s\ncodegen=%s\n' "$1" "$E" "$C"
+            printf 'Tunaxis (formerly PineForge) v%s\n\nengine=%s\ncodegen=%s\n' "$1" "$E" "$C"
             if [ -n "$H" ]; then printf 'hpo=%s\n' "$H"; fi
           }
           if [ "$RETAG" = true ]; then

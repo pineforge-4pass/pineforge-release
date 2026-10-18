@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# PineForge container entrypoint.
+# Tunaxis container entrypoint (formerly PineForge).
 #
 # Accepts a PineScript v6 strategy (/in/strategy.pine) OR a pre-transpiled
 # translation unit (/in/strategy.cpp). When a .pine is given, it is transpiled
-# locally with the bundled pineforge-codegen (no hosted API, no API key, source
+# locally with the bundled codegen (no hosted API, no API key, source
 # never leaves the container). The TU is then compiled against the prebuilt
 # libpineforge.a and run against the OHLCV at /in/ohlcv.csv; a JSON report is
 # emitted on stdout. Build / compile / transpile logs go to stderr so stdout
@@ -88,6 +88,7 @@
 #   4  backtest failure
 #   5  transpile failure (unsupported Pine construct or syntax error)
 set -euo pipefail
+echo "[Tunaxis] formerly PineForge" >&2
 
 PREFIX="${PINEFORGE_PREFIX:-/opt/pineforge}"
 IN_DIR="${PINEFORGE_IN_DIR:-/in}"
@@ -106,16 +107,21 @@ SO="${WORK}/strategy.so"
 run_transpile() {
     python3 - "$1" "$2" <<'PY'
 import sys
-from pineforge_codegen import transpile
-from pineforge_codegen.errors import CompileError
+from importlib.util import find_spec
+if find_spec("tunaxis_codegen") is not None:
+    from tunaxis_codegen import transpile
+    from tunaxis_codegen.errors import CompileError
+else:
+    from pineforge_codegen import transpile
+    from pineforge_codegen.errors import CompileError
 
 pine, out = sys.argv[1], sys.argv[2]
 try:
     cpp = transpile(open(pine).read(), filename="strategy.pine")
 except CompileError as e:
-    sys.stderr.write(f"[pineforge] transpile error: {e}\n"); sys.exit(5)
+    sys.stderr.write(f"[Tunaxis] transpile error: {e}\n"); sys.exit(5)
 except Exception as e:  # syntax / unexpected — still a transpile failure
-    sys.stderr.write(f"[pineforge] transpile error: {e}\n"); sys.exit(5)
+    sys.stderr.write(f"[Tunaxis] transpile error: {e}\n"); sys.exit(5)
 if out == "-":
     sys.stdout.write(cpp)
 else:
@@ -133,13 +139,18 @@ run_transpile_with_inventory() {
     python3 - "$1" "$2" "$3" <<'PY'
 import json
 import sys
+from importlib.util import find_spec
 
 pine, out, inventory_out = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
-    from pineforge_codegen import transpile_with_request_inventory
-    from pineforge_codegen.errors import CompileError
+    if find_spec("tunaxis_codegen") is not None:
+        from tunaxis_codegen import transpile_with_request_inventory
+        from tunaxis_codegen.errors import CompileError
+    else:
+        from pineforge_codegen import transpile_with_request_inventory
+        from pineforge_codegen.errors import CompileError
 except Exception as e:  # a codegen without the inventory API
-    sys.stderr.write(f"[pineforge] transpile error: no request-feed inventory API: {e}\n"); sys.exit(5)
+    sys.stderr.write(f"[Tunaxis] transpile error: no request-feed inventory API: {e}\n"); sys.exit(5)
 try:
     result = transpile_with_request_inventory(open(pine).read(), filename="strategy.pine")
     cpp = result["cpp"]
@@ -149,16 +160,16 @@ try:
     with open(inventory_out, "w", encoding="utf-8") as handle:
         json.dump(inventory, handle, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
 except CompileError as e:
-    sys.stderr.write(f"[pineforge] transpile error: {e}\n"); sys.exit(5)
+    sys.stderr.write(f"[Tunaxis] transpile error: {e}\n"); sys.exit(5)
 except Exception as e:  # syntax / unexpected — still a transpile failure
-    sys.stderr.write(f"[pineforge] transpile error: {e}\n"); sys.exit(5)
+    sys.stderr.write(f"[Tunaxis] transpile error: {e}\n"); sys.exit(5)
 PY
 }
 
 # --- Transpile-only mode: emit C++ on stdout and exit. ---------------------
 if [[ "${PINEFORGE_TRANSPILE_ONLY:-}" == "1" || "${PINEFORGE_TRANSPILE_ONLY:-}" == "true" ]]; then
     if [[ ! -f "${PINE}" ]]; then
-        echo "error: transpile-only mode needs /in/strategy.pine (mount with -v path/to/strategy.pine:/in/strategy.pine:ro)" >&2
+        echo "[Tunaxis] error: transpile-only mode needs /in/strategy.pine (mount with -v path/to/strategy.pine:/in/strategy.pine:ro)" >&2
         exit 2
     fi
     run_transpile "${PINE}" "-"
@@ -175,7 +186,7 @@ INVENTORY_IN=""
 
 # --- Resolve the translation unit: prefer .pine, fall back to .cpp. --------
 if [[ -f "${PINE}" ]]; then
-    echo "[pineforge] transpiling strategy.pine ..." >&2
+    echo "[Tunaxis] transpiling strategy.pine ..." >&2
     if [[ "${SELECTED}" == "true" ]]; then
         INVENTORY_IN="${WORK}/request_feed_inventory.source.json"
         run_transpile_with_inventory "${PINE}" "${GEN}" "${INVENTORY_IN}"   # set -e aborts (exit 5)
@@ -193,20 +204,20 @@ elif [[ -f "${SRC_CPP}" ]]; then
         # binder and run_json.py's --generated-cpp all use that one file, so the caller's
         # mutable file is read only here. A failed copy ends the run before compile and run.
         cp -- "${SRC_CPP}" "${GEN}" \
-            || { echo "[pineforge] cannot snapshot strategy.cpp into the work dir" >&2; exit 3; }
+            || { echo "[Tunaxis] cannot snapshot strategy.cpp into the work dir" >&2; exit 3; }
         SRC="${GEN}"
     fi
 else
-    echo "error: missing input — mount /in/strategy.pine (preferred) or /in/strategy.cpp" >&2
+    echo "[Tunaxis] error: missing input — mount /in/strategy.pine (preferred) or /in/strategy.cpp" >&2
     exit 2
 fi
 
 if [[ ! -f "${OHLCV}" ]]; then
-    echo "error: missing /in/ohlcv.csv (mount with -v path/to/ohlcv.csv:/in/ohlcv.csv:ro)" >&2
+    echo "[Tunaxis] error: missing /in/ohlcv.csv (mount with -v path/to/ohlcv.csv:/in/ohlcv.csv:ro)" >&2
     exit 2
 fi
 
-echo "[pineforge] compiling strategy.cpp ..." >&2
+echo "[Tunaxis] compiling strategy.cpp ..." >&2
 
 # Same link incantation as tutorial/CMakeLists.txt, condensed:
 # whole-archive forces the c_abi.cpp symbols (pf_version_get,
@@ -221,7 +232,7 @@ g++ -std=c++17 -O2 -ffp-contract=off -fPIC -shared \
     "${SRC}" \
     -Wl,--whole-archive "${PREFIX}/lib/libpineforge.a" -Wl,--no-whole-archive \
     -o "${SO}" \
-    || { echo "[pineforge] compile failed" >&2; exit 3; }
+    || { echo "[Tunaxis] compile failed" >&2; exit 3; }
 
 # --- Selected path: bind the inventory to the C++ and library just built. ---
 # Reached only after g++ linked (a failed link exited 3 above). A refusal ends the
@@ -231,20 +242,20 @@ g++ -std=c++17 -O2 -ffp-contract=off -fPIC -shared \
 BOUND_INVENTORY=""
 if [[ "${SELECTED}" == "true" ]]; then
     if [[ -n "${INVENTORY_IN}" ]]; then
-        echo "[pineforge] binding request-feed inventory ..." >&2
+        echo "[Tunaxis] binding request-feed inventory ..." >&2
         BOUND_INVENTORY="${WORK}/request_feed_inventory.json"
         python3 "${PREFIX}/bin/bind_compiled_inventory.py" \
             --inventory "${INVENTORY_IN}" \
             --cpp "${SRC}" \
             --so "${SO}" \
             --out "${BOUND_INVENTORY}" \
-            || { echo "[pineforge] request-feed inventory binding failed" >&2; exit 3; }
+            || { echo "[Tunaxis] request-feed inventory binding failed" >&2; exit 3; }
     else
-        echo "[pineforge] no request-feed inventory for this strategy.cpp; none is passed on" >&2
+        echo "[Tunaxis] no request-feed inventory for this strategy.cpp; none is passed on" >&2
     fi
 fi
 
-echo "[pineforge] running backtest ..." >&2
+echo "[Tunaxis] running backtest ..." >&2
 
 # Optional per-run knobs (mirror scripts/run_strategy.py). Built conditionally so
 # unset env never passes an empty/invalid flag.
@@ -297,4 +308,4 @@ python3 "${PREFIX}/bin/run_json.py" \
     --generated-cpp     "${SRC}" \
     --transpiled        "${TRANSPILED}" \
     ${extra[@]+"${extra[@]}"} \
-    || { echo "[pineforge] backtest failed" >&2; exit 4; }
+    || { echo "[Tunaxis] backtest failed" >&2; exit 4; }

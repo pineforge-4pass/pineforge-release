@@ -161,7 +161,18 @@ class MemoryRegistry:
     def digest(self, tag):
         return self.tags.get(tag)
 
-    def point(self, tag, digest, fixed=False):
+    def alias_digest(self, tag):
+        return self.digest(tag)
+
+    def restore(self, tag, rejected, previous):
+        if self.digest(tag) != rejected:
+            return True
+        if previous is None:
+            return False
+        self.point(tag, previous)
+        return True
+
+    def point(self, tag, digest, fixed=False, source=contract.IMAGE):
         if fixed:
             contract.require(self.tags.get(tag, digest) == digest, "fixed image changed")
         self.tags[tag] = digest
@@ -191,6 +202,44 @@ class FinalizeClient:
 
 
 class ManifestTests(unittest.TestCase):
+    def test_existing_fixture_bytes_and_ids_validate_without_rewriting(self):
+        from facts_validate import validate_facts
+        hashes = {
+            "release-manifest.json": "12a79d3776c447b1caf9513c96db3407b1d3cd2d71a510081e6763e994c2288e",
+            "release-ready.json": "b2709e7545387bb43a978adabce983ae128d7bee5791fdc0eb912e0fdda05e06",
+            "repo-descriptions-facts.json": "acc0639894780a571be10383eb22b1fbd150f704e1f0ee5d8906ab8d101d4f7b",
+        }
+        before = {path.name: path.read_bytes() for path in (ROOT / "tests/fixtures").glob("*.json")}
+        self.assertEqual(set(before), set(hashes))
+        for name, raw in before.items():
+            self.assertEqual(contract.sha256(raw), hashes[name], name)
+        raw = before["release-manifest.json"]
+        contract.validate_payload(contract.decode(before["release-ready.json"]), raw)
+        validate_facts(contract.decode(before["repo-descriptions-facts.json"]))
+        self.assertEqual(contract.canonical(contract.validate(contract.decode(raw))), raw)
+        for name, raw in before.items():
+            self.assertEqual((ROOT / "tests/fixtures" / name).read_bytes(), raw)
+        schema = contract.decode((ROOT / "facts/facts.schema.json").read_bytes())
+        self.assertEqual(schema["$id"], "https://raw.githubusercontent.com/pineforge-4pass/pineforge-release/main/facts/facts.schema.json")
+        self.assertEqual(schema["properties"]["schema"]["const"], "pineforge/facts/v1")
+        self.assertEqual(set(schema["required"]), {"schema", "scoreboard", "releases", "inventory"})
+
+    def test_both_repository_names_optional_names_and_invalid_name_lists(self):
+        for repository in contract.IMAGES:
+            for names in (None, [repository], list(contract.IMAGES)):
+                obj = fixture_manifest()
+                obj["image"]["repository"] = repository
+                if names is not None:
+                    obj["image"]["repositories"] = names
+                raw = contract.canonical(obj)
+                self.assertEqual(contract.validate_payload(contract.payload(raw), raw)["image"], obj["image"])
+        for names in ([], [contract.IMAGE, contract.IMAGE], ["ghcr.io/unrelated/image"],
+                      [contract.IMAGES[1]], "not-an-array"):
+            obj = fixture_manifest()
+            obj["image"]["repositories"] = names
+            with self.subTest(names=names), self.assertRaises(contract.Invalid):
+                contract.payload(contract.canonical(obj))
+
     def test_section_32_exact_fields_types_and_non_circular_identity(self):
         raw = (ROOT / "tests/fixtures/release-manifest.json").read_bytes()
         event = contract.payload(raw)
@@ -786,6 +835,44 @@ class ReceiptTests(unittest.TestCase):
         self.assertNotIn(b"fixture", raw)
         self.assertNotIn(b"e2e/one", raw)
         self.assertEqual(public["deployed"]["image_digest"], self.event["image"]["digest"])
+        self.assertEqual(public["image"]["repositories"], list(contract.IMAGES))
+
+    def test_receipts_accept_either_image_reference_with_one_matching_digest(self):
+        for repository in contract.IMAGES:
+            manifest = fixture_manifest()
+            manifest["image"].update(repository=repository, repositories=list(contract.IMAGES))
+            self.event = contract.payload(contract.canonical(manifest))
+            self.receipt["event_id"] = self.event["event_id"]
+            for name in ("preview", "deployed", "previous"):
+                self.receipt[name].update(image_digest=repository + "@" + self.event["image"]["digest"],
+                                          image_reference=repository + "@" + self.event["image"]["digest"],
+                                          image_repositories=list(contract.IMAGES))
+            public = self.verify()
+            self.assertEqual(public["image"]["digest"], manifest["image"]["digest"])
+            self.assertEqual(public["image"]["repositories"], list(contract.IMAGES))
+        different = "sha256:" + contract.sha256(contract.canonical({"another": "image"}))
+        self.receipt["deployed"].update(image_digest=contract.IMAGES[1] + "@" + different,
+                                         image_reference=contract.IMAGES[1] + "@" + different)
+        with self.assertRaisesRegex(contract.Invalid, "actual served source/image differs"):
+            self.verify()
+
+    def test_receipt_names_cannot_hide_a_different_reference_or_unrelated_repository(self):
+        for reference in (contract.IMAGES[1] + "@sha256:" + "f" * 64,
+                          "ghcr.io/unrelated/image@" + self.event["image"]["digest"]):
+            self.receipt["preview"]["image_reference"] = reference
+            with self.subTest(reference=reference), self.assertRaises(contract.Invalid):
+                self.verify()
+
+    def test_replaying_an_old_neutral_receipt_keeps_its_original_bytes(self):
+        current = self.verify()
+        previous = {key: value for key, value in current.items() if key != "image"}
+        original = contract.canonical(previous)
+        self.assertFalse(receipts.transition(previous, current))
+        self.assertEqual(contract.canonical(previous), original)
+        changed = copy.deepcopy(current)
+        changed["evidence_sha256"] = contract.sha256(original + b"changed evidence")
+        with self.assertRaises(contract.Invalid):
+            receipts.transition(previous, changed)
 
     def test_example_builder_and_documented_examples_use_the_hub_validator(self):
         self.receipt = receipt_example.build_receipt(self.event)

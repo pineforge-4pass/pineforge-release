@@ -60,6 +60,19 @@ class RuntimeSmokeTests(unittest.TestCase):
                 self.verify()
             setattr(self, field, old)
 
+    def test_runtime_pulls_the_recorded_product_repository_for_either_name(self):
+        for repository in contract.IMAGES:
+            with self.subTest(repository=repository):
+                self.calls.clear()
+                self.m["image"]["repository"] = repository
+                with patch.object(smoke, "command", side_effect=self.command):
+                    proof = self.verify()
+                self.assertEqual(set(proof), {"amd64", "arm64"})
+                for arch in proof:
+                    self.assertTrue(any(call[:2] == ("docker", "pull")
+                                        and repository + "@" + self.m["image"][arch + "_digest"] in call
+                                        for call in self.calls))
+
     def test_index_requires_unique_distinct_architectures_and_matching_original_bytes(self):
         index = {"manifests": [{"digest": self.m["image"][arch + "_digest"], "platform": {"os": "linux", "architecture": arch}}
                                for arch in ("amd64", "arm64")]}

@@ -16,7 +16,7 @@ import urllib.request
 import zipfile
 
 import release_pair as pair
-from release_contract import (COMMIT, Invalid, Pending, canonical, decode,
+from release_contract import (COMMIT, IMAGES, Invalid, Pending, canonical, decode,
                               match, require, sha256)
 
 PRODUCERS = {"engine": "pineforge-4pass/pineforge-engine",
@@ -40,9 +40,12 @@ class Client:
         self.token = os.environ.get("GH_TOKEN", "") if token is None else token
 
     def request(self, url, *, method="GET", data=None, github=False, binary=False, accept=None, extra_headers=None):
-        headers = {"User-Agent": "pineforge-release-reconciler", "Accept": accept or "application/vnd.github+json"}
+        headers = {"User-Agent": "tunaxis-release-reconciler", "Accept": accept or "application/vnd.github+json"}
         if extra_headers:
-            require(url.startswith("https://ghcr.io/v2/"), "unexpected registry origin")
+            allowed = any(url.startswith("https://ghcr.io/v2/" + image.removeprefix("ghcr.io/") + "/manifests/")
+                          or url == "https://ghcr.io/token?service=ghcr.io&scope=repository:"
+                          + image.removeprefix("ghcr.io/") + ":pull" for image in IMAGES)
+            require(allowed, "unexpected registry origin")
             headers.update(extra_headers)
         if github:
             require(url.startswith(("https://api.github.com/", "https://uploads.github.com/")), "unexpected authenticated origin")
@@ -68,6 +71,19 @@ class Client:
 
     def api(self, route, *, method="GET", data=None):
         return decode(self.request("https://api.github.com/" + route, method=method, data=data, github=True) or b"null")
+
+    def registry_token(self, repository):
+        require(repository in IMAGES, "unexpected image repository")
+        path = repository.removeprefix("ghcr.io/")
+        headers = {}
+        # The first push creates a private package. The existing workflow token
+        # can verify it before a package admin makes it public. No local Docker
+        # config or credential files are read, and redirects strip authorization.
+        if self.token:
+            login = os.environ.get("GITHUB_ACTOR", "github-actions") + ":" + self.token
+            headers["Authorization"] = "Basic " + base64.b64encode(login.encode()).decode()
+        return decode(self.request("https://ghcr.io/token?service=ghcr.io&scope=repository:" + path + ":pull",
+                                   extra_headers=headers))["token"]
 
     def pages(self, route):
         result = []

@@ -22,6 +22,34 @@ class FactsValidationCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["sha256"], hashlib.sha256(FACTS.read_bytes()).hexdigest())
 
+    def test_optional_product_images_accept_either_repository_without_changing_legacy_facts(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from release_contract import IMAGES
+        raw = FACTS.read_bytes()
+        canonical = json.loads(raw)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "facts.json"
+            for repository in IMAGES:
+                for names in (None, list(IMAGES)):
+                    obj = copy.deepcopy(canonical)
+                    image = {"repository": repository, "digest": "sha256:" + hashlib.sha256(raw).hexdigest()}
+                    if names is not None:
+                        image["repositories"] = names
+                    obj["image"] = image
+                    obj["releases"][next(iter(obj["releases"]))]["image"] = image
+                    path.write_text(json.dumps(obj))
+                    result = self.invoke(path)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            for image in ({"repository": "ghcr.io/unrelated/image", "digest": "sha256:" + "a" * 64},
+                          {"repository": IMAGES[0], "repositories": [IMAGES[1]], "digest": "sha256:" + "a" * 64},
+                          {"repository": IMAGES[0], "repositories": list(IMAGES) * 2, "digest": "sha256:" + "a" * 64}):
+                obj = copy.deepcopy(canonical)
+                obj["image"] = image
+                path.write_text(json.dumps(obj))
+                result = self.invoke(path)
+                self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(FACTS.read_bytes(), raw)
+
     def test_compared_trade_count_is_one_paired_active_integer_and_optional(self):
         canonical = json.loads(FACTS.read_text())
         score = canonical["scoreboard"]

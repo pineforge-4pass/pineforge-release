@@ -23,13 +23,9 @@ def rollback(client, store, registry, tag):
     incomplete = []
     for alias, good_digest in decode(before).items():
         require(alias == "latest" or alias == ".".join(event["release_version"].split(".")[:2]), "unexpected rollback alias")
-        if registry.digest(alias) != event["image"]["digest"]:
-            continue  # already restored or superseded; never move a newer alias
-        if good_digest is None:
+        if not registry.restore(alias, event["image"]["digest"], good_digest):
             incomplete.append(alias)  # deletion is forbidden; no previous good identity exists
-            continue
-        registry.point(alias, good_digest)
-    report_issue(client, row["tag_name"], f"Release {event['release_version']}: rejected / rollback",
+    report_issue(client, row["tag_name"], f"Tunaxis {event['release_version']}: rejected / rollback",
                  "Fan-out stopped. Recorded moving aliases restored where still owned by the rejected release. "
                  + ("No prior good identity exists for one or more aliases; operator repair is required. " if incomplete else "")
                  + "Fixed releases, manifests, candidates, source assets and tags were preserved.\n\n" + run_link())
@@ -44,7 +40,7 @@ def main():
     try:
         rollback(client, Store(client), Registry(), args.tag)
     except (Invalid, Pending, ValueError, KeyError, OSError):
-        print("::error::rollback incomplete; identities preserved; inspect the incident", file=sys.stderr)
+        print("::error::Tunaxis rollback incomplete; identities preserved; inspect the incident", file=sys.stderr)
         return 1
     return 0
 

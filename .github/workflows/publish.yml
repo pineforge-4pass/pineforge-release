@@ -23,7 +23,6 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE: ${{ github.repository }}   # pineforge-4pass/pineforge-release
 
 concurrency:
   group: release-candidate-${{ github.ref_name }}
@@ -67,6 +66,9 @@ jobs:
         with:
           python-version: '3.12'
       - run: python3 -m pip install -r facts/requirements-validation.txt
+
+      - name: Read product image contract
+        run: python3 scripts/release_pipeline.py image-config >> "$GITHUB_ENV"
 
       - name: Assert tag matches VERSION
         env:
@@ -265,6 +267,10 @@ jobs:
           # bundles the transpiler, whose LICENSE from codegen 1.3.0 is the
           # PineForge Source License 1.2 (see README, License).
           labels: |
+            org.opencontainers.image.title=Tunaxis
+            org.opencontainers.image.description=Tunaxis (formerly PineForge): PineScript v6 to deterministic backtest with bundled codegen and optional HPO
+            org.opencontainers.image.vendor=Tunaxis
+            org.opencontainers.image.source=https://github.com/pineforge-4pass/pineforge-release
             org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -503,6 +509,16 @@ jobs:
           python3 scripts/release_smoke.py --bindings "$RUNNER_TEMP/release-bindings.json" \
             --digest "$DIGEST" --output "$RUNNER_TEMP/release-verified.json"
 
+      # The original name is proven before copying the exact index; no second build.
+      - name: Publish verified candidate to both names and assert equal digests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.push_release.outputs.digest || steps.push_hpo.outputs.digest }}
+          CANDIDATE_TAG: candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_pipeline.py mirror-candidate --tag "$CANDIDATE_TAG" --digest "$DIGEST"
+
       # Store the verified candidate as a draft; only the finalizer publishes it.
       - name: GitHub Release
         env:
@@ -517,7 +533,7 @@ jobs:
         run: |
           set -euo pipefail
           components="engine ${E} + codegen ${C}${H:+ + hpo ${H}}"
-          printf 'Combined PineScript -> backtest image.\n\n%s\n\nReadiness requires the immutable release-manifest.json.\n\nDebian sources: [SOURCES.list](https://github.com/pineforge-4pass/pineforge-release/releases/download/%s/%s) and source assets at [release %s](https://github.com/pineforge-4pass/pineforge-release/releases/tag/%s).\n' \
+          printf 'Tunaxis (formerly PineForge): combined PineScript -> backtest image.\n\n%s\n\nReadiness requires the immutable release-manifest.json.\n\nDebian sources: [SOURCES.list](https://github.com/pineforge-4pass/pineforge-release/releases/download/%s/%s) and source assets at [release %s](https://github.com/pineforge-4pass/pineforge-release/releases/tag/%s).\n' \
             "$components" "$SOURCE_TAG" "$SOURCE_LIST" "$SOURCE_TAG" "$SOURCE_TAG" > "$RUNNER_TEMP/release-notes.md"
           python3 scripts/release_pipeline.py candidate --file "$RUNNER_TEMP/release-verified.json" \
             --tag "$TAG" --notes-file "$RUNNER_TEMP/release-notes.md" \

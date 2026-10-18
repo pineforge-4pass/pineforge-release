@@ -21,20 +21,23 @@
 # HPO_WHEEL_SHA256 checks the downloaded wheel when supplied to that target.
 # HPO_SDIST_SHA256 checks the native sdist before extraction when supplied.
 #
-# Published as ghcr.io/pineforge-4pass/pineforge-release:<own-semver>.
+# Tunaxis (formerly PineForge); published under both names in release_contract.py.
 
 ARG ENGINE_VERSION
 ARG CODEGEN_VERSION
+ARG CODEGEN_DIST=pineforge-codegen
 
 # --- Stage 1: stage the pure-Python transpiler (final image carries no pip) ---
 FROM debian:bookworm-slim AS codegen
 ARG CODEGEN_VERSION
+ARG CODEGEN_DIST
 RUN test -n "${CODEGEN_VERSION}" || { echo "ERROR: CODEGEN_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
+RUN case "${CODEGEN_DIST}" in pineforge-codegen|tunaxis-codegen) ;; *) echo "Tunaxis: unsupported CODEGEN_DIST" >&2; exit 1 ;; esac
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN pip3 install --break-system-packages --no-cache-dir -U \
-        --target /opt/codegen "pineforge-codegen==${CODEGEN_VERSION}"
+        --target /opt/codegen "${CODEGEN_DIST}==${CODEGEN_VERSION}"
 
 # --- Stage 2: fetch + verify the engine static-lib tarball (per build arch) ---
 FROM debian:bookworm-slim AS engine
@@ -70,8 +73,9 @@ ARG RELEASE_GIT_SHA=unknown
 ARG RELEASE_BUILD_DATE=unknown
 RUN test -n "${ENGINE_VERSION}" && test -n "${CODEGEN_VERSION}" || { echo "ERROR: ENGINE_VERSION + CODEGEN_VERSION build-args are required (CI resolves them)" >&2; exit 1; }
 
-LABEL org.opencontainers.image.title="pineforge-release" \
-      org.opencontainers.image.description="Full PineScript v6 -> deterministic backtest (engine static lib + bundled codegen transpiler)" \
+LABEL org.opencontainers.image.title="Tunaxis" \
+      org.opencontainers.image.description="Tunaxis (formerly PineForge): PineScript v6 -> deterministic backtest (engine static lib + bundled codegen transpiler)" \
+      org.opencontainers.image.vendor="Tunaxis" \
       org.opencontainers.image.version="${RELEASE_VERSION}" \
       org.opencontainers.image.revision="${RELEASE_GIT_SHA}" \
       org.opencontainers.image.created="${RELEASE_BUILD_DATE}" \
@@ -113,8 +117,8 @@ RUN mkdir -p /opt/pineforge/bin
 COPY --from=engine  /opt/pineforge/lib       /opt/pineforge/lib
 COPY --from=engine  /opt/pineforge/include   /opt/pineforge/include
 COPY --from=codegen /opt/codegen             /opt/pineforge/pycodegen
-# The harness is the engine's runtime files for the pinned engine tag, all eight and nothing
-# else: scripts/sync-harness.sh writes them into docker/ and records their sha256 in
+# The harness is seven engine Python files plus the hub entrypoint, all eight and nothing
+# else: scripts/sync-harness.sh refreshes the Python files and records every sha256 in
 # HARNESS-SHA256SUMS, which the build checks below. entrypoint.sh calls
 # bind_compiled_inventory.py; run_json.py imports the other modules from its own directory.
 COPY docker/run_json.py   /opt/pineforge/bin/run_json.py
@@ -128,8 +132,9 @@ COPY docker/selected_window_report.py  /opt/pineforge/bin/selected_window_report
 COPY docker/HARNESS-SHA256SUMS         /opt/pineforge/bin/HARNESS-SHA256SUMS
 RUN chmod +x /opt/pineforge/bin/entrypoint.sh /opt/pineforge/bin/run_json.py
 
-# Every harness file in the image must be byte for byte the engine's file at the ref that
-# scripts/sync-harness.sh synced from: the script recorded the sha256 of each fetched file in
+# Every harness file in the image must match the hub's recorded bytes after
+# scripts/sync-harness.sh refreshed the engine files and retained the hub entrypoint.
+# The script recorded the sha256 of every installed file in
 # HARNESS-SHA256SUMS and the build recomputes them here, on the installed files. The sums file
 # must name exactly the eight files above, in this order, and nothing else may sit in bin/;
 # a missing, extra, changed or empty entry fails the build.
@@ -187,6 +192,7 @@ RUN set -eu; \
     python3 -I /tmp/check_hpo_resolution.py \
       --hpo-wheel "$wheel" --hpo-version "${HPO_VERSION}" \
       --codegen-root /opt/codegen --codegen-version "${CODEGEN_VERSION}" \
+      --codegen-dist "${CODEGEN_DIST}" \
       --report /tmp/hpo-resolution.json; \
     pip3 install --break-system-packages --no-cache-dir --no-deps \
       --target /opt/hpo "$wheel"; \
@@ -196,7 +202,8 @@ RUN set -eu; \
     test -f "$1/LICENSE"; test -f "$1/NOTICE"; \
     test -f "$1/THIRD_PARTY_LICENSES/sobol_joe_kuo.txt"; \
     cp -r "$1/." /opt/hpo-licenses/pineforge-hpo/; \
-    set -- /opt/codegen/pineforge_codegen-*.dist-info/licenses; \
+    codegen_dist="$(printf '%s' "${CODEGEN_DIST}" | tr '-' '_')"; \
+    set -- /opt/codegen/"${codegen_dist}"-*.dist-info/licenses; \
     test "$#" -eq 1; test -f "$1/LICENSE"; \
     cp -r "$1/." /opt/hpo-licenses/pineforge-codegen/
 
@@ -272,7 +279,7 @@ RUN test -n "${HPO_VERSION}" && test -n "${HPO_GCC_DEFAULTS_VERSION}" && test -n
     && test -n "${HPO_BINUTILS_VERSION}" && test -n "${HPO_EIGEN_VERSION}" \
     || { echo "ERROR: HPO_VERSION and HPO runtime toolchain package version build-args are required" >&2; exit 1; }
 
-LABEL org.opencontainers.image.description="Full PineScript v6 -> deterministic backtest and HPO (engine static lib + bundled codegen transpiler + native HPO runner)" \
+LABEL org.opencontainers.image.description="Tunaxis (formerly PineForge): PineScript v6 -> deterministic backtest and HPO (engine static lib + bundled codegen transpiler + native HPO runner)" \
       io.pineforge.hpo.version="${HPO_VERSION}"
 
 # Pin the runtime compiler and Eigen to the same packages as hpo-toolchain.
