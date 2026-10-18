@@ -190,7 +190,7 @@ class Registry:
         match("sha256:" + SHA, rejected)
         if previous is not None:
             match("sha256:" + SHA, previous)
-        current = set(self.digests(tag).values())
+        current = set(self._copy_preflight(tag).values())
         if any(value not in (None, rejected, previous) for value in current):
             require(rejected not in current and len(current - {None}) <= 1,
                     "rollback alias partly superseded; operator repair required")

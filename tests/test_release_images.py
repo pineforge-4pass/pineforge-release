@@ -290,6 +290,72 @@ class FirstRegistryCopyTests(unittest.TestCase):
         self.assertEqual(len(self.transport.storage.calls), 1)
         self.assertNotIn((self.new, next_tag), self.transport.storage.tags)
 
+    def test_restore_copies_previous_digest_to_both_names_when_first_new_read_is_denied(self):
+        previous_raw = contract.canonical({"release": "previous rollback before package creation"})
+        for endpoint in ("token", "manifest"):
+            with self.subTest(endpoint=endpoint):
+                transport = RegistryHTTPTransport()
+                transport.storage.seed(contract.IMAGE, "latest", self.raw)
+                previous = transport.storage.seed(contract.IMAGE, "previous", previous_raw)
+                transport.before[self.new, endpoint] = self.denied()
+                with patch.object(artifacts.urllib.request, "build_opener", return_value=transport):
+                    registry = pipeline.Registry(runner=transport.storage.run)
+                    self.assertTrue(registry.restore("latest", self.digest, previous))
+                    self.assertEqual(registry.digests("latest"),
+                                     {repository: previous for repository in contract.IMAGES})
+                self.assertEqual(len(transport.storage.calls), 1)
+                self.assertEqual(transport.storage.calls[0][-1], contract.IMAGE + "@" + previous)
+
+    def test_restore_keeps_old_name_and_post_copy_denials_strict(self):
+        previous_raw = contract.canonical({"release": "previous strict rollback target"})
+        previous = self.transport.storage.seed(contract.IMAGE, "previous", previous_raw)
+        self.transport.storage.seed(contract.IMAGE, "latest", self.raw)
+        self.transport.before[contract.IMAGE, "manifest"] = self.denied()
+        with self.assertRaises(artifacts.RegistryReadError):
+            self.registry.restore("latest", self.digest, previous)
+        self.assertEqual(self.transport.storage.calls, [])
+        self.transport.before = {(self.new, "manifest"): self.denied()}
+        self.transport.after[self.new, "manifest"] = self.denied()
+        with self.assertRaises(artifacts.RegistryReadError):
+            self.registry.restore("latest", self.digest, previous)
+        self.assertEqual(len(self.transport.storage.calls), 1)
+        # A completed write also makes every subsequent restore preflight strict.
+        with self.assertRaises(artifacts.RegistryReadError):
+            self.registry.restore("latest", self.digest, previous)
+        self.assertEqual(len(self.transport.storage.calls), 1)
+
+    def test_rollback_restores_both_aliases_before_the_new_package_exists(self):
+        manifest = fixture_manifest()
+        manifest["image"]["digest"] = self.digest
+        client, store = FinalizeClient(manifest), MemoryStore(manifest)
+        row = store.get("v1.6.0")
+        store.put(row, contract.ASSET, contract.canonical(manifest))
+        previous_raw = contract.canonical({"release": "previous complete rollback target"})
+        previous = self.transport.storage.seed(contract.IMAGE, "previous", previous_raw)
+        for alias in ("latest", "1.6"):
+            self.transport.storage.seed(contract.IMAGE, alias, self.raw)
+        store.put(row, "release-aliases-before.json",
+                  contract.canonical({"latest": previous, "1.6": previous}))
+        self.transport.before[self.new, "manifest"] = self.denied()
+        reports = []
+
+        def report(client, key, title, text):
+            reports.append(text)
+
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "99"}), \
+                patch.object(rollback, "Client", return_value=client), \
+                patch.object(rollback, "Store", return_value=store), \
+                patch.object(rollback, "Registry", return_value=self.registry), \
+                patch.object(rollback, "report_issue", side_effect=report), \
+                patch.object(sys, "argv", ["release_rollback.py", "--tag", "v1.6.0"]):
+            self.assertEqual(rollback.main(), 0)
+        for alias in ("latest", "1.6"):
+            self.assertEqual(self.registry.digests(alias),
+                             {repository: previous for repository in contract.IMAGES})
+        self.assertEqual(len(reports), 1)
+        self.assertNotIn("Alias failures:", reports[0])
+        self.assertEqual(len(self.transport.storage.calls), 2)
+
     def test_old_name_403_never_authorizes_copy(self):
         for endpoint in ("token", "manifest"):
             with self.subTest(endpoint=endpoint):
