@@ -6,3 +6,6 @@ referencing==0.35.1
 rpds-py==0.20.0
 rfc3339-validator==0.1.4
 six==1.16.0
+
+# YAML workflow structure checks used by acceptance tests.
+PyYAML==6.0.3
