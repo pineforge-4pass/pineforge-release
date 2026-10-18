@@ -176,6 +176,7 @@ ENTRYPOINT ["/opt/pineforge/bin/entrypoint.sh"]
 # --- HPO wheel: resolve with installed codegen before the separate install ---
 FROM codegen AS hpo-wheel
 ARG CODEGEN_VERSION
+ARG CODEGEN_DIST
 ARG HPO_VERSION
 ARG HPO_WHEEL_SHA256
 RUN test -n "${HPO_VERSION}" && test -n "${CODEGEN_VERSION}" || { echo "ERROR: HPO_VERSION + CODEGEN_VERSION build-args are required (CI resolves them)" >&2; exit 1; }

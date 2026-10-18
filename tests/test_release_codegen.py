@@ -23,6 +23,18 @@ from test_release_hpo_image import _dockerfile_stages
 from test_release_workflows import _run_block
 
 
+def codegen_dist_scope_problems(dockerfile):
+    problems = []
+    for stage in _dockerfile_stages(dockerfile):
+        uses_dist = any(re.search(r"\$(?:\{CODEGEN_DIST\}|CODEGEN_DIST\b)", body)
+                        for keyword, body in stage.instructions if keyword != "ARG")
+        declared = {shlex.split(body)[0].split("=", 1)[0]
+                    for keyword, body in stage.instructions if keyword == "ARG"}
+        if uses_dist and "CODEGEN_DIST" not in declared:
+            problems.append(stage.name)
+    return problems
+
+
 class CodegenSelectionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -31,6 +43,23 @@ class CodegenSelectionTests(unittest.TestCase):
         cls.programs = re.findall(r"python3 - [^\n]+ <<'PY'\n(.*?)\nPY", cls.entrypoint, re.S)
         if len(cls.programs) != 2:
             raise AssertionError("expected both transpile programs from the real entrypoint")
+
+    def test_every_stage_using_codegen_dist_declares_its_own_build_argument(self):
+        self.assertEqual(codegen_dist_scope_problems(self.dockerfile), [])
+        users = [stage for stage in _dockerfile_stages(self.dockerfile)
+                 if any(re.search(r"\$(?:\{CODEGEN_DIST\}|CODEGEN_DIST\b)", body)
+                        for keyword, body in stage.instructions if keyword != "ARG")]
+        self.assertTrue(users)
+        for stage in users:
+            with self.subTest(stage=stage.name):
+                # Remove only this parsed stage's own ARG; inherited values
+                # and injected process environment cannot satisfy this check.
+                declaration = next(body for keyword, body in stage.instructions
+                                   if keyword == "ARG" and body.split("=", 1)[0] == "CODEGEN_DIST")
+                altered_stage = stage.text.replace("ARG " + declaration + "\n", "", 1)
+                self.assertNotEqual(altered_stage, stage.text)
+                altered = self.dockerfile.replace(stage.text, altered_stage, 1)
+                self.assertEqual(codegen_dist_scope_problems(altered), [stage.name])
 
     def package(self, root, name, *, broken=False):
         package = root / name
