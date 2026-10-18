@@ -164,14 +164,6 @@ class MemoryRegistry:
     def alias_digest(self, tag):
         return self.digest(tag)
 
-    def restore(self, tag, rejected, previous):
-        if self.digest(tag) != rejected:
-            return True
-        if previous is None:
-            return False
-        self.point(tag, previous)
-        return True
-
     def point(self, tag, digest, fixed=False, source=contract.IMAGE):
         if fixed:
             contract.require(self.tags.get(tag, digest) == digest, "fixed image changed")
@@ -463,11 +455,28 @@ class FinalizerTests(unittest.TestCase):
         # The fake has no consumer dispatch endpoint; any send would fail above.
 
     def test_rollback_preserves_fixed_identity_and_stops_finalizer(self):
+        # Import lazily: the shared transport module imports this module's
+        # manifest/store fixtures. Only storage/command boundaries are fake;
+        # restore, point and digest are the production Registry methods.
+        from test_release_images import RegistryTransport
+        self.registry = RegistryTransport()
+        raw = contract.canonical({"schemaVersion": 2, "manifests": [
+            {"digest": self.m["image"][arch + "_digest"],
+             "platform": {"architecture": arch, "os": "linux"}}
+            for arch in ("amd64", "arm64")]})
+        self.m["image"]["digest"] = self.registry.seed(contract.IMAGE, "candidate-rollback-test", raw)
+        previous_raw = contract.canonical({"release": "previous legacy rollback fixture"})
+        previous = self.registry.seed(contract.IMAGE, "latest", previous_raw)
+        self.registry.seed(contract.IMAGE, "1.6", previous_raw)
+        self.client, self.store = FinalizeClient(self.m), MemoryStore(self.m)
+        self.row = self.store.get("v1.6.0")
         event = self.finish()
         with patch.dict(os.environ, {"GITHUB_RUN_ID": "99"}), patch.object(rollback, "report_issue"):
             rollback.rollback(self.client, self.store, self.registry, "v1.6.0")
-        self.assertEqual(self.registry.tags["latest"], "sha256:" + "0" * 64)
-        self.assertEqual(self.registry.tags["1.6.0"], event["image"]["digest"])
+        for alias in ("latest", "1.6"):
+            self.assertEqual(self.registry.digests(alias), {repository: previous for repository in contract.IMAGES})
+        self.assertEqual(self.registry.digests("1.6.0"),
+                         {repository: event["image"]["digest"] for repository in contract.IMAGES})
         self.assertEqual(contract.payload(self.store.read(self.row, contract.ASSET)), event)
         self.assertIsNone(self.finish())
 
