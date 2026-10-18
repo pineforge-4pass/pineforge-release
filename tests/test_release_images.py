@@ -121,6 +121,8 @@ class RegistryHTTPTransport:
         self.reads.append((repository, endpoint, copied, dict(request.header_items())))
         faults = self.after if copied else self.before
         fault = faults.get((repository, endpoint, ref), faults.get((repository, endpoint)))
+        if callable(fault):
+            fault = fault()
         if fault is not None:
             status, body = fault
             if callable(body):
@@ -414,6 +416,26 @@ class FirstRegistryCopyTests(unittest.TestCase):
         with self.assertRaises(artifacts.RegistryReadError):
             self.registry.restore("latest", self.digest, previous)
         self.assertEqual(len(self.transport.storage.calls), 1)
+
+    def test_restore_refuses_drifted_new_alias_after_a_transient_first_read_denial(self):
+        self.transport.storage.seed(contract.IMAGE, "latest", self.raw)
+        previous_raw = contract.canonical({"release": "previous drift guard target"})
+        previous = self.transport.storage.seed(contract.IMAGE, "previous", previous_raw)
+        newer_raw = contract.canonical({"release": "newer drifted image"})
+        newer = self.transport.storage.seed(self.new, "latest", newer_raw)
+        new_reads = []
+
+        def first_read_denied():
+            new_reads.append("latest")
+            return self.denied() if len(new_reads) == 1 else None
+
+        self.transport.before[self.new, "manifest", "latest"] = first_read_denied
+        with self.assertRaisesRegex(contract.Invalid, "partly superseded"):
+            self.registry.restore("latest", self.digest, previous)
+        self.assertEqual(len(new_reads), 2)
+        self.assertEqual(self.transport.storage.calls, [])
+        self.assertEqual(self.registry.digests("latest"),
+                         {contract.IMAGE: self.digest, self.new: newer})
         # A completed write also makes every subsequent restore preflight strict.
         with self.assertRaises(artifacts.RegistryReadError):
             self.registry.restore("latest", self.digest, previous)
