@@ -1,4 +1,4 @@
-# PineForge facts tokens
+# Tunaxis facts tokens
 
 `facts.json` is the public, machine-written quantity store shared by the engine,
 codegen, corpus, website and hosted MCP. `facts.schema.json` defines its contract.
