@@ -106,6 +106,7 @@ class Store:
 class Registry:
     def __init__(self, runner=None):
         self.command = runner or command
+        self._new_name_seen = False
 
     def raw(self, ref, *, repository=IMAGE):
         match(r"(?:sha256:[0-9a-f]{64}|[A-Za-z0-9_.-]+)", ref)
@@ -114,9 +115,12 @@ class Registry:
         # Hash the actual OCI response bytes, avoiding CLI newline changes.
         client = Client()
         token = client.registry_token(repository)
-        return client.request("https://ghcr.io/v2/" + path + "/manifests/" + ref,
+        raw = client.request("https://ghcr.io/v2/" + path + "/manifests/" + ref,
                               accept="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
                               extra_headers={"Authorization": "Bearer " + token} if token else {})
+        if repository != IMAGE:
+            self._new_name_seen = True
+        return raw
 
     def digest(self, tag, *, repository=IMAGE):
         match(r"[A-Za-z0-9_.-]+", tag)
@@ -125,6 +129,8 @@ class Registry:
         except Pending:
             return None
         decode(raw)
+        if repository != IMAGE:
+            self._new_name_seen = True
         return "sha256:" + sha256(raw)
 
     def digests(self, tag):
@@ -140,7 +146,7 @@ class Registry:
                 # Only before a copy, and only after this same old-name tag
                 # was successfully read and exists. Post-copy reads never use
                 # this exception, even when GHCR still reports DENIED.
-                if old is None or not error.absent_before_copy:
+                if self._new_name_seen or old is None or not error.absent_before_copy:
                     raise
                 current[repository] = None
         return current
@@ -171,6 +177,7 @@ class Registry:
         targets = [part for repository in IMAGES for part in ("--tag", repository + ":" + tag)]
         self.command("docker", "buildx", "imagetools", "create", "--prefer-index=false",
                      *targets, source + "@" + digest)
+        self._new_name_seen = True
         self.assert_equal(tag, digest)
 
     def mirror_candidate(self, tag, digest):

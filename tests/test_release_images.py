@@ -252,6 +252,44 @@ class FirstRegistryCopyTests(unittest.TestCase):
                         registry.mirror_candidate(self.tag, self.digest)
                 self.assertEqual(len(transport.storage.calls), 1)
 
+    def test_later_point_cannot_treat_new_name_denial_as_absent_after_a_successful_copy(self):
+        self.transport.before[self.new, "token"] = self.denied()
+        self.registry.point(self.tag, self.digest, fixed=True)
+        next_tag = "candidate-next-copy"
+        self.transport.storage.seed(contract.IMAGE, next_tag, self.raw)
+        self.transport.after[self.new, "token"] = self.denied()
+        with self.assertRaises(artifacts.RegistryReadError):
+            self.registry.point(next_tag, self.digest, fixed=True)
+        self.assertEqual(len(self.transport.storage.calls), 1)
+        self.assertNotIn((self.new, next_tag), self.transport.storage.tags)
+
+    def test_successful_new_name_read_disables_first_copy_exception_without_a_write(self):
+        for reader in ("raw", "digest"):
+            with self.subTest(reader=reader):
+                transport = RegistryHTTPTransport()
+                for repository in contract.IMAGES:
+                    transport.storage.seed(repository, self.tag, self.raw)
+                with patch.object(artifacts.urllib.request, "build_opener", return_value=transport):
+                    registry = pipeline.Registry(runner=transport.storage.run)
+                    ref = self.digest if reader == "raw" else self.tag
+                    getattr(registry, reader)(ref, repository=self.new)
+                    transport.before[self.new, "manifest"] = self.denied()
+                    with self.assertRaises(artifacts.RegistryReadError):
+                        registry.point(self.tag, self.digest, fixed=True)
+                self.assertEqual(transport.storage.calls, [])
+
+    def test_successful_write_disables_exception_even_if_its_readback_fails(self):
+        self.transport.before[self.new, "token"] = self.denied()
+        self.transport.after[self.new, "token"] = self.denied()
+        with self.assertRaises(artifacts.RegistryReadError):
+            self.registry.point(self.tag, self.digest, fixed=True)
+        next_tag = "candidate-after-failed-readback"
+        self.transport.storage.seed(contract.IMAGE, next_tag, self.raw)
+        with self.assertRaises(artifacts.RegistryReadError):
+            self.registry.point(next_tag, self.digest, fixed=True)
+        self.assertEqual(len(self.transport.storage.calls), 1)
+        self.assertNotIn((self.new, next_tag), self.transport.storage.tags)
+
     def test_old_name_403_never_authorizes_copy(self):
         for endpoint in ("token", "manifest"):
             with self.subTest(endpoint=endpoint):
