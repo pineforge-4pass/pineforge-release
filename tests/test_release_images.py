@@ -118,7 +118,8 @@ class RegistryHTTPTransport:
     def reply(self, repository, endpoint, ref, request):
         copied = bool(self.storage.calls)
         self.reads.append((repository, endpoint, copied, dict(request.header_items())))
-        fault = (self.after if copied else self.before).get((repository, endpoint))
+        faults = self.after if copied else self.before
+        fault = faults.get((repository, endpoint, ref), faults.get((repository, endpoint)))
         if fault is not None:
             status, body = fault
             if callable(body):
@@ -202,7 +203,7 @@ class FirstRegistryCopyTests(unittest.TestCase):
                     reports.append(text)
 
                 # A 500 exercises the guarded error-body read; a broken 200
-                # exercises the alias loop's catch for an unexpected Exception.
+                # exercises normalization of a successful-response transport failure.
                 with patch.dict(os.environ, {"GITHUB_RUN_ID": "99"}), \
                         patch.object(rollback, "Client", return_value=client), \
                         patch.object(rollback, "Store", return_value=store), \
@@ -219,6 +220,41 @@ class FirstRegistryCopyTests(unittest.TestCase):
                     if status == 500:
                         self.assertIn("- " + alias + ": artifact request failed (HTTP 500)", reports[0])
                 self.assertEqual(self.transport.storage.calls, [])
+
+    def test_finalize_continues_after_incomplete_200_body_and_reports_the_failed_row(self):
+        bad, good = fixture_manifest("1.6.1"), fixture_manifest("1.6.0")
+        for manifest in (bad, good):
+            raw = contract.canonical({"schemaVersion": 2, "release": manifest["release_version"],
+                                      "manifests": [{"digest": manifest["image"][arch + "_digest"],
+                                                     "platform": {"architecture": arch, "os": "linux"}}
+                                                    for arch in ("amd64", "arm64")]})
+            manifest["image"]["digest"] = self.transport.storage.seed(
+                contract.IMAGE, "candidate-" + manifest["release_version"], raw)
+        client, store = FinalizeClient(bad, good), MemoryStore(bad, good)
+        body = UnreadableBodyFactory(lambda: http.client.IncompleteRead(b"partial successful response"))
+        self.transport.before[contract.IMAGE, "manifest", "1.6.1"] = 200, body
+        reports = []
+
+        def report(client, key, title, text, **options):
+            reports.append((key, title))
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "GITHUB_RUN_ID": "99", "GITHUB_RUN_ATTEMPT": "1", "RELEASE_READY_CONSUMERS": "",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "report_issue", side_effect=report), \
+                patch.object(pipeline, "npm", side_effect=lambda client, pin, inventory: {
+                    **pin, "npm_version": pin["version"],
+                    "npm_integrity": good["versions"]["codegen"]["npm_integrity"]}):
+            output = Path(tmp) / "deliveries.json"
+            with self.assertRaisesRegex(contract.Invalid, "release finalization failed"):
+                pipeline.finalize_all(client, store, self.registry, "", output)
+            self.assertEqual(contract.decode(output.read_bytes()), [])
+        self.assertEqual(body.read_calls, 1)
+        self.assertEqual(reports, [("v1.6.1", "Tunaxis 1.6.1: readiness failed"),
+                                   ("v1.6.0", "Tunaxis 1.6.0: complete")])
+        self.assertTrue(store.get("v1.6.1")["draft"])
+        self.assertFalse(store.get("v1.6.0")["draft"])
+        self.registry.assert_equal("1.6.0", good["image"]["digest"])
 
     def test_new_name_denied_before_copy_is_absent_only_after_old_tag_read_succeeds(self):
         for endpoint, status in (("token", 401), ("token", 403), ("manifest", 403)):

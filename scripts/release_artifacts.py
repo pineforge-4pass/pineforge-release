@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from email.parser import BytesParser
 import hashlib
+import http.client
 import io
 import os
 import re
@@ -109,7 +110,7 @@ class Client:
                 if error.code in (401, 403) or codes:
                     raise RegistryReadError(status=error.code, codes=codes) from None
             raise Invalid(f"artifact request failed (HTTP {error.code})") from None
-        except (urllib.error.URLError, TimeoutError, OSError):
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
             raise Invalid("artifact transport failed") from None
 
     def api(self, route, *, method="GET", data=None):
