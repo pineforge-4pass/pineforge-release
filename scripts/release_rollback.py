@@ -20,16 +20,24 @@ def rollback(client, store, registry, tag):
     if rejected is None:
         store.put(row, "release-rejected.json", canonical({"event_id": event["event_id"], "timestamp": now(),
                                                           "reason": "rollback", "run_id": int(os.environ["GITHUB_RUN_ID"])}))
-    incomplete = []
+    failures = []
+    allowed = ("latest", ".".join(event["release_version"].split(".")[:2]))
     for alias, good_digest in decode(before).items():
-        require(alias == "latest" or alias == ".".join(event["release_version"].split(".")[:2]), "unexpected rollback alias")
-        if not registry.restore(alias, event["image"]["digest"], good_digest):
-            incomplete.append(alias)  # deletion is forbidden; no previous good identity exists
+        label = alias if alias in allowed else "unrecognized alias"
+        try:
+            require(alias in allowed, "unexpected rollback alias")
+            if not registry.restore(alias, event["image"]["digest"], good_digest):
+                failures.append(label + ": no prior good identity; operator repair required (deletion is forbidden)")
+        except (Invalid, Pending) as error:
+            failures.append(label + ": " + str(error))
+        except (ValueError, KeyError, TypeError, OSError):
+            failures.append(label + ": alias restoration failed; inspect workflow evidence")
     report_issue(client, row["tag_name"], f"Tunaxis {event['release_version']}: rejected / rollback",
-                 "Fan-out stopped. Recorded moving aliases restored where still owned by the rejected release. "
-                 + ("No prior good identity exists for one or more aliases; operator repair is required. " if incomplete else "")
-                 + "Fixed releases, manifests, candidates, source assets and tags were preserved.\n\n" + run_link())
-    require(not incomplete, "rollback lacks a previous good alias identity")
+                 "Fan-out stopped. Restoration of recorded moving aliases was attempted on both image names; "
+                 "newer aliases were preserved. Fixed releases, manifests, candidates, source assets and tags were preserved."
+                 + ("\n\nAlias failures:\n" + "\n".join("- " + failure for failure in failures) if failures else "")
+                 + "\n\n" + run_link())
+    require(not failures, "rollback incomplete; inspect the incident's alias failures")
 
 
 def main():

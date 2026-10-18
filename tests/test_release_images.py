@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import base64
 import io
+import json
 import os
 import sys
 import unittest
@@ -276,6 +277,56 @@ class DualImageTests(unittest.TestCase):
             self.assert_both(tag, previous)
         self.assert_both("1.6.0", self.digest)
         self.assertEqual(store.read(store.get("v1.6.0"), "release-aliases-before.json"), before)
+        self.assertEqual(contract.payload(store.read(store.get("v1.6.0"), contract.ASSET)), event)
+        self.assertIsNone(pipeline.finalize(client, store, self.registry, store.get("v1.6.0")))
+
+    def test_rollback_reports_partial_supersession_continues_other_aliases_and_exits_nonzero(self):
+        for previous_minor in (True, False):
+            with self.subTest(previous_minor=previous_minor):
+                self.registry = RegistryTransport()
+                self.registry.seed(contract.IMAGE, self.tag, self.index)
+                previous_raw = contract.canonical({"release": "previous good rollback target"})
+                previous = self.registry.seed(contract.IMAGE, "latest", previous_raw)
+                if previous_minor:
+                    self.registry.seed(contract.IMAGE, "1.6", previous_raw)
+                client, store, event = self.finish()
+                # Historical alias evidence may list latest first. Preserve
+                # its actual values while modeling that valid JSON ordering,
+                # so the failing alias precedes the still-restorable one.
+                before = contract.decode(store.read(store.get("v1.6.0"), "release-aliases-before.json"))
+                store.assets["v1.6.0", "release-aliases-before.json"] = (
+                    json.dumps({alias: before[alias] for alias in ("latest", "1.6")}) + "\n").encode()
+                newer_raw = contract.canonical({"release": "newer owner"})
+                newer = self.registry.seed(contract.IMAGES[1], "latest", newer_raw)
+                reports = []
+
+                def report(client, key, title, body):
+                    reports.append((key, title, body))
+
+                # Only external storage, registry transport and incident writes
+                # are substituted. main(), rollback() and Registry.restore()
+                # all execute their production failure/continuation logic.
+                with patch.dict(os.environ, {"GITHUB_RUN_ID": "99"}), \
+                        patch.object(rollback, "Client", return_value=client), \
+                        patch.object(rollback, "Store", return_value=store), \
+                        patch.object(rollback, "Registry", return_value=self.registry), \
+                        patch.object(rollback, "report_issue", side_effect=report), \
+                        patch.object(sys, "argv", ["release_rollback.py", "--tag", "v1.6.0"]):
+                    self.assertEqual(rollback.main(), 1)
+                self.assertEqual(len(reports), 1)
+                body = reports[0][2]
+                self.assertIn("latest: rollback alias partly superseded", body)
+                self.assertEqual(self.registry.digests("latest"),
+                                 {contract.IMAGE: self.digest, contract.IMAGES[1]: newer})
+                if previous_minor:
+                    self.assert_both("1.6", previous)
+                    self.assertNotIn("1.6:", body)
+                else:
+                    self.assert_both("1.6", self.digest)
+                    self.assertIn("1.6: no prior good identity", body)
+                self.assert_both("1.6.0", self.digest)
+                self.assertEqual(contract.payload(store.read(store.get("v1.6.0"), contract.ASSET)), event)
+                self.assertIsNone(pipeline.finalize(client, store, self.registry, store.get("v1.6.0")))
 
     def test_rollback_repairs_a_partial_prior_restore_and_does_not_move_newer_aliases(self):
         good_raw = contract.canonical({"release": "good"})
