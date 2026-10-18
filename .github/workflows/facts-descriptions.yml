@@ -32,16 +32,9 @@ jobs:
   descriptions:
     if: github.ref == 'refs/heads/main'
     environment: descriptions
-    runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
       FACTS_DESCRIPTIONS_APPLY_ENABLED: ${{ vars.FACTS_DESCRIPTIONS_APPLY_ENABLED }}
       DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || vars.FACTS_DESCRIPTIONS_APPLY_ENABLED != 'true' }}
     steps:
