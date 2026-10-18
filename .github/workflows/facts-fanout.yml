@@ -27,9 +27,15 @@ jobs:
   web:
     if: github.ref == 'refs/heads/main'
     environment: release-automation
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
       FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
       # toJSON returns a nonempty string even for false; manual false is preserved.
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && toJSON(inputs.dry_run) || (vars.FACTS_WEB_DISPATCH_ENABLED != 'true' && 'true' || 'false') }}
@@ -95,9 +101,15 @@ jobs:
   license:
     if: github.ref == 'refs/heads/main'
     environment: release-automation
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name != 'pull_request_target' &&
+          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     env:
+      PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
       FACTS_CONSUMER_ROLE: license
       FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}
       # toJSON returns a nonempty string even for false; manual false is preserved.
