@@ -28,10 +28,12 @@ def rollback(client, store, registry, tag):
             require(alias in allowed, "unexpected rollback alias")
             if not registry.restore(alias, event["image"]["digest"], good_digest):
                 failures.append(label + ": no prior good identity; operator repair required (deletion is forbidden)")
-        except (Invalid, Pending) as error:
+        except Invalid as error:
             failures.append(label + ": " + str(error))
-        except Exception:
-            failures.append(label + ": alias restoration failed; inspect workflow evidence")
+        except Exception as error:
+            print(type(error).__name__, file=sys.stderr)
+            detail = str(error) if isinstance(error, Pending) else "alias restoration failed; inspect workflow evidence"
+            failures.append(label + ": " + detail)
     report_issue(client, row["tag_name"], release_incident_title(event["release_version"], "rejected / rollback"),
                  "Fan-out stopped. Restoration of recorded moving aliases was attempted on both image names; "
                  "newer aliases were preserved. Fixed releases, manifests, candidates, source assets and tags were preserved."

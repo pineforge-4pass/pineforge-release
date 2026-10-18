@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import base64
+from contextlib import redirect_stderr
 import http.client
 import io
 import json
@@ -255,6 +256,43 @@ class FirstRegistryCopyTests(unittest.TestCase):
         self.assertTrue(store.get("v1.6.1")["draft"])
         self.assertFalse(store.get("v1.6.0")["draft"])
         self.registry.assert_equal("1.6.0", good["image"]["digest"])
+
+    def test_unexpected_rollback_errors_log_only_the_class_for_each_alias(self):
+        manifest = fixture_manifest()
+        manifest["image"]["digest"] = self.digest
+        client, store = FinalizeClient(manifest), MemoryStore(manifest)
+        row = store.get("v1.6.0")
+        store.put(row, contract.ASSET, contract.canonical(manifest))
+        previous_raw = contract.canonical({"release": "previous diagnostic test target"})
+        previous = self.transport.storage.seed(contract.IMAGE, "previous", previous_raw)
+        for alias in ("latest", "1.6"):
+            self.transport.storage.seed(contract.IMAGE, alias, self.raw)
+        store.put(row, "release-aliases-before.json",
+                  contract.canonical({"latest": previous, "1.6": previous}))
+        private_message = "https://private.invalid/diagnostic?token=synthetic-private-value"
+        body = UnreadableBodyFactory(lambda: RuntimeError(private_message))
+        self.transport.before[contract.IMAGE, "manifest"] = 200, body
+        reports, stderr = [], io.StringIO()
+
+        def report(client, key, title, text):
+            reports.append(text)
+
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "99"}), \
+                patch.object(rollback, "Client", return_value=client), \
+                patch.object(rollback, "Store", return_value=store), \
+                patch.object(rollback, "Registry", return_value=self.registry), \
+                patch.object(rollback, "report_issue", side_effect=report), \
+                patch.object(sys, "argv", ["release_rollback.py", "--tag", "v1.6.0"]), \
+                redirect_stderr(stderr):
+            self.assertEqual(rollback.main(), 1)
+        self.assertEqual(body.read_calls, 2)
+        self.assertEqual(stderr.getvalue().splitlines().count("RuntimeError"), 2)
+        self.assertEqual(len(reports), 1)
+        for output in (stderr.getvalue(), reports[0]):
+            self.assertNotIn(private_message, output)
+            self.assertNotIn("private.invalid", output)
+        for alias in ("latest", "1.6"):
+            self.assertIn("- " + alias + ": alias restoration failed", reports[0])
 
     def test_new_name_denied_before_copy_is_absent_only_after_old_tag_read_succeeds(self):
         for endpoint, status in (("token", 401), ("token", 403), ("manifest", 403)):
