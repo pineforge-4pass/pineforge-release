@@ -244,6 +244,10 @@ def validate_candidate(obj):
     return obj
 
 
+def release_incident_title(release, state):
+    return f"Tunaxis {version(release.removeprefix('v'))}: {state}"
+
+
 def report_issue(client, key, title, body, *, complete=False):
     if os.environ.get("RELEASE_REPORT_TOKEN"):
         client = Client(token=os.environ["RELEASE_REPORT_TOKEN"])
@@ -258,7 +262,7 @@ def report_issue(client, key, title, body, *, complete=False):
     require(len(found) <= 1, "duplicate release incident markers")
     if found:
         state = "closed" if complete else "open"
-        if found[0]["body"] != body or found[0]["state"] != state:
+        if found[0]["title"] != title or found[0]["body"] != body or found[0]["state"] != state:
             client.api(f"repos/{HUB}/issues/{found[0]['number']}", method="PATCH",
                        data={"title": title, "body": body, "state": state})
     else:
@@ -495,18 +499,18 @@ def finalize_all(client, store, registry, tag, output):
                 if asset["name"].startswith("release-status-"):
                     previous_status = store.read(row, asset["name"])
             if previous_status != canonical(status):
-                report_issue(client, row["tag_name"], f"Release {event['release_version']}: " + ("complete" if status["complete"] else "pending/failed"),
+                report_issue(client, row["tag_name"], release_incident_title(event["release_version"], "complete" if status["complete"] else "pending/failed"),
                              body, complete=status["complete"])
                 store.put(row, f"release-status-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}.json", canonical(status))
         except Pending as error:
             limit = int(os.environ.get("RELEASE_READY_MAX_AGE_MINUTES", "60"))
             overdue = age_minutes(row["created_at"]) > limit
-            report_issue(client, row["tag_name"], f"Release {row['tag_name']}: readiness pending",
+            report_issue(client, row["tag_name"], release_incident_title(row["tag_name"], "readiness pending"),
                          str(error) + (" (readiness overdue)" if overdue else "")
                          + "\n\nThe scheduled finalizer retries without rebuilding the candidate.\n\n" + run_link())
         except (Invalid, ValueError, KeyError, TypeError):
             failures.append(row["tag_name"])
-            report_issue(client, row["tag_name"], f"Release {row['tag_name']}: readiness failed",
+            report_issue(client, row["tag_name"], release_incident_title(row["tag_name"], "readiness failed"),
                          "Readiness verification failed. No new aliases or consumer delivery authorized.\n\n" + run_link())
     Path(output).write_bytes(canonical(deliveries))
     facts_freshness(client, store, receipt_roles())

@@ -6,7 +6,7 @@ import sys
 
 from release_artifacts import Client
 from release_contract import ASSET, Invalid, Pending, canonical, decode, payload, require
-from release_pipeline import Registry, Store, now, report_issue, run_link
+from release_pipeline import Registry, Store, now, release_incident_title, report_issue, run_link
 
 
 def rollback(client, store, registry, tag):
@@ -32,7 +32,7 @@ def rollback(client, store, registry, tag):
             failures.append(label + ": " + str(error))
         except (ValueError, KeyError, TypeError, OSError):
             failures.append(label + ": alias restoration failed; inspect workflow evidence")
-    report_issue(client, row["tag_name"], f"Tunaxis {event['release_version']}: rejected / rollback",
+    report_issue(client, row["tag_name"], release_incident_title(event["release_version"], "rejected / rollback"),
                  "Fan-out stopped. Restoration of recorded moving aliases was attempted on both image names; "
                  "newer aliases were preserved. Fixed releases, manifests, candidates, source assets and tags were preserved."
                  + ("\n\nAlias failures:\n" + "\n".join("- " + failure for failure in failures) if failures else "")

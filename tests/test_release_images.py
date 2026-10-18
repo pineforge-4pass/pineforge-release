@@ -12,6 +12,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
@@ -328,6 +329,29 @@ class DualImageTests(unittest.TestCase):
                 self.assertEqual(contract.payload(store.read(store.get("v1.6.0"), contract.ASSET)), event)
                 self.assertIsNone(pipeline.finalize(client, store, self.registry, store.get("v1.6.0")))
 
+    def test_finalizer_and_rollback_build_the_same_incident_title_prefix(self):
+        previous_raw = contract.canonical({"release": "previous title test target"})
+        for alias in ("latest", "1.6"):
+            self.registry.seed(contract.IMAGE, alias, previous_raw)
+        client, store, event = self.finish()
+        reports = []
+
+        def report(client, key, title, body, **options):
+            reports.append((key, title))
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "GITHUB_RUN_ID": "99", "GITHUB_RUN_ATTEMPT": "1", "RELEASE_READY_CONSUMERS": "",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "report_issue", side_effect=report), \
+                patch.object(rollback, "report_issue", side_effect=report):
+            pipeline.finalize_all(client, store, self.registry, "v1.6.0", Path(tmp) / "deliveries.json")
+            rollback.rollback(client, store, self.registry, "v1.6.0")
+        self.assertEqual(reports, [("v1.6.0", "Tunaxis 1.6.0: complete"),
+                                   ("v1.6.0", "Tunaxis 1.6.0: rejected / rollback")])
+        for state in ("readiness pending", "readiness failed", "consumer failed"):
+            self.assertEqual(pipeline.release_incident_title("v1.6.0", state),
+                             pipeline.release_incident_title(event["release_version"], state))
+
     def test_rollback_repairs_a_partial_prior_restore_and_does_not_move_newer_aliases(self):
         good_raw = contract.canonical({"release": "good"})
         good = self.registry.seed(contract.IMAGE, "latest", good_raw)
@@ -373,6 +397,30 @@ class DualImageTests(unittest.TestCase):
 
 
 class ReleaseTextTests(unittest.TestCase):
+    def test_issue_title_only_drift_is_repaired_once_under_the_existing_marker(self):
+        issue = {"number": 7, "title": "Release v1.6.0: readiness pending", "state": "open",
+                 "body": "<!-- pineforge-release-chain:v1.6.0 -->\n\nWaiting for artifacts."}
+        updates = []
+
+        class GitHubTransport:
+            def pages(self, route):
+                return [issue]
+
+            def api(self, route, *, method="GET", data=None):
+                updates.append((route, method, data))
+                issue.update(data)
+                return issue
+
+        client = GitHubTransport()
+        title = pipeline.release_incident_title("v1.6.0", "readiness pending")
+        with patch.dict(os.environ, {"RELEASE_REPORT_TOKEN": "", "RELEASE_REPORT_OWNER": ""}):
+            for _ in range(2):
+                pipeline.report_issue(client, "v1.6.0", title, "Waiting for artifacts.")
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0][0:2], ("repos/" + contract.HUB + "/issues/7", "PATCH"))
+        self.assertEqual(updates[0][2]["title"], "Tunaxis 1.6.0: readiness pending")
+        self.assertEqual(issue["body"], "<!-- pineforge-release-chain:v1.6.0 -->\n\nWaiting for artifacts.")
+
     def test_registry_reads_both_names_and_authenticates_first_private_package_readback(self):
         raw = contract.canonical({"schemaVersion": 2, "manifests": []})
         calls = []

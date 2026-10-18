@@ -19,7 +19,7 @@ from release_artifacts import Client
 from release_contract import (ASSET, COMMIT, HUB, IMAGES, ROLES, SHA, Invalid, Pending,
                               canonical, decode, image_digest, image_repositories, keys, match,
                               optional_keys, payload, positive, require, sha256, validate_image, version)
-from release_pipeline import Store, receipt_roles, receipts, report_issue, run_link
+from release_pipeline import Store, receipt_roles, receipts, release_incident_title, report_issue, run_link
 
 STATES = ("pending", "pr_open", "testing", "ready", "merged", "deploying", "verified", "failed", "superseded", "skipped_by_policy")
 RANK = {state: i for i, state in enumerate(STATES[:7])}
@@ -371,7 +371,7 @@ def collect(client, hub_client, store, role, run_id=0):
             store.put(row, f"{stem}{public['attempt']}-{public['sequence']}.json", canonical(public))
             if public["state"] == "failed":
                 incident = "facts-" + facts_target["sha256"] if facts_only else row["tag_name"]
-                title = "Facts consumer failed" if facts_only else f"Release {event['release_version']}: consumer failed"
+                title = "Facts consumer failed" if facts_only else release_incident_title(event["release_version"], "consumer failed")
                 report_issue(hub_client, incident, title,
                              f"Consumer role: {role}; failed stage evidence retained in the consumer's private report.\n\n" + run_link())
 
