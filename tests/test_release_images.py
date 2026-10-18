@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import copy
 import base64
+import io
 import os
 import sys
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +21,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 import release_contract as contract
+import release_artifacts as artifacts
 import release_pipeline as pipeline
 import release_rollback as rollback
 import release_smoke as smoke
@@ -60,6 +63,143 @@ class RegistryTransport(pipeline.Registry):
             repository, tag = reference.rsplit(":", 1)
             self.seed(repository, tag, raw + b" " if repository == self.corrupt else raw)
         return b""
+
+
+class RegistryHTTPTransport:
+    """HTTP and copy boundaries only; Client.request/Registry.raw remain real."""
+
+    def __init__(self):
+        self.storage = RegistryTransport()
+        self.before, self.after = {}, {}
+        self.tokenless = set()
+        self.reads = []
+
+    def open(self, request, *, timeout):
+        url = request.full_url
+        for repository in contract.IMAGES:
+            path = repository.removeprefix("ghcr.io/")
+            token_url = "https://ghcr.io/token?service=ghcr.io&scope=repository:" + path + ":pull"
+            manifest_url = "https://ghcr.io/v2/" + path + "/manifests/"
+            if url == token_url:
+                return self.reply(repository, "token", "", request)
+            if url.startswith(manifest_url):
+                return self.reply(repository, "manifest", url.removeprefix(manifest_url), request)
+        raise AssertionError("unmodeled HTTP registry request")
+
+    def reply(self, repository, endpoint, ref, request):
+        copied = bool(self.storage.calls)
+        self.reads.append((repository, endpoint, copied, dict(request.header_items())))
+        fault = (self.after if copied else self.before).get((repository, endpoint))
+        if fault is not None:
+            status, body = fault
+            if status == 200:
+                return io.BytesIO(body)
+            raise urllib.error.HTTPError(request.full_url, status, "registry response", {}, io.BytesIO(body))
+        if endpoint == "token":
+            return io.BytesIO(contract.canonical({} if repository in self.tokenless else {"token": "test-pull"}))
+        try:
+            raw = self.storage.raw(ref, repository=repository)
+        except contract.Pending:
+            raise urllib.error.HTTPError(request.full_url, 404, "missing manifest", {}, io.BytesIO(b"{}")) from None
+        return io.BytesIO(raw)
+
+
+class FirstRegistryCopyTests(unittest.TestCase):
+    def setUp(self):
+        self.transport = RegistryHTTPTransport()
+        self.registry = pipeline.Registry(runner=self.transport.storage.run)
+        self.tag = "candidate-first-copy"
+        self.raw = contract.canonical({"schemaVersion": 2, "manifests": []})
+        self.digest = self.transport.storage.seed(contract.IMAGE, self.tag, self.raw)
+        self.new = contract.IMAGES[1]
+        self.opener = patch.object(artifacts.urllib.request, "build_opener", return_value=self.transport)
+        self.opener.start()
+        self.addCleanup(self.opener.stop)
+
+    def denied(self, status=403, code="DENIED"):
+        return status, contract.canonical({"errors": [{"code": code}]})
+
+    def test_new_name_denied_before_copy_is_absent_only_after_old_tag_read_succeeds(self):
+        for endpoint, status in (("token", 401), ("token", 403), ("manifest", 403)):
+            with self.subTest(endpoint=endpoint, status=status):
+                transport = RegistryHTTPTransport()
+                transport.storage.seed(contract.IMAGE, self.tag, self.raw)
+                transport.before[self.new, endpoint] = self.denied(status)
+                with patch.object(artifacts.urllib.request, "build_opener", return_value=transport):
+                    registry = pipeline.Registry(runner=transport.storage.run)
+                    registry.mirror_candidate(self.tag, self.digest)
+                    registry.assert_equal(self.tag, self.digest)
+                self.assertEqual(len(transport.storage.calls), 1)
+                old_read = next(i for i, read in enumerate(transport.reads)
+                                if read[:3] == (contract.IMAGE, "manifest", False))
+                denied_read = next(i for i, read in enumerate(transport.reads)
+                                   if read[:3] == (self.new, endpoint, False))
+                self.assertLess(old_read, denied_read)
+
+    def test_tokenless_new_name_reaches_actual_manifest_403_then_copies(self):
+        self.transport.tokenless.add(self.new)
+        self.transport.before[self.new, "manifest"] = self.denied()
+        self.registry.mirror_candidate(self.tag, self.digest)
+        self.registry.assert_equal(self.tag, self.digest)
+        reads = [read for read in self.transport.reads if read[:2] == (self.new, "manifest")]
+        self.assertTrue(reads)
+        for read in reads:
+            self.assertNotIn("Authorization", read[3])
+
+    def test_named_registry_error_replies_are_classified_before_copy(self):
+        for code in ("DENIED", "UNAUTHORIZED", "NAME_UNKNOWN"):
+            for body in ({"errors": [{"code": code}]}, {"error": code.lower()}):
+                with self.subTest(body=body):
+                    transport = RegistryHTTPTransport()
+                    transport.storage.seed(contract.IMAGE, self.tag, self.raw)
+                    transport.before[self.new, "token"] = 200, contract.canonical(body)
+                    with patch.object(artifacts.urllib.request, "build_opener", return_value=transport):
+                        registry = pipeline.Registry(runner=transport.storage.run)
+                        registry.mirror_candidate(self.tag, self.digest)
+                        registry.assert_equal(self.tag, self.digest)
+                    self.assertEqual(len(transport.storage.calls), 1)
+
+    def test_same_new_name_403_after_copy_is_a_failure(self):
+        for endpoint in ("token", "manifest"):
+            with self.subTest(endpoint=endpoint):
+                transport = RegistryHTTPTransport()
+                transport.storage.seed(contract.IMAGE, self.tag, self.raw)
+                transport.before[self.new, endpoint] = self.denied()
+                transport.after[self.new, endpoint] = self.denied()
+                with patch.object(artifacts.urllib.request, "build_opener", return_value=transport):
+                    registry = pipeline.Registry(runner=transport.storage.run)
+                    with self.assertRaises(artifacts.RegistryReadError):
+                        registry.mirror_candidate(self.tag, self.digest)
+                self.assertEqual(len(transport.storage.calls), 1)
+
+    def test_old_name_403_never_authorizes_copy(self):
+        for endpoint in ("token", "manifest"):
+            with self.subTest(endpoint=endpoint):
+                self.transport.before = {(contract.IMAGE, endpoint): self.denied()}
+                with self.assertRaises(artifacts.RegistryReadError):
+                    self.registry.point(self.tag, self.digest, fixed=True)
+                self.assertEqual(self.transport.storage.calls, [])
+
+    def test_old_tag_absent_direct_denial_and_other_http_errors_remain_strict(self):
+        self.transport.before[self.new, "token"] = self.denied()
+        with self.assertRaises(artifacts.RegistryReadError):
+            self.registry.point("missing-old-tag", self.digest, fixed=True)
+        with self.assertRaises(artifacts.RegistryReadError):
+            self.registry.digest(self.tag, repository=self.new)
+        self.assertEqual(self.transport.storage.calls, [])
+        for status in (429, 500):
+            self.transport.before[self.new, "token"] = status, b"{}"
+            with self.subTest(status=status), self.assertRaises(contract.Invalid):
+                self.registry.point(self.tag, self.digest, fixed=True)
+            self.assertEqual(self.transport.storage.calls, [])
+
+    def test_corrupted_destination_digest_still_fails_after_denied_preflight(self):
+        self.transport.before[self.new, "token"] = self.denied()
+        self.transport.storage.corrupt = self.new
+        with self.assertRaisesRegex(contract.Invalid, "digests differ"):
+            self.registry.mirror_candidate(self.tag, self.digest)
+        self.assertNotEqual(self.registry.digest(self.tag), self.registry.digest(self.tag, repository=self.new))
+        self.assertEqual(len(self.transport.storage.calls), 1)
 
 
 class DualImageTests(unittest.TestCase):

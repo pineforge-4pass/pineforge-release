@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import release_pair as pair
-from release_artifacts import Client, PRODUCERS, command, npm, producer
+from release_artifacts import Client, PRODUCERS, RegistryReadError, command, npm, producer
 from release_contract import (ASSET, COMMIT, HUB, IMAGE, IMAGES, ROLES, SCHEMA, SHA, Invalid,
                               Pending, bind_facts, canonical, decode, keys, match,
                               payload, positive, require, same_image, sha256, validate, validate_image, version)
@@ -116,7 +116,7 @@ class Registry:
         token = client.registry_token(repository)
         return client.request("https://ghcr.io/v2/" + path + "/manifests/" + ref,
                               accept="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
-                              extra_headers={"Authorization": "Bearer " + token})
+                              extra_headers={"Authorization": "Bearer " + token} if token else {})
 
     def digest(self, tag, *, repository=IMAGE):
         match(r"[A-Za-z0-9_.-]+", tag)
@@ -129,6 +129,21 @@ class Registry:
 
     def digests(self, tag):
         return {repository: self.digest(tag, repository=repository) for repository in IMAGES}
+
+    def _copy_preflight(self, tag):
+        old = self.digest(tag)
+        current = {IMAGE: old}
+        for repository in IMAGES[1:]:
+            try:
+                current[repository] = self.digest(tag, repository=repository)
+            except RegistryReadError as error:
+                # Only before a copy, and only after this same old-name tag
+                # was successfully read and exists. Post-copy reads never use
+                # this exception, even when GHCR still reports DENIED.
+                if old is None or not error.absent_before_copy:
+                    raise
+                current[repository] = None
+        return current
 
     def assert_equal(self, tag, expected):
         match("sha256:" + SHA, expected)
@@ -145,7 +160,7 @@ class Registry:
     def point(self, tag, digest, *, fixed=False, source=IMAGE):
         match("sha256:" + SHA, digest)
         require(source in IMAGES, "unexpected source image repository")
-        current = self.digests(tag)
+        current = self._copy_preflight(tag)
         # Preflight BOTH fixed tags before making any registry mutation.
         require(not fixed or all(value in (None, digest) for value in current.values()),
                 "fixed image identity already exists with a different digest")
