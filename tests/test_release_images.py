@@ -416,6 +416,10 @@ class FirstRegistryCopyTests(unittest.TestCase):
         with self.assertRaises(artifacts.RegistryReadError):
             self.registry.restore("latest", self.digest, previous)
         self.assertEqual(len(self.transport.storage.calls), 1)
+        # A completed write also makes every subsequent restore preflight strict.
+        with self.assertRaises(artifacts.RegistryReadError):
+            self.registry.restore("latest", self.digest, previous)
+        self.assertEqual(len(self.transport.storage.calls), 1)
 
     def test_restore_refuses_drifted_new_alias_after_a_transient_first_read_denial(self):
         self.transport.storage.seed(contract.IMAGE, "latest", self.raw)
@@ -436,10 +440,6 @@ class FirstRegistryCopyTests(unittest.TestCase):
         self.assertEqual(self.transport.storage.calls, [])
         self.assertEqual(self.registry.digests("latest"),
                          {contract.IMAGE: self.digest, self.new: newer})
-        # A completed write also makes every subsequent restore preflight strict.
-        with self.assertRaises(artifacts.RegistryReadError):
-            self.registry.restore("latest", self.digest, previous)
-        self.assertEqual(len(self.transport.storage.calls), 1)
 
     def test_rollback_restores_both_aliases_before_the_new_package_exists(self):
         manifest = fixture_manifest()
