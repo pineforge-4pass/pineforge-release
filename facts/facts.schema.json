@@ -110,7 +110,13 @@
       "additionalProperties": false,
       "required": ["repository", "digest"],
       "properties": {
-        "repository": {"type": "string"},
+        "repository": {
+          "type": "string",
+          "enum": [
+            "ghcr.io/pineforge-4pass/pineforge-release",
+            "ghcr.io/pineforge-4pass/tunaxis-release"
+          ]
+        },
         "repositories": {
           "type": "array",
           "minItems": 1,

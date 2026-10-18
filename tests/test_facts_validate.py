@@ -1,4 +1,4 @@
-"""Canonical validation exercised only through its public CLI."""
+"""Facts CLI validation and committed schema compatibility."""
 import copy
 import hashlib
 import json
@@ -21,6 +21,42 @@ class FactsValidationCLI(unittest.TestCase):
         result = self.invoke(FACTS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["sha256"], hashlib.sha256(FACTS.read_bytes()).hexdigest())
+
+    def test_committed_facts_and_all_json_fixtures_keep_valid_with_the_repository_enum(self):
+        from jsonschema import Draft202012Validator, FormatChecker, ValidationError
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import release_contract as contract
+        schema = json.loads((ROOT / "facts/facts.schema.json").read_bytes())
+        validator = Draft202012Validator(schema, format_checker=FormatChecker())
+        repository_schema = schema["$defs"]["image"]["properties"]["repository"]
+        repository_validator = Draft202012Validator(repository_schema)
+        self.assertEqual(repository_schema["enum"], list(contract.IMAGES))
+        for repository in contract.IMAGES:
+            repository_validator.validate(repository)
+        with self.assertRaises(ValidationError):
+            repository_validator.validate("ghcr.io/unrelated/image")
+        manifest_raw = (ROOT / "tests/fixtures/release-manifest.json").read_bytes()
+        paths = [FACTS, *sorted((ROOT / "tests/fixtures").glob("*.json"))]
+        for path in paths:
+            with self.subTest(path=path.name):
+                raw = path.read_bytes()
+                document = json.loads(raw)
+                if document["schema"] == schema["properties"]["schema"]["const"]:
+                    validator.validate(document)
+                    result = self.invoke(path)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout)["sha256"], hashlib.sha256(raw).hexdigest())
+                elif document["schema"] == contract.SCHEMA:
+                    # Release fixtures keep their complete existing validators;
+                    # their repository must also meet the changed facts constraint.
+                    if "manifest" in document:
+                        contract.validate_payload(document, manifest_raw)
+                    else:
+                        contract.payload(raw)
+                    repository_validator.validate(document["image"]["repository"])
+                else:
+                    self.fail("committed fixture has no applicable schema validator")
+                self.assertEqual(path.read_bytes(), raw)
 
     def test_optional_product_images_accept_either_repository_without_changing_legacy_facts(self):
         sys.path.insert(0, str(ROOT / "scripts"))
