@@ -25,6 +25,20 @@ def example_policy(consumer="offline"):
             "e2e": {"workflow": "release-coordinator.yml", "expected": ["candidate", "release/ready"], "approved_skips": []},
             "deploy": {"workflow": "release.yml", "expected": ["deploy"], "approved_skips": []},
         }
+    if consumer == "application":
+        # Only the base, artifact, CI job names and post-merge gate are known.
+        # Replace example workflow names and E2E/deploy inventories from APP.
+        return {
+            "workflow": "example-application-report.yml", "artifact": "release-receipt-application", "base": "dev",
+            "ci": {"workflow": "example-application-ci.yml",
+                   "expected": ["check", "image-build-contexts", "studio-responsive (1)", "studio-responsive (2)",
+                                "studio-responsive (3)", "studio-paths", "studio-perf-build", "studio-perf"],
+                   "approved_skips": []},
+            "e2e": {"workflow": "example-application-e2e.yml", "expected": ["example-candidate-e2e"], "approved_skips": []},
+            "deploy": {"workflow": "example-application-deploy.yml",
+                       "expected": ["example-served-identity", "example-rollback-identity"], "approved_skips": []},
+            "post_merge": {"workflow": "ci-post-merge.yml", "expected": ["test", "int"], "approved_skips": []},
+        }
     policy = {"workflow": "release.yml", "artifact": "release-receipt-" + consumer, "base": "main"}
     for name in ("ci", "e2e", "deploy"):
         policy[name] = {"workflow": name + ".yml", "expected": [name + "/one", name + "/two"], "approved_skips": []}
@@ -36,9 +50,10 @@ def build_receipt(event=None, *, consumer="offline", facts=None):
     require(consumer in RECEIPT_ROLES, "unexpected consumer")
     require((facts is not None and consumer in ("web", "license")) or event is not None, "receipt target missing")
     head, merge = "1" * 40, "2" * 40
+    policy = example_policy(consumer)
     receipt = {"schema": "pineforge/facts-consumer-receipt/v1" if facts is not None else "pineforge/consumer-receipt/v1",
                "consumer": consumer, "attempt": 90, "sequence": 7, "state": "verified", "timestamp": "2020-01-01T00:07:00Z",
-               "pr": {"number": 9, "base": "main", "base_sha": "3" * 40, "head": head, "merge": merge}}
+               "pr": {"number": 9, "base": policy["base"], "base_sha": "3" * 40, "head": head, "merge": merge}}
     if facts is not None:
         receipt["facts"] = dict(facts)
         image_digest = None
@@ -47,9 +62,10 @@ def build_receipt(event=None, *, consumer="offline", facts=None):
         receipt.update(event_id=event["event_id"], release_version=event["release_version"])
         image_digest = event["image"]["digest"]
         facts_commit, facts_sha = event["facts"]["commit"], event["facts"]["sha256"]
-    for run_id, name in enumerate(("ci", "e2e", "deploy"), 1):
-        expected = example_policy(consumer)[name]["expected"]
-        sha = merge if name == "deploy" else head
+    sections = ("ci", "e2e", "deploy") + (("post_merge",) if consumer == "application" else ())
+    for run_id, name in enumerate(sections, 1):
+        expected = policy[name]["expected"]
+        sha = merge if name in ("deploy", "post_merge") else head
         if consumer == "hosted" and name == "e2e":
             sha = receipt["pr"]["base_sha"]
         receipt[name] = {"run_id": run_id, "run_attempt": 1, "sha": sha,

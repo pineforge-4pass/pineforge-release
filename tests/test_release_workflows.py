@@ -21,6 +21,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 REPO = WORKFLOWS.parent.parent
@@ -1411,6 +1412,293 @@ class PythonTestGateTest(unittest.TestCase):
         self.assertIn("python3 -m unittest discover -s tests -p 'test_release_*.py' -v", job)
         fingerprint = text[text.index("\n  fingerprint-canonical:\n"):text.index("\n  release-rules:\n")]
         self.assertNotIn("test_release_", fingerprint)
+
+
+class PrTierWorkflowTest(unittest.TestCase):
+    ROUTED_JOBS = {
+        "python-test.yml": {"fingerprint-canonical", "release-rules", "description-renderer",
+                            "release-ready-replay", "release-ready"},
+        "facts-validate.yml": {"validate"},
+    }
+    RUNNER = """${{ github.event_name != 'pull_request_target' &&
+        github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+        contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) &&
+        fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}"""
+
+    def assert_runner(self, expression):
+        self.assertEqual(" ".join(expression.split()), " ".join(self.RUNNER.split()))
+
+    def test_all_pr_jobs_pin_hosted_pr_and_preserve_non_pr_pool_guards(self):
+        pr_workflows = {path.name: _workflow(path.name) for path in WORKFLOWS.glob("*.yml")
+                        if "pull_request" in _workflow(path.name)["on"]}
+        self.assertEqual(set(pr_workflows), set(self.ROUTED_JOBS))
+        for name, workflow in pr_workflows.items():
+            with self.subTest(workflow=name):
+                self.assertEqual(workflow["name"], name.removesuffix(".yml"))
+                self.assertEqual(workflow["permissions"], {"contents": "read"})
+                self.assertEqual(workflow["concurrency"], {
+                    "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}",
+                    "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+                })
+                self.assertFalse(workflow["on"]["pull_request"])
+                self.assertNotIn("pull_request_target", workflow["on"])
+                expected = self.ROUTED_JOBS[name] | ({"changes"} if name == "python-test.yml" else set())
+                self.assertEqual(set(workflow["jobs"]), expected)
+                for identity, job in workflow["jobs"].items():
+                    self.assertEqual(job.get("name", identity),
+                                     "release/ready" if identity == "release-ready" else identity)
+                    self.assertNotIn("uses", job, "PR coverage must not hide a reusable pool job")
+                    self.assertNotIn("permissions", job)
+                    if identity == "changes":
+                        self.assertEqual(job["runs-on"], "ubuntu-24.04")
+                    else:
+                        self.assert_runner(job["runs-on"])
+                text = (WORKFLOWS / name).read_text()
+                for forbidden in ("secrets.", "create-github-app-token", "id-token:", ": write"):
+                    self.assertNotIn(forbidden, text)
+
+    def test_runner_pin_rejects_old_pr_pool_allowlist_and_missing_guards(self):
+        runner = _workflow("python-test.yml")["jobs"]["release-rules"]["runs-on"]
+        self.assert_runner(runner)
+        mutants = (
+            runner.replace('["push","workflow_dispatch"', '["push","pull_request","workflow_dispatch"'),
+            runner.replace("github.event_name != 'pull_request_target' &&", ""),
+            runner.replace("github.actor != 'dependabot[bot]' &&", ""),
+            runner.replace("github.triggering_actor != 'dependabot[bot]' &&", ""),
+            runner.replace(" || 'ubuntu-24.04'", ""),
+            runner.replace("'ubuntu-24.04'", """fromJSON('["self-hosted","pf-ci","pf-ci-x64"]')"""),
+            runner.replace('"schedule",', ""),
+        )
+        for mutant in mutants:
+            with self.subTest(runner=mutant):
+                self.assertNotEqual(mutant, runner)
+                with self.assertRaises(AssertionError):
+                    self.assert_runner(mutant)
+
+    def test_docs_only_gates_keep_existing_checks_and_main_coverage(self):
+        workflow = _workflow("python-test.yml")
+        self.assertEqual(set(workflow["on"]), {"pull_request", "push", "merge_group"})
+        self.assertEqual(workflow["on"]["push"]["branches"], ["main", "master"])
+        changes = workflow["jobs"]["changes"]
+        self.assertEqual(changes["outputs"], {"docs-only": "${{ steps.paths.outputs.docs-only }}"})
+        self.assertEqual(changes["steps"][0]["with"]["fetch-depth"], "0")
+        self.assertEqual(changes["steps"][0]["if"], "github.event_name == 'pull_request'")
+        for identity in self.ROUTED_JOBS["python-test.yml"] - {"release-ready"}:
+            job = workflow["jobs"][identity]
+            self.assertEqual(job["needs"], "changes")
+            self.assertEqual(job["if"], "needs.changes.outputs.docs-only == 'false'")
+        aggregate = workflow["jobs"]["release-ready"]
+        self.assertEqual(aggregate["name"], "release/ready")
+        self.assertEqual(aggregate["if"], "${{ always() }}")
+        self.assertEqual(set(aggregate["needs"]), self.ROUTED_JOBS["python-test.yml"] - {"release-ready"} | {"changes"})
+        facts = _workflow("facts-validate.yml")
+        self.assertEqual(set(facts["on"]), {"pull_request", "push"})
+        self.assertEqual(facts["on"]["push"]["branches"], ["main"])
+        self.assertEqual(facts["on"]["push"]["paths"], [
+            "facts/**", "scripts/repo_descriptions.py", "scripts/facts_*.py",
+            "tests/test_repo_descriptions.py", "tests/test_facts_*.py",
+            "tests/test_release_workflows.py", ".github/workflows/**",
+        ])
+        validate = facts["jobs"]["validate"]
+        self.assertNotIn("if", validate, "the validate check must finish even on docs-only PRs")
+        self.assertEqual(validate["steps"][0]["with"]["fetch-depth"],
+                         "${{ github.event_name == 'pull_request' && '0' || '1' }}")
+        for step in validate["steps"][2:]:
+            self.assertEqual(step["if"], "steps.paths.outputs.docs-only == 'false'")
+
+    def detector(self, workflow):
+        jobs = _workflow(workflow)["jobs"]
+        job = jobs["changes" if workflow == "python-test.yml" else "validate"]
+        return next(step for step in job["steps"] if step.get("id") == "paths")["run"]
+
+    def detect(self, workflow, paths, event="pull_request", *, fail=False, script=None):
+        if script is None:
+            script = self.detector(workflow)
+        self.assertTrue(script.startswith("python3 - <<'PY'\n"))
+        self.assertTrue(script.endswith("PY\n"))
+        program = script.removeprefix("python3 - <<'PY'\n").removesuffix("PY\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "outputs"
+            env = {"EVENT_NAME": event, "BASE_SHA": "base", "HEAD_SHA": "head",
+                   "GITHUB_OUTPUT": str(output)}
+            changed = b"".join(os.fsencode(path) + b"\0" for path in paths)
+            with patch.dict(os.environ, env, clear=True), patch("subprocess.check_output", return_value=changed) as diff:
+                if fail:
+                    diff.side_effect = subprocess.CalledProcessError(1, "git diff")
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        exec(compile(program, workflow, "exec"), {})
+                    self.assertFalse(output.exists())
+                else:
+                    exec(compile(program, workflow, "exec"), {})
+                if event == "pull_request":
+                    diff.assert_called_once_with([
+                        "git", "diff", "--name-only", "--no-renames", "-z", "base...head", "--",
+                    ])
+                else:
+                    diff.assert_not_called()
+            return output.read_text() if output.exists() else None
+
+    def test_docs_detection_executes_actual_scripts_on_docs_mixed_and_unknown_paths(self):
+        self.assertEqual(self.detector("python-test.yml"), self.detector("facts-validate.yml"))
+        cases = (
+            (["README.md", "docs/release-chain.md", "LICENSE"], False),
+            (["README.md"], False),
+            (["docs/release-chain.md"], False),
+            (["LICENSE"], False),
+            (["tools/release-dry-run/README.md"], False),
+            (["scripts/guide.rst"], False),
+            ([".github/workflows/README.md"], False),
+            (["docs/guide.md", "docs/index.rst"], True),
+            (["docs/screenshot with spaces.png", "docs/note\ncontinued.txt"], True),
+            (["facts/README.md"], True),
+            ([], False),
+            (["README.md", "scripts/release_pair.py"], False),
+            (["facts/README.md", "docs/release-chain.md"], False),
+            (["facts/README.md", "tools/release-dry-run/README.md"], False),
+            (["docs/release-chain.md", "docs/renamed.md"], False),
+            (["requirements.txt"], False),
+            (["docs/check.py"], False),
+            (["facts/facts.json"], False),
+            ([".github/workflows/python-test.yml"], False),
+            (["VERSION"], False),
+            (["scripts/renamed.py", "docs/renamed.md"], False),
+        )
+        for workflow in self.ROUTED_JOBS:
+            for paths, expected in cases:
+                with self.subTest(workflow=workflow, paths=paths):
+                    self.assertEqual(self.detect(workflow, paths), f"docs-only={str(expected).lower()}\n")
+            self.detect(workflow, ["README.md"], fail=True)
+            for event in ("push", "merge_group", "schedule", "workflow_dispatch", "release"):
+                with self.subTest(workflow=workflow, event=event):
+                    self.assertEqual(self.detect(workflow, ["README.md"], event), "docs-only=false\n")
+
+    def test_test_input_exclusions_are_exact_and_each_is_needed(self):
+        rules = (
+            "test_inputs = {'README.md', 'docs/release-chain.md', 'LICENSE'}",
+            "str(path) not in test_inputs and",
+            "path.parts[:2] != ('.github', 'workflows') and",
+            "path.parts[0] not in {'scripts', 'tools'} and",
+        )
+        mutations = (
+            ("'README.md', ", "", "README.md"),
+            ("'docs/release-chain.md', ", "", "docs/release-chain.md"),
+            (", 'LICENSE'}", "}", "LICENSE"),
+            ("path.parts[:2] != ('.github', 'workflows') and", "",
+             ".github/workflows/README.md"),
+            ("{'scripts', 'tools'}", "{'tools'}", "scripts/guide.rst"),
+            ("{'scripts', 'tools'}", "{'scripts'}", "tools/release-dry-run/README.md"),
+        )
+        for workflow in self.ROUTED_JOBS:
+            script = self.detector(workflow)
+            for rule in rules:
+                self.assertIn(rule, script)
+            for before, after, path in mutations:
+                with self.subTest(workflow=workflow, path=path):
+                    self.assertIn(before, script)
+                    self.assertEqual(self.detect(workflow, [path]), "docs-only=false\n")
+                    mutant = script.replace(before, after, 1)
+                    self.assertNotEqual(mutant, script)
+                    with self.assertRaises(AssertionError):
+                        self.assertEqual(self.detect(workflow, [path], script=mutant),
+                                         "docs-only=false\n")
+
+    @staticmethod
+    def named_repo_files(source):
+        """Conservatively collect file literals, joined Paths, aliases and globs.
+
+        Looking at names as well as read calls covers copyfile and files passed
+        to subprocesses. The classifier's own synthetic path cases are excluded.
+        """
+        tree = ast.parse(source)
+        tree.body = [node for node in tree.body
+                     if not (isinstance(node, ast.ClassDef) and node.name == "PrTierWorkflowTest")]
+        bases = {"ROOT": REPO, "REPO": REPO, "WORKFLOWS": WORKFLOWS}
+
+        def path_value(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if node.value and "\n" not in node.value and "\0" not in node.value:
+                    return Path(node.value)
+            elif isinstance(node, ast.Name):
+                return bases.get(node.id)
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+                left, right = path_value(node.left), path_value(node.right)
+                if left is not None and right is not None:
+                    return left / right
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                  and node.func.id in {"Path", "PurePosixPath"}):
+                parts = [path_value(arg) for arg in node.args]
+                if parts and all(part is not None for part in parts):
+                    return Path(*parts)
+            return None
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                value = path_value(node.value)
+                if value is not None:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            bases[target.id] = value
+
+        candidates = set()
+        for node in ast.walk(tree):
+            value = path_value(node)
+            if value is not None:
+                candidates.add(value)
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"glob", "rglob"} and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)):
+                base = path_value(node.func.value)
+                if base is not None:
+                    base = (REPO / base).resolve()
+                    if base.is_relative_to(REPO) and base.is_dir():
+                        candidates.update(getattr(base, node.func.attr)(node.args[0].value))
+        files = set()
+        for candidate in candidates:
+            try:
+                path = (REPO / candidate).resolve()
+                if path.is_relative_to(REPO) and path.is_file():
+                    files.add(path.relative_to(REPO).as_posix())
+            except (OSError, ValueError):
+                # A non-path test literal can contain invalid/overlong components.
+                continue
+        return files
+
+    def assert_test_inputs_run(self, workflow, inputs):
+        for path in sorted(inputs):
+            self.assertEqual(self.detect(workflow, [path]), "docs-only=false\n",
+                             f"{workflow}: {path} is named or scanned by a test; keep its suites on PRs")
+
+    def test_no_test_input_is_skipped_as_documentation(self):
+        sources = sorted((REPO / "tests").rglob("test_*.py"))
+        sources += sorted((REPO / "tools" / "release-dry-run").glob("test_*.py"))
+        inputs = set()
+        for source in sources:
+            inputs.update(self.named_repo_files(source.read_text(encoding="utf-8")))
+        # These are found in other tests, not injected into the scan's result.
+        self.assertTrue({"README.md", "docs/release-chain.md", "LICENSE",
+                         "tools/release-dry-run/README.md"} <= inputs)
+        for workflow in self.ROUTED_JOBS:
+            self.assert_test_inputs_run(workflow, inputs)
+
+    def test_test_input_guard_rejects_new_document_reads(self):
+        sources = (
+            'text = open("facts/README.md").read()',
+            'text = Path("facts/README.md").read_text()',
+            'text = (ROOT / "facts" / "README.md").read_bytes()',
+            'doc = REPO / "facts"\ntext = (doc / "README.md").read_text()',
+            'shutil.copyfile(REPO / "facts/README.md", destination)',
+            'for path in (ROOT / "facts").glob("*.md"):\n    text = path.read_text()',
+            'for path in (ROOT / "facts").rglob("*.md"):\n    text = path.read_text()',
+        )
+        for source in sources:
+            inputs = self.named_repo_files(source)
+            self.assertIn("facts/README.md", inputs)
+            for workflow in self.ROUTED_JOBS:
+                with self.subTest(workflow=workflow, source=source):
+                    with self.assertRaises(AssertionError):
+                        self.assert_test_inputs_run(workflow, inputs)
+        self.assertEqual(self.named_repo_files('# open("facts/README.md").read()\n'), set())
 
 
 if __name__ == "__main__":

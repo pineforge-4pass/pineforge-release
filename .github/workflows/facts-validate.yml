@@ -2,14 +2,6 @@ name: facts-validate
 
 on:
   pull_request:
-    paths:
-      - 'facts/**'
-      - 'scripts/repo_descriptions.py'
-      - 'scripts/facts_*.py'
-      - 'tests/test_repo_descriptions.py'
-      - 'tests/test_facts_*.py'
-      - 'tests/test_release_workflows.py'
-      - '.github/workflows/**'
   push:
     branches: [main]
     paths:
@@ -24,14 +16,17 @@ on:
 permissions:
   contents: read
 
+# Only superseded PR runs share a cancellable group. Other events use run_id.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   validate:
     runs-on: >-
       ${{ github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) &&
           fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
@@ -39,16 +34,56 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
           persist-credentials: false
+      - name: Detect documentation-only PR
+        id: paths
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          from pathlib import PurePosixPath
+
+          docs_only = False
+          if os.environ['EVENT_NAME'] == 'pull_request':
+              paths = subprocess.check_output([
+                  'git', 'diff', '--name-only', '--no-renames', '-z',
+                  os.environ['BASE_SHA'] + '...' + os.environ['HEAD_SHA'], '--',
+              ]).split(b'\0')
+              paths = [PurePosixPath(os.fsdecode(path)) for path in paths if path]
+              # Release tests consume these documents and scan automation files.
+              test_inputs = {'README.md', 'docs/release-chain.md', 'LICENSE'}
+              docs_only = bool(paths) and all(
+                  str(path) not in test_inputs and
+                  path.parts[:2] != ('.github', 'workflows') and
+                  path.parts[0] not in {'scripts', 'tools'} and (
+                      path.suffix in {'.md', '.rst'} or str(path) == 'LICENSE' or
+                      (path.parts[0] == 'docs' and path.suffix in {
+                          '.txt', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.pdf',
+                      })
+                  )
+                  for path in paths
+              )
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('docs-only=' + str(docs_only).lower() + '\n')
+          PY
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: steps.paths.outputs.docs-only == 'false'
         with:
           python-version: '3.12'
       - run: python3 -m pip install -r facts/requirements-validation.txt
+        if: steps.paths.outputs.docs-only == 'false'
       - name: Validate the whole canonical document and descriptions
+        if: steps.paths.outputs.docs-only == 'false'
         run: |
           python3 scripts/facts_validate.py --facts facts/facts.json
           python3 scripts/repo_descriptions.py render --facts facts/facts.json
       - name: Render deterministic full and corpus SVGs and endpoint JSON
+        if: steps.paths.outputs.docs-only == 'false'
         run: |
           set -euo pipefail
           for variant in full corpus; do
@@ -60,4 +95,5 @@ jobs:
             python3 scripts/facts_cards.py --facts facts/facts.json --variant "$variant" --format json > "$RUNNER_TEMP/$variant.json"
           done
       - name: CLI acceptance including parsed SVG and JSON content
+        if: steps.paths.outputs.docs-only == 'false'
         run: python3 -m unittest discover -s tests -p 'test_facts_*.py' -v

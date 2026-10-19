@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hosted receipt regressions for CI/cloud only; all API and ZIP bytes are local.
+"""Hosted/application receipt regressions for CI/cloud; API and ZIP bytes are local.
 
 These fixtures exercise the real validator, not the consumer's proposed copy.
 Unexpected API routes or downloads fail immediately without making a request.
@@ -7,6 +7,7 @@ Unexpected API routes or downloads fail immediately without making a request.
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -21,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import consumer_receipt_example as example  # noqa: E402
 import release_contract as contract  # noqa: E402
+import release_pipeline as pipeline  # noqa: E402
 import release_receipts as receipts  # noqa: E402
 
 
@@ -32,6 +34,20 @@ HOSTED_POLICY = {
     "deploy": {"workflow": "release.yml", "expected": ["deploy"], "approved_skips": []},
 }
 
+# Independently transcribed from the requested APP gate and documented examples.
+# The example-* workflows and E2E/deploy inventories must be supplied by APP.
+APPLICATION_POLICY = {
+    "workflow": "example-application-report.yml", "artifact": "release-receipt-application", "base": "dev",
+    "ci": {"workflow": "example-application-ci.yml",
+           "expected": ["check", "image-build-contexts", "studio-responsive (1)", "studio-responsive (2)",
+                        "studio-responsive (3)", "studio-paths", "studio-perf-build", "studio-perf"],
+           "approved_skips": []},
+    "e2e": {"workflow": "example-application-e2e.yml", "expected": ["example-candidate-e2e"], "approved_skips": []},
+    "deploy": {"workflow": "example-application-deploy.yml",
+               "expected": ["example-served-identity", "example-rollback-identity"], "approved_skips": []},
+    "post_merge": {"workflow": "ci-post-merge.yml", "expected": ["test", "int"], "approved_skips": []},
+}
+
 
 class ReceiptFixture:
     repo = "pineforge-4pass/fixture"
@@ -41,8 +57,12 @@ class ReceiptFixture:
             HOSTED_POLICY if consumer == "hosted" else example.example_policy(consumer)))
         self.event = contract.payload((ROOT / "tests/fixtures/release-manifest.json").read_bytes())
         self.receipt = example.build_receipt(self.event, consumer=consumer)
+        # An explicit legacy policy still exercises a receipt without post_merge.
+        if "post_merge" not in self.policy:
+            self.receipt.pop("post_merge", None)
         self.pr = self.receipt["pr"]
-        self.actual_pr = {"base": {"ref": "main", "sha": self.pr["base_sha"]},
+        self.pr["base"] = self.policy["base"]
+        self.actual_pr = {"base": {"ref": self.pr["base"], "sha": self.pr["base_sha"]},
                           "head": {"sha": self.pr["head"], "repo": {"full_name": self.repo}},
                           "merged": True, "merge_commit_sha": self.pr["merge"], "merged_at": "2020-01-01T00:05:00Z"}
         self.metadata = {"full_name": self.repo, "default_branch": "main"}
@@ -51,8 +71,11 @@ class ReceiptFixture:
                           f"repos/{self.repo}/commits/{self.pr['merge']}": self.commit}
         self.runs, self.jobs = {}, {}
         coordinator = self.policy["e2e"]["workflow"] == "release-coordinator.yml"
-        for stage, run_id, attempt in (("ci", 41, 2), ("e2e", 52, 3), ("deploy", 63, 4)):
-            sha = self.pr["merge"] if stage == "deploy" else self.pr["head"]
+        stages = (("ci", 41, 2), ("e2e", 52, 3), ("deploy", 63, 4))
+        if "post_merge" in self.policy:
+            stages += (("post_merge", 74, 5),)
+        for stage, run_id, attempt in stages:
+            sha = self.pr["merge"] if stage in ("deploy", "post_merge") else self.pr["head"]
             if stage == "e2e" and coordinator:
                 sha = self.pr["base_sha"]
             expected = self.policy[stage]["expected"]
@@ -64,10 +87,13 @@ class ReceiptFixture:
                    "head_sha": sha, "status": "completed", "conclusion": "success",
                    "event": "workflow_run" if stage == "e2e" and coordinator else (
                        "pull_request" if stage == "ci" else "push"),
-                   "head_branch": "main", "repository": {"full_name": self.repo},
+                   "head_branch": self.policy["base"], "repository": {"full_name": self.repo},
                    "head_repository": {"full_name": self.repo}}
+            finished = "2020-01-01T00:06:00Z" if stage == "deploy" else "2020-01-01T00:04:00Z"
+            if stage == "post_merge":
+                finished = "2020-01-01T00:06:30Z"
             jobs = [{"name": name, "status": "completed", "conclusion": "success",
-                     "completed_at": "2020-01-01T00:06:00Z" if stage == "deploy" else "2020-01-01T00:04:00Z"}
+                     "completed_at": finished}
                     for name in expected]
             self.runs[stage], self.jobs[stage] = run, jobs
             route = f"repos/{self.repo}/actions/runs/{run_id}/attempts/{attempt}"
@@ -496,6 +522,267 @@ class HostedCoordinatorReceiptTests(unittest.TestCase):
                 f.actual_pr["base"]["sha"] = "f" * 40
             with self.subTest(mutation=mutation), self.assertRaises(contract.Invalid):
                 f.verify()
+
+
+class ApplicationPostMergeReceiptTests(unittest.TestCase):
+    def fixture(self):
+        return ReceiptFixture("application", APPLICATION_POLICY)
+
+    def test_documented_application_policy_with_post_merge_is_accepted(self):
+        doc = (ROOT / "docs/release-chain.md").read_text().split("## Supervisor configuration\n", 1)[1]
+        policies = [json.loads(raw) for raw in re.findall(r"```json\n(.*?)\n```", doc, re.S)]
+        documented = next(policy for policy in policies if "application" in policy)
+        self.assertEqual(documented["application"], APPLICATION_POLICY)
+        self.assertEqual(example.example_policy("application"), APPLICATION_POLICY)
+        with patch.dict(os.environ, {"RELEASE_RECEIPT_POLICY": json.dumps(documented)}):
+            self.assertEqual(receipts.profile("application"), APPLICATION_POLICY)
+
+    def test_post_merge_policy_is_rejected_for_every_other_role(self):
+        for role in ("offline", "hosted", "web", "data", "license"):
+            policy = example.example_policy(role)
+            policy["post_merge"] = copy.deepcopy(APPLICATION_POLICY["post_merge"])
+            with self.subTest(role=role), patch.dict(os.environ, {"RELEASE_RECEIPT_POLICY": json.dumps({role: policy})}):
+                with self.assertRaisesRegex(contract.Invalid, "post-merge policy is only valid for application"):
+                    receipts.profile(role)
+
+    def test_post_merge_policy_rejects_empty_duplicate_skippable_or_malformed_inventory(self):
+        cases = (
+            ("expected", [], "empty or duplicate required inventory"),
+            ("expected", ["test", "test"], "empty or duplicate required inventory"),
+            ("expected", None, "empty or duplicate required inventory"),
+            ("approved_skips", ["unknown"], "invalid skip policy"),
+            ("approved_skips", None, "invalid skip policy"),
+            ("approved_skips", ["test"], "post-merge checks cannot be skipped"),
+            ("approved_skips", ["int"], "post-merge checks cannot be skipped"),
+            ("approved_skips", ["test", "int"], "entire required inventory cannot be skipped"),
+            ("workflow", "ci-post-merge.yaml", "malformed identity"),
+            ("workflow", ".github/workflows/ci-post-merge.yml", "malformed identity"),
+        )
+        for key, value, message in cases:
+            policy = copy.deepcopy(APPLICATION_POLICY)
+            policy["post_merge"][key] = value
+            with self.subTest(key=key, value=value), patch.dict(os.environ, {
+                    "RELEASE_RECEIPT_POLICY": json.dumps({"application": policy})}):
+                with self.assertRaisesRegex(contract.Invalid, message):
+                    receipts.profile("application")
+
+    def test_post_merge_policy_has_exact_section_fields(self):
+        for mutation in ("missing_expected", "extra_field"):
+            policy = copy.deepcopy(APPLICATION_POLICY)
+            if mutation == "missing_expected":
+                policy["post_merge"].pop("expected")
+            else:
+                policy["post_merge"]["extra"] = True
+            with self.subTest(mutation=mutation), patch.dict(os.environ, {
+                    "RELEASE_RECEIPT_POLICY": json.dumps({"application": policy})}):
+                with self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+                    receipts.profile("application")
+
+    def test_missing_post_merge_member_is_rejected_even_before_verified(self):
+        for state in ("pending", "ready", "verified"):
+            f = self.fixture()
+            f.receipt["state"] = state
+            f.receipt.pop("post_merge")
+            with self.subTest(state=state), self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+                f.verify()
+            self.assertEqual(f.queries, [])
+
+    def test_post_merge_member_is_rejected_without_policy_for_every_role(self):
+        for role in ("offline", "hosted", "application", "web", "data", "license"):
+            policy = example.example_policy("offline")
+            policy["artifact"] = "release-receipt-" + role
+            f = ReceiptFixture(role, policy)
+            self.assertNotIn("post_merge", f.verify())
+            f.queries.clear()
+            f.receipt["post_merge"] = None
+            with self.subTest(role=role), self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+                f.verify()
+            self.assertEqual(f.queries, [])
+
+    def test_facts_only_receipt_still_rejects_post_merge(self):
+        for role in ("web", "license"):
+            f = ReceiptFixture(role)
+            f.receipt.update(schema="pineforge/facts-consumer-receipt/v1",
+                             facts={key: f.event["facts"][key] for key in ("commit", "sha256")})
+            f.receipt.pop("event_id")
+            f.receipt.pop("release_version")
+            f.event = None
+            self.assertEqual(f.verify()["state"], "verified")
+            f.receipt["post_merge"] = None
+            with self.subTest(role=role), self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+                f.verify()
+
+    def test_verified_post_merge_cannot_be_null_or_malformed(self):
+        for evidence in (None, {"unvalidated": True}):
+            f = self.fixture()
+            f.receipt["post_merge"] = evidence
+            with self.subTest(evidence=evidence), self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+                f.verify()
+
+    def test_verified_post_merge_is_accepted_and_public_evidence_is_neutral(self):
+        f = self.fixture()
+        public = f.verify()
+        self.assertEqual(public["state"], "verified")
+        self.assertEqual(public["post_merge"], {
+            "run_id": 74, "run_attempt": 5,
+            "inventory_sha256": hashlib.sha256(b'{"int":"success","test":"success"}\n').hexdigest(),
+        })
+        self.assertIn(f"repos/{f.repo}/actions/runs/74/attempts/5/jobs?per_page=100&page=1", f.queries)
+        raw = contract.canonical(public)
+        for private in (b"fixture", b"ci-post-merge.yml", b'"test"', b'"int"', b"example-application"):
+            self.assertNotIn(private, raw)
+
+    def test_post_merge_response_cannot_substitute_another_run(self):
+        f = self.fixture()
+        f.runs["post_merge"]["id"] += 1
+        with self.assertRaisesRegex(contract.Invalid, "post-merge run identity differs"):
+            f.verify()
+
+    def test_post_merge_response_cannot_substitute_another_attempt(self):
+        f = self.fixture()
+        f.runs["post_merge"]["run_attempt"] += 1
+        with self.assertRaisesRegex(contract.Invalid, "post-merge run identity differs"):
+            f.verify()
+
+    def test_post_merge_requires_push_event(self):
+        for event in ("pull_request", "workflow_run", "workflow_dispatch", "repository_dispatch"):
+            f = self.fixture()
+            f.runs["post_merge"]["event"] = event
+            with self.subTest(event=event), self.assertRaisesRegex(contract.Invalid, "post-merge checks must use push"):
+                f.verify()
+
+    def test_post_merge_requires_the_policy_base_branch(self):
+        for branch in ("main", "feature"):
+            f = self.fixture()
+            f.runs["post_merge"]["head_branch"] = branch
+            with self.subTest(branch=branch), self.assertRaisesRegex(contract.Invalid, "post-merge checks branch differs from policy"):
+                f.verify()
+
+    def test_post_merge_receipt_and_github_sha_must_independently_equal_merge(self):
+        for target in ("receipt", "github", "both"):
+            f = self.fixture()
+            if target in ("receipt", "both"):
+                f.receipt["post_merge"]["sha"] = f.pr["head"]
+            if target in ("github", "both"):
+                f.runs["post_merge"]["head_sha"] = f.pr["head"]
+            message = "unexpected checks workflow or head" if target == "github" else "checks ran against a different source"
+            with self.subTest(target=target), self.assertRaisesRegex(contract.Invalid, message):
+                f.verify()
+
+    def test_post_merge_requires_the_configured_workflow_path(self):
+        f = self.fixture()
+        f.runs["post_merge"]["path"] = ".github/workflows/other.yml"
+        with self.assertRaisesRegex(contract.Invalid, "unexpected checks workflow or head"):
+            f.verify()
+
+    def test_post_merge_run_must_be_completed_and_successful(self):
+        for key, value in (("status", "in_progress"), ("conclusion", "failure"), ("conclusion", "cancelled"),
+                           ("conclusion", "skipped"), ("conclusion", None)):
+            f = self.fixture()
+            f.runs["post_merge"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(contract.Invalid, "required check run not successful"):
+                f.verify()
+
+    def test_each_post_merge_job_must_be_present_once_completed_and_successful(self):
+        for name in ("test", "int"):
+            for mutation in ("missing", "duplicate", "in_progress", "failure", "cancelled", "skipped", "no_completion"):
+                f = self.fixture()
+                job = next(row for row in f.jobs["post_merge"] if row["name"] == name)
+                if mutation == "missing":
+                    f.jobs["post_merge"].remove(job)
+                elif mutation == "duplicate":
+                    f.jobs["post_merge"].append(copy.deepcopy(job))
+                elif mutation == "in_progress":
+                    job["status"] = mutation
+                elif mutation == "no_completion":
+                    job.pop("completed_at")
+                else:
+                    job["conclusion"] = mutation
+                    f.receipt["post_merge"]["results"][name] = mutation
+                message = ("required check missing or incomplete" if mutation in ("missing", "duplicate", "in_progress")
+                           else "required check completion time missing" if mutation == "no_completion"
+                           else "required check failed/cancelled/skipped")
+                with self.subTest(name=name, mutation=mutation), self.assertRaisesRegex(contract.Invalid, message):
+                    f.verify()
+
+    def test_post_merge_reported_inventory_and_results_must_match(self):
+        for key, value, message in (
+                ("expected", ["int", "test"], "required check inventory differs from owner policy"),
+                ("approved_skips", ["test"], "required check inventory differs from owner policy"),
+                ("results", {"test": "success"}, "reported checks differ from GitHub"),
+                ("results", {"test": "success", "int": "skipped"}, "reported checks differ from GitHub"),
+                ("results", {"test": "success", "int": "success", "extra": "success"}, "reported checks differ from GitHub")):
+            f = self.fixture()
+            f.receipt["post_merge"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(contract.Invalid, message):
+                f.verify()
+
+    def test_receipt_timestamp_must_cover_the_last_post_merge_job(self):
+        for name in ("test", "int"):
+            f = self.fixture()
+            next(row for row in f.jobs["post_merge"] if row["name"] == name)["completed_at"] = "2020-01-01T00:07:01Z"
+            with self.subTest(name=name), self.assertRaisesRegex(contract.Invalid, "served receipt predates post-merge verification"):
+                f.verify()
+        f = self.fixture()
+        f.receipt["timestamp"] = "2020-01-01T00:06:30Z"
+        self.assertEqual(f.verify()["state"], "verified")
+
+    def test_earlier_states_require_the_member_but_do_not_validate_its_value(self):
+        for state in ("pending", "pr_open", "testing", "ready", "merged", "deploying", "failed", "superseded", "skipped_by_policy"):
+            for evidence in (None, {"unvalidated": True}):
+                f = self.fixture()
+                f.receipt.update(state=state, post_merge=evidence, deploy=None, deployed=None)
+                if state == "skipped_by_policy":
+                    f.event["prerelease"] = True
+                with self.subTest(state=state, evidence=evidence):
+                    public = f.verify()
+                    self.assertEqual(public["state"], state)
+                    self.assertNotIn("post_merge", public)
+                    self.assertFalse(any("/runs/74/" in route for route in f.queries))
+
+    def test_example_emits_post_merge_only_for_application_and_validates(self):
+        f = self.fixture()
+        built = example.build_receipt(f.event, consumer="application")
+        self.assertEqual(built["pr"]["base"], "dev")
+        self.assertEqual(built["post_merge"], {
+            "run_id": 4, "run_attempt": 1, "sha": "2" * 40,
+            "expected": ["test", "int"], "approved_skips": [], "results": {"test": "success", "int": "success"},
+        })
+        for stage in ("ci", "e2e", "deploy", "post_merge"):
+            evidence = built[stage]
+            route = f"repos/{f.repo}/actions/runs/{evidence['run_id']}/attempts/{evidence['run_attempt']}"
+            f.responses[route] = {**f.runs[stage], "id": evidence["run_id"], "run_attempt": evidence["run_attempt"]}
+            f.responses[route + "/jobs?per_page=100&page=1"] = {"jobs": f.jobs[stage]}
+        f.receipt = built
+        self.assertEqual(f.verify()["post_merge"]["run_id"], 4)
+        for role in ("offline", "hosted", "web", "data", "license"):
+            with self.subTest(role=role):
+                self.assertNotIn("post_merge", example.example_policy(role))
+                self.assertNotIn("post_merge", example.build_receipt(f.event, consumer=role))
+
+    def test_public_post_merge_is_retained_and_aggregate_uses_verified_state(self):
+        f = self.fixture()
+        public = f.verify()
+        name = "consumer-application-90-7.json"
+        row = {"tag_name": "v" + f.event["release_version"], "assets": [{"id": 1, "name": name}]}
+
+        class Store:
+            def get(self, tag):
+                if tag != row["tag_name"]:
+                    raise AssertionError("unexpected fixture release")
+                return row
+
+            def read(self, release, asset):
+                if release != row or asset != name:
+                    raise AssertionError("unexpected fixture asset")
+                return contract.canonical(public)
+
+        store = Store()
+        self.assertEqual(pipeline.receipts(store, row, f.event["event_id"]), {"application": public})
+        self.assertEqual(pipeline.aggregate(store, row, f.event, enabled=("application",)), {
+            "schema": "pineforge/release-status/v1", "event_id": f.event["event_id"],
+            "release_version": f.event["release_version"], "consumers": {"application": "verified"}, "complete": True,
+        })
 
 
 if __name__ == "__main__":

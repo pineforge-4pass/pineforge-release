@@ -304,12 +304,18 @@ of `expected`, never the whole list). Workflow filenames match
 callback. Reporting runs must use that configured workflow and an event of
 `push`, `workflow_dispatch`, `workflow_run`, or `repository_dispatch`.
 
+Only the `application` policy may additionally contain `post_merge`. It has the
+same exact `workflow`, `expected`, `approved_skips` fields and inventory rules,
+with `approved_skips` required to be `[]`. Its workflow must be a `.yml`
+filename. Policies for all other roles must omit it.
+
 **Types and product receipt fields.** An integer below is a JSON integer from
 1 through 9007199254740991, never a boolean or numeric string. A commit is
 exactly 40 lowercase hexadecimal characters. A SHA-256 is exactly 64 lowercase
 hexadecimal characters; a digest is `sha256:` followed by a SHA-256. Every field
-in this table is required. Evidence fields can be `null` until their stage
-requires them. Objects have exactly the fields defined here.
+in this table is required except the conditional `post_merge` field. Evidence
+fields can be `null` until their stage requires them. Objects have exactly the
+fields defined here.
 
 | Field | Type and allowed value |
 |---|---|
@@ -320,9 +326,10 @@ requires them. Objects have exactly the fields defined here.
 | `attempt` | Integer identifying an automation attempt, increasing per consumer/target; use the coordinator's GitHub run ID, not `GITHUB_RUN_ATTEMPT` alone. |
 | `sequence` | Integer, strictly increasing for new snapshots within that attempt. It may restart at 1 for a larger attempt. |
 | `state` | One of the ten strings in the state table below. |
-| `timestamp` | Real UTC timestamp string `YYYY-MM-DDTHH:MM:SSZ`, at most five minutes in the future; for verified, at/after the final deploy check completion. |
+| `timestamp` | Real UTC timestamp string `YYYY-MM-DDTHH:MM:SSZ`, at most five minutes in the future; for verified, at/after the final deploy check completion and, when configured, the final post-merge check completion. |
 | `pr` | PR object below, or `null` before PR evidence exists. |
 | `ci`, `e2e`, `deploy` | Each a check-evidence object below, or `null` before that evidence exists. |
+| `post_merge` | Application only: required exactly when the policy contains `post_merge`, otherwise forbidden. Same check-evidence object below; may be `null` before `verified`. |
 | `preview`, `deployed`, `previous` | Each a served-identity object below, or `null` before that evidence exists. `previous` records the rollback identity; only `data.previous` has the temporary pre-manifest bootstrap form below. |
 
 The PR object has exactly these fields:
@@ -336,13 +343,13 @@ The PR object has exactly these fields:
 | `merge` | `null` before merge, then the actual merge/squash commit. |
 
 A check-evidence object has exactly these fields, for each of `ci`, `e2e`,
-`deploy`:
+`deploy`, and the conditional application `post_merge`:
 
 | Field | Type and allowed value |
 |---|---|
 | `run_id` | Integer, GitHub Actions run in the configured consumer repository. |
 | `run_attempt` | Integer, the particular GitHub attempt whose jobs are checked. |
-| `sha` | Commit; `pr.head` for CI/E2E, `pr.merge` for deploy. Hosted `release-coordinator.yml` E2E alone uses `pr.base_sha`, subject to the binding checks below. |
+| `sha` | Commit; `pr.head` for CI/E2E, `pr.merge` for deploy and post-merge. Hosted `release-coordinator.yml` E2E alone uses `pr.base_sha`, subject to the binding checks below. |
 | `expected` | Array of unique job-name strings, exactly the corresponding policy list, in the same order. |
 | `approved_skips` | Array of job-name strings, exactly the corresponding policy list, in the same order. |
 | `results` | Object with exactly one key per expected job; values `success`, or `skipped` only for owner-approved skips. Must equal actual GitHub jobs. |
@@ -353,6 +360,19 @@ at least one must succeed. CI/E2E must finish before the PR's actual merge time.
 The merge commit's first parent must be `base_sha`, proving the tested base
 landed. An unmerged PR must still have the tested base. Rebase/merge-queue source
 graphs need an approved adapter before enablement.
+
+For a configured application `post_merge` gate, only `verified` validates its
+value. The hub checks the recorded run and attempt at exactly `pr.merge`, with
+path `.github/workflows/<post_merge.workflow>`, completed status, successful run
+conclusion, and every expected job completed successfully; no skips are allowed.
+The run read from GitHub must have the receipt's run id and attempt.
+GitHub results must equal the receipt. The run must have event `push` and
+`head_branch == policy.base` (`dev` in the application example), and the receipt
+timestamp must be at or after the last expected job completion. Earlier states
+still require the member but do not validate its value, just as deployment
+evidence is deferred. The neutral verified receipt adds `post_merge` containing
+only `run_id`, `run_attempt`, and `inventory_sha256`, the SHA-256 of the canonical
+results object, in the same form as `deploy`.
 
 **Hosted coordinator binding.** Only consumer `hosted`, with CI workflow
 `release-pr.yml` and E2E workflow `release-coordinator.yml`, can use the base-code
@@ -484,7 +504,7 @@ reported state even if earlier snapshots were never collected.
 | `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. |
 | `merged` | Ready evidence plus actual merge commit, tested first parent and CI/E2E completion before merge. |
 | `deploying` | Same evidence as merged; serving has not yet been verified. |
-| `verified` | All prior gates + successful complete deploy inventory + deployed and previous identities; report source is the merge commit. |
+| `verified` | All prior gates + successful complete deploy inventory + deployed and previous identities; report source is the merge commit. Application also requires its post-merge gate when configured. |
 | `failed` | Terminal failure in this attempt; evidence may be null, details stay in the consumer report. |
 | `superseded` | Terminal obsolete target in this attempt; evidence may be null. |
 | `skipped_by_policy` | Terminal policy skip, accepted only for product prereleases, never stable or facts-only. |
@@ -510,6 +530,7 @@ installed image digest if available. Preview/deployed facts commit and hash must
 both equal the target. Previous records the prior served identity using the
 ordinary five-key form; the data bootstrap never applies to facts-only receipts.
 The same PR, full CI/E2E-before-merge, deploy and reporting-source gates apply.
+Facts-only receipts and policies never contain `post_merge`.
 
 The hub fetches `facts/facts.json` at that exact commit, checks its SHA-256 and
 schema/semantics, and requires the commit to be on canonical main history.
@@ -754,6 +775,10 @@ form; the data bootstrap above is a separate, literal documented example.
 Use `--consumer hosted` for a synthetic hosted receipt with CI at the PR head
 and coordinator E2E at the tested base. Its example policy is the exact hosted
 entry below; a real coordinator must also publish its verified binding artifact.
+Use `--consumer application` for a synthetic application receipt with base `dev`
+and `post_merge` evidence at the merge commit. Its policy matches the application
+example below; replace all `example-*` values with APP's real workflows and
+inventories before use. Other consumer examples omit `post_merge`.
 
 Neutral hub assets retain numeric IDs, commit/image/facts identities and hashes
 of private evidence/inventories. Private repository names, job labels, deployment
@@ -781,7 +806,7 @@ rejects missing/skipped/cancelled jobs and covers merge-group events too.
 | App installation permissions | The App's full permission set on every installed repository, including the private compute repository | Confirm the full set in the App's settings before the owner decides O-1. The App already holds Actions write for the hub; installing it on compute grants that and every other App permission there. The mint uses `owner: github.repository_owner` and joins the same owner's installation. Hub tag/dispatch and explicit publish replay; consumer dispatch and completion evidence reads. Each mint asks only for the permissions needed by that job; delivery-only compute uses only the existing Contents-write dispatch mint. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
 | `RELEASE_HOSTED_MCP_REPOSITORY`, `RELEASE_APPLICATION_REPOSITORY`, `FACTS_WEB_REPOSITORY` (existing) | Hub `release-automation` environment secrets | Private short repository names for neutral hosted/application/web targets. Public offline/data/license names are fixed in workflows. |
 | `RELEASE_COMPUTE_REPOSITORY` (new secret) | Hub `release-automation` environment secrets | Private short name of the compute target repository; the application target likewise lives in `RELEASE_APPLICATION_REPOSITORY`. Both reuse the existing one-target App mint. No values belong in source or public audit assets. |
-| `RELEASE_RECEIPT_POLICY` (new secret) | Hub `release-automation` environment | JSON map of each enabled receipt role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories. Compute needs no entry. Keep private workflow/job details out of public source. |
+| `RELEASE_RECEIPT_POLICY` (new secret) | Hub repository Actions secret (read by the receipt verify job, which runs in the `release-automation` environment; do not also create it in the environment, it would shadow this one) | JSON map of each enabled receipt role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories, plus optional application-only `post_merge`. Compute needs no entry. Keep private workflow/job details out of public source. |
 | `RELEASE_READY_CONSUMERS` (new variable) | Hub repository | Explicit comma-separated upgraded product receiver roles. Empty sends nothing; disabled roles do not block aggregate completion or become overdue. Facts flags independently select web/license receipt polling and freshness. |
 | `RELEASE_COMPUTE_FIRST_PAIR` (new variable; empty/off) | Hub repository | Bare canonical semver lower bound for compute, including prereleases. Compute must also be in `RELEASE_READY_CONSUMERS`. When selected, validate the value once before processing releases. A malformed value disables compute for that run and sets the fixed `compute_configuration_error` output before any release work. Other roles are processed as with compute off; the configuration error alone leaves the script's exit status at 0. The workflow reports it after consumer notification as described below. Diagnostics name the variable and say its value was not accepted, without exposing the value. The configuration error creates or reopens no per-release incident. An unselected compute role ignores the value. Keep empty until the receiver merges; no older-pair backfill for the initial rollout. |
 | `RELEASE_REPORT_OWNER` (new variable) | Hub repository | GitHub login to assign/mention on release and failure issues. |
@@ -819,6 +844,13 @@ hosted credential-isolation contract. Merge that hosted entry into the existing
 other consumer entry. The supervisor applies the live policy; this change does
 not alter GitHub settings.
 
+The `application` entry uses the supplied base `dev`, literal artifact name,
+eight CI job names (including exact matrix expansions), and post-merge gate.
+Its reporting `workflow`, CI workflow filename, and entire `e2e` and `deploy`
+sections below are **example values**, marked `example-*`; APP must provide
+their real values. When CI expands to 13 jobs, APP must supply all 13 exact job
+names. Do not use the example E2E/deploy inventories as production gates.
+
 ```json
 {
   "offline": {
@@ -846,6 +878,40 @@ not alter GitHub settings.
       "expected": ["deploy"],
       "approved_skips": []
     }
+  },
+  "application": {
+    "workflow": "example-application-report.yml",
+    "artifact": "release-receipt-application",
+    "base": "dev",
+    "ci": {
+      "workflow": "example-application-ci.yml",
+      "expected": [
+        "check",
+        "image-build-contexts",
+        "studio-responsive (1)",
+        "studio-responsive (2)",
+        "studio-responsive (3)",
+        "studio-paths",
+        "studio-perf-build",
+        "studio-perf"
+      ],
+      "approved_skips": []
+    },
+    "e2e": {
+      "workflow": "example-application-e2e.yml",
+      "expected": ["example-candidate-e2e"],
+      "approved_skips": []
+    },
+    "deploy": {
+      "workflow": "example-application-deploy.yml",
+      "expected": ["example-served-identity", "example-rollback-identity"],
+      "approved_skips": []
+    },
+    "post_merge": {
+      "workflow": "ci-post-merge.yml",
+      "expected": ["test", "int"],
+      "approved_skips": []
+    }
   }
 }
 ```
@@ -853,6 +919,14 @@ not alter GitHub settings.
 Supervisor must populate the **actual complete expected job names**, including
 matrix expansions, from each reviewed consumer lane. A tiny example inventory
 must never be used to omit existing required checks.
+
+Rollout order for the application `post_merge` section: a receipt must carry
+`post_merge` exactly when the policy has it, and `collect` re-checks every
+retained application reporting artifact and stops at the first invalid one.
+Put the policy with `post_merge` in place together with the application
+emitter change. While an artifact of the old shape is retained, application
+polling stays blocked until it expires. Changing any inventory has the same
+effect.
 
 ## Rollback and validation
 
