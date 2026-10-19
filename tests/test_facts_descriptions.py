@@ -35,6 +35,8 @@ class DescriptionsCLI(unittest.TestCase):
         self.expected = json.loads(rendered.stdout)["repositories"]
         self.state = {row["repo"]: {"full_name": row["repo"].swapcase(), "private": False,
                                     "description": "old public description"} for row in self.expected}
+        # The configured hub API name and the frozen policy identify the same repo.
+        self.state[HUB] = self.state[next(row["repo"] for row in self.expected if row["role"] == "release")]
         self.fail_patch = None
         self.disconnect_patch = False
         self.fail_read = False

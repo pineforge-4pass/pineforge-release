@@ -89,7 +89,7 @@
         "properties": {
           "source": {
             "type": "string",
-            "pattern": "^https://github\\.com/pineforge-4pass/"
+            "pattern": "^https://github\\.com/(?:pineforge-4pass|tunaxis)/"
           },
           "scoreboard": {
             "$ref": "#/$defs/scoreboard"

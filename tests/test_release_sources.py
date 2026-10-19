@@ -32,6 +32,7 @@ FIXTURES = REPO / "tests" / "fixtures"
 REGISTRY_HEADER = "set-id\trelease-tag\tn-pairs\tsources-list-sha256\tlist-asset\n"
 NOTICE_PATH = "/usr/share/doc/pineforge/SOURCES.txt"
 RELEASES_URL = "https://github.com/pineforge-4pass/pineforge-release/releases"
+ORGS = ("pineforge-4pass", "tunaxis")
 
 
 def _cli(*arguments: str):
@@ -470,9 +471,13 @@ class SourceNoticeTest(unittest.TestCase):
                       _dockerfile_stages((REPO / "docker" / "Dockerfile").read_text())}
         cls.template = (REPO / "docker" / "SOURCES.txt.in").read_text(encoding="utf-8")
 
-    def test_template_preserves_biz_notice_verbatim_except_version_token(self):
+    def test_template_preserves_biz_notice_verbatim_except_version_token_and_exact_org_alias(self):
         approved = (FIXTURES / "GPL-NOTICE-v1.txt").read_text(encoding="utf-8")
-        self.assertEqual(self.template, approved.replace("<this version>", "@RELEASE_VERSION@"))
+        templates = {
+            approved.replace("<this version>", "@RELEASE_VERSION@").replace(
+                f"https://github.com/{ORGS[0]}/", f"https://github.com/{org}/")
+            for org in ORGS}
+        self.assertIn(self.template, templates)
         self.assertEqual(re.findall(r"@[A-Za-z0-9_]+@", self.template), ["@RELEASE_VERSION@"])
         self.assertNotIn("<this version>", self.template)
 
