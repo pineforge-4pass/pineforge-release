@@ -619,6 +619,18 @@ class ApplicationPostMergeReceiptTests(unittest.TestCase):
         for private in (b"fixture", b"ci-post-merge.yml", b'"test"', b'"int"', b"example-application"):
             self.assertNotIn(private, raw)
 
+    def test_post_merge_response_cannot_substitute_another_run(self):
+        f = self.fixture()
+        f.runs["post_merge"]["id"] += 1
+        with self.assertRaisesRegex(contract.Invalid, "post-merge run identity differs"):
+            f.verify()
+
+    def test_post_merge_response_cannot_substitute_another_attempt(self):
+        f = self.fixture()
+        f.runs["post_merge"]["run_attempt"] += 1
+        with self.assertRaisesRegex(contract.Invalid, "post-merge run identity differs"):
+            f.verify()
+
     def test_post_merge_requires_push_event(self):
         for event in ("pull_request", "workflow_run", "workflow_dispatch", "repository_dispatch"):
             f = self.fixture()

@@ -260,6 +260,7 @@ For a configured application `post_merge` gate, only `verified` validates its
 value. The hub checks the recorded run and attempt at exactly `pr.merge`, with
 path `.github/workflows/<post_merge.workflow>`, completed status, successful run
 conclusion, and every expected job completed successfully; no skips are allowed.
+The run read from GitHub must have the receipt's run id and attempt.
 GitHub results must equal the receipt. The run must have event `push` and
 `head_branch == policy.base` (`dev` in the application example), and the receipt
 timestamp must be at or after the last expected job completion. Earlier states
@@ -697,7 +698,7 @@ rejects missing/skipped/cancelled jobs and covers merge-group events too.
 | `PINEFORGE_APP_ID`, `PINEFORGE_APP_PRIVATE_KEY` (existing) | Hub `release-automation` environment | Short-lived, one-target installation tokens; no PAT fallback. |
 | App installation permissions | Hub: Contents write + Actions write; enabled consumers: Contents read/write, Actions read, Pull requests read | Hub tag/dispatch and explicit publish replay; consumer dispatch and completion evidence reads. Each mint asks only for the permissions needed by that job. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
 | `RELEASE_HOSTED_MCP_REPOSITORY`, `RELEASE_APPLICATION_REPOSITORY`, `FACTS_WEB_REPOSITORY` (existing) | Hub `release-automation` environment secrets | Private short repository names for neutral hosted/application/web targets. Public offline/data/license names are fixed in workflows. |
-| `RELEASE_RECEIPT_POLICY` (new secret) | Hub `release-automation` environment | JSON map of each enabled role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories, plus optional application-only `post_merge`. Keep private workflow/job details out of public source. |
+| `RELEASE_RECEIPT_POLICY` (new secret) | Hub repository Actions secret (read by the receipt verify job, which runs in the `release-automation` environment; do not also create it in the environment, it would shadow this one) | JSON map of each enabled role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories, plus optional application-only `post_merge`. Keep private workflow/job details out of public source. |
 | `RELEASE_READY_CONSUMERS` (new variable) | Hub repository | Explicit comma-separated upgraded product receiver roles. Empty sends nothing; disabled roles do not block aggregate completion or become overdue. Facts flags independently select web/license receipt polling and freshness. |
 | `RELEASE_REPORT_OWNER` (new variable) | Hub repository | GitHub login to assign/mention on release and failure issues. |
 | `RELEASE_READY_MAX_AGE_MINUTES` (optional variable; 60) | Hub repository | Missing readiness prerequisite alert threshold. |
@@ -791,6 +792,14 @@ names. Do not use the example E2E/deploy inventories as production gates.
 Supervisor must populate the **actual complete expected job names**, including
 matrix expansions, from each reviewed consumer lane. A tiny example inventory
 must never be used to omit existing required checks.
+
+Rollout order for the application `post_merge` section: a receipt must carry
+`post_merge` exactly when the policy has it, and `collect` re-checks every
+retained application reporting artifact and stops at the first invalid one.
+Put the policy with `post_merge` in place together with the application
+emitter change. While an artifact of the old shape is retained, application
+polling stays blocked until it expires. Changing any inventory has the same
+effect.
 
 ## Rollback and validation
 

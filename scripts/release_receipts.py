@@ -283,6 +283,8 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
                             "inventory_sha256": sha256(canonical(receipt["deploy"]["results"]))}
         if "post_merge" in policy:
             post_run = check_run(client, repo, receipt["post_merge"], policy["post_merge"], pr["merge"])
+            require(post_run["id"] == receipt["post_merge"]["run_id"] and post_run["run_attempt"] == receipt["post_merge"]["run_attempt"],
+                    "post-merge run identity differs")
             require(post_run["event"] == "push", "post-merge checks must use push")
             require(post_run["head_branch"] == policy["base"], "post-merge checks branch differs from policy")
             require(receipt["timestamp"] >= post_run["checked_finished_at"], "served receipt predates post-merge verification")
