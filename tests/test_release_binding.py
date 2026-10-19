@@ -219,6 +219,39 @@ class ManifestTests(unittest.TestCase):
         self.assertIs(type(event["run_id"]), int)
         contract.validate_payload(event, raw)
 
+    def test_image_repository_accepts_exact_old_and_new_organization_paths(self):
+        for organization, repository in (
+                ("old", "ghcr.io/pineforge-4pass/pineforge-release"),
+                ("new", "ghcr.io/tunaxis/pineforge-release")):
+            with self.subTest(organization=organization):
+                obj = fixture_manifest()
+                obj["image"]["repository"] = repository
+                raw = contract.canonical(obj)
+                event = contract.payload(raw)
+                self.assertEqual(event["image"]["repository"], repository)
+                contract.validate_payload(event, raw)
+
+    def test_image_repository_rejects_other_paths_and_wrong_types(self):
+        for case, repository in (
+                ("third_organization", "ghcr.io/other/pineforge-release"),
+                ("old_organization_other_repository", "ghcr.io/pineforge-4pass/other"),
+                ("new_organization_other_repository", "ghcr.io/tunaxis/other"),
+                ("empty", ""),
+                ("different_case", "GHCR.IO/tunaxis/pineforge-release"),
+                ("trailing_slash", "ghcr.io/tunaxis/pineforge-release/"),
+                ("null", None),
+                ("list", ["ghcr.io/tunaxis/pineforge-release"]),
+                ("object", {"repository": "ghcr.io/tunaxis/pineforge-release"}),
+                ("integer", 1)):
+            with self.subTest(case=case, repository=repository):
+                obj = fixture_manifest()
+                obj["image"]["repository"] = repository
+                with self.assertRaisesRegex(contract.Invalid, "^unexpected image repository$"):
+                    contract.payload(contract.canonical(obj))
+
+    def test_producer_image_stays_on_old_organization_path(self):
+        self.assertEqual(contract.IMAGE, "ghcr.io/pineforge-4pass/pineforge-release")
+
     def test_red_old_version_only_payload_cannot_authorize_a_consumer(self):
         raw = (ROOT / "tests/fixtures/release-manifest.json").read_bytes()
         with self.assertRaises(contract.Invalid):

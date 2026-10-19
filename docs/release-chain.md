@@ -107,6 +107,14 @@ contain its SHA-256; excluding them avoids a circular hash. `run_id` is the
 original candidate build run, a JSON integer. Replays fetch the existing bytes;
 attempt IDs occur only in receipts. HPO is explicitly null before the cutoff.
 
+`image.repository` must equal EXACTLY one of two values, the image path before
+and after the GitHub organization rename:
+`ghcr.io/pineforge-4pass/pineforge-release` or `ghcr.io/tunaxis/pineforge-release`.
+The validator in `scripts/release_contract.py` compares the whole string; any
+other organization, repository name, case, trailing slash, prefix or empty value is
+rejected. A consumer builds its pin from the validated payload value, never from a
+constant of its own.
+
 Consumers must fetch the asset from the fixed hub repository's matching GitHub
 release, hash the original bytes, compare the complete payload, and verify the
 referenced artifacts. No arbitrary repository/asset/path is accepted from the
