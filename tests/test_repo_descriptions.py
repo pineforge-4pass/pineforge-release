@@ -485,7 +485,7 @@ class DescriptionWorkflows(unittest.TestCase):
         self.assertIn("github.ref_protected", text)
         self.assertIn("vars.FACTS_DESCRIPTIONS_APPLY_ENABLED == 'true'", text)
         self.assertIn("env.DRY_RUN == 'false'", text)
-        self.assertIn("actions/create-github-app-token@v2", text)
+        self.assertIn("actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510", text)
         self.assertIn("secrets.DESCRIPTIONS_APP_ID", text)
         self.assertIn("secrets.DESCRIPTIONS_APP_PRIVATE_KEY", text)
         self.assertNotIn("PINEFORGE_APP_", text)
