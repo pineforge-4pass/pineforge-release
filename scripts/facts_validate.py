@@ -16,6 +16,8 @@ from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry
 from referencing.exceptions import NoSuchResource
 
+from release_contract import Invalid, validate_image
+
 ROOT = Path(__file__).resolve().parents[1]
 FACTS_SCHEMA = ROOT / "facts/facts.schema.json"
 MAX_INPUT_BYTES = 2 * 1024 * 1024
@@ -160,6 +162,12 @@ def validate_facts(facts):
     if error is not None:
         raise InputError(f"facts schema validation failed ({error.validator})")
     scalar_safety(facts)
+    for record in (facts, *facts["releases"].values()):
+        if "image" in record:
+            try:
+                validate_image(record["image"], architectures=False)
+            except Invalid as error:
+                raise InputError("invalid product image identity in facts") from error
     scoreboard_invariants(facts["scoreboard"])
     # The one public trade count: both fields together on the active scoreboard, never on a release snapshot.
     active = facts["scoreboard"]
@@ -204,7 +212,7 @@ def main():
         print(json.dumps({"sha256": sha, "schema": facts["schema"], "status": "valid"}, sort_keys=True))
         return 0
     except (InputError, OSError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
-        print("facts-validate: invalid facts or unavailable input", file=sys.stderr)
+        print("Tunaxis facts-validate: invalid facts or unavailable input", file=sys.stderr)
         return 2
 
 

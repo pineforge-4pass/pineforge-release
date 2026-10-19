@@ -61,7 +61,7 @@ class GitHub:
             require(bool(token), "a descriptions App token is required")
             payload = json.dumps({"description": description}, ensure_ascii=True, separators=(",", ":")).encode()
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
-                   "User-Agent": "pineforge-facts-descriptions", "Cache-Control": "no-cache"}
+                   "User-Agent": "tunaxis-facts-descriptions", "Cache-Control": "no-cache"}
         if token:
             headers["Authorization"] = "Bearer " + token
         if payload is not None:
@@ -276,7 +276,7 @@ def main():
         sys.stdout.write(output)
         return code
     except (InputError, ApiError, OSError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
-        print("facts-descriptions: invalid input or source unavailable; no receipt emitted", file=sys.stderr)
+        print("Tunaxis facts-descriptions: invalid input or source unavailable; no receipt emitted", file=sys.stderr)
         return 2
 
 

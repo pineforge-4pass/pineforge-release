@@ -14,7 +14,7 @@ from facts_validate import InputError, load_facts
 def render(facts, sha256, variant, format, theme):
     scoreboard = facts["scoreboard"]
     score = scoreboard if variant == "full" else scoreboard["scopes"]["corpus"]
-    label = "PineForge scoreboard" if variant == "full" else "PineForge corpus scoreboard"
+    label = "Tunaxis scoreboard" if variant == "full" else "Tunaxis corpus scoreboard"
     message = (f'{score["excellent"]:,}/{score["graded"]:,} excellent; '
                f'{score["strong"]:,} strong; {score["belowStrong"]:,} below strong; '
                f'{score["engineErrors"]:,} engine errors')
@@ -26,7 +26,7 @@ def render(facts, sha256, variant, format, theme):
                           ensure_ascii=True, sort_keys=True, indent=2) + "\n"
     background, foreground, muted = (("#101820", "#f5f6f7", "#b7c4cb") if theme == "dark"
                                     else ("#f7f8f9", "#172731", "#405563"))
-    description = f"{label}: {message}. {provenance}. Canonical facts: https://pineforge.dev/facts.json."
+    description = f"{label} (formerly PineForge): {message}. {provenance}. Canonical facts: https://pineforge.dev/facts.json."
     # No timestamps, external assets, scripts, fonts, or floating-point layout.
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" width="880" height="240" viewBox="0 0 880 240" '
@@ -59,7 +59,7 @@ def main():
         sys.stdout.write(output)
         return 0
     except (InputError, OSError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
-        print("facts-cards: invalid facts or unavailable input", file=sys.stderr)
+        print("Tunaxis facts-cards: invalid facts or unavailable input", file=sys.stderr)
         return 2
 
 

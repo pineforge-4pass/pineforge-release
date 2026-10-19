@@ -34,7 +34,8 @@ def assert_ready_wiring(case, publish, finalizer):
     steps = publish["jobs"]["publish"]["steps"]
     named = {row.get("name"): row for row in steps}
     order = ["Check Debian source mirror", "Check pushed Debian source mirror",
-             "Verify real candidate runtime on both architectures", "GitHub Release"]
+             "Verify real candidate runtime on both architectures",
+             "Publish verified candidate to both names and assert equal digests", "GitHub Release"]
     positions = [steps.index(named[name]) for name in order]
     case.assertEqual(positions, sorted(positions))
     for name in order:
@@ -45,6 +46,15 @@ def assert_ready_wiring(case, publish, finalizer):
     case.assertTrue(tags[0].startswith("type=raw,value=candidate-"))
     case.assertIn("org.opencontainers.image.version=${{ github.ref_name }}", named["Image metadata"]["with"]["labels"])
     case.assertIn("org.opencontainers.image.revision=${{ github.sha }}", named["Image metadata"]["with"]["labels"])
+    for label in ("org.opencontainers.image.title=Tunaxis", "org.opencontainers.image.vendor=Tunaxis",
+                  "org.opencontainers.image.description=Tunaxis (formerly PineForge):",
+                  "org.opencontainers.image.source=https://github.com/" + contract.HUB):
+        case.assertIn(label, named["Image metadata"]["with"]["labels"])
+    case.assertIn("scripts/release_pipeline.py image-config", named["Read product image contract"]["run"])
+    mirror = named["Publish verified candidate to both names and assert equal digests"]
+    case.assertIn('scripts/release_pipeline.py mirror-candidate --tag "$CANDIDATE_TAG" --digest "$DIGEST"', mirror["run"])
+    case.assertEqual(mirror["env"]["CANDIDATE_TAG"], "candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}")
+    case.assertEqual(mirror["env"]["DIGEST"], "${{ steps.push_release.outputs.digest || steps.push_hpo.outputs.digest }}")
     case.assertEqual(publish["jobs"]["notify-consumers"]["uses"], "./.github/workflows/release-finalize.yml")
     finalize = finalizer["jobs"]["finalize"]
     case.assertTrue(any("scripts/release_pipeline.py finalize" in row.get("run", "") for row in finalize["steps"]))
@@ -81,11 +91,14 @@ class ReadyWiringTests(unittest.TestCase):
 
     def test_negative_controls_detect_removed_runtime_gate_early_latest_and_skipped_fanout(self):
         original = workflow("publish.yml")
-        for mutation in ("runtime", "latest", "fanout"):
+        for mutation in ("runtime", "mirror", "latest", "fanout"):
             obj, finalizer = copy.deepcopy(original), workflow("release-finalize.yml")
             if mutation == "runtime":
                 obj["jobs"]["publish"]["steps"] = [s for s in obj["jobs"]["publish"]["steps"]
                                                          if s.get("name") != "Verify real candidate runtime on both architectures"]
+            elif mutation == "mirror":
+                obj["jobs"]["publish"]["steps"] = [s for s in obj["jobs"]["publish"]["steps"]
+                                                         if s.get("name") != "Publish verified candidate to both names and assert equal digests"]
             elif mutation == "latest":
                 step = next(s for s in obj["jobs"]["publish"]["steps"] if s.get("name") == "Image metadata")
                 step["with"]["tags"] += "\ntype=raw,value=latest"

@@ -34,10 +34,11 @@ def check(args) -> None:
     report_path = args.report.resolve()
     if report_path.exists():
         raise ValueError("resolution report must be a new file, not a stale result")
+    codegen_dist = getattr(args, "codegen_dist", "pineforge-codegen")
     installed = [dist for dist in importlib.metadata.distributions(path=[str(codegen_root)])
-                 if _name(dist.metadata["Name"]) == "pineforge-codegen"]
+                 if _name(dist.metadata["Name"]) == codegen_dist]
     if len(installed) != 1:
-        raise ValueError("the codegen target must contain exactly one installed pineforge-codegen")
+        raise ValueError("the codegen target must contain exactly one installed " + codegen_dist)
     if Version(installed[0].version) != Version(args.codegen_version):
         raise ValueError("installed codegen does not match the requested CODEGEN_VERSION")
 
@@ -79,7 +80,7 @@ def check(args) -> None:
         if option not in help_result.stdout:
             raise ValueError("installed pip lacks the required " + option + " option")
 
-    pin = "pineforge-codegen==" + installed[0].version
+    pin = codegen_dist + "==" + installed[0].version
     result = subprocess.run(
         pip + ["--break-system-packages", "--no-cache-dir", "--no-index",
                "--only-binary=:all:", "--dry-run", "--report", str(report_path),
@@ -103,13 +104,13 @@ def check(args) -> None:
     for item in report["install"]:
         candidate = item["metadata"]
         name = _name(candidate["name"])
-        if name == "pineforge-codegen":
+        if name in ("pineforge-codegen", "tunaxis-codegen"):
             raise ValueError("pip would replace the installed codegen; refusing the HPO build")
         if name == "pineforge-hpo":
             hpo.append(candidate)
     if len(hpo) != 1 or Version(hpo[0]["version"]) != Version(args.hpo_version):
         raise ValueError("pip did not resolve exactly the requested HPO wheel")
-    print("hpo: pip resolves with the installed codegen; no replacement is planned")
+    print("Tunaxis hpo: pip resolves with the installed codegen; no replacement is planned")
 
 
 def main() -> int:
@@ -118,6 +119,7 @@ def main() -> int:
     parser.add_argument("--hpo-version", required=True)
     parser.add_argument("--codegen-root", type=Path, required=True)
     parser.add_argument("--codegen-version", required=True)
+    parser.add_argument("--codegen-dist", choices=("pineforge-codegen", "tunaxis-codegen"), default="pineforge-codegen")
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     try:

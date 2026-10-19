@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from email.parser import BytesParser
 import hashlib
+import http.client
 import io
 import os
 import re
@@ -16,12 +17,45 @@ import urllib.request
 import zipfile
 
 import release_pair as pair
-from release_contract import (COMMIT, Invalid, Pending, canonical, decode,
+from release_contract import (COMMIT, IMAGES, Invalid, Pending, canonical, decode,
                               match, require, sha256)
 
 PRODUCERS = {"engine": "pineforge-4pass/pineforge-engine",
              "codegen": "pineforge-4pass/pineforge-codegen-oss",
              "hpo": "pineforge-4pass/pineforge-hpo"}
+REGISTRY_ABSENT_CODES = {"DENIED", "UNAUTHORIZED", "NAME_UNKNOWN"}
+
+
+def registry_read_url(url):
+    return any(url.startswith("https://ghcr.io/v2/" + image.removeprefix("ghcr.io/") + "/manifests/")
+               or url == "https://ghcr.io/token?service=ghcr.io&scope=repository:"
+               + image.removeprefix("ghcr.io/") + ":pull" for image in IMAGES)
+
+
+def registry_error_codes(raw):
+    try:
+        obj = decode(raw)
+    except Invalid:
+        return set()
+    if not isinstance(obj, dict):
+        return set()
+    errors = obj.get("errors", [])
+    codes = [row.get("code") for row in errors if isinstance(row, dict)] if isinstance(errors, list) else []
+    codes.append(obj.get("error"))
+    return {code.upper() for code in codes if isinstance(code, str)} & REGISTRY_ABSENT_CODES
+
+
+class RegistryReadError(Invalid):
+    """A denied registry read remains an error unless first-copy preflight permits it."""
+
+    def __init__(self, *, status=None, codes=()):
+        super().__init__("registry manifest or pull-token read denied")
+        self.status = status
+        self.codes = frozenset(codes)
+
+    @property
+    def absent_before_copy(self):
+        return self.status in (401, 403) or bool(self.codes & REGISTRY_ABSENT_CODES)
 
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
@@ -34,15 +68,16 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Client:
-    """404 is missing. Auth, rate limits and every other HTTP/transport error fail."""
+    """404 is missing; typed registry denials are errors with a scoped preflight exception."""
 
     def __init__(self, token=None):
         self.token = os.environ.get("GH_TOKEN", "") if token is None else token
 
     def request(self, url, *, method="GET", data=None, github=False, binary=False, accept=None, extra_headers=None):
-        headers = {"User-Agent": "pineforge-release-reconciler", "Accept": accept or "application/vnd.github+json"}
+        headers = {"User-Agent": "tunaxis-release-reconciler", "Accept": accept or "application/vnd.github+json"}
+        registry_read = registry_read_url(url)
         if extra_headers:
-            require(url.startswith("https://ghcr.io/v2/"), "unexpected registry origin")
+            require(registry_read, "unexpected registry origin")
             headers.update(extra_headers)
         if github:
             require(url.startswith(("https://api.github.com/", "https://uploads.github.com/")), "unexpected authenticated origin")
@@ -58,16 +93,47 @@ class Client:
             with urllib.request.build_opener(SafeRedirect()).open(request, timeout=120) as response:
                 raw = response.read(512 * 1024 * 1024 + 1)
                 require(len(raw) <= 512 * 1024 * 1024, "artifact exceeds size limit")
+                if registry_read:
+                    codes = registry_error_codes(raw)
+                    if codes:
+                        raise RegistryReadError(codes=codes)
                 return raw
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 raise Pending("published artifact unavailable") from None
+            if registry_read:
+                try:
+                    body = error.read(64 * 1024)
+                except Exception:
+                    body = b""  # The known HTTP status still determines failure classification.
+                codes = registry_error_codes(body)
+                if error.code in (401, 403) or codes:
+                    raise RegistryReadError(status=error.code, codes=codes) from None
             raise Invalid(f"artifact request failed (HTTP {error.code})") from None
-        except (urllib.error.URLError, TimeoutError, OSError):
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
             raise Invalid("artifact transport failed") from None
 
     def api(self, route, *, method="GET", data=None):
         return decode(self.request("https://api.github.com/" + route, method=method, data=data, github=True) or b"null")
+
+    def registry_token(self, repository):
+        require(repository in IMAGES, "unexpected image repository")
+        path = repository.removeprefix("ghcr.io/")
+        headers = {}
+        # The first push creates a private package. The existing workflow token
+        # can verify it before a package admin makes it public. No local Docker
+        # config or credential files are read, and redirects strip authorization.
+        if self.token:
+            login = os.environ.get("GITHUB_ACTOR", "github-actions") + ":" + self.token
+            headers["Authorization"] = "Basic " + base64.b64encode(login.encode()).decode()
+        obj = decode(self.request("https://ghcr.io/token?service=ghcr.io&scope=repository:" + path + ":pull",
+                                  extra_headers=headers))
+        require(isinstance(obj, dict), "malformed registry pull-token response")
+        token = obj.get("token", "")
+        require(isinstance(token, str), "malformed registry pull token")
+        # A tokenless response may still permit an anonymous manifest read.
+        # Its actual status/error is classified by request(), never guessed here.
+        return token
 
     def pages(self, route):
         result = []

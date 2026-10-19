@@ -6,7 +6,7 @@ import sys
 
 from release_artifacts import Client
 from release_contract import ASSET, Invalid, Pending, canonical, decode, payload, require
-from release_pipeline import Registry, Store, now, report_issue, run_link
+from release_pipeline import Registry, Store, now, release_incident_title, report_issue, run_link
 
 
 def rollback(client, store, registry, tag):
@@ -20,20 +20,26 @@ def rollback(client, store, registry, tag):
     if rejected is None:
         store.put(row, "release-rejected.json", canonical({"event_id": event["event_id"], "timestamp": now(),
                                                           "reason": "rollback", "run_id": int(os.environ["GITHUB_RUN_ID"])}))
-    incomplete = []
+    failures = []
+    allowed = ("latest", ".".join(event["release_version"].split(".")[:2]))
     for alias, good_digest in decode(before).items():
-        require(alias == "latest" or alias == ".".join(event["release_version"].split(".")[:2]), "unexpected rollback alias")
-        if registry.digest(alias) != event["image"]["digest"]:
-            continue  # already restored or superseded; never move a newer alias
-        if good_digest is None:
-            incomplete.append(alias)  # deletion is forbidden; no previous good identity exists
-            continue
-        registry.point(alias, good_digest)
-    report_issue(client, row["tag_name"], f"Release {event['release_version']}: rejected / rollback",
-                 "Fan-out stopped. Recorded moving aliases restored where still owned by the rejected release. "
-                 + ("No prior good identity exists for one or more aliases; operator repair is required. " if incomplete else "")
-                 + "Fixed releases, manifests, candidates, source assets and tags were preserved.\n\n" + run_link())
-    require(not incomplete, "rollback lacks a previous good alias identity")
+        label = alias if alias in allowed else "unrecognized alias"
+        try:
+            require(alias in allowed, "unexpected rollback alias")
+            if not registry.restore(alias, event["image"]["digest"], good_digest):
+                failures.append(label + ": no prior good identity; operator repair required (deletion is forbidden)")
+        except Invalid as error:
+            failures.append(label + ": " + str(error))
+        except Exception as error:
+            print(type(error).__name__, file=sys.stderr)
+            detail = str(error) if isinstance(error, Pending) else "alias restoration failed; inspect workflow evidence"
+            failures.append(label + ": " + detail)
+    report_issue(client, row["tag_name"], release_incident_title(event["release_version"], "rejected / rollback"),
+                 "Fan-out stopped. Restoration of recorded moving aliases was attempted on both image names; "
+                 "newer aliases were preserved. Fixed releases, manifests, candidates, source assets and tags were preserved."
+                 + ("\n\nAlias failures:\n" + "\n".join("- " + failure for failure in failures) if failures else "")
+                 + "\n\n" + run_link())
+    require(not failures, "rollback incomplete; inspect the incident's alias failures")
 
 
 def main():
@@ -44,7 +50,7 @@ def main():
     try:
         rollback(client, Store(client), Registry(), args.tag)
     except (Invalid, Pending, ValueError, KeyError, OSError):
-        print("::error::rollback incomplete; identities preserved; inspect the incident", file=sys.stderr)
+        print("::error::Tunaxis rollback incomplete; identities preserved; inspect the incident", file=sys.stderr)
         return 1
     return 0
 

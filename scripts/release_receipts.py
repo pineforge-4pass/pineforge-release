@@ -16,10 +16,10 @@ import zipfile
 from pathlib import Path
 
 from release_artifacts import Client
-from release_contract import (ASSET, COMMIT, HUB, ROLES, SHA, Invalid, Pending,
-                              canonical, decode, keys, match, payload, positive,
-                              require, sha256, version)
-from release_pipeline import Store, receipt_roles, receipts, report_issue, run_link
+from release_contract import (ASSET, COMMIT, HUB, IMAGES, ROLES, SHA, Invalid, Pending,
+                              canonical, decode, image_digest, image_repositories, keys, match,
+                              optional_keys, payload, positive, require, sha256, validate_image, version)
+from release_pipeline import Store, receipt_roles, receipts, release_incident_title, report_issue, run_link
 
 STATES = ("pending", "pr_open", "testing", "ready", "merged", "deploying", "verified", "failed", "superseded", "skipped_by_policy")
 RANK = {state: i for i, state in enumerate(STATES[:7])}
@@ -147,13 +147,21 @@ def check_coordinator(client, repo, evidence, policy, pr, ci):
 
 
 def identity(obj, *, facts_only=False):
-    keys(obj, ("source", "image_digest", "facts_commit", "facts_sha256", "deployment_id_sha256"))
+    optional_keys(obj, ("source", "image_digest", "facts_commit", "facts_sha256", "deployment_id_sha256"),
+                  ("image_repositories", "image_reference"))
     match(COMMIT, obj["source"])
     match(COMMIT, obj["facts_commit"])
     for name in ("facts_sha256", "deployment_id_sha256"):
         match(SHA, obj[name])
     if not facts_only or obj["image_digest"] is not None:
-        match("sha256:" + SHA, obj["image_digest"])
+        image_digest(obj["image_digest"])
+    if "image_repositories" in obj:
+        image_repositories(obj["image_repositories"])
+        require(obj["image_digest"] is not None, "image names require a digest")
+    if "image_reference" in obj:
+        require("@" in obj["image_reference"]
+                and image_digest(obj["image_reference"]) == image_digest(obj["image_digest"]),
+                "served image reference differs from digest")
 
 
 def validate_receipt(client, repo, receipt, event, policy, reporting_run):
@@ -167,6 +175,7 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         match(SHA, receipt["facts"]["sha256"])
     else:
         require(receipt["event_id"] == event["event_id"] and receipt["release_version"] == event["release_version"], "receipt event differs")
+        validate_image(event["image"])
     positive(receipt["attempt"])
     positive(receipt["sequence"])
     require(receipt["state"] in STATES, "invalid receipt state")
@@ -182,6 +191,8 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         public["facts"] = receipt["facts"]
     else:
         public.update(event_id=receipt["event_id"], release_version=receipt["release_version"])
+        public["image"] = {"repository": event["image"]["repository"],
+                           "repositories": list(IMAGES), "digest": event["image"]["digest"]}
     public["evidence_sha256"] = sha256(canonical(receipt))
     public["reporting_run_id"] = reporting_run["id"]
     state = receipt["state"]
@@ -209,7 +220,7 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
             e2e_run = check_run(client, repo, receipt["e2e"], policy["e2e"], pr["head"])
         identity(receipt["preview"], facts_only=facts_only)
         require(receipt["preview"]["source"] == pr["head"]
-                and (facts_only or receipt["preview"]["image_digest"] == event["image"]["digest"]),
+                and (facts_only or image_digest(receipt["preview"]["image_digest"]) == event["image"]["digest"]),
                 "preview did not exercise the candidate source/image")
         for name in ("ci", "e2e"):
             public[name] = {"run_id": receipt[name]["run_id"], "run_attempt": receipt[name]["run_attempt"],
@@ -231,7 +242,7 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         identity(receipt["deployed"], facts_only=facts_only)
         identity(receipt["previous"], facts_only=facts_only)
         require(receipt["deployed"]["source"] == pr["merge"]
-                and (facts_only or receipt["deployed"]["image_digest"] == event["image"]["digest"]),
+                and (facts_only or image_digest(receipt["deployed"]["image_digest"]) == event["image"]["digest"]),
                 "actual served source/image differs")
         # A retained newer facts snapshot is allowed only with verified bytes
         # and the same immutable release entry (checked below by the adapter).
@@ -255,7 +266,15 @@ def transition(previous, current):
     if new < old:
         return False
     if new == old:
-        require(previous == current, "receipt identity reused with different evidence")
+        same = previous == current
+        if not same and "image" not in previous and "image" in current:
+            # Old neutral receipts predate this derived optional metadata. The
+            # signed consumer bytes remain bound by the same evidence hash;
+            # replay must not replace their existing append-only asset.
+            validate_image(current["image"], architectures=False)
+            match(SHA, current["evidence_sha256"])
+            same = previous == {key: value for key, value in current.items() if key != "image"}
+        require(same, "receipt identity reused with different evidence")
         return False
     if previous["state"] == "verified":
         require(current["state"] == "verified", "verified release cannot regress to a delivery/intermediate state")
@@ -352,7 +371,7 @@ def collect(client, hub_client, store, role, run_id=0):
             store.put(row, f"{stem}{public['attempt']}-{public['sequence']}.json", canonical(public))
             if public["state"] == "failed":
                 incident = "facts-" + facts_target["sha256"] if facts_only else row["tag_name"]
-                title = "Facts consumer failed" if facts_only else f"Release {event['release_version']}: consumer failed"
+                title = "Facts consumer failed" if facts_only else release_incident_title(event["release_version"], "consumer failed")
                 report_issue(hub_client, incident, title,
                              f"Consumer role: {role}; failed stage evidence retained in the consumer's private report.\n\n" + run_link())
 
@@ -415,7 +434,7 @@ def main():
                 if store.read(row, name) is None:
                     store.put(row, name, canonical(obj))
     except (Invalid, Pending, ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile):
-        print("::error::consumer evidence invalid or unavailable; no verified state recorded", file=sys.stderr)
+        print("::error::Tunaxis consumer evidence invalid or unavailable; no verified state recorded", file=sys.stderr)
         return 1
     return 0
 

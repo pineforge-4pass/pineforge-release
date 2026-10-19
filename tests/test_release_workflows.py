@@ -543,6 +543,7 @@ class HpoWorkflowTest(unittest.TestCase):
     def fixture(self, root):
         (root / "scripts").mkdir()
         shutil.copyfile(REPO / "scripts" / "release_pair.py", root / "scripts" / "release_pair.py")
+        shutil.copyfile(REPO / "scripts" / "release_contract.py", root / "scripts" / "release_contract.py")
         (root / "VERSION").write_text("1.5.9\n", encoding="utf-8")
         (root / "state").mkdir()
         (root / "gitconfig-empty").touch()
@@ -866,7 +867,7 @@ class HpoWorkflowTest(unittest.TestCase):
                 expected = (f"pair pending: {component} {spellings[component]} recorded, waiting for {waiting}; "
                             "the landed pair stays engine 1.5.9 + codegen 1.5.9 and nothing is built or published")
                 self.assertEqual((root / "summary").read_text(), expected + "\n")
-                self.assertEqual(done.stdout, f"::notice title=pineforge pair pending::{expected}\n")
+                self.assertEqual(done.stdout, f"::notice title=Tunaxis pair pending::{expected}\n")
 
     def test_github_release_notes_name_hpo_only_when_paired(self):
         step = _step(self.publisher.split("\n  notify-consumers:\n", 1)[0], "GitHub Release")
@@ -881,6 +882,8 @@ class HpoWorkflowTest(unittest.TestCase):
                                       cwd=root, env=env, capture_output=True, text=True)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 notes = (root / "release-notes.md").read_text()
+                self.assertTrue(notes.startswith("Tunaxis (formerly PineForge): "))
+                self.assertEqual(notes.count("formerly PineForge"), 1)
                 expected = f"engine {version} + codegen {version}" + (f" + hpo {hpo}" if hpo else "")
                 self.assertEqual(notes.splitlines()[2], expected)
 
@@ -1123,7 +1126,12 @@ class HarnessSyncTest(unittest.TestCase):
     def test_the_script_fetches_every_file_and_records_the_sums_of_what_it_fetched(self):
         fetch = 'curl -fsSL "${BASE}/${f}" -o "docker/${f}"'
         write = '( cd docker && "${sha256[@]}" -- "${FILES[@]}" ) > "docker/${SUMS}"'
-        self.assertIn('for f in "${FILES[@]}"; do\n  ' + fetch + "\n", self.script)
+        self.assertIn('for f in "${FILES[@]}"; do\n', self.script)
+        self.assertIn('if [ "$f" = entrypoint.sh ]; then', self.script)
+        self.assertIn('\n  ' + fetch + "\n", self.script)
+        retain = self.script.index('if [ "$f" = entrypoint.sh ]; then')
+        self.assertLess(retain, self.script.index(fetch))
+        self.assertIn('continue\n  fi\n  ' + fetch, self.script[retain:])
         self.assertIn(write, self.script)
         self.assertLess(self.script.index(fetch), self.script.index(write))
         # --files names the sums file with the synced files, for the workflow's git add

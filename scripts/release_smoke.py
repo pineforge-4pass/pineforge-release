@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from release_artifacts import command
-from release_contract import IMAGE, decode, require, sha256
+from release_contract import IMAGE, IMAGES, decode, require, sha256, validate_image
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/release-smoke"
@@ -18,7 +18,7 @@ def inspect_index(digest):
     raw = Registry().raw(digest)
     require("sha256:" + sha256(raw) == digest, "image index bytes differ from digest")
     index = decode(raw)
-    out = {"repository": IMAGE, "digest": digest}
+    out = {"repository": IMAGE, "repositories": list(IMAGES), "digest": digest}
     for arch in ("amd64", "arm64"):
         rows = [row for row in index["manifests"] if row.get("platform") == {"architecture": arch, "os": "linux"}
                 or (row.get("platform", {}).get("architecture") == arch and row.get("platform", {}).get("os") == "linux")]
@@ -30,9 +30,10 @@ def inspect_index(digest):
 
 def verify_runtime(image, versions, hub_commit, release_version, inventories):
     """Every command must exit zero and each JSON output must have nonempty real results."""
+    validate_image(image)
     proof = {}
     for arch in ("amd64", "arm64"):
-        ref = IMAGE + "@" + image[arch + "_digest"]
+        ref = image["repository"] + "@" + image[arch + "_digest"]
         command("docker", "pull", "--platform", "linux/" + arch, ref)
         labels = decode(command("docker", "image", "inspect", ref))[0]["Config"]["Labels"]
         for name, expected in (("org.opencontainers.image.revision", hub_commit),

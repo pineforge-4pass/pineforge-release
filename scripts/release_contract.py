@@ -15,6 +15,7 @@ import release_pair as pair
 
 HUB = "pineforge-4pass/pineforge-release"
 IMAGE = "ghcr.io/" + HUB
+IMAGES = (IMAGE, "ghcr.io/pineforge-4pass/tunaxis-release")
 SCHEMA = "pineforge/release-ready/v1"
 ASSET = "release-manifest.json"
 ROLES = ("offline", "hosted", "application", "web", "data", "license")
@@ -61,6 +62,50 @@ def decode(raw):
 
 def keys(obj, names):
     require(type(obj) is dict and set(obj) == set(names), "unexpected object fields")
+
+
+def optional_keys(obj, required, optional=()):
+    require(type(obj) is dict and set(required) <= set(obj)
+            and set(obj) <= set(required) | set(optional), "unexpected object fields")
+
+
+def image_repositories(names):
+    require(type(names) is list and bool(names)
+            and all(isinstance(name, str) and name in IMAGES for name in names)
+            and len(names) == len(set(names)), "unexpected image repositories")
+    return names
+
+
+def image_digest(reference):
+    """One content identity, whether bare or pinned under either product name."""
+    require(isinstance(reference, str), "malformed image identity")
+    if "@" in reference:
+        repository, reference = reference.split("@", 1)
+        require(repository in IMAGES, "unexpected image repository")
+    return match("sha256:" + SHA, reference)
+
+
+def validate_image(image, *, architectures=True):
+    required = {"repository", "digest"}
+    if architectures:
+        required |= {"amd64_digest", "arm64_digest"}
+    optional_keys(image, required, {"repositories"})
+    require(image["repository"] in IMAGES, "unexpected image repository")
+    if "repositories" in image:
+        require(image["repository"] in image_repositories(image["repositories"]),
+                "primary image repository missing from names")
+    for name in required - {"repository"}:
+        match("sha256:" + SHA, image[name])
+    if architectures:
+        require(len({image[name] for name in ("digest", "amd64_digest", "arm64_digest")}) == 3,
+                "image index and architecture identities must be distinct")
+    return image
+
+
+def same_image(left, right):
+    validate_image(left)
+    validate_image(right)
+    return all(left[name] == right[name] for name in ("digest", "amd64_digest", "arm64_digest"))
 
 
 def match(pattern, value):
@@ -110,13 +155,7 @@ def validate(manifest):
     else:
         require(h is None, "HPO must be explicitly null before cutoff")
     pair.check(str(v), e["version"], c["version"], hpo=h["version"] if h else "")
-    image = manifest["image"]
-    keys(image, ("repository", "digest", "amd64_digest", "arm64_digest"))
-    require(image["repository"] == IMAGE, "unexpected image repository")
-    for name in ("digest", "amd64_digest", "arm64_digest"):
-        match("sha256:" + SHA, image[name])
-    require(len({image[name] for name in ("digest", "amd64_digest", "arm64_digest")}) == 3,
-            "image index and architecture identities must be distinct")
+    validate_image(manifest["image"])
     facts = manifest["facts"]
     keys(facts, ("commit", "path", "sha256", "release_key"))
     match(COMMIT, facts["commit"])

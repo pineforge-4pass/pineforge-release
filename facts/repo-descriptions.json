@@ -48,7 +48,7 @@
         "commit": "59082e696f0c7a95c1aa0d3179e1aac23f79fc04",
         "url": "https://github.com/pineforge-4pass/pineforge-engine/blob/59082e696f0c7a95c1aa0d3179e1aac23f79fc04/LICENSE"
       },
-      "template": "Open-source {{word:cpp_standard}} engine for backtesting and forward execution, with a versioned C ABI; {{word:pine_language}} runs through code generation. Against TradingView's own trade lists, all {{facts:scoreboard.graded|grouped}} graded probes ({{facts:inventory.corpusScripts|int}} open-corpus strategies, {{facts:inventory.closedScripts|int}} closed-test scripts) grade excellent or strong: {{facts:scoreboard.excellent|grouped}} excellent, {{facts:scoreboard.strong|int}} strong. {{license:engine}}."
+      "template": "Tunaxis (formerly PineForge): open-source {{word:cpp_standard}} backtesting and forward-execution engine; versioned C ABI, {{word:pine_language}} via codegen. Against TradingView's trade lists, all {{facts:scoreboard.graded|grouped}} graded probes ({{facts:inventory.corpusScripts|int}} open-corpus strategies, {{facts:inventory.closedScripts|int}} closed-test scripts) grade excellent or strong: {{facts:scoreboard.excellent|grouped}} excellent, {{facts:scoreboard.strong|int}} strong. {{license:engine}}."
     },
     {
       "role": "codegen-oss",
@@ -61,7 +61,7 @@
         "commit": "1e6eb83354b74ede1326fe55e576e91ea81f156b",
         "url": "https://github.com/pineforge-4pass/pineforge-codegen-oss/blob/1e6eb83354b74ede1326fe55e576e91ea81f156b/LICENSE"
       },
-      "template": "{{word:pine_language}} to C++ transpiler for the pineforge-engine runtime. Pure Python; source-available under the {{license:codegen}}: free for noncommercial use and personal trading, commercial use needs a license."
+      "template": "Tunaxis (formerly PineForge): {{word:pine_language}} to C++ transpiler for the pineforge-engine runtime. Pure Python; source-available under the {{license:codegen}}: free for noncommercial use and personal trading, commercial use needs a license."
     },
     {
       "role": "corpus",
@@ -74,7 +74,7 @@
         "commit": "262bab123176989464cbab04aa94c72b3d3143be",
         "url": "https://github.com/pineforge-4pass/pineforge-corpus/blob/262bab123176989464cbab04aa94c72b3d3143be/LICENSE"
       },
-      "template": "Open Pine Script reference corpus and TradingView trade traces. Current graded corpus: {{facts:scoreboard.scopes.corpus.excellent|grouped}}/{{facts:scoreboard.scopes.corpus.graded|grouped}} excellent probes. Historical script inventory ({{facts:inventory.sourceRelease|text}}): {{facts:inventory.corpusScripts|grouped}} scripts. {{license:corpus}}."
+      "template": "Tunaxis (formerly PineForge): open Pine Script reference corpus and TradingView trade traces. Current graded corpus: {{facts:scoreboard.scopes.corpus.excellent|grouped}}/{{facts:scoreboard.scopes.corpus.graded|grouped}} excellent probes. Historical script inventory ({{facts:inventory.sourceRelease|text}}): {{facts:inventory.corpusScripts|grouped}} scripts. {{license:corpus}}."
     },
     {
       "role": "hpo",
@@ -87,7 +87,7 @@
         "commit": "dab7b6775588da0f112eb363a70561c212dce80b",
         "url": "https://github.com/pineforge-4pass/pineforge-hpo/blob/dab7b6775588da0f112eb363a70561c212dce80b/LICENSE"
       },
-      "template": "Native C++ hyperparameter optimization for PineForge strategies. Source-available under the {{license:hpo}}: free for personal trading and noncommercial use; commercial use requires a license shared with codegen."
+      "template": "Tunaxis (formerly PineForge): native C++ hyperparameter optimization for strategies. Source-available under the {{license:hpo}}: free for personal trading and noncommercial use; commercial use requires a license shared with codegen."
     },
     {
       "role": "release",
@@ -100,7 +100,7 @@
         "commit": "f93dfca830b8a4a20d43c682a84d52a62bd942fd",
         "url": "https://github.com/pineforge-4pass/pineforge-release/blob/f93dfca830b8a4a20d43c682a84d52a62bd942fd/LICENSE"
       },
-      "template": "Full {{word:pine_compact}} → deterministic backtest: pineforge-engine runtime + bundled codegen transpiler"
+      "template": "Tunaxis (formerly PineForge): full {{word:pine_compact}} → deterministic backtest: pineforge-engine runtime + bundled codegen transpiler"
     },
     {
       "role": "backtest-mcp",
@@ -113,7 +113,7 @@
         "commit": "7ced51880a47af6793e80c65d5de0599c251e25a",
         "url": "https://github.com/pineforge-4pass/pineforge-backtest-mcp/blob/7ced51880a47af6793e80c65d5de0599c251e25a/LICENSE"
       },
-      "template": "Offline MCP server: an AI agent transpiles {{word:pine_compact}} → C++ and runs deterministic, TradingView-parity backtests locally (transpile, backtest, parameter grid, Binance OHLCV, Pine coverage lookup). One Docker container, no API key; code & data stay on your machine."
+      "template": "Tunaxis (formerly PineForge): offline MCP server: an AI agent transpiles {{word:pine_compact}} → C++ and runs deterministic, TradingView-parity backtests locally (transpile, backtest, parameter grid, Binance OHLCV, Pine coverage lookup). One Docker container, no API key; code & data stay on your machine."
     }
   ]
 }
