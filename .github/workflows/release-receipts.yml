@@ -30,7 +30,7 @@ jobs:
     outputs:
       consumers: ${{ steps.plan.outputs.consumers }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           persist-credentials: false
@@ -60,11 +60,11 @@ jobs:
     env:
       TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || '' }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
       - run: python3 -m pip install -r facts/requirements-validation.txt
@@ -76,7 +76,7 @@ jobs:
           fi
       - name: Mint one consumer evidence token
         id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.PINEFORGE_APP_ID }}
           private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
