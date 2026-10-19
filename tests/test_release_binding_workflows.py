@@ -98,21 +98,57 @@ class ReadyWiringTests(unittest.TestCase):
         wf = workflow("python-test.yml")
         job = wf["jobs"]["release-ready"]
         self.assertEqual(job["name"], "release/ready")
-        self.assertEqual(set(job["needs"]), {"fingerprint-canonical", "release-rules", "description-renderer", "release-ready-replay"})
+        self.assertEqual(set(job["needs"]), {"changes", "fingerprint-canonical", "release-rules",
+                                            "description-renderer", "release-ready-replay"})
         script = job["steps"][0]["run"]
         # Execute the workflow's actual aggregate program in a child process.
         import subprocess
         expected = {name: {"result": "success"} for name in job["needs"]}
+        expected["changes"]["outputs"] = {"docs-only": "false"}
         for bad in (None, "failure", "cancelled", "skipped", "missing"):
             results = copy.deepcopy(expected)
             if bad == "missing":
                 results.pop("release-rules")
             elif bad:
                 results["release-rules"]["result"] = bad
-            done = subprocess.run(["bash", "--noprofile", "--norc", "-c", script],
-                                  env={"PATH": os.environ.get("PATH", ""), "RESULTS": json.dumps(results)},
-                                  capture_output=True, text=True)
-            self.assertEqual(done.returncode == 0, bad is None, (bad, done.stderr))
+            for event in ("pull_request", "push", "merge_group"):
+                with self.subTest(result=bad, event=event):
+                    done = subprocess.run(["bash", "--noprofile", "--norc", "-c", script],
+                                          env={"PATH": os.environ.get("PATH", ""), "RESULTS": json.dumps(results),
+                                               "EVENT_NAME": event},
+                                          capture_output=True, text=True)
+                    self.assertEqual(done.returncode == 0, bad is None, (bad, done.stderr))
+
+    def test_aggregate_accepts_only_verified_docs_pr_skips_and_rejects_detector_failures(self):
+        import subprocess
+        job = workflow("python-test.yml")["jobs"]["release-ready"]
+        expected = {name: {"result": "skipped"} for name in job["needs"]}
+        expected["changes"] = {"result": "success", "outputs": {"docs-only": "true"}}
+        cases = [("docs PR", "pull_request", expected, True)]
+        for event in ("push", "merge_group", "schedule", "workflow_dispatch", "release"):
+            cases.append((event, event, copy.deepcopy(expected), False))
+        for name in job["needs"]:
+            for bad in ("failure", "cancelled", "missing", "success" if name != "changes" else "skipped"):
+                results = copy.deepcopy(expected)
+                if bad == "missing":
+                    results.pop(name)
+                else:
+                    results[name]["result"] = bad
+                cases.append((name + ":" + bad, "pull_request", results, False))
+        for value in (None, "", "invalid", "false"):
+            results = copy.deepcopy(expected)
+            results["changes"]["outputs"] = {} if value is None else {"docs-only": value}
+            cases.append(("output:" + str(value), "pull_request", results, False))
+        results = copy.deepcopy(expected)
+        results["unexpected"] = {"result": "success"}
+        cases.append(("extra job", "pull_request", results, False))
+        for label, event, results, accepted in cases:
+            with self.subTest(case=label):
+                done = subprocess.run(["bash", "--noprofile", "--norc", "-c", job["steps"][0]["run"]],
+                                      env={"PATH": os.environ.get("PATH", ""), "RESULTS": json.dumps(results),
+                                           "EVENT_NAME": event},
+                                      capture_output=True, text=True)
+                self.assertEqual(done.returncode == 0, accepted, done.stderr)
 
     def test_facts_license_extension_keeps_exact_three_field_payload(self):
         wf = workflow("facts-fanout.yml")
