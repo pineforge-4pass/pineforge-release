@@ -58,18 +58,24 @@ def profile(role):
     profiles = decode(os.environ.get("RELEASE_RECEIPT_POLICY", "{}"))
     require(role in profiles, "consumer evidence policy not configured")
     policy = profiles[role]
-    keys(policy, ("workflow", "artifact", "base", "ci", "e2e", "deploy"))
-    for item in (policy, policy["ci"], policy["e2e"], policy["deploy"]):
+    sections = ("ci", "e2e", "deploy")
+    if type(policy) is dict and "post_merge" in policy:
+        require(role == "application", "post-merge policy is only valid for application")
+        sections += ("post_merge",)
+    keys(policy, ("workflow", "artifact", "base", *sections))
+    for item in (policy, *(policy[name] for name in sections)):
         match(r"[A-Za-z0-9_.-]+\.yml", item["workflow"])
     match(r"[A-Za-z0-9_.-]+", policy["artifact"])
     require(policy["base"] in ("main", "dev"), "unapproved consumer base")
-    for name in ("ci", "e2e", "deploy"):
+    for name in sections:
         row = policy[name]
         keys(row, ("workflow", "expected", "approved_skips"))
         require(type(row["expected"]) is list and len(row["expected"]) > 0
                 and len(row["expected"]) == len(set(row["expected"])), "empty or duplicate required inventory")
         require(type(row["approved_skips"]) is list and set(row["approved_skips"]) <= set(row["expected"]), "invalid skip policy")
         require(set(row["expected"]) - set(row["approved_skips"]), "entire required inventory cannot be skipped")
+        if name == "post_merge":
+            require(row["approved_skips"] == [], "post-merge checks cannot be skipped")
     return policy
 
 
@@ -186,7 +192,10 @@ def identity(obj, *, facts_only=False, consumer=None, slot=None):
 
 def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     facts_only = receipt.get("schema") == FACTS_SCHEMA
-    keys(receipt, COMMON_FIELDS | ({"facts"} if facts_only else {"event_id", "release_version"}))
+    fields = {"facts"} if facts_only else {"event_id", "release_version"}
+    if not facts_only and "post_merge" in policy:
+        fields.add("post_merge")
+    keys(receipt, COMMON_FIELDS | fields)
     require(receipt["schema"] in (PRODUCT_SCHEMA, FACTS_SCHEMA) and receipt["consumer"] in ROLES, "invalid consumer receipt schema")
     if facts_only:
         require(event is None and receipt["consumer"] in ("web", "license"), "unexpected facts-only receipt")
@@ -272,6 +281,13 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         public["previous"] = receipt["previous"]
         public["deploy"] = {"run_id": receipt["deploy"]["run_id"], "run_attempt": receipt["deploy"]["run_attempt"],
                             "inventory_sha256": sha256(canonical(receipt["deploy"]["results"]))}
+        if "post_merge" in policy:
+            post_run = check_run(client, repo, receipt["post_merge"], policy["post_merge"], pr["merge"])
+            require(post_run["event"] == "push", "post-merge checks must use push")
+            require(post_run["head_branch"] == policy["base"], "post-merge checks branch differs from policy")
+            require(receipt["timestamp"] >= post_run["checked_finished_at"], "served receipt predates post-merge verification")
+            public["post_merge"] = {"run_id": receipt["post_merge"]["run_id"], "run_attempt": receipt["post_merge"]["run_attempt"],
+                                    "inventory_sha256": sha256(canonical(receipt["post_merge"]["results"]))}
     if facts_only:
         for name in ("preview", "deployed"):
             if name in public:
