@@ -340,12 +340,23 @@ hashes fail. `deployment_id_sha256` is recomputed as SHA-256 of canonical JSON
 over exactly `{package, version, distributions}`, matching the data adapter's
 `served()` identity: sorted keys, compact separators, UTF-8, and a final LF.
 
-This form is valid once, only for pineforge-data 0.3.0 as the previous release
-when publishing 0.3.1. Any other package/version and every real previous must
-use the ordinary five-key form; a real previous with any `provenance` key is
-refused. Data 0.3.1 as a later release's previous is a real identity.
-**Removal: remove with the data exemption once 0.3.1 is verified.** Delete this
-temporary form from the contract at that point.
+This form is meant for one use, only for pineforge-data 0.3.0 as the previous
+release when publishing 0.3.1. The hub validates the form and its scope (data
+consumer, `previous` slot, exact values); a receipt carries no data package
+version, so the hub does NOT itself refuse the form in a later data receipt.
+The one-time limit is enforced by the data producer (the exemption in
+pineforge-data `scripts/release_chain/publishing.py`, constant block
+`BOOTSTRAP_PACKAGE`, only for the 0.3.1 first-adopter lock) and by removal.
+Any other package/version and every real previous must use the ordinary
+five-key form; a real previous with any `provenance` key is refused. Data 0.3.1
+as a later release's previous is a real identity.
+**Removal (both repos, in step):** delete this temporary form from the contract
+and the data exemption only after (1) data 0.3.1 is verified AND (2) every
+stored `release-receipt-data` artifact whose receipt carries the bootstrap
+`previous` has expired (data uploads it with 90-day retention): the scheduled
+collector re-validates every retained receipt artifact, so dropping the form
+earlier makes the whole data sweep fail until they expire. If the form must go
+sooner, first make the collector skip receipts already stored byte-identically.
 
 **State machine.** Ordered progress is
 `pending → pr_open → testing → ready → merged → deploying → verified`.
@@ -626,7 +637,7 @@ license example. Real consumer builders must supply actual evidence, target
 identities and their owner-approved inventories. The hub test validates these
 examples against its own validator, including the documented JSON.
 Both complete examples and the synthetic builder use the ordinary five-key
-form; the data bootstrap above is a separate, literal regression fixture.
+form; the data bootstrap above is a separate, literal documented example.
 Use `--consumer hosted` for a synthetic hosted receipt with CI at the PR head
 and coordinator E2E at the tested base. Its example policy is the exact hosted
 entry below; a real coordinator must also publish its verified binding artifact.

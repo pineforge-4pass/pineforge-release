@@ -28,7 +28,9 @@ FACTS_SCHEMA = "pineforge/facts-consumer-receipt/v1"
 COMMON_FIELDS = {"schema", "consumer", "attempt", "sequence", "state", "timestamp",
                  "pr", "ci", "e2e", "deploy", "preview", "deployed", "previous"}
 
-# TEMPORARY first-adopter previous: remove with the data exemption once 0.3.1 is verified.
+# TEMPORARY first-adopter previous. Remove together with pineforge-data's BOOTSTRAP_PACKAGE exemption
+# (scripts/release_chain/publishing.py), only after data 0.3.1 is verified AND every retained
+# release-receipt-data artifact carrying this previous has expired (see docs/release-chain.md).
 DATA_BOOTSTRAP_PREVIOUS = {
     "provenance": "pre-manifest-bootstrap",
     "package": "pineforge-data",
