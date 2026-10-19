@@ -1,8 +1,13 @@
 # Tunaxis automatic release hub
 
-The Tunaxis product image is published as `ghcr.io/pineforge-4pass/tunaxis-release`
-and `ghcr.io/pineforge-4pass/pineforge-release`; both repositories carry the same
-image digest and tags.
+Tunaxis was formerly PineForge.
+
+The Tunaxis product image is published today as
+`ghcr.io/pineforge-4pass/pineforge-release`. From the Tunaxis switch on, new
+releases will also be published as `ghcr.io/pineforge-4pass/tunaxis-release`,
+with matching release tags and digests once published beside the existing
+image. Historical tags remain under the existing name; `candidate-*` tags
+are published only to `pineforge-release`.
 
 This implements briefs 1 (hub reconciliation) and 2 of the 2026-10-16 release
 chain design. Engine/codegen/HPO remain the producers. `release_pair.py` remains
@@ -617,7 +622,7 @@ rejects missing/skipped/cancelled jobs and covers merge-group events too.
 | `RELEASE_CONSUMER_MAX_AGE_MINUTES` (optional variable; 180) | Hub repository | Non-app missing/stalled completion threshold. |
 | `RELEASE_APPLICATION_MAX_AGE_MINUTES` (optional variable; 1440) | Hub repository | App stage freshness, separate from per-test time limits. |
 | `FACTS_LICENSE_DISPATCH_ENABLED` (new variable) | Hub repository | Set true after the license facts receiver and receipt policy are ready; also selects license receipt polling without product dispatch. Existing repository `FACTS_WEB_DISPATCH_ENABLED` independently selects web facts dispatch/polling. |
-| Actions permissions, Issues, GHCR visibility | Hub repository | Permit workflow contents/packages/issues writes; enable Issues and public pulls of both GHCR packages. |
+| Actions permissions, Issues, GHCR visibility | Hub repository | Permit workflow contents/packages/issues writes; enable Issues and public pulls of the existing `pineforge-release` GHCR package. From the Tunaxis switch on, enable public pulls of `tunaxis-release` once published beside it. |
 | `release-automation` environment (existing) | Hub repository | Permit protected main and release `v*` tags and the intended automatic jobs. Required human reviewers would pause full automation. |
 | Release asset setting | Hub repository | These releases keep append-only audit/receipt assets after publication; GitHub's repository-wide immutable-release setting must permit these appends. The scripts enforce manifest/fixed-tag byte immutability and never overwrite/delete them. |
 | Receivers and callback credentials | Each enabled consumer | Receiver on default branch; own CI + E2E aggregate required; scoped hub Contents-write callback token; artifact upload/read access. |

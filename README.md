@@ -6,19 +6,21 @@ Tunaxis was formerly PineForge. This is the `pineforge-release` hub repository.
 
 The **full PineScript v6 → deterministic backtest** product image: the
 [`pineforge-engine`](https://github.com/pineforge-4pass/pineforge-engine) pure
-runtime **plus** the bundled [`tunaxis-codegen`](https://pypi.org/project/tunaxis-codegen/)
-transpiler (formerly `pineforge-codegen`, which forwards). Run a `.pine` file in,
-get trades out — no hosted API, source never leaves the box.
+runtime **plus** the bundled Tunaxis transpiler
+([`pineforge-codegen`](https://pypi.org/project/pineforge-codegen/)). Run a `.pine`
+file in, get trades out — no hosted API, source never leaves the box.
 
 ```
-docker pull ghcr.io/pineforge-4pass/tunaxis-release:latest
+docker pull ghcr.io/pineforge-4pass/pineforge-release:latest
 docker run --rm \
   -v "$PWD/strategy.pine:/in/strategy.pine:ro" \
   -v "$PWD/ohlcv.csv:/in/ohlcv.csv:ro" \
-  ghcr.io/pineforge-4pass/tunaxis-release:latest > report.json
+  ghcr.io/pineforge-4pass/pineforge-release:latest > report.json
 ```
 
-The same image is still published as `ghcr.io/pineforge-4pass/pineforge-release` (identical digest, identical tags), so existing pulls keep working.
+Today, pull `ghcr.io/pineforge-4pass/pineforge-release`. From the Tunaxis switch
+on, `tunaxis-release` will be published beside it for new releases; `candidate-*`
+tags stay only in the existing repository (see [Image tags](#image-tags)).
 
 - **`strategy.pine`** — a PineScript v6 strategy (`//@version=6`; any other
   version is rejected with exit code 5).
@@ -44,10 +46,8 @@ if ta.crossunder(fast, slow)
 jq '.summary' report.json      # total_trades, wins, losses, net_pnl, max_drawdown, ...
 ```
 
-`latest` is the newest stable release; pin one with
-`ghcr.io/pineforge-4pass/tunaxis-release:X.Y.Z` (replace `X.Y.Z` with the release
-version; see [Image tags](#image-tags)). The image is multi-arch (`linux/amd64`,
-`linux/arm64`).
+`latest` is the newest stable release; pin one with `:X.Y.Z` (see
+[Image tags](#image-tags)). The image is multi-arch (`linux/amd64`, `linux/arm64`).
 
 ### Knobs, modes and exit codes
 
@@ -78,7 +78,7 @@ variables listed under [Why this repo exists](#why-this-repo-exists)):
 
 ```
 docker inspect --format '{{ index .Config.Labels "io.pineforge.engine.version" }} {{ index .Config.Labels "io.pineforge.codegen.version" }}' \
-  ghcr.io/pineforge-4pass/tunaxis-release:latest      # e.g. "1.0.0 1.0.0"
+  ghcr.io/pineforge-4pass/pineforge-release:latest      # e.g. "1.0.0 1.0.0"
 ```
 
 ### Other symbols' bars (`PINEFORGE_SYMBOL_FEEDS`)
@@ -106,7 +106,7 @@ docker run --rm \
   -v $(pwd)/btcusdt-240.csv:/in/ohlcv.csv:ro \
   -v $(pwd)/symbols:/in/symbols:ro \
   -e PINEFORGE_SYMBOL_FEEDS=/in/symbols/symbols.json \
-  ghcr.io/pineforge-4pass/tunaxis-release:1.3.0 > report.json
+  ghcr.io/pineforge-4pass/pineforge-release:1.3.0 > report.json
 ```
 
 - A key is the exact string the script passes at run time, exchange prefix and
@@ -136,7 +136,7 @@ symbol), warm-up history, the merge rule and its refusals.
 
 ## Why this repo exists
 
-The engine (the C++ runtime) and the transpiler (`tunaxis-codegen`) are
+The engine (the C++ runtime) and the Tunaxis transpiler (`pineforge-codegen`) are
 separate products. This repo is the single place they are composed. On the 0.x
 line they have **independent version lineages**: it pins each one independently
 and owns its **own semver**. From 1.0.0 on they **share one version**: the only
@@ -153,7 +153,7 @@ as build-args with no defaults.
 | Version | Where | Meaning |
 |---------|-------|---------|
 | `ENGINE_VERSION` | resolved by CI; recorded in the release tag message + `io.pineforge.engine.version` label | `pineforge-engine` release whose static-lib tarball (libpineforge.a + headers) is fetched |
-| `CODEGEN_VERSION` | resolved by CI; recorded in the release tag message + `io.pineforge.codegen.version` label | `tunaxis-codegen` PyPI version baked in |
+| `CODEGEN_VERSION` | resolved by CI; recorded in the release tag message + `io.pineforge.codegen.version` label | `pineforge-codegen` PyPI version baked in |
 | `VERSION` | repo root | 0.x: this image's own semver; from 1.0.0 on: the pair version |
 
 The combined image also carries `io.pineforge.engine.version` /
@@ -240,7 +240,12 @@ combined image, package identities and measured release facts are ready.
 
 ## Image tags
 
-The following tags apply to both image repository names, with identical digests.
+The following tags are published today under
+`ghcr.io/pineforge-4pass/pineforge-release`. From the Tunaxis switch on, new
+releases will also carry these tags under
+`ghcr.io/pineforge-4pass/tunaxis-release`, with matching digests once published
+beside the existing image. Historical tags, including `1.3.0`, remain under the
+existing name; `candidate-*` tags are published only to `pineforge-release`.
 
 `X.Y.Z` · `X.Y` · `latest` · `engine<E>-codegen<C>` · `sha-<short>`
 
@@ -292,7 +297,7 @@ terms, so that licence does not cover the whole image:
 - **`pineforge-engine`** (`libpineforge.a` and headers): Apache-2.0, with Eigen
   under MPL-2.0 — see the engine's
   [`LEGAL.md`](https://github.com/pineforge-4pass/pineforge-engine/blob/main/LEGAL.md).
-- **`pineforge-codegen`** (the transpiler): source-available. From codegen
+- **Tunaxis transpiler** (`pineforge-codegen`): source-available. From codegen
   1.3.0 (images from 1.3.0 on) it is under the PineForge Source License 1.2;
   earlier releases keep the licence they shipped with: codegen 1.2.0 (the
   1.2.0 image) the PineForge Source License 1.1, and releases up to 1.1.0
