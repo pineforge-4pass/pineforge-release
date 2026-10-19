@@ -216,7 +216,9 @@ class PublishTest(unittest.TestCase):
     def test_prerelease_flag_is_in_every_dispatch_payload(self):
         finalizer = _workflow("release-finalize.yml")
         steps = finalizer["jobs"]["notify-consumers"]["steps"]
-        send = next(step for step in steps if step.get("name", "").startswith("Dispatch pineforge-release"))
+        # Application/compute use release-pair, whose flag is inside build.
+        # Both payload contracts and channel policies are checked in binding tests.
+        send = next(step for step in steps if step.get("name", "").startswith("Dispatch consumer event"))
         self.assertIn("scripts/release_pipeline.py dispatch", send["run"])
         self.assertNotIn("client_payload[", send["run"])
         self.assertEqual(finalizer["jobs"]["notify-consumers"]["strategy"]["fail-fast"], "false")
@@ -976,18 +978,57 @@ class NotifyConsumersTest(unittest.TestCase):
         self.assertEqual(job["needs"], "finalize")
         self.assertEqual(job["strategy"]["fail-fast"], "false")
         self.assertEqual(job["strategy"]["matrix"]["include"], "${{ fromJSON(needs.finalize.outputs.deliveries) }}")
-        send = next(s for s in job["steps"] if s.get("name", "").startswith("Dispatch pineforge-release"))
+        send = next(s for s in job["steps"] if s.get("name", "").startswith("Dispatch consumer event"))
         self.assertIn("release_pipeline.py dispatch", send["run"])
         self.assertNotIn("client_payload[", send["run"])
 
     def test_all_consumer_roles_have_explicit_registry_and_policy(self):
+        import release_contract as contract
         import release_pipeline as pipeline
-        expected = {"offline", "hosted", "application", "web", "data", "license"}
+        expected = {"offline", "hosted", "application", "web", "data", "license", "compute"}
+        self.assertEqual(set(contract.ROLES), expected)
+        self.assertEqual(contract.DELIVERY_ONLY, ("compute",))
+        self.assertEqual(set(contract.RECEIPT_ROLES), expected - {"compute"})
         self.assertEqual(set(pipeline.configured_roles(",".join(sorted(expected)))), expected)
         self.assertEqual(pipeline.configured_roles(""), [])
         for bad in ("unknown", "offline,offline", "offline, hosted", "offline\nhosted"):
             with self.subTest(bad=bad), self.assertRaises(pipeline.Invalid):
                 pipeline.configured_roles(bad)
+
+    def test_compute_target_reuses_the_exact_single_target_app_mint(self):
+        text = (WORKFLOWS / "release-finalize.yml").read_text()
+        job = _workflow("release-finalize.yml")["jobs"]["notify-consumers"]
+        target = job["env"]["TARGET_REPOSITORY"]
+        self.assertEqual(target.count("secrets.RELEASE_COMPUTE_REPOSITORY"), 1)
+        self.assertEqual(text.count("secrets.RELEASE_COMPUTE_REPOSITORY"), 1)
+        self.assertIn("matrix.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY", target)
+        mints = [step for step in job["steps"] if "create-github-app-token@" in step.get("uses", "")]
+        self.assertEqual(len(mints), 1)
+        self.assertEqual(mints[0]["uses"],
+                         "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510")
+        self.assertEqual(mints[0]["with"], {
+            "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
+            "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
+            "owner": "${{ github.repository_owner }}",
+            "repositories": "${{ env.TARGET_REPOSITORY }}",
+            "permission-contents": "write", "github-api-url": "https://api.github.com",
+        })
+        self.assertEqual(set(re.findall(r"secrets\.([A-Z_]+)", text)), {
+            "PINEFORGE_APP_ID", "PINEFORGE_APP_PRIVATE_KEY", "RELEASE_HOSTED_MCP_REPOSITORY",
+            "RELEASE_APPLICATION_REPOSITORY", "FACTS_WEB_REPOSITORY", "RELEASE_COMPUTE_REPOSITORY",
+        })
+
+    def test_compute_first_pair_is_explicit_and_receipt_workflow_stays_receipt_only(self):
+        finalize = _workflow("release-finalize.yml")["jobs"]["finalize"]
+        step = next(s for s in finalize["steps"] if s.get("id") == "ready")
+        self.assertEqual(step["env"]["RELEASE_COMPUTE_FIRST_PAIR"], "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}")
+        self.assertEqual(step["env"]["RELEASE_READY_CONSUMERS"], "${{ vars.RELEASE_READY_CONSUMERS }}")
+        text = (WORKFLOWS / "release-receipts.yml").read_text()
+        self.assertIn("DELIVERY_ONLY", text)
+        self.assertNotIn("RELEASE_COMPUTE_REPOSITORY", text)
+        self.assertNotIn("matrix.consumer == 'compute'", text)
+        planner = _workflow("release-receipts.yml")["jobs"]["plan"]
+        self.assertTrue(any("release_receipts.py signal" in s.get("run", "") for s in planner["steps"]))
 
 
 class HarnessSyncTest(unittest.TestCase):

@@ -15,12 +15,14 @@ from urllib.parse import quote
 
 import release_pair as pair
 from release_artifacts import Client, PRODUCERS, command, npm, producer
-from release_contract import (ASSET, COMMIT, HUB, IMAGE, ROLES, SCHEMA, SHA, Invalid,
-                              Pending, bind_facts, canonical, decode, keys, match,
-                              payload, positive, require, sha256, validate, version)
+from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYPES,
+                              HUB, IMAGE, RECEIPT_ROLES, ROLES, SCHEMA, SHA, Invalid,
+                              Pending, bind_facts, canonical, decode, match,
+                              pair_payload, payload, positive, require, sha256,
+                              validate, validate_candidate, version)
 
-CANDIDATE = "release-candidate.json"
 FACTS_RECEIPTS_TAG = "facts-receipts"
+COMPLETE_STATES = ("verified", "skipped_by_policy", "superseded", "delivered")
 # Delay after each reserved attempt: two retries, then an acknowledgement grace
 # period before a terminal failure. Reservations survive failed/cancelled jobs.
 DELIVERY_BACKOFF_MINUTES = (15, 60, 15)
@@ -148,27 +150,6 @@ def bindings(client, release_version, engine, codegen, hpo, hub_commit):
             "hub_commit": hub_commit, "versions": versions, "inventories": inventories}
 
 
-def validate_candidate(obj):
-    keys(obj, ("schema", "release_version", "hub_commit", "versions", "inventories", "image", "verification", "sources", "run_id"))
-    require(obj["schema"] == "pineforge/release-candidate/v1", "invalid candidate schema")
-    v = version(obj["release_version"])
-    match(COMMIT, obj["hub_commit"])
-    positive(obj["run_id"])
-    pins = obj["versions"]
-    pair.check(str(v), pins["engine"]["version"], pins["codegen"]["version"], hpo=pins["hpo"]["version"] if pins["hpo"] else "")
-    keys(obj["verification"], ("amd64", "arm64"))
-    for result in obj["verification"].values():
-        match(SHA, result["backtest_sha256"])
-        positive(result["trades"])
-        if pins["hpo"]:
-            require(type(result["hpo_trials"]) is int and result["hpo_trials"] == 9, "HPO smoke incomplete")
-            match(SHA, result["hpo_sha256"])
-    keys(obj["sources"], ("release_tag", "list_asset", "list_sha256", "amd64_sha256", "arm64_sha256"))
-    for name in ("list_sha256", "amd64_sha256", "arm64_sha256"):
-        match(SHA, obj["sources"][name])
-    return obj
-
-
 def report_issue(client, key, title, body, *, complete=False):
     if os.environ.get("RELEASE_REPORT_TOKEN"):
         client = Client(token=os.environ["RELEASE_REPORT_TOKEN"])
@@ -267,11 +248,22 @@ def configured_roles(raw):
 
 
 def receipt_roles():
-    roles = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+    roles = [role for role in configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+             if role not in DELIVERY_ONLY]
     for role, flag in (("web", "FACTS_WEB_DISPATCH_ENABLED"), ("license", "FACTS_LICENSE_DISPATCH_ENABLED")):
         if os.environ.get(flag) == "true" and role not in roles:
             roles.append(role)
     return roles
+
+
+def delivery_roles(release_version, enabled):
+    """Compute is off until both role selection and the first-pair floor allow it."""
+    if "compute" not in enabled:
+        return enabled
+    first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
+    if first and version(release_version) >= version(first):
+        return enabled
+    return [role for role in enabled if role != "compute"]
 
 
 def candidate_exists(store, tag):
@@ -287,7 +279,7 @@ def receipts(store, row, event_id):
     for item in sorted(fresh["assets"], key=lambda a: a["id"]):
         if item["name"].startswith("consumer-"):
             obj = decode(store.read(fresh, item["name"]))
-            require(obj["event_id"] == event_id and obj["consumer"] in ROLES, "consumer receipt identity differs")
+            require(obj["event_id"] == event_id and obj["consumer"] in RECEIPT_ROLES, "consumer receipt identity differs")
             old = result.get(obj["consumer"])
             if old is None or (obj["attempt"], obj["sequence"]) > (old["attempt"], old["sequence"]):
                 result[obj["consumer"]] = obj
@@ -301,7 +293,12 @@ def aggregate(store, row, event, *, enabled=(), newest=None):
         if role not in enabled:
             continue
         obj = by_role.get(role)
-        if newest is not None and version(event["release_version"]) < newest and (not obj or obj["state"] != "verified"):
+        if role in DELIVERY_ONLY:
+            # P16: compute records every pair, including rc and older pairs.
+            # It bypasses aggregate supersession (release_pipeline.py:304-305)
+            # and the dispatch refusal (release_pipeline.py:563-567), before this change.
+            states[role] = "delivered" if store.read(row, f"delivery-{role}.json") is not None else "pending"
+        elif newest is not None and version(event["release_version"]) < newest and (not obj or obj["state"] != "verified"):
             states[role] = "superseded"
         elif obj:
             states[role] = obj["state"]
@@ -311,7 +308,7 @@ def aggregate(store, row, event, *, enabled=(), newest=None):
             states[role] = "pending"
     return {"schema": "pineforge/release-status/v1", "event_id": event["event_id"],
             "release_version": event["release_version"], "consumers": states,
-            "complete": all(value in ("verified", "skipped_by_policy", "superseded") for value in states.values())}
+            "complete": all(value in COMPLETE_STATES for value in states.values())}
 
 
 def plan_delivery(store, row, event, role):
@@ -393,7 +390,7 @@ def finalize_all(client, store, registry, tag, output):
             if event is None:
                 continue
             newest = finalized_version(store)
-            status = aggregate(store, row, event, enabled=enabled, newest=newest)
+            status = aggregate(store, row, event, enabled=delivery_roles(event["release_version"], enabled), newest=newest)
             for role, state in status["consumers"].items():
                 if state == "pending":
                     delivery, failed = plan_delivery(store, row, event, role)
@@ -401,8 +398,7 @@ def finalize_all(client, store, registry, tag, output):
                         deliveries.append(delivery)
                     if failed:
                         status["consumers"][role] = "failed"
-            status["complete"] = all(state in ("verified", "skipped_by_policy", "superseded")
-                                     for state in status["consumers"].values())
+            status["complete"] = all(state in COMPLETE_STATES for state in status["consumers"].values())
             pending = [role for role, state in status["consumers"].items()
                        if state in ("pending", "pr_open", "testing", "ready", "merged", "deploying")]
             by_role = receipts(store, row, event["event_id"])
@@ -413,7 +409,8 @@ def finalize_all(client, store, registry, tag, output):
             status["stale"] = stale
             body = "Event: `" + event["event_id"] + "`\n\n" + "\n".join(
                 f"- {role}: {state}" + (" (completion overdue)" if role in stale else "") for role, state in status["consumers"].items())
-            body += "\n\nDispatch acceptance is transport only. Verified means checked consumer receipt and served-state evidence."
+            body += ("\n\nDelivery-only roles complete at delivered (transport acceptance). "
+                     "Verified means checked consumer receipt and served-state evidence.")
             previous_status = None
             for asset in sorted(store.get(row["tag_name"])["assets"], key=lambda item: item["id"]):
                 if asset["name"].startswith("release-status-"):
@@ -560,15 +557,22 @@ def main():
             raw = public.download(f"https://github.com/{HUB}/releases/download/{args.tag}/{ASSET}", {"github.com"})
             event = payload(raw)
             require(args.tag == "v" + event["release_version"], "dispatch release differs")
-            newer = [pair.parse(r["tag_name"]) for r in public.pages(f"repos/{HUB}/releases")
-                     if not r["draft"] and (event["prerelease"] or not r["prerelease"])
-                     and any(a["name"] == ASSET for a in r["assets"])
-                     and not any(a["name"] == "release-rejected.json" for a in r["assets"])]
-            require(not newer or version(event["release_version"]) >= max(newer), "release superseded before dispatch")
+            # Delivery-only compute records each pair; a newer pair cannot cancel it.
+            if args.consumer not in DELIVERY_ONLY:
+                newer = [pair.parse(r["tag_name"]) for r in public.pages(f"repos/{HUB}/releases")
+                         if not r["draft"] and (event["prerelease"] or not r["prerelease"])
+                         and any(a["name"] == ASSET for a in r["assets"])
+                         and not any(a["name"] == "release-rejected.json" for a in r["assets"])]
+                require(not newer or version(event["release_version"]) >= max(newer), "release superseded before dispatch")
+            event_type = EVENT_TYPES[args.consumer]
+            client_payload = event
+            if event_type == "release-pair":
+                candidate_raw = public.download(f"https://github.com/{HUB}/releases/download/{args.tag}/{CANDIDATE}", {"github.com"})
+                client_payload = pair_payload(raw, candidate_raw)
             target = os.environ.get("TARGET_REPOSITORY", "")
             match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", target)
             client.api(f"repos/pineforge-4pass/{target}/dispatches", method="POST",
-                       data={"event_type": "pineforge-release", "client_payload": event})
+                       data={"event_type": event_type, "client_payload": client_payload})
             Path(args.output).write_bytes(canonical({"schema": "pineforge/release-delivery/v1", "event_id": event["event_id"],
                 "consumer": args.consumer, "state": "dispatch_accepted", "attempt": args.attempt,
                 "run_id": int(os.environ["GITHUB_RUN_ID"]), "timestamp": now()}))

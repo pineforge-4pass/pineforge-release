@@ -90,9 +90,12 @@ The previous alias digests are preserved before the first promotion.
 
 ## Exact ready event contract
 
-The event type remains **`pineforge-release`**. Its ten payload fields are exactly
-section 3.2 of the design: `schema`, `event_id`, `release_version`, `prerelease`,
-`hub_commit`, `versions`, `image`, `facts`, `manifest`, `run_id`.
+The `offline`, `hosted`, `web`, `data` and `license` event type remains
+**`pineforge-release`**, with unchanged payload bytes. Its ten payload fields are
+exactly section 3.2 of the design: `schema`, `event_id`, `release_version`,
+`prerelease`, `hub_commit`, `versions`, `image`, `facts`, `manifest`, `run_id`.
+The `application` and `compute` roles use **`release-pair`**, described below.
+`EVENT_TYPES` in `scripts/release_contract.py` is the single role-to-event table.
 
 Fixtures for consumer implementations:
 
@@ -121,6 +124,67 @@ referenced artifacts. No arbitrary repository/asset/path is accepted from the
 sender. A newer verified canonical facts snapshot may be retained if its target
 release entry agrees exactly. Record the actually consumed commit and digest.
 
+### Pair event for application and compute
+
+`pair_payload(manifest_raw, candidate_raw)` in `scripts/release_contract.py`
+builds the same `release-pair` payload for both targets. It validates the
+immutable manifest and the candidate's existing smoke/source gates, then
+requires equal release version, image, hub commit, build run and producer pins.
+The manifest's codegen npm fields are the finalizer's additions; all original
+candidate codegen fields must still agree. Missing or mismatched input fails
+before a dispatch. URLs come from the fixed hub repository and fixed asset
+names, never from target configuration.
+
+The payload has exactly these eight top-level keys:
+
+| Key | Value / source |
+|---|---|
+| `pair_id` | Manifest `release_version`, bare canonical semver including any prerelease suffix. |
+| `engine_tag` | Manifest `versions.engine.tag`. |
+| `codegen_tag` | `v` plus manifest `versions.codegen.version`; the codegen binding has no tag field. |
+| `hpo_tag` | Manifest `versions.hpo.tag`, using its PEP 440 spelling, or JSON null before the HPO cutoff. |
+| `receipt_url` | Fixed hub's `releases/download/v<pair_id>/release-manifest.json` HTTPS URL. |
+| `receipt_sha256` | Lowercase SHA-256 of the untouched published manifest bytes, equal to the ready contract's `manifest.sha256`. |
+| `source_sets` | A one-element array containing the checked candidate's `sources`: exactly `release_tag`, `list_asset`, `list_sha256`, `amd64_sha256`, `arm64_sha256`. Source tags are public version tags and list assets have the public `set-NN.SOURCES.list` form. |
+| `build` | Exactly the six members in the following table. |
+
+| `build` key | Value / source |
+|---|---|
+| `prerelease` | Manifest boolean `prerelease`. |
+| `hub_commit` | Manifest `hub_commit`. |
+| `run_id` | Manifest integer `run_id`, the original candidate build run. |
+| `image` | Manifest image object: exactly `repository`, `digest`, `amd64_digest`, `arm64_digest`, with the fixed public hub image paths and bare OCI digests validated above. |
+| `candidate_url` | Fixed hub's `releases/download/v<pair_id>/release-candidate.json` HTTPS URL. |
+| `candidate_sha256` | Lowercase SHA-256 of the untouched published candidate bytes. |
+
+The application remains a normal receipt role. Its event type changes to
+`release-pair` so it receives the shared pair/build inputs; this does not change
+its CI/E2E/deploy receipt requirements. It remains `skipped_by_policy` for
+prereleases because its receiver refuses those dispatches.
+
+Builders remain deployers: the application builds its Cloud Run image and
+hosted builds its container. The compute receiver only validates each pair and
+records evidence; it builds nothing and dispatches nothing onward. It reports
+no consumer receipt to this hub. Private target repository names, deployment
+registry paths, project/account identities and VM names stay in trusted deployer
+configuration. Public deployment evidence carries bare OCI digests and hashes
+of private evidence, never those private identifiers.
+
+Both target repository names live in the hub's `release-automation` environment
+secrets: `RELEASE_APPLICATION_REPOSITORY` and `RELEASE_COMPUTE_REPOSITORY`.
+The sender reuses the existing App token mint, scoped to one target with
+Contents write. The supervisor supplies the secret values; source, matrices,
+public audit assets and incidents contain only neutral roles.
+
+For an agreed manual replay, select a non-rejected finalized pair and fetch its
+original manifest and candidate. Reconstruct these eight inputs using the same
+mapping and byte hashes, then run the configured compute receiver
+`release-pair.yml` on its default branch. Supply `source_sets` and `build` as
+JSON strings; blank `hpo_tag` decodes to null. Repeating the same
+`(pair_id, receipt_sha256)` is idempotent. Failed sends retain the existing
+bounded delivery history and report a neutral incident to
+`RELEASE_REPORT_OWNER`. No older-pair backfill is needed for the initial rollout.
+
 `facts-update` remains exactly `{commit, sha256, dry_run}`. The existing guarded
 web sender is retained and an independently gated license job uses the same
 validator and transport. A facts-only change sends `facts-update` to enabled
@@ -135,17 +199,44 @@ Product dispatch is enabled only for roles in repository variable
 creates PRs and gates merge/deployment on its full CI/E2E. Keep `license` out of
 product dispatch: its facts receiver is independently selected by
 `FACTS_LICENSE_DISPATCH_ENABLED=true`. Web facts polling is similarly selected
-by `FACTS_WEB_DISPATCH_ENABLED=true`. Each selected role needs a receipt policy.
+by `FACTS_WEB_DISPATCH_ENABLED=true`. Each selected receipt role needs a receipt
+policy; `compute` is delivery-only and needs none.
 Disabled product roles are omitted from aggregate consumers, completion and
 staleness calculations; an empty product set completes with no deliveries.
 Prerelease application/web/data/license roles, if configured, are explicitly
 `skipped_by_policy`; offline/hosted must enforce their dev/next policy.
 
+| Role | Product event type | Completion | Prerelease policy |
+|---|---|---|---|
+| `offline` | `pineforge-release` | Verified consumer receipt | Consumer dev/next gates |
+| `hosted` | `pineforge-release` | Verified consumer receipt | Consumer dev/next gates |
+| `application` | `release-pair` | Verified consumer receipt | `skipped_by_policy` |
+| `web` | `pineforge-release` | Verified consumer receipt | `skipped_by_policy` |
+| `data` | `pineforge-release` | Verified consumer receipt | `skipped_by_policy` |
+| `license` | `pineforge-release` if explicitly selected; normally facts-only | Verified consumer receipt | `skipped_by_policy` for product releases |
+| `compute` | `release-pair` | `delivered` after transport acceptance | Receives every eligible pair, including rc |
+
+Compute is planned only when **both** `compute` is in `RELEASE_READY_CONSUMERS`
+and repository variable `RELEASE_COMPUTE_FIRST_PAIR` is nonempty and no greater
+than the pair's version, using the hub's semver parser. Empty means off, even if
+the role is listed. Below-floor pairs are omitted from compute's deliveries,
+aggregate and staleness inventory. Leave the variable empty until the compute
+receiver is merged, then the supervisor sets the agreed current application/
+hosted pair. There is no automatic backfill below that floor.
+
+`DELIVERY_ONLY = ("compute",)` explicitly separates delivery roles from the six
+`RECEIPT_ROLES`. Before `delivery-compute.json`, compute is `pending`; after that
+asset it is `delivered`, which counts as complete and can close a release
+incident. It never becomes `superseded` or `skipped_by_policy`, and a newer ready
+release does not refuse an eligible compute send or retry. `delivered` proves
+transport acceptance; it makes no deployment or served-state claim.
+
 Delivery acceptance is recorded once as `delivery-<consumer>.json`, independently
 of consumer progress. Its presence stops further dispatch even if the consumer
-has not yet reported completion. A missing receipt becomes pending/overdue; it
-never triggers another build or an endless product event retry. Before each
-send the finalizer reserves an append-only `delivery-attempt-<consumer>-N.json`.
+has not yet reported completion. For receipt roles, a missing receipt becomes
+pending/overdue; it never triggers another build or an endless product event
+retry. Before each send the finalizer reserves an append-only
+`delivery-attempt-<consumer>-N.json`.
 It permits **three total attempts**: the first immediately, a second at least
 15 minutes after the first, and a third at least 60 minutes after the second.
 After a further 15-minute acknowledgement grace period without delivery
@@ -157,15 +248,18 @@ evidence can still advance progress; scheduled runs do not clear the retry
 history. Investigate and use an explicit reviewed
 recovery for an exhausted delivery.
 
-`release-receipts.yml` polls selected consumers every 15 minutes and accepts the
-callback below to repair dropped notifications. It mints a target-only read
+`release-receipts.yml` polls selected receipt consumers every 15 minutes and
+accepts the callback below to repair dropped notifications. It mints a target-only read
 token, verifies the artifact and full GitHub CI/E2E/deploy evidence, then appends
-a neutral receipt. Acceptance of a dispatch or callback never means verified.
+a neutral receipt. Its planner excludes `DELIVERY_ONLY` roles, so compute has
+no policy lookup, read token or workflow poll; compute callbacks and consumer
+receipts are refused. Acceptance of a dispatch or callback never means verified.
 
 ## Consumer receipt contract v1
 
-This is the single consumer-to-hub contract for all six lanes. Implement the
-artifact and callback in the consumer's trusted default-branch coordinator.
+This is the single consumer-to-hub contract for the six receipt lanes;
+delivery-only compute is excluded. Implement the artifact and callback in the
+consumer's trusted default-branch coordinator.
 No Python knowledge is required. The hub validates both complete examples below
 and the [example builder](../scripts/consumer_receipt_example.py) in CI.
 
@@ -655,26 +749,30 @@ of private evidence/inventories. Private repository names, job labels, deploymen
 URLs and raw deployment IDs stay in the consumer artifact. Aggregate assets are
 appended only when state changes; one release incident tracks progress and is
 assigned/mentioned to the configured owner. Only verified served-state evidence
-produces consumer success. Facts freshness uses the latest facts-file change,
+produces receipt-role success; compute completes at delivery acceptance as
+described above. Facts freshness uses the latest facts-file change,
 not unrelated main commits; current served facts evidence becomes overdue after
 30 minutes. Product readiness and consumer-stage ages have separate thresholds,
 with a longer app default. Monitor these assets/issues, not green dispatch runs.
 
 ## Supervisor configuration
 
-Do not enable a role until its consumer lane has removed moving runtime defaults
-and installed PR/CI/E2E/deploy gates. Consumer App identities must not bypass
-their required branch checks, and no consumer may use an admin merge. Configure
-`release/ready` as a required hub branch/ruleset status; its exact inventory
+Do not enable a receipt role until its consumer lane has removed moving runtime
+defaults and installed PR/CI/E2E/deploy gates. Compute instead waits for its
+merged pair-validation receiver and explicit first-pair gate. Consumer App
+identities must not bypass their required branch checks, and no consumer may use
+an admin merge. Configure `release/ready` as a required hub branch/ruleset status; its exact inventory
 rejects missing/skipped/cancelled jobs and covers merge-group events too.
 
 | Name / setting | Scope | Purpose |
 |---|---|---|
 | `PINEFORGE_APP_ID`, `PINEFORGE_APP_PRIVATE_KEY` (existing) | Hub `release-automation` environment | Short-lived, one-target installation tokens; no PAT fallback. |
-| App installation permissions | Hub: Contents write + Actions write; enabled consumers: Contents read/write, Actions read, Pull requests read | Hub tag/dispatch and explicit publish replay; consumer dispatch and completion evidence reads. Each mint asks only for the permissions needed by that job. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
+| App installation permissions | Hub: Contents write + Actions write; receipt consumers: Contents read/write, Actions read, Pull requests read | Hub tag/dispatch and explicit publish replay; consumer dispatch and completion evidence reads. Each mint asks only for the permissions needed by that job; delivery-only compute uses only the existing Contents-write dispatch mint. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
 | `RELEASE_HOSTED_MCP_REPOSITORY`, `RELEASE_APPLICATION_REPOSITORY`, `FACTS_WEB_REPOSITORY` (existing) | Hub `release-automation` environment secrets | Private short repository names for neutral hosted/application/web targets. Public offline/data/license names are fixed in workflows. |
-| `RELEASE_RECEIPT_POLICY` (new secret) | Hub `release-automation` environment | JSON map of each enabled role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories. Keep private workflow/job details out of public source. |
+| `RELEASE_COMPUTE_REPOSITORY` (new secret) | Hub `release-automation` environment secrets | Private short name of the compute target repository; the application target likewise lives in `RELEASE_APPLICATION_REPOSITORY`. Both reuse the existing one-target App mint. No values belong in source or public audit assets. |
+| `RELEASE_RECEIPT_POLICY` (new secret) | Hub `release-automation` environment | JSON map of each enabled receipt role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories. Compute needs no entry. Keep private workflow/job details out of public source. |
 | `RELEASE_READY_CONSUMERS` (new variable) | Hub repository | Explicit comma-separated upgraded product receiver roles. Empty sends nothing; disabled roles do not block aggregate completion or become overdue. Facts flags independently select web/license receipt polling and freshness. |
+| `RELEASE_COMPUTE_FIRST_PAIR` (new variable; empty/off) | Hub repository | Bare canonical semver lower bound for compute, including prereleases. Compute must also be in `RELEASE_READY_CONSUMERS`. Keep empty until the receiver merges; no older-pair backfill for the initial rollout. |
 | `RELEASE_REPORT_OWNER` (new variable) | Hub repository | GitHub login to assign/mention on release and failure issues. |
 | `RELEASE_READY_MAX_AGE_MINUTES` (optional variable; 60) | Hub repository | Missing readiness prerequisite alert threshold. |
 | `RELEASE_CONSUMER_MAX_AGE_MINUTES` (optional variable; 180) | Hub repository | Non-app missing/stalled completion threshold. |
@@ -683,7 +781,7 @@ rejects missing/skipped/cancelled jobs and covers merge-group events too.
 | Actions permissions, Issues, GHCR visibility | Hub repository | Permit workflow contents/packages/issues writes; enable Issues and public pulls of the existing GHCR package. |
 | `release-automation` environment (existing) | Hub repository | Permit protected main and release `v*` tags and the intended automatic jobs. Required human reviewers would pause full automation. |
 | Release asset setting | Hub repository | These releases keep append-only audit/receipt assets after publication; GitHub's repository-wide immutable-release setting must permit these appends. The scripts enforce manifest/fixed-tag byte immutability and never overwrite/delete them. |
-| Receivers and callback credentials | Each enabled consumer | Receiver on default branch; own CI + E2E aggregate required; scoped hub Contents-write callback token; artifact upload/read access. |
+| Receivers and callback credentials | Each enabled receipt consumer | Receiver on default branch; own CI + E2E aggregate required; scoped hub Contents-write callback token; artifact upload/read access. Delivery-only compute instead requires its pair-validation receiver, with no consumer callback or receipt artifact polling. |
 
 Policy example: the `offline` entry remains a synthetic structure, not a
 production inventory. The `hosted` entry is the exact policy from the reviewed
@@ -748,7 +846,6 @@ replacement, archive digests, PR/head/base/attempt mismatches and inventory
 changes, plus regressions for the original exact-SHA path. The existing
 `test_release_*.py` discovery includes it in CI. These tests are written for
 CI/cloud execution and are not run on the Mac; local validation is limited to
-Python compilation and `git diff --check` (plus YAML parsing if a workflow
-changes).
+Python compilation and `git diff --check`. Workflow tests parse YAML on CI/cloud.
 No test suite, Docker runtime/build, live dispatch, publication, token mint,
 credential read or deployment is needed on the Mac to implement this lane.

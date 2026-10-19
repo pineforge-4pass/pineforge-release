@@ -21,7 +21,19 @@ IMAGES = (IMAGE_OLD, IMAGE_NEW)
 IMAGE = IMAGE_OLD
 SCHEMA = "pineforge/release-ready/v1"
 ASSET = "release-manifest.json"
-ROLES = ("offline", "hosted", "application", "web", "data", "license")
+CANDIDATE = "release-candidate.json"
+ROLES = ("offline", "hosted", "application", "web", "data", "license", "compute")
+DELIVERY_ONLY = ("compute",)
+RECEIPT_ROLES = tuple(role for role in ROLES if role not in DELIVERY_ONLY)
+EVENT_TYPES = {
+    "offline": "pineforge-release",
+    "hosted": "pineforge-release",
+    "application": "release-pair",
+    "web": "pineforge-release",
+    "data": "pineforge-release",
+    "license": "pineforge-release",
+    "compute": "release-pair",
+}
 SHA = r"[0-9a-f]{64}"
 COMMIT = r"[0-9a-f]{40}"
 MANIFEST_KEYS = {"schema", "release_version", "prerelease", "hub_commit", "versions", "image", "facts", "run_id"}
@@ -135,6 +147,63 @@ def payload(raw):
     require(canonical(manifest) == raw, "noncanonical manifest bytes")
     digest = sha256(raw)
     return {**manifest, "event_id": "sha256:" + digest, "manifest": {"asset": ASSET, "sha256": digest}}
+
+
+def validate_candidate(obj):
+    keys(obj, ("schema", "release_version", "hub_commit", "versions", "inventories", "image", "verification", "sources", "run_id"))
+    require(obj["schema"] == "pineforge/release-candidate/v1", "invalid candidate schema")
+    v = version(obj["release_version"])
+    match(COMMIT, obj["hub_commit"])
+    positive(obj["run_id"])
+    pins = obj["versions"]
+    pair.check(str(v), pins["engine"]["version"], pins["codegen"]["version"], hpo=pins["hpo"]["version"] if pins["hpo"] else "")
+    keys(obj["verification"], ("amd64", "arm64"))
+    for result in obj["verification"].values():
+        match(SHA, result["backtest_sha256"])
+        positive(result["trades"])
+        if pins["hpo"]:
+            require(type(result["hpo_trials"]) is int and result["hpo_trials"] == 9, "HPO smoke incomplete")
+            match(SHA, result["hpo_sha256"])
+    keys(obj["sources"], ("release_tag", "list_asset", "list_sha256", "amd64_sha256", "arm64_sha256"))
+    for name in ("list_sha256", "amd64_sha256", "arm64_sha256"):
+        match(SHA, obj["sources"][name])
+    return obj
+
+
+def pair_payload(manifest_raw, candidate_raw):
+    """P04/P05: validate the published pair and hash its untouched asset bytes."""
+    manifest = payload(manifest_raw)
+    candidate = validate_candidate(decode(candidate_raw))
+    require(all(manifest[name] == candidate[name]
+                for name in ("release_version", "image", "hub_commit", "run_id")),
+            "manifest does not bind this candidate")
+    for role in ("engine", "codegen", "hpo"):
+        actual = manifest["versions"][role]
+        if role == "codegen":
+            # npm is resolved during finalization, after the candidate is built.
+            actual = {key: value for key, value in actual.items() if key not in ("npm_version", "npm_integrity")}
+        require(actual == candidate["versions"][role], "manifest producer identity differs from candidate")
+    sources = candidate["sources"]
+    # Only public source-bundle identities can enter the event. No arbitrary
+    # repository, URL, deployment name or private path is copied from a candidate.
+    match(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc)\.[0-9]+)?", sources["release_tag"])
+    version(sources["release_tag"][1:])
+    match(r"set-[0-9]{2,}\.SOURCES\.list", sources["list_asset"])
+    base = f"https://github.com/{HUB}/releases/download/v{manifest['release_version']}/"
+    return {
+        "pair_id": manifest["release_version"],
+        "engine_tag": manifest["versions"]["engine"]["tag"],
+        "codegen_tag": "v" + manifest["versions"]["codegen"]["version"],
+        "hpo_tag": manifest["versions"]["hpo"]["tag"] if manifest["versions"]["hpo"] else None,
+        "receipt_url": base + ASSET,
+        "receipt_sha256": sha256(manifest_raw),
+        "source_sets": [sources],
+        "build": {
+            "prerelease": manifest["prerelease"], "hub_commit": manifest["hub_commit"],
+            "run_id": manifest["run_id"], "image": manifest["image"],
+            "candidate_url": base + CANDIDATE, "candidate_sha256": sha256(candidate_raw),
+        },
+    }
 
 
 def validate_payload(event, raw):

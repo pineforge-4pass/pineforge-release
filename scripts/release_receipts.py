@@ -16,7 +16,7 @@ import zipfile
 from pathlib import Path
 
 from release_artifacts import Client
-from release_contract import (ASSET, COMMIT, HUB, ROLES, SHA, Invalid, Pending,
+from release_contract import (ASSET, COMMIT, HUB, RECEIPT_ROLES, ROLES, SHA, Invalid, Pending,
                               canonical, decode, keys, match, payload, positive,
                               require, sha256, version)
 from release_pipeline import Store, receipt_roles, receipts, report_issue, run_link
@@ -55,6 +55,7 @@ def object_pages(client, route, key):
 
 
 def profile(role):
+    require(role in RECEIPT_ROLES, "unexpected receipt role")
     profiles = decode(os.environ.get("RELEASE_RECEIPT_POLICY", "{}"))
     require(role in profiles, "consumer evidence policy not configured")
     policy = profiles[role]
@@ -187,7 +188,7 @@ def identity(obj, *, facts_only=False, consumer=None, slot=None):
 def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     facts_only = receipt.get("schema") == FACTS_SCHEMA
     keys(receipt, COMMON_FIELDS | ({"facts"} if facts_only else {"event_id", "release_version"}))
-    require(receipt["schema"] in (PRODUCT_SCHEMA, FACTS_SCHEMA) and receipt["consumer"] in ROLES, "invalid consumer receipt schema")
+    require(receipt["schema"] in (PRODUCT_SCHEMA, FACTS_SCHEMA) and receipt["consumer"] in RECEIPT_ROLES, "invalid consumer receipt schema")
     if facts_only:
         require(event is None and receipt["consumer"] in ("web", "license"), "unexpected facts-only receipt")
         keys(receipt["facts"], ("commit", "sha256"))
@@ -329,6 +330,8 @@ def validate_facts_target(client, target):
 
 
 def collect(client, hub_client, store, role, run_id=0):
+    # DELIVERY_ONLY roles have no consumer policy or evidence workflow to poll.
+    require(role in RECEIPT_ROLES, "unexpected receipt role")
     target = os.environ.get("TARGET_REPOSITORY", "")
     match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", target)
     repo = "pineforge-4pass/" + target
@@ -392,7 +395,8 @@ def collect(client, hub_client, store, role, run_id=0):
 
 def signal_targets(signal, enabled):
     keys(signal, ("schema", "consumer", "release_version", "run_id"))
-    require(signal["schema"] == "pineforge/consumer-signal/v1" and signal["consumer"] in enabled, "invalid consumer signal")
+    require(signal["schema"] == "pineforge/consumer-signal/v1"
+            and signal["consumer"] in RECEIPT_ROLES and signal["consumer"] in enabled, "invalid consumer signal")
     if signal["release_version"] is None:
         require(signal["consumer"] in ("web", "license"), "unexpected facts-only signal role")
     else:
@@ -405,7 +409,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("collect")
-    p.add_argument("--consumer", choices=ROLES, required=True)
+    p.add_argument("--consumer", choices=RECEIPT_ROLES, required=True)
     p.add_argument("--run-id", default="0")
     p = sub.add_parser("delivery")
     for name in ("tag", "consumer", "file"):

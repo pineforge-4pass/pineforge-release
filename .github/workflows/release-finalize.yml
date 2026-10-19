@@ -57,6 +57,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
           FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
           FACTS_LICENSE_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}
           RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
@@ -92,7 +93,7 @@ jobs:
         include: ${{ fromJSON(needs.finalize.outputs.deliveries) }}
     env:
       # Private targets never enter matrix outputs, log messages or public receipts.
-      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || '' }}
+      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || matrix.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -114,7 +115,7 @@ jobs:
           repositories: ${{ env.TARGET_REPOSITORY }}
           permission-contents: write
           github-api-url: https://api.github.com
-      - name: Dispatch pineforge-release from immutable bytes
+      - name: Dispatch consumer event from immutable bytes
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ matrix.tag }}

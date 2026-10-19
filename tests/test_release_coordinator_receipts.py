@@ -426,7 +426,7 @@ class HostedCoordinatorReceiptTests(unittest.TestCase):
         self.assertEqual(f.verify()["state"], "verified")
 
     def test_adapter_rejects_every_non_hosted_consumer_before_calling_the_helper(self):
-        for consumer in (role for role in contract.ROLES if role != "hosted"):
+        for consumer in (role for role in contract.RECEIPT_ROLES if role != "hosted"):
             f = ReceiptFixture(consumer, HOSTED_POLICY)
             with self.subTest(consumer=consumer), patch.object(receipts, "check_coordinator") as adapter:
                 with self.assertRaisesRegex(contract.Invalid, "unexpected coordinator consumer"):
@@ -455,7 +455,7 @@ class HostedCoordinatorReceiptTests(unittest.TestCase):
                     f.verify()
 
     def test_legacy_receipts_keep_the_original_sha_rules_without_the_adapter(self):
-        for consumer in contract.ROLES:
+        for consumer in contract.RECEIPT_ROLES:
             policy = example.example_policy("offline")
             policy["artifact"] = "release-receipt-" + consumer
             f = ReceiptFixture(consumer, policy)
@@ -470,6 +470,19 @@ class HostedCoordinatorReceiptTests(unittest.TestCase):
                         f.verify()
                     f.receipt[stage]["sha"] = f.runs[stage]["head_sha"] = original
                 adapter.assert_not_called()
+
+    def test_compute_receipt_is_refused_before_coordinator_or_legacy_checks(self):
+        for policy in (HOSTED_POLICY, example.example_policy("offline")):
+            f = ReceiptFixture("offline", policy)
+            f.receipt["consumer"] = "compute"
+            with self.subTest(workflow=policy["e2e"]["workflow"]), \
+                    patch.object(receipts, "check_coordinator") as adapter, patch.object(receipts, "check_run") as check:
+                with self.assertRaisesRegex(contract.Invalid, "^invalid consumer receipt schema$"):
+                    f.verify()
+                adapter.assert_not_called()
+                check.assert_not_called()
+                self.assertEqual(f.queries, [])
+                self.assertEqual(f.downloads, [])
 
     def test_hosted_keeps_premerge_completion_first_parent_and_base_freshness_checks(self):
         for mutation in ("late_ci", "late_e2e", "first_parent", "unmerged_base"):
