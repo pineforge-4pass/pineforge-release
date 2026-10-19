@@ -19,18 +19,67 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      docs-only: ${{ steps.paths.outputs.docs-only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect documentation-only PR
+        id: paths
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          from pathlib import PurePosixPath
+
+          docs_only = False
+          if os.environ['EVENT_NAME'] == 'pull_request':
+              paths = subprocess.check_output([
+                  'git', 'diff', '--name-only', '--no-renames', '-z',
+                  os.environ['BASE_SHA'] + '...' + os.environ['HEAD_SHA'], '--',
+              ]).split(b'\0')
+              paths = [PurePosixPath(os.fsdecode(path)) for path in paths if path]
+              # Release tests consume these documents and scan automation files.
+              test_inputs = {'README.md', 'docs/release-chain.md', 'LICENSE'}
+              docs_only = bool(paths) and all(
+                  str(path) not in test_inputs and
+                  path.parts[:2] != ('.github', 'workflows') and
+                  path.parts[0] not in {'scripts', 'tools'} and (
+                      path.suffix in {'.md', '.rst'} or str(path) == 'LICENSE' or
+                      (path.parts[0] == 'docs' and path.suffix in {
+                          '.txt', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.pdf',
+                      })
+                  )
+                  for path in paths
+              )
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('docs-only=' + str(docs_only).lower() + '\n')
+          PY
+
   fingerprint-canonical:
+    needs: changes
+    if: needs.changes.outputs.docs-only == 'false'
     runs-on: >-
       ${{ github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) &&
           fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -46,17 +95,19 @@ jobs:
           python3 tests/test_fingerprint_canonical.py
 
   release-rules:
+    needs: changes
+    if: needs.changes.outputs.docs-only == 'false'
     runs-on: >-
       ${{ github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) &&
           fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -90,12 +141,12 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_release_*.py' -v
 
   description-renderer:
+    needs: changes
+    if: needs.changes.outputs.docs-only == 'false'
     runs-on: >-
       ${{ github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) &&
           fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
@@ -112,12 +163,12 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_repo_descriptions.py' -v
 
   release-ready-replay:
+    needs: changes
+    if: needs.changes.outputs.docs-only == 'false'
     runs-on: >-
       ${{ github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) &&
           fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
@@ -135,13 +186,11 @@ jobs:
   release-ready:
     name: release/ready
     if: ${{ always() }}
-    needs: [fingerprint-canonical, release-rules, description-renderer, release-ready-replay]
+    needs: [changes, fingerprint-canonical, release-rules, description-renderer, release-ready-replay]
     runs-on: >-
       ${{ github.event_name != 'pull_request_target' &&
           github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+          contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) &&
           fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
@@ -149,11 +198,22 @@ jobs:
       - name: Require the complete expected inventory
         env:
           RESULTS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           python3 - <<'PY'
           import json, os
           results = json.loads(os.environ['RESULTS'])
           expected = {'fingerprint-canonical', 'release-rules', 'description-renderer', 'release-ready-replay'}
-          if set(results) != expected or any(job['result'] != 'success' for job in results.values()):
+          if set(results) != expected | {'changes'} or results['changes']['result'] != 'success':
+              raise SystemExit('release/ready: change detection failed or the job inventory differs')
+          docs_only = results['changes']['outputs'].get('docs-only')
+          if docs_only not in {'true', 'false'}:
+              raise SystemExit('release/ready: missing or invalid change detection output')
+          required_result = 'success'
+          if docs_only == 'true':
+              if os.environ['EVENT_NAME'] != 'pull_request':
+                  raise SystemExit('release/ready: only a documentation-only PR may skip suites')
+              required_result = 'skipped'
+          if any(results[name]['result'] != required_result for name in expected):
               raise SystemExit('release/ready: a required job failed, was cancelled, skipped or missing')
           PY
