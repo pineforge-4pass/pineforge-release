@@ -69,6 +69,22 @@ def facts_for(manifest):
     return facts
 
 
+def bootstrap_previous():
+    """Independent literal transcription of the reviewed pre-manifest form."""
+    return {
+        "provenance": "pre-manifest-bootstrap",
+        "package": "pineforge-data",
+        "version": "0.3.0",
+        "source": "fb5cec39b6c6d70af103df0df182d47bb5812191",
+        "image_digest": "sha256:b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86",
+        "deployment_id_sha256": "12ffb9b3d3cd270604b06f558ae73a9eb0ca1e2f82a84d45728232091d3e3307",
+        "distributions": {
+            "pineforge_data-0.3.0-py3-none-any.whl": "609b3e9976ae55fc290c725731cf1dd0266c9b3eb6f3353122c8bcdc05e497bc",
+            "pineforge_data-0.3.0.tar.gz": "f29a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc",
+        },
+    }
+
+
 def candidate(manifest):
     pins = copy.deepcopy(manifest["versions"])
     for name in ("npm_version", "npm_integrity"):
@@ -767,6 +783,8 @@ class ReceiptTests(unittest.TestCase):
                 "updated_at": "2020-01-01T00:04:00Z"}
             self.api_data[f"repos/{self.repo}/actions/runs/{index}/attempts/1/jobs?per_page=100&page=1"] = {
                 "jobs": [{"name": item, "status": "completed", "conclusion": "success", "completed_at": "2020-01-01T00:04:00Z"} for item in expected]}
+        # Ordinary five-key identities stay applicable to every consumer.
+        # The data bootstrap is a separate literal fixture, never synthesized.
         identity = {"source": self.head, "image_digest": self.event["image"]["digest"],
                     "facts_commit": self.event["facts"]["commit"], "facts_sha256": self.event["facts"]["sha256"],
                     "deployment_id_sha256": "d" * 64}
@@ -779,6 +797,10 @@ class ReceiptTests(unittest.TestCase):
     def verify(self):
         return receipts.validate_receipt(self, self.repo, self.receipt, self.event, self.policy, self.run)
 
+    def data_bootstrap_previous(self):
+        self.receipt.update(consumer="data", previous=bootstrap_previous())
+        return self.receipt["previous"]
+
     def test_complete_evidence_is_verified_and_public_receipt_is_neutral(self):
         public = self.verify()
         self.assertEqual(public["state"], "verified")
@@ -786,6 +808,253 @@ class ReceiptTests(unittest.TestCase):
         self.assertNotIn(b"fixture", raw)
         self.assertNotIn(b"e2e/one", raw)
         self.assertEqual(public["deployed"]["image_digest"], self.event["image"]["digest"])
+
+    def test_exact_data_bootstrap_previous_is_verified(self):
+        previous = self.data_bootstrap_previous()
+        public = self.verify()
+        self.assertEqual(public["state"], "verified")
+        self.assertEqual(public["previous"], previous)
+        self.assertNotIn("facts_commit", public["previous"])
+        self.assertNotIn("facts_sha256", public["previous"])
+
+    def test_documented_data_bootstrap_previous_uses_the_hub_validator(self):
+        doc = (ROOT / "docs/release-chain.md").read_text().split("## Consumer receipt contract v1\n", 1)[1].split("## Supervisor configuration", 1)[0]
+        examples = [json.loads(raw) for raw in re.findall(r"```json\n(.*?)\n```", doc, re.S)]
+        previous = [obj for obj in examples if obj.get("provenance") == "pre-manifest-bootstrap"]
+        self.assertEqual(previous, [bootstrap_previous()])
+        self.receipt.update(consumer="data", previous=previous[0])
+        self.assertEqual(self.verify()["previous"], previous[0])
+
+    def test_data_bootstrap_previous_refuses_web(self):
+        self.data_bootstrap_previous()
+        self.receipt["consumer"] = "web"
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_license(self):
+        self.data_bootstrap_previous()
+        self.receipt["consumer"] = "license"
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_offline(self):
+        self.data_bootstrap_previous()
+        self.receipt["consumer"] = "offline"
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_hosted(self):
+        self.data_bootstrap_previous()
+        self.receipt["consumer"] = "hosted"
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_application(self):
+        self.data_bootstrap_previous()
+        self.receipt["consumer"] = "application"
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_hub_subject(self):
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            receipts.identity(bootstrap_previous(), consumer="hub", slot="previous")
+
+    def test_data_bootstrap_previous_refuses_another_package(self):
+        previous = self.data_bootstrap_previous()
+        # Alternate hashes are literals for the changed deployment identity:
+        # a self-consistent hash cannot excuse an unpinned package/version/map.
+        previous.update(package="pineforge-other",
+                        deployment_id_sha256="8f2f306592fa9fef24528932c434169ef65749ceb08a6808cadd588c16d16779")
+        with self.assertRaisesRegex(contract.Invalid, "bootstrap previous identity differs"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_version_0_3_1(self):
+        previous = self.data_bootstrap_previous()
+        previous.update(version="0.3.1",
+                        deployment_id_sha256="08023494e81a761dd2973d3a876f82fe6830ebdc3c6d8a2cfa3d24a7796c5325")
+        with self.assertRaisesRegex(contract.Invalid, "bootstrap previous identity differs"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_version_0_2_0(self):
+        previous = self.data_bootstrap_previous()
+        previous.update(version="0.2.0",
+                        deployment_id_sha256="b3dea0a3aa8b32a16fc483c279e1c832d8159b7b407f42a131460f411e9736b4")
+        with self.assertRaisesRegex(contract.Invalid, "bootstrap previous identity differs"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_missing_distributions(self):
+        self.data_bootstrap_previous().pop("distributions")
+        with self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_incomplete_distribution_inventory(self):
+        original = self.data_bootstrap_previous()
+        for missing in ("pineforge_data-0.3.0-py3-none-any.whl", "pineforge_data-0.3.0.tar.gz"):
+            self.receipt["previous"] = copy.deepcopy(original)
+            self.receipt["previous"]["distributions"].pop(missing)
+            with self.subTest(missing=missing), self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+                self.verify()
+
+    def test_data_bootstrap_previous_refuses_empty_or_null_distributions(self):
+        previous = self.data_bootstrap_previous()
+        for distributions in ({}, None, []):
+            previous["distributions"] = distributions
+            with self.subTest(distributions=distributions), self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+                self.verify()
+
+    def test_data_bootstrap_previous_refuses_extra_distribution(self):
+        previous = self.data_bootstrap_previous()
+        previous["distributions"]["extra.whl"] = "0000000000000000000000000000000000000000000000000000000000000000"
+        with self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_wrong_wheel_hash(self):
+        previous = self.data_bootstrap_previous()
+        previous["distributions"]["pineforge_data-0.3.0-py3-none-any.whl"] = "009b3e9976ae55fc290c725731cf1dd0266c9b3eb6f3353122c8bcdc05e497bc"
+        previous["deployment_id_sha256"] = "83e8a707daccc5c75526e1419bd2b0f44e5477036b395d3500156bf0f4d2eeb5"
+        with self.assertRaisesRegex(contract.Invalid, "bootstrap previous identity differs"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_wrong_sdist_hash(self):
+        previous = self.data_bootstrap_previous()
+        previous["distributions"]["pineforge_data-0.3.0.tar.gz"] = "029a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc"
+        previous["deployment_id_sha256"] = "cee2a7fef1cd296b6de3473b531938d7653d2efa511ab5d188f8a53072994a01"
+        with self.assertRaisesRegex(contract.Invalid, "bootstrap previous identity differs"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_swapped_distribution_names(self):
+        previous = self.data_bootstrap_previous()
+        previous["distributions"] = {
+            "pineforge_data-0.3.0-py3-none-any.whl": "f29a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc",
+            "pineforge_data-0.3.0.tar.gz": "609b3e9976ae55fc290c725731cf1dd0266c9b3eb6f3353122c8bcdc05e497bc",
+        }
+        previous["deployment_id_sha256"] = "7c24d8060b89adf87c9885ea2e8541aefff834dd252aaefd67890b6882278e21"
+        with self.assertRaisesRegex(contract.Invalid, "bootstrap previous identity differs"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_wrong_source(self):
+        self.data_bootstrap_previous()["source"] = "0000000000000000000000000000000000000000"
+        with self.assertRaisesRegex(contract.Invalid, "bootstrap previous identity differs"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_wrong_image_digest(self):
+        self.data_bootstrap_previous()["image_digest"] = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        with self.assertRaisesRegex(contract.Invalid, "bootstrap previous identity differs"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_wrong_deployment_hash(self):
+        self.data_bootstrap_previous()["deployment_id_sha256"] = "0000000000000000000000000000000000000000000000000000000000000000"
+        with self.assertRaisesRegex(contract.Invalid, "bootstrap deployment identity differs"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_hash_without_canonical_final_lf(self):
+        self.data_bootstrap_previous()["deployment_id_sha256"] = "5b92247b57110c8942f0883ca2a0f401dedc80a381a03b4dcb62170c37779eeb"
+        with self.assertRaisesRegex(contract.Invalid, "bootstrap deployment identity differs"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_other_provenance(self):
+        previous = self.data_bootstrap_previous()
+        for provenance in ("release-manifest", "", None, True):
+            previous["provenance"] = provenance
+            with self.subTest(provenance=provenance), self.assertRaisesRegex(contract.Invalid, "bootstrap previous identity differs"):
+                self.verify()
+
+    def test_data_bootstrap_previous_refuses_extra_key(self):
+        self.data_bootstrap_previous()["extra"] = True
+        with self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_each_missing_key(self):
+        original = self.data_bootstrap_previous()
+        for missing in ("provenance", "package", "version", "source", "image_digest", "deployment_id_sha256", "distributions"):
+            self.receipt["previous"] = copy.deepcopy(original)
+            self.receipt["previous"].pop(missing)
+            with self.subTest(missing=missing), self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+                self.verify()
+
+    def test_data_bootstrap_previous_refuses_facts_commit_value(self):
+        self.data_bootstrap_previous()["facts_commit"] = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        with self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_facts_sha256_value(self):
+        self.data_bootstrap_previous()["facts_sha256"] = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        with self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_null_facts_commit(self):
+        self.data_bootstrap_previous()["facts_commit"] = None
+        with self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_null_facts_sha256(self):
+        self.data_bootstrap_previous()["facts_sha256"] = None
+        with self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_preview_slot(self):
+        previous = self.data_bootstrap_previous()
+        # Exercise identity() directly too, so a later source/image check
+        # cannot mask removal of the slot restriction.
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            receipts.identity(previous, consumer="data", slot="preview")
+        self.receipt["preview"] = previous
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            self.verify()
+
+    def test_data_bootstrap_previous_refuses_deployed_slot(self):
+        previous = self.data_bootstrap_previous()
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            receipts.identity(previous, consumer="data", slot="deployed")
+        self.receipt["deployed"] = previous
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            self.verify()
+
+    def test_data_bootstrap_previous_needs_explicit_consumer_and_slot(self):
+        for context in ({}, {"consumer": "data"}, {"slot": "previous"}):
+            with self.subTest(context=context), self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+                receipts.identity(bootstrap_previous(), **context)
+
+    def test_data_bootstrap_previous_refuses_facts_only_receipts(self):
+        previous = self.data_bootstrap_previous()
+        self.receipt.update(schema="pineforge/facts-consumer-receipt/v1",
+                            facts={"commit": self.event["facts"]["commit"], "sha256": self.event["facts"]["sha256"]})
+        self.receipt.pop("event_id")
+        self.receipt.pop("release_version")
+        self.event = None
+        for consumer in ("web", "license"):
+            self.receipt["consumer"] = consumer
+            with self.subTest(consumer=consumer), self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+                self.verify()
+        # Isolate facts_only from the independent consumer-role restriction.
+        with self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+            receipts.identity(previous, consumer="data", slot="previous", facts_only=True)
+
+    def test_bootstrap_scope_is_checked_before_identity_stage(self):
+        original = copy.deepcopy(self.receipt)
+        for state in ("pending", "pr_open", "testing", "ready", "merged", "deploying", "failed", "superseded", "skipped_by_policy"):
+            for slot in ("preview", "deployed", "previous"):
+                self.receipt = copy.deepcopy(original)
+                self.receipt.update(state=state, consumer="web" if slot == "previous" else "data")
+                self.receipt[slot] = bootstrap_previous()
+                with self.subTest(state=state, slot=slot), self.assertRaisesRegex(contract.Invalid, "only valid for product data.previous"):
+                    self.verify()
+
+    def test_real_five_key_previous_still_passes_for_every_consumer(self):
+        for consumer in ("offline", "hosted", "application", "web", "data", "license"):
+            self.receipt["consumer"] = consumer
+            with self.subTest(consumer=consumer):
+                public = self.verify()
+                self.assertEqual(public["state"], "verified")
+                self.assertEqual(set(public["previous"]),
+                                 {"source", "image_digest", "facts_commit", "facts_sha256", "deployment_id_sha256"})
+
+    def test_real_previous_with_provenance_is_refused(self):
+        self.receipt["consumer"] = "data"
+        for provenance in ("pre-manifest-bootstrap", "release-manifest", None):
+            self.receipt["previous"]["provenance"] = provenance
+            with self.subTest(provenance=provenance), self.assertRaisesRegex(contract.Invalid, "unexpected object fields"):
+                self.verify()
 
     def test_example_builder_and_documented_examples_use_the_hub_validator(self):
         self.receipt = receipt_example.build_receipt(self.event)

@@ -3,6 +3,9 @@
 
 Replace the synthetic PR, workflow and served identities with observed evidence
 in a real consumer. CI validates both examples with the hub's actual validator.
+These examples use the ordinary five-key served identity, including previous.
+The temporary data.previous bootstrap is not synthesized: it describes only
+the pinned pre-manifest pineforge-data 0.3.0 release in docs/release-chain.md.
 """
 from __future__ import annotations
 

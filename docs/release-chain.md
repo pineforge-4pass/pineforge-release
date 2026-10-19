@@ -210,7 +210,7 @@ requires them. Objects have exactly the fields defined here.
 | `timestamp` | Real UTC timestamp string `YYYY-MM-DDTHH:MM:SSZ`, at most five minutes in the future; for verified, at/after the final deploy check completion. |
 | `pr` | PR object below, or `null` before PR evidence exists. |
 | `ci`, `e2e`, `deploy` | Each a check-evidence object below, or `null` before that evidence exists. |
-| `preview`, `deployed`, `previous` | Each a served-identity object below, or `null` before that evidence exists. `previous` records the rollback identity. |
+| `preview`, `deployed`, `previous` | Each a served-identity object below, or `null` before that evidence exists. `previous` records the rollback identity; only `data.previous` has the temporary pre-manifest bootstrap form below. |
 
 The PR object has exactly these fields:
 
@@ -283,7 +283,7 @@ inventory. Hosted CI requires `validate`, `checks`, `container`, `candidate`;
 hosted deploy requires `deploy`. Neither inventory permits skips. The public
 receipt and callback schemas remain v1; the binding stays consumer-side.
 
-A served-identity object has exactly these fields:
+An ordinary served-identity object has exactly these five fields:
 
 | Field | Type and allowed value |
 |---|---|
@@ -293,6 +293,9 @@ A served-identity object has exactly these fields:
 | `facts_sha256` | SHA-256 of the exact facts bytes consumed. |
 | `deployment_id_sha256` | SHA-256 of the consumer's raw deployment/distribution identity; no raw private deployment ID or URL. |
 
+The ordinary form never has a `provenance` key, including for a real previous
+release. The sole alternative is the temporary data `previous` form below.
+
 For product receipts, the hub fetches facts from its fixed repository, verifies
 bytes and schema, checks equal/newer Git ancestry, and requires an unchanged
 immutable release entry. The prerelease pinned-snapshot rule above applies when
@@ -301,6 +304,59 @@ served/distribution identity verification and previous/rollback identity
 recording. A successful deploy command alone is insufficient. For npm/PyPI,
 served state means verified distribution/channel identity. The verified
 reporting run itself must be at `pr.merge`.
+
+**Pre-manifest data `previous` (temporary).** Pineforge-data 0.3.1 is the first
+data release under this chain. Its previous release, 0.3.0, has neither a
+`release_lock.json` nor a `release_manifest.json`. It used the pinned hub 1.0.0
+image, while hub facts start at 1.0.1. No true `facts_commit` or `facts_sha256`
+ever existed for that previous release. Those keys are **ABSENT**: absence is
+chosen over a null or a made-up sentinel value. Either key present with a value,
+including `null`, is refused.
+
+Only a product receipt (`schema: pineforge/consumer-receipt/v1`) with
+`consumer: data` may use this object, and only in `previous`. It is refused in
+`preview`, `deployed`, every other consumer, and every facts-only receipt. The
+object has exactly the seven keys shown here; extra or missing keys are refused:
+
+```json
+{
+  "provenance": "pre-manifest-bootstrap",
+  "package": "pineforge-data",
+  "version": "0.3.0",
+  "source": "fb5cec39b6c6d70af103df0df182d47bb5812191",
+  "image_digest": "sha256:b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86",
+  "deployment_id_sha256": "12ffb9b3d3cd270604b06f558ae73a9eb0ca1e2f82a84d45728232091d3e3307",
+  "distributions": {
+    "pineforge_data-0.3.0-py3-none-any.whl": "609b3e9976ae55fc290c725731cf1dd0266c9b3eb6f3353122c8bcdc05e497bc",
+    "pineforge_data-0.3.0.tar.gz": "f29a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc"
+  }
+}
+```
+
+Every value is pinned: `source` is the v0.3.0 tag commit, `image_digest` is the
+hub 1.0.0 default, and `distributions` contains exactly those public wheel/sdist
+names and their recorded PyPI/GitHub-release SHA-256 values. Swapped names or
+hashes fail. `deployment_id_sha256` is recomputed as SHA-256 of canonical JSON
+over exactly `{package, version, distributions}`, matching the data adapter's
+`served()` identity: sorted keys, compact separators, UTF-8, and a final LF.
+
+This form is meant for one use, only for pineforge-data 0.3.0 as the previous
+release when publishing 0.3.1. The hub validates the form and its scope (data
+consumer, `previous` slot, exact values); a receipt carries no data package
+version, so the hub does NOT itself refuse the form in a later data receipt.
+The one-time limit is enforced by the data producer (the exemption in
+pineforge-data `scripts/release_chain/publishing.py`, constant block
+`BOOTSTRAP_PACKAGE`, only for the 0.3.1 first-adopter lock) and by removal.
+Any other package/version and every real previous must use the ordinary
+five-key form; a real previous with any `provenance` key is refused. Data 0.3.1
+as a later release's previous is a real identity.
+**Removal (both repos, in step):** delete this temporary form from the contract
+and the data exemption only after (1) data 0.3.1 is verified AND (2) every
+stored `release-receipt-data` artifact whose receipt carries the bootstrap
+`previous` has expired (data uploads it with 90-day retention): the scheduled
+collector re-validates every retained receipt artifact, so dropping the form
+earlier makes the whole data sweep fail until they expire. If the form must go
+sooner, first make the collector skip receipts already stored byte-identically.
 
 **State machine.** Ordered progress is
 `pending → pr_open → testing → ready → merged → deploying → verified`.
@@ -338,8 +394,9 @@ and `sha256` (SHA-256 string) from the validated `facts-update` request. No
 product event, manifest, version, image or ready release is needed. Keep the
 `image_digest` key in identities, using `null` if irrelevant, or an observed
 installed image digest if available. Preview/deployed facts commit and hash must
-both equal the target. Previous records the prior served identity. The same PR,
-full CI/E2E-before-merge, deploy and reporting-source gates apply.
+both equal the target. Previous records the prior served identity using the
+ordinary five-key form; the data bootstrap never applies to facts-only receipts.
+The same PR, full CI/E2E-before-merge, deploy and reporting-source gates apply.
 
 The hub fetches `facts/facts.json` at that exact commit, checks its SHA-256 and
 schema/semantics, and requires the commit to be on canonical main history.
@@ -579,6 +636,8 @@ example, or `python3 scripts/consumer_receipt_example.py --facts-only` for the
 license example. Real consumer builders must supply actual evidence, target
 identities and their owner-approved inventories. The hub test validates these
 examples against its own validator, including the documented JSON.
+Both complete examples and the synthetic builder use the ordinary five-key
+form; the data bootstrap above is a separate, literal documented example.
 Use `--consumer hosted` for a synthetic hosted receipt with CI at the PR head
 and coordinator E2E at the tested base. Its example policy is the exact hosted
 entry below; a real coordinator must also publish its verified binding artifact.
