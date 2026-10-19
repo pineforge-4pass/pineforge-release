@@ -3,7 +3,7 @@
   "version": 2,
   "labels": {
     "apache": "Apache-2.0",
-    "source": "PineForge Source License 1.2"
+    "source": "Tunaxis Source License 1.3"
   },
   "licenses": {
     "engine": {
@@ -81,7 +81,7 @@
       "repo": "pineforge-4pass/pineforge-hpo",
       "public": true,
       "disposition": "managed",
-      "reason": "HPO v0.11.0 released original code under PineForge Source License 1.2; versions through v0.10.0 retain Apache-2.0. Free personal trading and noncommercial use; one commercial license covers HPO and codegen.",
+      "reason": "HPO original code is under the Tunaxis Source License 1.3 (released as the PineForge Source License 1.2 in v0.11.0); versions through v0.10.0 retain Apache-2.0. Free personal trading and noncommercial use; one commercial license covers HPO and codegen.",
       "source": {
         "repo": "pineforge-4pass/pineforge-hpo",
         "commit": "dab7b6775588da0f112eb363a70561c212dce80b",

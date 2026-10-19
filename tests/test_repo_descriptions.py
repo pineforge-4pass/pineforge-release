@@ -106,7 +106,7 @@ class DescriptionCLI(unittest.TestCase):
         corpus = score["scopes"]["corpus"]
         self.assertIn(f'{corpus["excellent"]:,}/{corpus["graded"]:,} excellent probes',
                       rows["corpus"]["expected"])
-        self.assertIn("PineForge Source License 1.2", rows["codegen-oss"]["expected"])
+        self.assertIn("Tunaxis Source License 1.3", rows["codegen-oss"]["expected"])
         self.assertIn("scoreboard.graded", rows["engine"]["tokens"])
         self.assertIn("inventory.closedScripts", rows["engine"]["tokens"])
         for row in rows.values():
@@ -330,13 +330,13 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(hpo["tokens"], [])
         self.assertEqual(hpo["expected"],
                          "Native C++ hyperparameter optimization for PineForge strategies. Source-available under "
-                         "the PineForge Source License 1.2: free for personal trading and noncommercial use; "
+                         "the Tunaxis Source License 1.3: free for personal trading and noncommercial use; "
                          "commercial use requires a license shared with codegen.")
         source = hpo["public_source"]
         self.assertEqual(source["repo"], hpo["repo"])
         self.assertEqual(source["commit"], "dab7b6775588da0f112eb363a70561c212dce80b")
         self.assertEqual(source["url"], f'https://github.com/{hpo["repo"]}/blob/{source["commit"]}/LICENSE')
-        self.assertEqual(hpo["license_sources"], [dict(id="hpo", label="PineForge Source License 1.2", **source)])
+        self.assertEqual(hpo["license_sources"], [dict(id="hpo", label="Tunaxis Source License 1.3", **source)])
         self.assertNotEqual(source["commit"], rows["codegen-oss"]["public_source"]["commit"])
         self.assertIn("v0.11.0", hpo["reason"])
         self.assertIn("versions through v0.10.0 retain Apache-2.0", hpo["reason"])
