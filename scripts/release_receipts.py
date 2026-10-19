@@ -28,6 +28,19 @@ FACTS_SCHEMA = "pineforge/facts-consumer-receipt/v1"
 COMMON_FIELDS = {"schema", "consumer", "attempt", "sequence", "state", "timestamp",
                  "pr", "ci", "e2e", "deploy", "preview", "deployed", "previous"}
 
+# TEMPORARY first-adopter previous: remove with the data exemption once 0.3.1 is verified.
+DATA_BOOTSTRAP_PREVIOUS = {
+    "provenance": "pre-manifest-bootstrap",
+    "package": "pineforge-data",
+    "version": "0.3.0",
+    "source": "fb5cec39b6c6d70af103df0df182d47bb5812191",
+    "image_digest": "sha256:b271873d0e91a9eeeb4595daaded9bdfbdbcd3925d3ec1300a833395e2004c86",
+    "distributions": {
+        "pineforge_data-0.3.0-py3-none-any.whl": "609b3e9976ae55fc290c725731cf1dd0266c9b3eb6f3353122c8bcdc05e497bc",
+        "pineforge_data-0.3.0.tar.gz": "f29a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc",
+    },
+}
+
 
 def object_pages(client, route, key):
     rows = []
@@ -146,7 +159,20 @@ def check_coordinator(client, repo, evidence, policy, pr, ci):
     return run
 
 
-def identity(obj, *, facts_only=False):
+def identity(obj, *, facts_only=False, consumer=None, slot=None):
+    if type(obj) is dict and "provenance" in obj:
+        require(not facts_only and consumer == "data" and slot == "previous",
+                "bootstrap identity is only valid for product data.previous")
+        # Facts keys (including null values) and all other additions fail here.
+        keys(obj, (*DATA_BOOTSTRAP_PREVIOUS, "deployment_id_sha256"))
+        keys(obj["distributions"], DATA_BOOTSTRAP_PREVIOUS["distributions"])
+        require(all(obj[name] == value for name, value in DATA_BOOTSTRAP_PREVIOUS.items()),
+                "bootstrap previous identity differs")
+        # Match pineforge-data scripts/release_chain/receipts.py served() byte for byte.
+        deployment = {name: obj[name] for name in ("package", "version", "distributions")}
+        require(obj["deployment_id_sha256"] == sha256(canonical(deployment)),
+                "bootstrap deployment identity differs")
+        return
     keys(obj, ("source", "image_digest", "facts_commit", "facts_sha256", "deployment_id_sha256"))
     match(COMMIT, obj["source"])
     match(COMMIT, obj["facts_commit"])
@@ -176,6 +202,11 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     require(reporting_run["path"] == ".github/workflows/" + policy["workflow"], "untrusted receipt workflow")
     require(reporting_run["event"] in ("push", "workflow_dispatch", "workflow_run", "repository_dispatch"),
             "receipt must come from the trusted consumer coordinator")
+    # A provenance-bearing identity must obey the temporary rule even before
+    # its evidence stage is required (including states that return early).
+    for name in ("preview", "deployed", "previous"):
+        if type(receipt[name]) is dict and "provenance" in receipt[name]:
+            identity(receipt[name], facts_only=facts_only, consumer=receipt["consumer"], slot=name)
     # A public receipt never contains private URLs, names, job labels or raw deployment IDs.
     public = {key: receipt[key] for key in ("schema", "consumer", "attempt", "sequence", "state", "timestamp")}
     if facts_only:
@@ -207,7 +238,7 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
             e2e_run = check_coordinator(client, repo, receipt["e2e"], policy["e2e"], pr, receipt["ci"])
         else:
             e2e_run = check_run(client, repo, receipt["e2e"], policy["e2e"], pr["head"])
-        identity(receipt["preview"], facts_only=facts_only)
+        identity(receipt["preview"], facts_only=facts_only, consumer=receipt["consumer"], slot="preview")
         require(receipt["preview"]["source"] == pr["head"]
                 and (facts_only or receipt["preview"]["image_digest"] == event["image"]["digest"]),
                 "preview did not exercise the candidate source/image")
@@ -228,8 +259,8 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         require(reporting_run["head_sha"] == pr["merge"] and reporting_run["event"] != "pull_request", "served receipt source differs")
         deployed_run = check_run(client, repo, receipt["deploy"], policy["deploy"], pr["merge"])
         require(receipt["timestamp"] >= deployed_run["checked_finished_at"], "served receipt predates verification")
-        identity(receipt["deployed"], facts_only=facts_only)
-        identity(receipt["previous"], facts_only=facts_only)
+        identity(receipt["deployed"], facts_only=facts_only, consumer=receipt["consumer"], slot="deployed")
+        identity(receipt["previous"], facts_only=facts_only, consumer=receipt["consumer"], slot="previous")
         require(receipt["deployed"]["source"] == pr["merge"]
                 and (facts_only or receipt["deployed"]["image_digest"] == event["image"]["digest"]),
                 "actual served source/image differs")
