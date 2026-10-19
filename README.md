@@ -1,3 +1,5 @@
+<picture><source media="(prefers-color-scheme: dark)" srcset="https://tunaxis.com/brand/v1/lockup-dark.png"><img alt="Tunaxis" src="https://tunaxis.com/brand/v1/lockup-light.png" height="40"></picture>
+
 # Tunaxis
 
 Tunaxis was formerly PineForge. This is the `pineforge-release` hub repository.
