@@ -1029,6 +1029,43 @@ class NotifyConsumersTest(unittest.TestCase):
         planner = _workflow("release-receipts.yml")["jobs"]["plan"]
         self.assertTrue(any("release_receipts.py signal" in s.get("run", "") for s in planner["steps"]))
 
+    def test_compute_configuration_error_is_reported_after_consumer_delivery(self):
+        jobs = _workflow("release-finalize.yml")["jobs"]
+        finalize = jobs["finalize"]
+        self.assertEqual(finalize["outputs"]["compute_configuration_error"],
+                         "${{ steps.ready.outputs.compute_configuration_error }}")
+        self.assertEqual(finalize["outputs"]["deliveries"], "${{ steps.ready.outputs.deliveries }}")
+        ready = next(step for step in finalize["steps"] if step.get("id") == "ready")
+        self.assertEqual(ready["run"].splitlines(), [
+            "set -euo pipefail",
+            'python3 scripts/release_pipeline.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"',
+            'echo "deliveries=$(cat "$RUNNER_TEMP/deliveries.json")" >> "$GITHUB_OUTPUT"',
+        ])
+        notify = jobs["notify-consumers"]
+        self.assertEqual(notify["needs"], "finalize")
+        self.assertEqual(notify["if"], "needs.finalize.outputs.deliveries != '[]'")
+        self.assertNotIn("compute_configuration_error", notify["if"])
+        self.assertEqual(notify["strategy"]["matrix"]["include"],
+                         "${{ fromJSON(needs.finalize.outputs.deliveries) }}")
+
+        reporter = jobs["report-compute-configuration-error"]
+        self.assertEqual(reporter["needs"], ["finalize", "notify-consumers"])
+        self.assertEqual(reporter["if"],
+                         "${{ always() && needs.finalize.outputs.compute_configuration_error != '' }}")
+        self.assertEqual(reporter["permissions"], {})
+        self.assertEqual(set(reporter), {"needs", "if", "runs-on", "permissions", "steps"})
+        self.assertEqual(len(reporter["steps"]), 1)
+        step = reporter["steps"][0]
+        self.assertEqual(set(step), {"name", "run"})
+        self.assertEqual(step["run"].splitlines(), [
+            "echo '::error::RELEASE_COMPUTE_FIRST_PAIR value was not accepted; compute is off for this run'",
+            "exit 1",
+        ])
+        # Exact job/step shapes exclude checkout, environments, credentials and token mints.
+        text = json.dumps(reporter)
+        for forbidden in ("checkout", "secrets.", "github.token", "create-github-app-token"):
+            self.assertNotIn(forbidden, text)
+
 
 class HarnessSyncTest(unittest.TestCase):
     """The release image carries exactly the engine's eight runtime harness files. One script holds

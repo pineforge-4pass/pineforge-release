@@ -742,13 +742,14 @@ class FinalizerTests(unittest.TestCase):
         legacy = "offline,hosted,application,web,data,license"
         manifests = [fixture_manifest(v) for v in ("1.6.0", "1.6.1", "1.6.2-rc.1")]
 
-        def run(first, enabled):
+        def run(first, enabled, *, github_output_enabled=True):
             client, store, registry = FinalizeClient(*manifests), MemoryStore(*manifests), MemoryRegistry()
             store_type = pipeline.Store
-            stderr = io.StringIO()
+            stderr, stdout = io.StringIO(), io.StringIO()
             with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
                     "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
                     "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_OUTPUT": str(Path(tmp) / "github-output") if github_output_enabled else "",
                     "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                     patch.object(pipeline, "Client", return_value=client), \
                     patch.object(pipeline, "Store", side_effect=lambda bound_client:
@@ -757,33 +758,98 @@ class FinalizerTests(unittest.TestCase):
                     patch.object(pipeline, "age_minutes", return_value=0), \
                     patch.object(pipeline, "now", return_value="2026-10-16T00:00:00Z"), \
                     patch.object(pipeline, "version", wraps=pipeline.version) as parse_version, \
-                    patch.object(pipeline, "report_issue") as report, patch.object(sys, "stderr", stderr):
+                    patch.object(pipeline, "report_issue") as report, \
+                    patch.object(sys, "stderr", stderr), patch.object(sys, "stdout", stdout):
                 output = Path(tmp) / "deliveries.json"
+                github_output = Path(tmp) / "github-output"
+                github_output.write_text("existing_output=kept\n", encoding="utf-8")
                 with patch.object(sys, "argv", ["release_pipeline.py", "finalize", "--output", str(output)]):
                     result = pipeline.main()
                 deliveries = output.read_bytes()
+                configuration_output = github_output.read_text(encoding="utf-8")
                 reports = [(call.args[1:], call.kwargs) for call in report.call_args_list]
                 validations = sum(call.args == (first,) for call in parse_version.call_args_list)
-            return result, stderr.getvalue(), deliveries, store.assets, reports, registry.operations, validations
+            return (result, stderr.getvalue(), deliveries, store.assets, reports, registry.operations,
+                    validations, configuration_output, stdout.getvalue())
 
         baseline = run("", legacy)
         self.assertEqual(baseline[:2], (0, ""))
+        self.assertEqual(baseline[7:], ("existing_output=kept\n", ""))
         self.assertEqual(json.loads(baseline[2]), [
             {"consumer": "offline", "tag": "v1.6.2-rc.1", "attempt": 1},
             {"consumer": "hosted", "tag": "v1.6.2-rc.1", "attempt": 1},
             *({"consumer": role, "tag": "v1.6.1", "attempt": 1} for role in legacy.split(",")),
         ])
-        for first in ("v1.6.0", "1.6", "private-workload"):
+        configuration_line = ("compute_configuration_error=RELEASE_COMPUTE_FIRST_PAIR value was not accepted; "
+                              "compute is off for this run\n")
+        for first in ("v1.6.0", "1.6", "v1.7.0"):
             with self.subTest(first=first):
                 actual = run(first, legacy + ",compute")
                 self.assertEqual(actual[2:6], baseline[2:6])
-                self.assertEqual(actual[0], 1)
-                self.assertEqual(actual[1].splitlines(), [
-                    f"::error::invalid RELEASE_COMPUTE_FIRST_PAIR value {first!r}; compute is off for this run"])
+                self.assertEqual(actual[:2], (0, ""))
                 self.assertEqual(actual[6], 1)
+                self.assertEqual(actual[7:], ("existing_output=kept\n" + configuration_line, ""))
                 unselected = run(first, legacy)
                 self.assertEqual(unselected[:6], baseline[:6])
                 self.assertEqual(unselected[6], 0)
+                self.assertEqual(unselected[7:], baseline[7:])
+
+        standalone = run("v1.7.0", legacy + ",compute", github_output_enabled=False)
+        self.assertEqual(standalone[:6], baseline[:6])
+        self.assertEqual(standalone[6:], (1, "existing_output=kept\n", configuration_line))
+
+    def test_compute_configuration_output_precedes_row_and_facts_failures(self):
+        configuration_line = ("compute_configuration_error=RELEASE_COMPUTE_FIRST_PAIR value was not accepted; "
+                              "compute is off for this run\n")
+
+        def check_configuration_output(*args, **kwargs):
+            self.assertEqual(github_output.read_text(encoding="utf-8"), configuration_line)
+
+        class MissingFactsClockClient(FinalizeClient):
+            def api(self, route, **kwargs):
+                if route == f"repos/{contract.HUB}/commits?path=facts/facts.json&sha=main&per_page=1":
+                    check_configuration_output()
+                    return []
+                return super().api(route, **kwargs)
+
+        for failure in ("row", "facts"):
+            with self.subTest(failure=failure):
+                manifest = fixture_manifest()
+                if failure == "row":
+                    manifest["image"]["digest"] = "malformed"
+                client = MissingFactsClockClient(manifest) if failure == "facts" else FinalizeClient(manifest)
+                store, registry = MemoryStore(manifest), MemoryRegistry()
+                store_type = pipeline.Store
+                stderr, stdout = io.StringIO(), io.StringIO()
+                with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                        "RELEASE_READY_CONSUMERS": "offline,web,compute", "RELEASE_COMPUTE_FIRST_PAIR": "v1.7.0",
+                        "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                        "GITHUB_OUTPUT": str(Path(tmp) / "github-output"),
+                        "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                        patch.object(pipeline, "Client", return_value=client), \
+                        patch.object(pipeline, "Store", side_effect=lambda bound_client:
+                                     store if bound_client is client else store_type(bound_client)), \
+                        patch.object(pipeline, "Registry", return_value=registry), \
+                        patch.object(pipeline, "age_minutes", return_value=0), \
+                        patch.object(pipeline, "report_issue", side_effect=check_configuration_output) as report, \
+                        patch.object(sys, "stderr", stderr), patch.object(sys, "stdout", stdout):
+                    output = Path(tmp) / "deliveries.json"
+                    github_output = Path(tmp) / "github-output"
+                    github_output.write_text("", encoding="utf-8")
+                    with patch.object(sys, "argv", ["release_pipeline.py", "finalize", "--output", str(output)]):
+                        self.assertEqual(pipeline.main(), 1)
+                    check_configuration_output()
+                    self.assertEqual(stderr.getvalue().splitlines(), [
+                        "::error::release chain operation failed; inspect the neutral incident and workflow run"])
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(json.loads(output.read_bytes()), [] if failure == "row" else [
+                        {"consumer": "offline", "tag": "v1.6.0", "attempt": 1},
+                        {"consumer": "web", "tag": "v1.6.0", "attempt": 1},
+                    ])
+                    if failure == "row":
+                        self.assertTrue(any(call.args[2] == "Release v1.6.0: readiness failed"
+                                            for call in report.call_args_list))
+                    self.assertFalse(any("compute" in name for _, name in store.assets))
 
     def test_finalize_all_never_redispatches_after_delivery_acceptance(self):
         event = self.finish()

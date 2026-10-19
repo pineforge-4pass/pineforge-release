@@ -28,10 +28,6 @@ COMPLETE_STATES = ("verified", "skipped_by_policy", "superseded", "delivered")
 DELIVERY_BACKOFF_MINUTES = (15, 60, 15)
 
 
-class ComputeConfigurationError(Invalid):
-    """Report a bad compute floor once, after processing the other roles."""
-
-
 def now():
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -382,15 +378,24 @@ def facts_freshness(client, store, roles):
 
 def finalize_all(client, store, registry, tag, output):
     enabled = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
-    compute_first_pair, configuration_error = None, None
+    compute_first_pair = None
     if "compute" in enabled:
         first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
         if first:
             try:
                 compute_first_pair = version(first)
             except ValueError:
-                configuration_error = ComputeConfigurationError(
-                    f"invalid RELEASE_COMPUTE_FIRST_PAIR value {first!r}; compute is off for this run")
+                # Preserve the diagnostic even if later row/facts work fails.
+                # The workflow reports it after sending the other roles.
+                configuration_output = (
+                    "compute_configuration_error=RELEASE_COMPUTE_FIRST_PAIR value was not accepted; "
+                    "compute is off for this run\n")
+                github_output = os.environ.get("GITHUB_OUTPUT")
+                if github_output:
+                    with Path(github_output).open("a", encoding="utf-8") as stream:
+                        stream.write(configuration_output)
+                else:
+                    print(configuration_output, end="")
     rows = [store.get(tag)] if tag else store.releases()
     deliveries, failures = [], []
     # Highest semver first: old completion cannot briefly acquire latest.
@@ -445,8 +450,6 @@ def finalize_all(client, store, registry, tag, output):
                          "Readiness verification failed. No new aliases or consumer delivery authorized.\n\n" + run_link())
     Path(output).write_bytes(canonical(deliveries))
     facts_freshness(client, store, receipt_roles())
-    if configuration_error is not None:
-        raise configuration_error
     require(not failures, "release finalization failed; inspect release incidents")
 
 
@@ -597,9 +600,6 @@ def main():
     except Pending as error:
         print("::notice::" + str(error), file=sys.stderr)
         return 3
-    except ComputeConfigurationError as error:
-        print("::error::" + str(error), file=sys.stderr)
-        return 1
     except (Invalid, ValueError, OSError, KeyError, TypeError, pair.RuleError):
         # No untrusted API bodies, private target names, paths or credentials.
         print("::error::release chain operation failed; inspect the neutral incident and workflow run", file=sys.stderr)
