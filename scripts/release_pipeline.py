@@ -28,6 +28,10 @@ COMPLETE_STATES = ("verified", "skipped_by_policy", "superseded", "delivered")
 DELIVERY_BACKOFF_MINUTES = (15, 60, 15)
 
 
+class ComputeConfigurationError(Invalid):
+    """Report a bad compute floor once, after processing the other roles."""
+
+
 def now():
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -256,12 +260,11 @@ def receipt_roles():
     return roles
 
 
-def delivery_roles(release_version, enabled):
+def delivery_roles(release_version, enabled, compute_first_pair):
     """Compute is off until both role selection and the first-pair floor allow it."""
     if "compute" not in enabled:
         return enabled
-    first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
-    if first and version(release_version) >= version(first):
+    if compute_first_pair is not None and version(release_version) >= compute_first_pair:
         return enabled
     return [role for role in enabled if role != "compute"]
 
@@ -379,6 +382,15 @@ def facts_freshness(client, store, roles):
 
 def finalize_all(client, store, registry, tag, output):
     enabled = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+    compute_first_pair, configuration_error = None, None
+    if "compute" in enabled:
+        first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
+        if first:
+            try:
+                compute_first_pair = version(first)
+            except ValueError:
+                configuration_error = ComputeConfigurationError(
+                    f"invalid RELEASE_COMPUTE_FIRST_PAIR value {first!r}; compute is off for this run")
     rows = [store.get(tag)] if tag else store.releases()
     deliveries, failures = [], []
     # Highest semver first: old completion cannot briefly acquire latest.
@@ -390,7 +402,8 @@ def finalize_all(client, store, registry, tag, output):
             if event is None:
                 continue
             newest = finalized_version(store)
-            status = aggregate(store, row, event, enabled=delivery_roles(event["release_version"], enabled), newest=newest)
+            status = aggregate(store, row, event,
+                               enabled=delivery_roles(event["release_version"], enabled, compute_first_pair), newest=newest)
             for role, state in status["consumers"].items():
                 if state == "pending":
                     delivery, failed = plan_delivery(store, row, event, role)
@@ -409,8 +422,9 @@ def finalize_all(client, store, registry, tag, output):
             status["stale"] = stale
             body = "Event: `" + event["event_id"] + "`\n\n" + "\n".join(
                 f"- {role}: {state}" + (" (completion overdue)" if role in stale else "") for role, state in status["consumers"].items())
-            body += ("\n\nDelivery-only roles complete at delivered (transport acceptance). "
-                     "Verified means checked consumer receipt and served-state evidence.")
+            body += "\n\nDispatch acceptance is transport only. Verified means checked consumer receipt and served-state evidence."
+            if any(role in DELIVERY_ONLY for role in status["consumers"]):
+                body += "\n\nDelivery-only roles complete at delivered (transport acceptance)."
             previous_status = None
             for asset in sorted(store.get(row["tag_name"])["assets"], key=lambda item: item["id"]):
                 if asset["name"].startswith("release-status-"):
@@ -431,6 +445,8 @@ def finalize_all(client, store, registry, tag, output):
                          "Readiness verification failed. No new aliases or consumer delivery authorized.\n\n" + run_link())
     Path(output).write_bytes(canonical(deliveries))
     facts_freshness(client, store, receipt_roles())
+    if configuration_error is not None:
+        raise configuration_error
     require(not failures, "release finalization failed; inspect release incidents")
 
 
@@ -581,6 +597,9 @@ def main():
     except Pending as error:
         print("::notice::" + str(error), file=sys.stderr)
         return 3
+    except ComputeConfigurationError as error:
+        print("::error::" + str(error), file=sys.stderr)
+        return 1
     except (Invalid, ValueError, OSError, KeyError, TypeError, pair.RuleError):
         # No untrusted API bodies, private target names, paths or credentials.
         print("::error::release chain operation failed; inspect the neutral incident and workflow run", file=sys.stderr)

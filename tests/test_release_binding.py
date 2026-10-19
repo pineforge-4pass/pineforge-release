@@ -33,6 +33,7 @@ import release_pair as pair  # noqa: E402
 import release_pipeline as pipeline  # noqa: E402
 import release_receipts as receipts  # noqa: E402
 import release_rollback as rollback  # noqa: E402
+import release_sources as sources  # noqa: E402
 import consumer_receipt_example as receipt_example  # noqa: E402
 
 
@@ -222,6 +223,8 @@ class FinalizeClient:
     def api(self, route, **kwargs):
         if route == f"repos/{contract.HUB}/git/ref/heads/main":
             return {"object": {"sha": "e" * 40}}
+        if route == f"repos/{contract.HUB}/commits?path=facts/facts.json&sha=main&per_page=1":
+            return [{"sha": "e" * 40, "commit": {"committer": {"date": "2026-10-16T00:00:00Z"}}}]
         raise AssertionError("unmodeled API request " + route)
 
     def file(self, repo, commit, path):
@@ -357,6 +360,32 @@ class PairPayloadTests(unittest.TestCase):
         self.assertNotEqual(actual["build"]["candidate_sha256"],
                             hashlib.sha256(contract.canonical(built)).hexdigest())
         self.assertEqual(actual["receipt_sha256"], hashlib.sha256(raw).hexdigest())
+
+    def test_pair_payload_uses_the_producer_source_tag_rule(self):
+        manifest = fixture_manifest()
+        raw = contract.canonical(manifest)
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "SOURCE-SETS.tsv"
+            for tag in ("v1.4.0-preview.1", "v1.4.0-nightly-2026.10", "v01.04.00", "v1.4.0-preview/1"):
+                built = candidate(manifest)
+                built["sources"]["release_tag"] = tag
+                registry.write_text(
+                    sources.REGISTRY_HEADER + "\n"
+                    + f"{'a' * 64}\t{tag}\t84\t{'b' * 64}\tset-02.SOURCES.list\n",
+                    encoding="utf-8")
+                with self.subTest(tag=tag):
+                    if tag == "v1.4.0-preview/1":
+                        with self.assertRaisesRegex(sources.SourcesError, "release tag must be a v-prefixed version"):
+                            sources.registry_set(registry, "a" * 64)
+                        with self.assertRaisesRegex(contract.Invalid, "^malformed identity$"):
+                            contract.pair_payload(raw, contract.canonical(built))
+                    else:
+                        produced = sources.registry_set(registry, "a" * 64)
+                        self.assertEqual(produced.release_tag, tag)
+                        candidate_raw = contract.canonical(built)
+                        actual = contract.pair_payload(raw, candidate_raw)
+                        self.assertEqual(actual, expected_pair_payload(raw, candidate_raw))
+                        self.assertEqual(actual["source_sets"][0]["release_tag"], produced.release_tag)
 
     def test_pair_payload_refuses_image_hub_commit_and_producer_mismatches(self):
         manifest = fixture_manifest()
@@ -622,7 +651,34 @@ class FinalizerTests(unittest.TestCase):
             self.assertTrue(status["complete"])
             self.assertEqual(status["stale"], [])
             self.assertTrue(report.call_args.kwargs["complete"])
+            self.assertIn("Delivery-only roles complete at delivered (transport acceptance).",
+                          report.call_args.args[3])
         self.assertFalse(any(a["name"].startswith("delivery-attempt-") for a in self.row["assets"]))
+
+    def test_compute_off_incident_body_is_byte_identical_to_base_literal(self):
+        legacy = "offline,hosted,application,web,data,license"
+        for enabled, first in ((legacy, "1.6.0"), (legacy + ",compute", ""),
+                               (legacy + ",compute", "1.6.1")):
+            store = MemoryStore(self.m)
+            row = store.get("v1.6.0")
+            store.put(row, contract.ASSET, (ROOT / "tests/fixtures/release-manifest.json").read_bytes())
+            with self.subTest(enabled=enabled, first=first), tempfile.TemporaryDirectory() as tmp, \
+                    patch.dict(os.environ, {
+                        "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                        "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                        "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                    patch.object(pipeline, "age_minutes", return_value=0), \
+                    patch.object(pipeline, "report_issue") as report:
+                pipeline.finalize_all(self.client, store, MemoryRegistry(), "v1.6.0",
+                                      Path(tmp) / "deliveries.json")
+                incidents = [call for call in report.call_args_list if call.args[1] == "v1.6.0"]
+                self.assertEqual(len(incidents), 1)
+                self.assertEqual(incidents[0].args[3].encode("utf-8"), (
+                    b"Event: `sha256:12a79d3776c447b1caf9513c96db3407b1d3cd2d71a510081e6763e994c2288e`\n\n"
+                    b"- offline: pending\n- hosted: pending\n- application: pending\n"
+                    b"- web: pending\n- data: pending\n- license: pending\n\n"
+                    b"Dispatch acceptance is transport only. "
+                    b"Verified means checked consumer receipt and served-state evidence."))
 
     def test_compute_plan_is_off_when_first_pair_is_empty(self):
         deliveries, status, store = self.plan(first="")
@@ -683,10 +739,51 @@ class FinalizerTests(unittest.TestCase):
                               {"consumer": "compute", "tag": "v1.6.0", "attempt": 1}])
 
     def test_compute_plan_refuses_a_noncanonical_first_pair(self):
+        legacy = "offline,hosted,application,web,data,license"
+        manifests = [fixture_manifest(v) for v in ("1.6.0", "1.6.1", "1.6.2-rc.1")]
+
+        def run(first, enabled):
+            client, store, registry = FinalizeClient(*manifests), MemoryStore(*manifests), MemoryRegistry()
+            store_type = pipeline.Store
+            stderr = io.StringIO()
+            with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                    "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                    "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                    "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                    patch.object(pipeline, "Client", return_value=client), \
+                    patch.object(pipeline, "Store", side_effect=lambda bound_client:
+                                 store if bound_client is client else store_type(bound_client)), \
+                    patch.object(pipeline, "Registry", return_value=registry), \
+                    patch.object(pipeline, "age_minutes", return_value=0), \
+                    patch.object(pipeline, "now", return_value="2026-10-16T00:00:00Z"), \
+                    patch.object(pipeline, "version", wraps=pipeline.version) as parse_version, \
+                    patch.object(pipeline, "report_issue") as report, patch.object(sys, "stderr", stderr):
+                output = Path(tmp) / "deliveries.json"
+                with patch.object(sys, "argv", ["release_pipeline.py", "finalize", "--output", str(output)]):
+                    result = pipeline.main()
+                deliveries = output.read_bytes()
+                reports = [(call.args[1:], call.kwargs) for call in report.call_args_list]
+                validations = sum(call.args == (first,) for call in parse_version.call_args_list)
+            return result, stderr.getvalue(), deliveries, store.assets, reports, registry.operations, validations
+
+        baseline = run("", legacy)
+        self.assertEqual(baseline[:2], (0, ""))
+        self.assertEqual(json.loads(baseline[2]), [
+            {"consumer": "offline", "tag": "v1.6.2-rc.1", "attempt": 1},
+            {"consumer": "hosted", "tag": "v1.6.2-rc.1", "attempt": 1},
+            *({"consumer": role, "tag": "v1.6.1", "attempt": 1} for role in legacy.split(",")),
+        ])
         for first in ("v1.6.0", "1.6", "private-workload"):
-            with self.subTest(first=first), \
-                    self.assertRaisesRegex(contract.Invalid, "^release finalization failed; inspect release incidents$"):
-                self.plan(first=first)
+            with self.subTest(first=first):
+                actual = run(first, legacy + ",compute")
+                self.assertEqual(actual[2:6], baseline[2:6])
+                self.assertEqual(actual[0], 1)
+                self.assertEqual(actual[1].splitlines(), [
+                    f"::error::invalid RELEASE_COMPUTE_FIRST_PAIR value {first!r}; compute is off for this run"])
+                self.assertEqual(actual[6], 1)
+                unselected = run(first, legacy)
+                self.assertEqual(unselected[:6], baseline[:6])
+                self.assertEqual(unselected[6], 0)
 
     def test_finalize_all_never_redispatches_after_delivery_acceptance(self):
         event = self.finish()
@@ -1534,7 +1631,7 @@ class ReceiptTests(unittest.TestCase):
                     self.verify()
 
     def test_real_five_key_previous_still_passes_for_every_consumer(self):
-        for consumer in contract.RECEIPT_ROLES:
+        for consumer in ("offline", "hosted", "application", "web", "data", "license"):
             self.receipt["consumer"] = consumer
             with self.subTest(consumer=consumer):
                 public = self.verify()

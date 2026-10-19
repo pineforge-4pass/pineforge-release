@@ -159,8 +159,11 @@ The payload has exactly these eight top-level keys:
 
 The application remains a normal receipt role. Its event type changes to
 `release-pair` so it receives the shared pair/build inputs; this does not change
-its CI/E2E/deploy receipt requirements. It remains `skipped_by_policy` for
-prereleases because its receiver refuses those dispatches.
+its CI/E2E/deploy receipt requirements. Derive
+`event_id = "sha256:" + receipt_sha256`; facts and image identity come from the
+manifest fetched at `receipt_url`, after checking its untouched bytes against
+`receipt_sha256`. It remains `skipped_by_policy` for prereleases because its
+receiver refuses those dispatches.
 
 Builders remain deployers: the application builds its Cloud Run image and
 hosted builds its container. The compute receiver only validates each pair and
@@ -173,8 +176,11 @@ of private evidence, never those private identifiers.
 Both target repository names live in the hub's `release-automation` environment
 secrets: `RELEASE_APPLICATION_REPOSITORY` and `RELEASE_COMPUTE_REPOSITORY`.
 The sender reuses the existing App token mint, scoped to one target with
-Contents write. The supervisor supplies the secret values; source, matrices,
-public audit assets and incidents contain only neutral roles.
+Contents write. The existing App must be installed on the private compute
+repository with installation permissions Contents read/write, Actions read and
+Pull requests read; this is owner item **O-1**, pending owner confirmation.
+The supervisor supplies the secret values; source, matrices, public audit
+assets and incidents contain only neutral roles.
 
 For an agreed manual replay, select a non-rejected finalized pair and fetch its
 original manifest and candidate. Reconstruct these eight inputs using the same
@@ -303,7 +309,7 @@ requires them. Objects have exactly the fields defined here.
 | Field | Type and allowed value |
 |---|---|
 | `schema` | String, exactly `pineforge/consumer-receipt/v1`. |
-| `event_id` | Digest string, exactly the verified hub manifest's event ID. |
+| `event_id` | Digest string, exactly the verified hub manifest's event ID. For application `release-pair`, `event_id = "sha256:" + receipt_sha256`; facts and image identity come from the manifest fetched at `receipt_url`, with its untouched bytes checked against `receipt_sha256`. |
 | `consumer` | String: `offline`, `hosted`, `application`, `web`, `data`, or `license`; must match the hub's scoped target/policy. License implements the facts-only variant below. |
 | `release_version` | Bare canonical semver string `X.Y.Z` or `X.Y.Z-{alpha,beta,rc}.N`, exactly the hub event's version; no leading `v` or leading-zero integers. |
 | `attempt` | Integer identifying an automation attempt, increasing per consumer/target; use the coordinator's GitHub run ID, not `GITHUB_RUN_ATTEMPT` alone. |
@@ -767,12 +773,12 @@ rejects missing/skipped/cancelled jobs and covers merge-group events too.
 | Name / setting | Scope | Purpose |
 |---|---|---|
 | `PINEFORGE_APP_ID`, `PINEFORGE_APP_PRIVATE_KEY` (existing) | Hub `release-automation` environment | Short-lived, one-target installation tokens; no PAT fallback. |
-| App installation permissions | Hub: Contents write + Actions write; receipt consumers: Contents read/write, Actions read, Pull requests read | Hub tag/dispatch and explicit publish replay; consumer dispatch and completion evidence reads. Each mint asks only for the permissions needed by that job; delivery-only compute uses only the existing Contents-write dispatch mint. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
+| App installation permissions | Hub: Contents write + Actions write; receipt consumers and private compute repository: Contents read/write, Actions read, Pull requests read | The existing App must be installed on the private compute repository with these full installation permissions (owner item O-1, pending confirmation). Hub tag/dispatch and explicit publish replay; consumer dispatch and completion evidence reads. Each mint asks only for the permissions needed by that job; delivery-only compute uses only the existing Contents-write dispatch mint. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
 | `RELEASE_HOSTED_MCP_REPOSITORY`, `RELEASE_APPLICATION_REPOSITORY`, `FACTS_WEB_REPOSITORY` (existing) | Hub `release-automation` environment secrets | Private short repository names for neutral hosted/application/web targets. Public offline/data/license names are fixed in workflows. |
 | `RELEASE_COMPUTE_REPOSITORY` (new secret) | Hub `release-automation` environment secrets | Private short name of the compute target repository; the application target likewise lives in `RELEASE_APPLICATION_REPOSITORY`. Both reuse the existing one-target App mint. No values belong in source or public audit assets. |
 | `RELEASE_RECEIPT_POLICY` (new secret) | Hub `release-automation` environment | JSON map of each enabled receipt role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories. Compute needs no entry. Keep private workflow/job details out of public source. |
 | `RELEASE_READY_CONSUMERS` (new variable) | Hub repository | Explicit comma-separated upgraded product receiver roles. Empty sends nothing; disabled roles do not block aggregate completion or become overdue. Facts flags independently select web/license receipt polling and freshness. |
-| `RELEASE_COMPUTE_FIRST_PAIR` (new variable; empty/off) | Hub repository | Bare canonical semver lower bound for compute, including prereleases. Compute must also be in `RELEASE_READY_CONSUMERS`. Keep empty until the receiver merges; no older-pair backfill for the initial rollout. |
+| `RELEASE_COMPUTE_FIRST_PAIR` (new variable; empty/off) | Hub repository | Bare canonical semver lower bound for compute, including prereleases. Compute must also be in `RELEASE_READY_CONSUMERS`. When selected, validate the value once before processing releases. A malformed value disables compute for that run; all other roles are processed as with compute off, then the run exits non-zero with one error naming this variable and its bad value. It creates or reopens no per-release incident because of that configuration error. An unselected compute role ignores the value. Keep empty until the receiver merges; no older-pair backfill for the initial rollout. |
 | `RELEASE_REPORT_OWNER` (new variable) | Hub repository | GitHub login to assign/mention on release and failure issues. |
 | `RELEASE_READY_MAX_AGE_MINUTES` (optional variable; 60) | Hub repository | Missing readiness prerequisite alert threshold. |
 | `RELEASE_CONSUMER_MAX_AGE_MINUTES` (optional variable; 180) | Hub repository | Non-app missing/stalled completion threshold. |
@@ -846,6 +852,7 @@ replacement, archive digests, PR/head/base/attempt mismatches and inventory
 changes, plus regressions for the original exact-SHA path. The existing
 `test_release_*.py` discovery includes it in CI. These tests are written for
 CI/cloud execution and are not run on the Mac; local validation is limited to
-Python compilation and `git diff --check`. Workflow tests parse YAML on CI/cloud.
+Python compilation and `git diff --check` (plus YAML parsing if a workflow
+changes).
 No test suite, Docker runtime/build, live dispatch, publication, token mint,
 credential read or deployment is needed on the Mac to implement this lane.

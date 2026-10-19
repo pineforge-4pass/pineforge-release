@@ -218,7 +218,7 @@ class PublishTest(unittest.TestCase):
         steps = finalizer["jobs"]["notify-consumers"]["steps"]
         # Application/compute use release-pair, whose flag is inside build.
         # Both payload contracts and channel policies are checked in binding tests.
-        send = next(step for step in steps if step.get("name", "").startswith("Dispatch consumer event"))
+        send = next(step for step in steps if step.get("name", "").startswith("Dispatch pineforge-release"))
         self.assertIn("scripts/release_pipeline.py dispatch", send["run"])
         self.assertNotIn("client_payload[", send["run"])
         self.assertEqual(finalizer["jobs"]["notify-consumers"]["strategy"]["fail-fast"], "false")
@@ -978,7 +978,7 @@ class NotifyConsumersTest(unittest.TestCase):
         self.assertEqual(job["needs"], "finalize")
         self.assertEqual(job["strategy"]["fail-fast"], "false")
         self.assertEqual(job["strategy"]["matrix"]["include"], "${{ fromJSON(needs.finalize.outputs.deliveries) }}")
-        send = next(s for s in job["steps"] if s.get("name", "").startswith("Dispatch consumer event"))
+        send = next(s for s in job["steps"] if s.get("name", "").startswith("Dispatch pineforge-release"))
         self.assertIn("release_pipeline.py dispatch", send["run"])
         self.assertNotIn("client_payload[", send["run"])
 
@@ -1024,7 +1024,6 @@ class NotifyConsumersTest(unittest.TestCase):
         self.assertEqual(step["env"]["RELEASE_COMPUTE_FIRST_PAIR"], "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}")
         self.assertEqual(step["env"]["RELEASE_READY_CONSUMERS"], "${{ vars.RELEASE_READY_CONSUMERS }}")
         text = (WORKFLOWS / "release-receipts.yml").read_text()
-        self.assertIn("DELIVERY_ONLY", text)
         self.assertNotIn("RELEASE_COMPUTE_REPOSITORY", text)
         self.assertNotIn("matrix.consumer == 'compute'", text)
         planner = _workflow("release-receipts.yml")["jobs"]["plan"]

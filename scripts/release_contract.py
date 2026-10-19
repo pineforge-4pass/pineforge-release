@@ -12,6 +12,7 @@ import json
 import re
 
 import release_pair as pair
+from release_sources import RELEASE_TAG
 
 HUB = "pineforge-4pass/pineforge-release"
 IMAGE_OLD = "ghcr.io/pineforge-4pass/pineforge-release"
@@ -186,8 +187,7 @@ def pair_payload(manifest_raw, candidate_raw):
     sources = candidate["sources"]
     # Only public source-bundle identities can enter the event. No arbitrary
     # repository, URL, deployment name or private path is copied from a candidate.
-    match(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc)\.[0-9]+)?", sources["release_tag"])
-    version(sources["release_tag"][1:])
+    match(RELEASE_TAG, sources["release_tag"])
     match(r"set-[0-9]{2,}\.SOURCES\.list", sources["list_asset"])
     base = f"https://github.com/{HUB}/releases/download/v{manifest['release_version']}/"
     return {

@@ -115,7 +115,7 @@ jobs:
           repositories: ${{ env.TARGET_REPOSITORY }}
           permission-contents: write
           github-api-url: https://api.github.com
-      - name: Dispatch consumer event from immutable bytes
+      - name: Dispatch pineforge-release from immutable bytes
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ matrix.tag }}
