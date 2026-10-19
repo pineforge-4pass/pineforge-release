@@ -77,7 +77,7 @@ jobs:
         with:
           app-id: ${{ secrets.DESCRIPTIONS_APP_ID }}
           private-key: ${{ secrets.DESCRIPTIONS_APP_PRIVATE_KEY }}
-          owner: pineforge-4pass
+          owner: ${{ github.repository_owner }}
           repositories: ${{ steps.source.outputs.repositories }}
           permission-administration: write
           github-api-url: https://api.github.com

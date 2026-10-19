@@ -42,7 +42,7 @@ jobs:
         with:
           app-id: ${{ secrets.PINEFORGE_APP_ID }}
           private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
-          owner: pineforge-4pass
+          owner: ${{ github.repository_owner }}
           repositories: pineforge-release
           permission-contents: write
           permission-actions: write   # explicit replay on an existing tag
