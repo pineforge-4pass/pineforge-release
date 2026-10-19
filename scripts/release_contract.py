@@ -14,7 +14,11 @@ import re
 import release_pair as pair
 
 HUB = "pineforge-4pass/pineforge-release"
-IMAGE = "ghcr.io/" + HUB
+IMAGE_OLD = "ghcr.io/pineforge-4pass/pineforge-release"
+IMAGE_NEW = "ghcr.io/tunaxis/pineforge-release"
+IMAGES = (IMAGE_OLD, IMAGE_NEW)
+# Producers and pullers stay on the old path until rename day.
+IMAGE = IMAGE_OLD
 SCHEMA = "pineforge/release-ready/v1"
 ASSET = "release-manifest.json"
 ROLES = ("offline", "hosted", "application", "web", "data", "license")
@@ -112,7 +116,8 @@ def validate(manifest):
     pair.check(str(v), e["version"], c["version"], hpo=h["version"] if h else "")
     image = manifest["image"]
     keys(image, ("repository", "digest", "amd64_digest", "arm64_digest"))
-    require(image["repository"] == IMAGE, "unexpected image repository")
+    require(isinstance(image["repository"], str) and image["repository"] in IMAGES,
+            "unexpected image repository")
     for name in ("digest", "amd64_digest", "arm64_digest"):
         match("sha256:" + SHA, image[name])
     require(len({image[name] for name in ("digest", "amd64_digest", "arm64_digest")}) == 3,
