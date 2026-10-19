@@ -394,7 +394,7 @@ class FanoutWorkflow(unittest.TestCase):
         self.assertIn("steps.source.outcome == 'success'", mint)
         self.assertIn("github.ref_protected", mint)
         self.assertIn("vars.FACTS_WEB_DISPATCH_ENABLED == 'true'", mint)
-        self.assertIn("actions/create-github-app-token@v2", mint)
+        self.assertIn("actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510", mint)
         self.assertIn("repositories: ${{ secrets.FACTS_WEB_REPOSITORY }}", mint)
         self.assertIn("owner: pineforge-4pass", mint)
         self.assertIn("permission-contents: write", mint)
