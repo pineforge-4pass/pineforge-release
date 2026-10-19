@@ -263,8 +263,8 @@ jobs:
           # The action derives the licences label from this repository's
           # Apache-2.0, and its labels override the Dockerfile's. The image also
           # bundles the transpiler, whose LICENSE is the Tunaxis Source License
-          # 1.3 (the PineForge Source License 1.2 in the images from 1.3.0 up to
-          # the first release under the Tunaxis name; see README, License).
+          # 1.3 (the PineForge Source License 1.2 in the images from 1.3.0 before
+          # the first release published under the Tunaxis name; see README, License).
           labels: |
             org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-Tunaxis-Source-License-1.3
             org.opencontainers.image.version=${{ github.ref_name }}

@@ -298,7 +298,7 @@ terms, so that licence does not cover the whole image:
   under MPL-2.0 — see the engine's
   [`LEGAL.md`](https://github.com/pineforge-4pass/pineforge-engine/blob/main/LEGAL.md).
 - **Tunaxis transpiler** (`pineforge-codegen`): source-available. From codegen
-  1.3.0 (images from 1.3.0 on) it is source-available under the PineForge
+  1.3.0 (images from 1.3.0 on) it is under the PineForge
   Source License 1.2 until the first release published under the Tunaxis
   name, and under the Tunaxis Source License 1.3 from that release on (the
   terms are those of 1.2; the licence is renamed);
@@ -318,7 +318,7 @@ The image's `org.opencontainers.image.licenses` label names the licences of the
 PineForge components: `Apache-2.0 AND LicenseRef-Tunaxis-Source-License-1.3`
 from the first release published under the Tunaxis name on, and
 `Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2` for the images from
-1.3.0 up to it; Apache-2.0 covers the engine and this repository's files, and a
+1.3.0 before it; Apache-2.0 covers the engine and this repository's files, and a
 `LicenseRef` covers the transpiler's LICENSE, the Tunaxis Source License 1.3
 (the PineForge Source License 1.2 in those earlier images; no SPDX identifier
 exists for either). The base image's packages, Eigen included, keep
@@ -343,7 +343,7 @@ The Dockerfile refuses to build when the harness `EXPECTED_PF_ABI` differs from
 `docker build` without `--target`, using `docker/Dockerfile`, builds the
 backtest image: the last `default` stage aliases the runtime, `release`.
 The default image differs from 1.5.0 only by the source notice, the two source
-labels and the retained Debian package copyright files.
+labels, the licences label and the retained Debian package copyright files.
 Only `ENGINE_VERSION` and `CODEGEN_VERSION` are required for that build, and its
 entrypoint remains `/opt/pineforge/bin/entrypoint.sh`.
 
