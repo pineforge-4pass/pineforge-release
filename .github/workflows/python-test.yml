@@ -85,7 +85,6 @@ jobs:
   changes:
     needs: authz
     runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
-    timeout-minutes: 10
     outputs:
       docs-only: ${{ steps.paths.outputs.docs-only }}
     steps:
@@ -196,7 +195,6 @@ jobs:
     needs: [authz, changes]
     if: needs.changes.outputs.docs-only == 'false'
     runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
-    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
