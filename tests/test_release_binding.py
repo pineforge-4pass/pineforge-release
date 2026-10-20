@@ -1230,7 +1230,10 @@ class ReceiptTests(unittest.TestCase):
         row["draft"] = False
         store.put(row, contract.ASSET, contract.canonical(self.manifest))
         self.api_data[f"repos/{self.repo}"] = {"full_name": self.repo}
-        self.api_data[f"repos/{self.repo}/actions/workflows/release.yml/runs?per_page=100&page=1"] = {"workflow_runs": [self.run]}
+        self.run["status"] = "completed"
+        self.api_data[f"repos/{self.repo}/actions/runs/{self.run['id']}"] = self.run
+        self.api_data[f"repos/{self.repo}/actions/artifacts?per_page=100&page=1"] = {
+            "artifacts": [{"name": self.policy["artifact"], "expired": False, "workflow_run": {"id": self.run["id"]}}]}
         owner = self
         newer = (json.dumps(facts, indent=2) + "\n").encode()
         class Hub:
