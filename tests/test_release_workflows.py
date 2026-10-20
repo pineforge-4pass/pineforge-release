@@ -242,7 +242,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         if ! [[ "$TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
           echo '::error::release tag did not resolve to a 40-character commit SHA'; exit 1
         fi
-        if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then
+        if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then
           echo "::error::release tag ${TAG} is not reachable from main"; exit 1
         fi
         printf 'sha=%s\n' "$TAG_COMMIT" >> "$GITHUB_OUTPUT"
@@ -396,7 +396,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             ("pattern", r'          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then' + "\n"),
             ("existence", '          if ! TAG_COMMIT="$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}")"; then\n'),
             ("sha-shape", '          if ! [[ "$TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then\n'),
-            ("reachability", '          if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then\n'),
+            ("reachability", '          if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then\n'),
         )
         for label, start in starts:
             self.assertEqual(text.count(start), 1, label)
@@ -675,6 +675,11 @@ class ReleaseTagGuardGitTest(unittest.TestCase):
         self.git(self.origin, "checkout", "-b", "side", first)
         self.git(self.origin, "commit", "--allow-empty", "-m", "Unmerged side commit")
         self.git(self.origin, "tag", "v1.6.4")
+        # Decoy tags named like main on the side commit: git resolves the short
+        # name origin/main in refs/tags/ before refs/remotes/, so a guard that
+        # names main loosely would accept the side-branch tag v1.6.4.
+        for decoy in ("origin/main", "main", "heads/main", "remotes/origin/main"):
+            self.git(self.origin, "tag", decoy)
         self.git(self.origin, "checkout", "main")
         self.checkout_index = 0
         self.text = (WORKFLOWS / "publish.yml").read_text(encoding="utf-8")
@@ -751,6 +756,10 @@ class ReleaseTagGuardGitTest(unittest.TestCase):
         unpeeled = pins.mutate(self.text, '"refs/tags/${TAG}^{commit}"', '"refs/tags/${TAG}"')
         with self.subTest(check="annotated tag must output its commit"), self.assertRaises(AssertionError):
             self.assert_table(unpeeled)
+        short_name = pins.mutate(
+            self.text, 'is-ancestor "$TAG_COMMIT" refs/remotes/origin/main', 'is-ancestor "$TAG_COMMIT" origin/main')
+        with self.subTest(check="a tag named origin/main must not stand in for main"), self.assertRaises(AssertionError):
+            self.assert_table(short_name)
 
     def test_guard_fetches_updated_main_before_testing_reachability(self):
         work = self.checkout()
@@ -760,7 +769,7 @@ class ReleaseTagGuardGitTest(unittest.TestCase):
         done, output = self.run_guard(self.text, work, "v2.0.0")
         self.assertEqual(done.returncode, 0, (done.stdout, done.stderr))
         self.assertEqual(output, ["sha=" + expected, "tag=v2.0.0"])
-        self.assertEqual(self.git(work, "rev-parse", "origin/main"), expected)
+        self.assertEqual(self.git(work, "rev-parse", "refs/remotes/origin/main"), expected)
 
     def test_guard_fails_closed_when_fetch_cannot_read_origin(self):
         work = self.checkout()

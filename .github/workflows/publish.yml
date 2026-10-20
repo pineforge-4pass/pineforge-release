@@ -68,7 +68,7 @@ jobs:
           if ! [[ "$TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
             echo '::error::release tag did not resolve to a 40-character commit SHA'; exit 1
           fi
-          if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then
             echo "::error::release tag ${TAG} is not reachable from main"; exit 1
           fi
           printf 'sha=%s\n' "$TAG_COMMIT" >> "$GITHUB_OUTPUT"

@@ -43,7 +43,8 @@ later job. With Contents read access and no secrets, it checks out main with
 full history and no persisted credentials. It validates the complete
 `vX.Y.Z` / `vX.Y.Z-rc.N` pattern before using the input in git, fetches tags and
 main, verifies that the tag exists and peels to a commit, and requires that
-commit to be an ancestor of `origin/main`. Both tagged checkouts use the guard's
+commit to be an ancestor of `refs/remotes/origin/main` (named in full: a tag
+called `origin/main` cannot stand in for it). Both tagged checkouts use the guard's
 verified commit SHA, with no persisted credentials, so moving a tag between
 jobs cannot change the tree built. A failed or skipped guard prevents
 finalization; failure reporting first refuses to check out or run repository
