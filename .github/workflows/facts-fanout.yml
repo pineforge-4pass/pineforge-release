@@ -28,7 +28,6 @@ jobs:
     if: github.ref == 'refs/heads/main'
     environment: release-automation
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     env:
       FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
       # toJSON returns a nonempty string even for false; manual false is preserved.
@@ -96,7 +95,6 @@ jobs:
     if: github.ref == 'refs/heads/main'
     environment: release-automation
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     env:
       FACTS_CONSUMER_ROLE: license
       FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}
