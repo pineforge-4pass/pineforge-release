@@ -16,7 +16,7 @@ LB-435 prepares these jobs for the literal `runs-on` array
 | `facts-descriptions.yml` | `descriptions` |
 | `facts-fanout.yml` | `web`, `license` |
 | `handle-upstream.yml` | `bump` |
-| `publish.yml` | `prepare`, `publish`, `failure-report` |
+| `publish.yml` | `tag-guard`, `prepare`, `publish`, `failure-report` |
 | `release-finalize.yml` | `finalize`, `notify-consumers` |
 | `release-receipts.yml` | `plan`, `verify` |
 | `release-reconcile.yml` | `producers` |
@@ -36,6 +36,21 @@ routing. Push this migration only after laneboss posts "pf-ci-release live";
 until then jobs on that label wait. The runner group allowlist must include
 these workflows at their protected refs when the class is live.
 
+The release runner group admits runs at `refs/heads/main` only. Publication
+uses `workflow_dispatch` on `main` with an explicit existing tag input;
+`tag-guard` fails any other workflow ref and is a required dependency of every
+later job. With Contents read access and no secrets, it checks out main with
+full history and no persisted credentials. It validates the complete
+`vX.Y.Z` / `vX.Y.Z-rc.N` pattern before using the input in git, fetches tags and
+main, verifies that the tag exists and peels to a commit, and requires that
+commit to be an ancestor of `origin/main`. Both tagged checkouts use the guard's
+verified commit SHA, with no persisted credentials, so moving a tag between
+jobs cannot change the tree built. A failed or skipped guard prevents
+finalization; failure reporting first refuses to check out or run repository
+code unless the guard succeeded.
+The reusable `release-finalize.yml` call inherits the caller's main ref.
+Tag pushes, release events and `workflow_run` do not start publication.
+
 ## Receive, verify and replay
 
 `handle-upstream.yml` still accepts `engine-release`, `codegen-release` and
@@ -51,23 +66,30 @@ three fixed producer repositories, excludes drafts/prereleases/non-product tags
 and versions older than hub VERSION. It checks whether the desired stable
 version already has a hub Git tag before downloading any artifacts. Only a
 version without that tag has its artifacts verified and the **same producer
-events** sent back to the existing handler. A hub tag hands completion to
-publish/finalize, even while the release is a draft awaiting prerequisites.
+events** sent back to the existing handler. After pushing a hub tag, the handler
+dispatches publication on `main` with that tag input, and finalization continues
+even while the release is a draft awaiting prerequisites.
 Older missed versions are superseded by the newest desired stable version;
 they are never replayed as downgrades after it. Duplicate notifications reuse
 the handler's existing decision. A stored candidate makes an unchanged-version
 decision a no-op even while the fixed image tag is absent. Nothing calls a
 producer's version-bump job.
 
-Recovery of an existing hub tag explicitly dispatches `publish.yml` **on that
-tag**. It never force-pushes or rewrites it. Manual replay is also available
-through Actions: select `publish`, select the existing tag as its ref, run.
+Recovery of an existing hub tag explicitly dispatches `publish.yml` **on main**
+with the existing tag supplied as the required `tag` input. It never force-pushes
+or rewrites it. Manual release or replay is also available through Actions:
+select `publish`, choose `main` as its ref, supply the existing tag in `tag`, run.
+Equivalently, use `gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=vX.Y.Z`
+(or `vX.Y.Z-rc.N`). Pushing a tag alone does not start
+publication. The handler dispatches after both a new tag push and retag recovery;
+an unchanged version with an image or verified candidate keeps its existing no-op.
 Tags predating this workflow need a reviewed migration; the hub does not invent
 new manifests for historical images without candidate verification.
 
 ## Candidate and readiness
 
-`publish.yml` first reuses `release-candidate.json` if already stored. Otherwise
+`publish.yml` validates the release tag before preparation can reuse
+`release-candidate.json` if already stored. Otherwise
 it preserves the existing harness, ABI, license and Debian source-mirror gates,
 builds only a unique `candidate-<commit>-<run>-<attempt>` image tag, and verifies
 the pushed child digests on amd64 and arm64. Each child must pass an actual

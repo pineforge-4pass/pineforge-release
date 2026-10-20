@@ -14,9 +14,9 @@ name: handle-upstream
 # artifacts, and the release version becomes the pair version.
 # Hpo joins at the single cutoff in scripts/release_pair.py: then an event
 # probes both partners and the tag records all three versions.
-# The App-token-pushed tag fires publish.yml (build the combined image -> fan
-# out to the MCPs and the app). A GITHUB_TOKEN-pushed tag would NOT re-trigger
-# publish.yml; the App token (a non-default credential) does. Idempotent, with
+# After pushing the tag, the handler dispatches publish.yml on main with that
+# tag as input (build the combined image -> fan out to the MCPs and the app).
+# The App token authorizes both the push and the dispatch. Idempotent, with
 # half-failed-release recovery, a downgrade guard, and serialized concurrency.
 
 on:
@@ -45,10 +45,10 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: pineforge-release
           permission-contents: write
-          permission-actions: write   # explicit replay on an existing tag
+          permission-actions: write   # publication and replay dispatched on main
           github-api-url: https://api.github.com
 
-      - name: Checkout main (App token bypasses the ruleset + re-fires publish.yml)
+      - name: Checkout main (App token bypasses the ruleset)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
@@ -320,12 +320,13 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
-          echo "versions unchanged but image missing — explicitly replaying publish.yml on ${TAG}"
-          gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref "$TAG"
+          echo "versions unchanged but image missing — explicitly replaying publish.yml on main for ${TAG}"
+          gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag="$TAG"
 
-      - name: Bump VERSION, commit, tag (fires publish.yml)
+      - name: Bump VERSION, commit, tag and dispatch publish.yml on main
         if: steps.decide.outputs.mode == 'bump'
         env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
           E:       ${{ steps.decide.outputs.engine }}
           C:       ${{ steps.decide.outputs.codegen }}
           H:       ${{ steps.decide.outputs.hpo }}
@@ -347,6 +348,7 @@ jobs:
             [ -n "$commit" ] || { echo "::error::VERSION is ${RELEASE} but main has no release commit for it; refusing to tag"; exit 1; }
             git tag -a "v${RELEASE}" "$commit" -m "$(tag_message "$RELEASE")"
             git push origin "v${RELEASE}"
+            gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag="v${RELEASE}"
             echo "tagged v${RELEASE} at ${commit} (${components}); publish.yml will build + fan out."
             exit 0
           fi
@@ -384,6 +386,7 @@ jobs:
           git tag -a "v${next}" -m "$(tag_message "$next")"
           git push origin HEAD:main
           git push origin "v${next}"
+          gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag="v${next}"
           echo "pushed v${next} (${components}); publish.yml will build + fan out."
 
       - name: Report failed upstream handling

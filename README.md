@@ -158,7 +158,8 @@ is the release tag, with its `v`: `v1.0.0`).
 
 ```
 {engine, codegen, HPO} releases → existing producer events → handle-upstream.yml
-  → lockstep VERSION + tag (App) → publish.yml: build and verify candidate
+  → lockstep VERSION + tag (App) → dispatch publish.yml on main with tag input
+  → publish.yml: guard tag shape, existence and ancestry → build verified SHA
   → release-finalize.yml: packages + measured release facts + immutable manifest
   → pineforge-release → consumer PR → own CI + E2E → merge/deploy → served receipt
   → release-receipts.yml → neutral aggregate status and owner issue
@@ -166,10 +167,12 @@ is the release tag, with its `v`: `v1.0.0`).
 
 - `handle-upstream.yml` — receives `repository_dispatch` from engine / codegen-oss / HPO
   (`{version, prerelease, run_id}`), applies the pairing rule, sets `VERSION`,
-  commits + tags (idempotent, with half-failed-release recovery and a downgrade
-  guard).
-- `publish.yml` — on the pushed tag or explicit replay: checks the pair, waits
-  for upstream artifacts, builds a multi-arch candidate and verifies both child
+  commits + tags, then dispatches `publish.yml` on `main` with the existing tag
+  input (idempotent, with half-failed-release recovery and a downgrade guard).
+- `publish.yml` — only by dispatch on `main` with a required `tag` input:
+  first checks the release tag's shape, existence and reachability from main.
+  It checks out the verified commit SHA, checks the pair, waits for upstream
+  artifacts, builds a multi-arch candidate and verifies both child
   digests. `release-finalize.yml` binds package identities and measured release
   facts before publishing the immutable manifest, fixed/moving tags and
   `pineforge-release` with the [release-ready/v1 payload](docs/release-chain.md).
@@ -181,6 +184,15 @@ is the release tag, with its `v`: `v1.0.0`).
   and no App token. Stable consumers without verified completion stay pending.
 - `release-reconcile.yml` validates and repairs missed stable producer events;
   `release-receipts.yml` validates consumer evidence and repairs dropped callbacks.
+
+For a manual release or replay, select `publish` in Actions, choose `main` as
+the workflow ref, and supply the existing `vX.Y.Z` or `vX.Y.Z-rc.N` tag in `tag`.
+The first `tag-guard` job requires a main-ref dispatch, validates the complete
+release tag pattern, fetches tags and main with full history, and requires the
+tag to peel to a commit reachable from `origin/main`. A missing, malformed,
+non-commit or side-branch tag fails before tagged checkout or publication.
+Later tagged checkouts use its verified SHA with no persisted credentials.
+Pushing a tag alone does not start publication.
 
 The release and facts-automation jobs use `["self-hosted","pf-ci","pf-ci-release"]`,
 the isolated release runner class, including candidate preparation, receipt planning
