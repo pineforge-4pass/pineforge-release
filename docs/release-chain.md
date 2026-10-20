@@ -62,7 +62,7 @@ own published artifacts are verified before the existing partner/pair decision.
 Incomplete lockstep waits. Invalid flags, source mismatches, authentication,
 rate limits and transport failures fail visibly.
 
-`release-reconcile.yml` wakes every 15 minutes or manually. It paginates the
+`release-reconcile.yml` wakes hourly or manually. It paginates the
 three fixed producer repositories, excludes drafts/prereleases/non-product tags
 and versions older than hub VERSION. It checks whether the desired stable
 version already has a hub Git tag before downloading any artifacts. Only a
@@ -106,7 +106,7 @@ uses the paginated releases list matched by `tag_name`, with a token that has
 Contents write/push access to see drafts. GitHub's `releases/tags/{tag}` endpoint
 exposes published releases only. Prepare, replay and finalization reuse the same
 draft and never create a second candidate for its version. The finalizer runs
-as a reusable job after publication, on facts-file changes, every 15 minutes,
+as a reusable job after publication, on facts-file changes, hourly,
 and on manual replay. It never rebuilds a stored verified candidate. It requires:
 
 - Engine's published Linux and macOS archives and matching checksums.
@@ -211,7 +211,7 @@ evidence can still advance progress; scheduled runs do not clear the retry
 history. Investigate and use an explicit reviewed
 recovery for an exhausted delivery.
 
-`release-receipts.yml` polls selected consumers every 15 minutes and accepts the
+`release-receipts.yml` polls selected consumers every 30 minutes and accepts the
 callback below to repair dropped notifications. It mints a target-only read
 token, verifies the artifact and full GitHub CI/E2E/deploy evidence, then appends
 a neutral receipt. Acceptance of a dispatch or callback never means verified.
