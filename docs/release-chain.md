@@ -6,6 +6,36 @@ the authority for semver order, lockstep and the HPO `1.6.0-rc.1` cutoff. The
 hub does not create producer versions or consumer commits, merge consumer PRs,
 or deploy consumers.
 
+## Release runner isolation
+
+LB-435 prepares these jobs for the literal `runs-on` array
+`["self-hosted","pf-ci","pf-ci-release"]`:
+
+| Workflow | Jobs |
+|---|---|
+| `facts-descriptions.yml` | `descriptions` |
+| `facts-fanout.yml` | `web`, `license` |
+| `handle-upstream.yml` | `bump` |
+| `publish.yml` | `prepare`, `publish`, `failure-report` |
+| `release-finalize.yml` | `finalize`, `notify-consumers` |
+| `release-receipts.yml` | `plan`, `verify` |
+| `release-reconcile.yml` | `producers` |
+| `release-rollback.yml` | `restore` |
+
+The class has its own runner group restricted to selected workflows at protected
+refs, its own no-role service account, and one job per runner, with nothing shared
+with PR classes. Secret-bearing jobs and jobs that build artifacts later published
+by a release job belong in this class. `prepare`, receipt `plan`, and
+`failure-report` also hold the automatic `GITHUB_TOKEN` through `github.token`,
+with Contents or Issues write access. The `publish.yml` reusable
+`notify-consumers` caller obtains its runners from `release-finalize.yml`.
+
+`pull_request` and `pull_request_target` workflows must never use this class.
+The PR jobs in `python-test.yml` and `facts-validate.yml` keep their existing
+routing. Push this migration only after laneboss posts "pf-ci-release live";
+until then jobs on that label wait. The runner group allowlist must include
+these workflows at their protected refs when the class is live.
+
 ## Receive, verify and replay
 
 `handle-upstream.yml` still accepts `engine-release`, `codegen-release` and

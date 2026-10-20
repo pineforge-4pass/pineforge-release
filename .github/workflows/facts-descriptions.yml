@@ -32,7 +32,7 @@ jobs:
   descriptions:
     if: github.ref == 'refs/heads/main'
     environment: descriptions
-    runs-on: ubuntu-latest
+    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
     timeout-minutes: 10
     env:
       FACTS_DESCRIPTIONS_APPLY_ENABLED: ${{ vars.FACTS_DESCRIPTIONS_APPLY_ENABLED }}

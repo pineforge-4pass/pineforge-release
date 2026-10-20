@@ -182,6 +182,13 @@ is the release tag, with its `v`: `v1.0.0`).
 - `release-reconcile.yml` validates and repairs missed stable producer events;
   `release-receipts.yml` validates consumer evidence and repairs dropped callbacks.
 
+The release and facts-automation jobs use `["self-hosted","pf-ci","pf-ci-release"]`,
+the isolated release runner class, including candidate preparation, receipt planning
+and failure reporting. Push this runner migration only after laneboss posts
+"pf-ci-release live"; until then jobs on that label wait.
+The [release runner policy](docs/release-chain.md#release-runner-isolation) lists
+the jobs and the class boundary.
+
 The rules live in `scripts/release_pair.py` (unit-tested in `tests/`).
 `tools/release-dry-run/` replays the current handler and readiness graph offline,
 including all three-component arrival orders, duplicate/lost delivery, missing

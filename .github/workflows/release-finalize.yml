@@ -28,7 +28,7 @@ jobs:
     concurrency:
       group: release-finalize
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
     environment: release-automation
     permissions:
       contents: write
@@ -77,7 +77,7 @@ jobs:
   notify-consumers:
     needs: finalize
     if: needs.finalize.outputs.deliveries != '[]'
-    runs-on: ubuntu-latest
+    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
     timeout-minutes: 10
     environment: release-automation
     concurrency:

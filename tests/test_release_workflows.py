@@ -9,6 +9,7 @@ directories). The source mirror wiring checks use PyYAML to parse the workflows.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import os
@@ -1335,6 +1336,98 @@ class PythonTestGateTest(unittest.TestCase):
         self.assertIn("python3 -m unittest discover -s tests -p 'test_release_*.py' -v", job)
         fingerprint = text[text.index("\n  fingerprint-canonical:\n"):text.index("\n  release-rules:\n")]
         self.assertNotIn("test_release_", fingerprint)
+
+
+class ReleaseRunnerWorkflowTest(unittest.TestCase):
+    RELEASE_JOBS = {
+        "facts-descriptions.yml": {"descriptions"},
+        "facts-fanout.yml": {"web", "license"},
+        "handle-upstream.yml": {"bump"},
+        "publish.yml": {"prepare", "publish", "failure-report"},
+        "release-finalize.yml": {"finalize", "notify-consumers"},
+        "release-receipts.yml": {"plan", "verify"},
+        "release-reconcile.yml": {"producers"},
+        "release-rollback.yml": {"restore"},
+    }
+    RUNNER = ["self-hosted", "pf-ci", "pf-ci-release"]
+
+    def release_workflows(self):
+        return {name: _workflow(name) for name in self.RELEASE_JOBS}
+
+    def assert_release_runners(self, workflows):
+        for name, identities in self.RELEASE_JOBS.items():
+            workflow = workflows[name]
+            triggers = workflow["on"]
+            if isinstance(triggers, str):
+                triggers = [triggers]
+            for event in ("pull_request", "pull_request_target"):
+                self.assertNotIn(event, triggers, f"{name}: {event} cannot use pf-ci-release")
+            # The reusable caller has no runs-on; its callee's jobs are pinned above.
+            expected = identities | ({"notify-consumers"} if name == "publish.yml" else set())
+            self.assertEqual(set(workflow["jobs"]), expected, f"{name}: release job inventory")
+            for identity in sorted(identities):
+                self.assertEqual(workflow["jobs"][identity]["runs-on"], self.RUNNER,
+                                 f"{name}:{identity}: runs-on must be the isolated release array")
+
+    def test_release_jobs_pin_the_isolated_class_and_never_accept_pr_events(self):
+        self.assert_release_runners(self.release_workflows())
+
+    def test_runner_pin_refuses_hosted_labels_other_pools_and_fallbacks_on_every_job(self):
+        original = self.release_workflows()
+        old_expression = """${{ github.event_name != 'pull_request_target' &&
+            github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+            contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+            (github.event_name != 'pull_request' ||
+             (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+            fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}"""
+        invalid_runners = (
+            "ubuntu-latest",
+            "ubuntu-24.04",
+            ["self-hosted", "pf-ci", "pf-ci-x64"],
+            ["self-hosted", "pf-ci", "pf-ci-release", "ubuntu-24.04"],
+            """${{ fromJSON('["self-hosted","pf-ci","pf-ci-release"]') || 'ubuntu-24.04' }}""",
+            old_expression,
+        )
+        for name, identities in self.RELEASE_JOBS.items():
+            for identity in sorted(identities):
+                for runner in invalid_runners:
+                    with self.subTest(workflow=name, job=identity, runner=runner):
+                        mutant = copy.deepcopy(original)
+                        mutant[name]["jobs"][identity]["runs-on"] = runner
+                        with self.assertRaisesRegex(AssertionError, "runs-on"):
+                            self.assert_release_runners(mutant)
+
+    def test_runner_pin_refuses_pr_triggers_in_mapping_sequence_and_scalar_forms(self):
+        original = self.release_workflows()
+        for name in self.RELEASE_JOBS:
+            for event in ("pull_request", "pull_request_target"):
+                declarations = (
+                    {**original[name]["on"], event: {}},
+                    [*original[name]["on"], event],
+                    event,
+                )
+                for triggers in declarations:
+                    with self.subTest(workflow=name, event=event, triggers=triggers):
+                        mutant = copy.deepcopy(original)
+                        mutant[name]["on"] = triggers
+                        with self.assertRaisesRegex(AssertionError, event):
+                            self.assert_release_runners(mutant)
+
+    def test_runner_inventory_pin_refuses_missing_and_unlisted_jobs(self):
+        original = self.release_workflows()
+        for name, workflow in original.items():
+            for identity in workflow["jobs"]:
+                with self.subTest(workflow=name, missing=identity):
+                    mutant = copy.deepcopy(original)
+                    mutant[name]["jobs"].pop(identity)
+                    with self.assertRaisesRegex(AssertionError, "release job inventory"):
+                        self.assert_release_runners(mutant)
+            with self.subTest(workflow=name, extra="unreviewed-release-job"):
+                mutant = copy.deepcopy(original)
+                identity = sorted(self.RELEASE_JOBS[name])[0]
+                mutant[name]["jobs"]["unreviewed-release-job"] = copy.deepcopy(workflow["jobs"][identity])
+                with self.assertRaisesRegex(AssertionError, "release job inventory"):
+                    self.assert_release_runners(mutant)
 
 
 class PrTierWorkflowTest(unittest.TestCase):
