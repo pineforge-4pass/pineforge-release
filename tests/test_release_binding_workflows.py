@@ -207,7 +207,7 @@ class ReadyWiringTests(unittest.TestCase):
         })
         self.assertEqual(job["steps"][0], wiring.PrTierWorkflowTest.AUTHZ_REFUSAL_STEP)
         step = job["steps"][1]
-        self.assertEqual(step["if"], "needs.authz.result == 'success'")
+        self.assertEqual(step.get("if"), "needs.authz.result == 'success'")
         self.assertEqual(step["env"]["AUTHZ_OK"], "${{ needs.authz.result == 'success' }}")
         for docs_only in ("false", "true"):
             expected = {name: {"result": "skipped" if docs_only == "true" else "success"}
