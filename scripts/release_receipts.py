@@ -359,20 +359,22 @@ def collect(client, hub_client, store, role, run_id=0):
         runs = [client.api(f"repos/{repo}/actions/runs/{run_id}")]
     else:
         artifacts_by_run = {}
-        for artifact in object_pages(client, f"repos/{repo}/actions/artifacts", "artifacts"):
+        for artifact in object_pages(client, f"repos/{repo}/actions/artifacts?name={policy['artifact']}", "artifacts"):
             if artifact["name"] == policy["artifact"] and not artifact["expired"]:
-                artifacts_by_run.setdefault(artifact["workflow_run"]["id"], []).append(artifact)
+                artifacts_by_run.setdefault(artifact["workflow_run"]["id"], {})[artifact["id"]] = artifact
         runs = [client.api(f"repos/{repo}/actions/runs/{candidate_id}")
                 for candidate_id in sorted(artifacts_by_run)]
     for run in sorted(runs, key=lambda row: row["id"]):
         if run["path"] != ".github/workflows/" + policy["workflow"]:
-            raise Invalid("unexpected reporting workflow")
+            # Never in the old workflow-run scope; only a callback naming such a run fails closed.
+            require(not run_id, "unexpected reporting workflow")
+            continue
         if run_id:
             receipt = fetch_artifact(client, repo, run, policy)
         else:
             if run["status"] != "completed":
                 continue
-            receipt = fetch_artifact(client, repo, run, policy, artifacts_by_run[run["id"]])
+            receipt = fetch_artifact(client, repo, run, policy, list(artifacts_by_run[run["id"]].values()))
         if receipt is None:
             require(not run_id, "callback has no receipt artifact")
             continue

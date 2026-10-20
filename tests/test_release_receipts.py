@@ -80,14 +80,6 @@ class HistoryClient:
         }
         self.responses.update({f"repos/{REPO}/actions/runs/{run_id}": run
                                for run_id, run in self.runs.items()})
-        self.listings = {
-            f"repos/{REPO}/actions/artifacts": ("artifacts", self.artifacts),
-            f"repos/{REPO}/actions/workflows/{POLICY['workflow']}/runs":
-                ("workflow_runs", list(self.runs.values())[::-1]),
-        }
-        for run_id in self.runs:
-            self.listings[f"repos/{REPO}/actions/runs/{run_id}/artifacts"] = (
-                "artifacts", [a for a in self.artifacts if a["workflow_run"]["id"] == run_id])
         for stage in ("ci", "e2e", "deploy"):
             evidence = self.documents[1049][stage]
             route = f"repos/{REPO}/actions/runs/{evidence['run_id']}/attempts/1"
@@ -116,12 +108,24 @@ class HistoryClient:
     def api(self, route):
         self.routes.append(route)
         base, _, query = route.partition("?")
-        if base in self.listings:
+        listings = {
+            f"repos/{REPO}/actions/artifacts": ("artifacts", self.artifacts),
+            f"repos/{REPO}/actions/workflows/{POLICY['workflow']}/runs":
+                ("workflow_runs", [r for r in reversed(self.runs.values())
+                                   if r["path"] == ".github/workflows/" + POLICY["workflow"]]),
+        }
+        for run_id in self.runs:
+            listings[f"repos/{REPO}/actions/runs/{run_id}/artifacts"] = (
+                "artifacts", [a for a in self.artifacts if a["workflow_run"]["id"] == run_id])
+        if base in listings:
             params = parse_qs(query)
-            if set(params) != {"per_page", "page"}:
+            named = base == f"repos/{REPO}/actions/artifacts"
+            if set(params) != ({"name", "per_page", "page"} if named else {"per_page", "page"}):
                 raise AssertionError("unexpected pagination query: " + route)
             size, page = int(params["per_page"][0]), int(params["page"][0])
-            key, rows = self.listings[base]
+            key, rows = listings[base]
+            if named:
+                rows = [row for row in rows if row["name"] == params["name"][0]]
             return copy.deepcopy({key: rows[(page - 1) * size:page * size]})
         if route not in self.responses:
             raise AssertionError("unexpected fixture API route: " + route)
@@ -184,7 +188,7 @@ class ReceiptCollectionTests(unittest.TestCase):
     def schedule_routes(self):
         return [
             f"repos/{REPO}",
-            f"repos/{REPO}/actions/artifacts?per_page=100&page=1",
+            f"repos/{REPO}/actions/artifacts?name={POLICY['artifact']}&per_page=100&page=1",
             f"repos/{REPO}/actions/runs/1007",
             f"repos/{REPO}/actions/runs/1049",
             f"https://api.github.com/repos/{REPO}/actions/artifacts/2007/zip",
@@ -218,14 +222,36 @@ class ReceiptCollectionTests(unittest.TestCase):
         self.assertEqual(self.store.writes, list(EXPECTED_STORED.items()))
 
     def test_repository_artifacts_are_paginated_and_unrelated_or_expired_entries_are_ignored(self):
-        unrelated = [{"id": 6000 + i, "name": "build-output", "expired": False,
+        unrelated = [{"id": 6000 + i, "name": POLICY["artifact"], "expired": True,
                       "workflow_run": {"id": 1001}} for i in range(100)]
         unrelated.append({"id": 7000, "name": POLICY["artifact"], "expired": True,
                           "workflow_run": {"id": 1011}})
         self.client.artifacts[:0] = unrelated
         self.client.runs[1001]["path"] = self.client.runs[1011]["path"] = ".github/workflows/other.yml"
         self.collect()
-        self.assert_routes(self.schedule_routes() + [f"repos/{REPO}/actions/artifacts?per_page=100&page=2"])
+        self.assert_routes(self.schedule_routes() + [
+            f"repos/{REPO}/actions/artifacts?name={POLICY['artifact']}&per_page=100&page=2"])
+        self.assertEqual(self.store.assets, EXPECTED_STORED)
+
+    def test_page_boundary_duplicate_artifact_is_downloaded_once(self):
+        self.client.artifacts[:0] = [
+            {"id": 6000 + i, "name": POLICY["artifact"], "expired": True,
+             "workflow_run": {"id": 1001}} for i in range(98)]
+        api = self.client.api
+
+        def api_with_page_shift(route):
+            response = api(route)
+            if route == f"repos/{REPO}/actions/artifacts?name={POLICY['artifact']}&per_page=100&page=1":
+                # A new row shifts page one's last artifact to the start of page two.
+                self.client.artifacts.insert(0, {
+                    "id": 7000, "name": POLICY["artifact"], "expired": True,
+                    "workflow_run": {"id": 1001}})
+            return response
+
+        with patch.object(self.client, "api", side_effect=api_with_page_shift):
+            self.collect()
+        self.assertEqual(self.client.routes.count(
+            f"https://api.github.com/repos/{REPO}/actions/artifacts/2007/zip"), 1)
         self.assertEqual(self.store.assets, EXPECTED_STORED)
 
     def test_incomplete_candidate_is_not_read_and_is_collected_after_completion(self):
@@ -242,11 +268,18 @@ class ReceiptCollectionTests(unittest.TestCase):
                 self.assertEqual(self.store.assets, EXPECTED_STORED)
                 self.assertEqual(self.store.writes, list(EXPECTED_STORED.items()))
 
-    def test_candidate_from_another_workflow_is_refused_before_downloading(self):
+    def test_schedule_ignores_foreign_workflow_artifact_but_callback_fails_closed(self):
+        self.client.artifacts.append({**self.client.artifact_by_run[1007], "id": 8000,
+                                      "workflow_run": {"id": 1001}})
+        self.client.runs[1001]["path"] = ".github/workflows/other.yml"
+        self.collect()
+        self.assertEqual(self.store.assets, EXPECTED_STORED)
+        self.assertNotIn(f"https://api.github.com/repos/{REPO}/actions/artifacts/8000/zip", self.client.routes)
+
+        self.client.routes.clear()
         self.client.runs[1007]["path"] = ".github/workflows/other.yml"
         with self.assertRaisesRegex(contract.Invalid, "unexpected reporting workflow"):
-            self.collect()
-        self.assertEqual(self.store.assets, {})
+            self.collect(1007)
         self.assertFalse(any(route.endswith("/zip") for route in self.client.routes))
 
     def test_duplicate_receipt_artifacts_on_one_run_are_still_ambiguous(self):

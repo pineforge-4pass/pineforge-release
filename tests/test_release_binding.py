@@ -1232,8 +1232,9 @@ class ReceiptTests(unittest.TestCase):
         self.api_data[f"repos/{self.repo}"] = {"full_name": self.repo}
         self.run["status"] = "completed"
         self.api_data[f"repos/{self.repo}/actions/runs/{self.run['id']}"] = self.run
-        self.api_data[f"repos/{self.repo}/actions/artifacts?per_page=100&page=1"] = {
-            "artifacts": [{"name": self.policy["artifact"], "expired": False, "workflow_run": {"id": self.run["id"]}}]}
+        self.api_data[f"repos/{self.repo}/actions/artifacts?name={self.policy['artifact']}&per_page=100&page=1"] = {
+            "artifacts": [{"id": 1, "name": self.policy["artifact"], "expired": False,
+                           "workflow_run": {"id": self.run["id"]}}]}
         owner = self
         newer = (json.dumps(facts, indent=2) + "\n").encode()
         class Hub:
