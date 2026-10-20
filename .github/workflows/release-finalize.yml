@@ -78,7 +78,6 @@ jobs:
     needs: finalize
     if: needs.finalize.outputs.deliveries != '[]'
     runs-on: ["self-hosted","pf-ci","pf-ci-release"]
-    timeout-minutes: 10
     environment: release-automation
     concurrency:
       group: release-delivery-${{ matrix.consumer }}-${{ matrix.tag }}
