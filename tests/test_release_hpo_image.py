@@ -871,15 +871,16 @@ class DispatcherModuleTest(unittest.TestCase):
 
 
 class ReadmePairRuleTest(unittest.TestCase):
-    # SHA-256 of README.md lines 196-225 (the pair rule) as published on the hub's main when this change was made.
+    # SHA-256 of README.md lines 215-244 (the pair rule, unchanged text; it was lines 196-225 before the
+    # release-flow section grew by 19 lines) as published on the hub's main when this change was made.
     # A checkout in CI has no origin/main, so the rule is pinned by digest; a deliberate change of the rule changes
     # this value in the same commit.
     PAIR_RULE_SHA256 = "35b72f7f5c7466cfc212a71eaf05df98f45e92411fd34a67bfff761556c61601"
 
-    def test_lines_196_to_225_are_byte_identical_to_the_published_rule(self):
+    def test_lines_215_to_244_are_byte_identical_to_the_published_rule(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
-        self.assertGreaterEqual(len(lines), 225)
-        self.assertEqual(hashlib.sha256(b"".join(lines[195:225])).hexdigest(), self.PAIR_RULE_SHA256)
+        self.assertGreaterEqual(len(lines), 244)
+        self.assertEqual(hashlib.sha256(b"".join(lines[214:244])).hexdigest(), self.PAIR_RULE_SHA256)
 
 
 if __name__ == "__main__":
