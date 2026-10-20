@@ -16,7 +16,7 @@ on:
     branches: [main]
     paths: ['facts/facts.json']
   schedule:
-    - cron: '3,18,33,48 * * * *'
+    - cron: '3 * * * *'
 
 permissions:
   contents: read
