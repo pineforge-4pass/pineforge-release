@@ -67,22 +67,23 @@ three fixed producer repositories, excludes drafts/prereleases/non-product tags
 and versions older than hub VERSION. It checks whether the desired stable
 version already has a hub Git tag before downloading any artifacts. Only a
 version without that tag has its artifacts verified and the **same producer
-events** sent back to the existing handler. After pushing a hub tag, the handler
-dispatches publication on `main` with that tag input, and finalization continues
-even while the release is a draft awaiting prerequisites.
+events** sent back to the existing handler. The handler pushes the hub tag;
+after the tag exists on main and `handle-upstream` is green, a user with write
+access dispatches `publish.yml` on `main` with that tag using the command below.
+Finalization then continues even while the release is a draft awaiting prerequisites.
 Older missed versions are superseded by the newest desired stable version;
 they are never replayed as downgrades after it. Duplicate notifications reuse
 the handler's existing decision. A stored candidate makes an unchanged-version
 decision a no-op even while the fixed image tag is absent. Nothing calls a
 producer's version-bump job.
 
-Recovery of an existing hub tag explicitly dispatches `publish.yml` **on main**
-with the existing tag supplied as the required `tag` input. It never force-pushes
-or rewrites it. Manual release or replay is also available through Actions:
-select `publish`, choose `main` as its ref, supply the existing tag in `tag`, run.
-Equivalently, use `gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=vX.Y.Z`
-(or `vX.Y.Z-rc.N`). Pushing a tag alone does not start
-publication. The handler dispatches after both a new tag push and retag recovery;
+Recovery of an existing hub tag emits an operator notice and never force-pushes
+or rewrites the tag. Publication and replay use the same operator command,
+run by a user with write access after the tag exists on main and
+`handle-upstream` is green:
+`gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=<vX.Y.Z or vX.Y.Z-rc.N>`.
+Use the actual existing tag as `tag`. Pushing a tag alone publishes nothing.
+Both a new tag push and retag recovery leave publication to the operator;
 an unchanged version with an image or verified candidate keeps its existing no-op.
 Tags predating this workflow need a reviewed migration; the hub does not invent
 new manifests for historical images without candidate verification.
@@ -827,7 +828,7 @@ untouched: pending `pf-ci-release`, including publication workflows.
 | Name / setting | Scope | Purpose |
 |---|---|---|
 | `PINEFORGE_APP_ID`, `PINEFORGE_APP_PRIVATE_KEY` (existing) | Hub `release-automation` environment | Short-lived, one-target installation tokens; no PAT fallback. |
-| App installation permissions | Hub: Contents write + Actions write; enabled consumers: Contents read/write, Actions read, Pull requests read | Hub tag/dispatch and explicit publish replay; consumer dispatch and completion evidence reads. Each mint asks only for the permissions needed by that job. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
+| App installation permissions | Hub: Contents write; enabled consumers: Contents read/write, Actions read, Pull requests read | Hub tag pushes and producer-event reconciliation; consumer dispatch and completion evidence reads. Publication and replay use the write-access operator's login. Each mint asks only for the permissions needed by that job. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
 | `RELEASE_HOSTED_MCP_REPOSITORY`, `RELEASE_APPLICATION_REPOSITORY`, `FACTS_WEB_REPOSITORY` (existing) | Hub `release-automation` environment secrets | Private short repository names for neutral hosted/application/web targets. Public offline/data/license names are fixed in workflows. |
 | `RELEASE_RECEIPT_POLICY` (new secret) | Hub repository Actions secret (read by the receipt verify job, which runs in the `release-automation` environment; do not also create it in the environment, it would shadow this one) | JSON map of each enabled role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories, plus optional application-only `post_merge`. Keep private workflow/job details out of public source. |
 | `RELEASE_READY_CONSUMERS` (new variable) | Hub repository | Explicit comma-separated upgraded product receiver roles. Empty sends nothing; disabled roles do not block aggregate completion or become overdue. Facts flags independently select web/license receipt polling and freshness. |

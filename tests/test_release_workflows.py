@@ -266,7 +266,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         "needs.prepare.result == 'success' && "
         "(needs.publish.result == 'success' || needs.publish.result == 'skipped') }}"
     )
-    DISPATCH = "gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag="
+    OPERATOR_COMMAND = "gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag="
     INPUT = (
         '    inputs:\n'
         '      tag:\n'
@@ -404,29 +404,56 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             end = text.index("          fi\n", at) + len("          fi\n")
             yield label, self.mutate(text, text[at:end], "")
 
+    def assert_no_publish_dispatch(self, text):
+        # The operator command is inert notice data. Exempt only a complete
+        # quoted assignment, with no command substitution or trailing code.
+        code = re.sub(
+            r'(?m)^[ \t]*line="(?![^\n]*\$\()[^"`\\\n]*' + re.escape(self.OPERATOR_COMMAND)
+            + r'(?:\$\{TAG\}|v\$\{RELEASE\}|v\$\{next\})"$', "", text,
+        )
+        code = re.sub(r"\\\n[ \t]*", " ", code)
+        self.assertNotRegex(code, r"\bworkflow\s+run\b[^\n]*\bpublish\.yml\b")
+        if "publish.yml" in code:
+            self.assertNotRegex(code, r"\bworkflow\s+run\b|\bcreateWorkflowDispatch\b|/dispatches\b",
+                                "no dispatch may target publish.yml, including a target supplied separately")
+
     def assert_handler(self, text):
+        self.assert_no_publish_dispatch(text)
         wf = self.parse(text)
         steps = wf.get("jobs", {}).get("bump", {}).get("steps", [])
+        app = next((row for row in steps if row.get("id") == "app"), {})
+        self.assertEqual(app.get("with", {}).get("permission-contents"), "write")
+        self.assertNotIn("permission-actions", app.get("with", {}))
+        self.assertNotRegex(_step(text, "Mint org App token"), r"(?m)^\s*permission-actions\s*:")
         replay = next((row for row in steps if row.get("name", "").startswith("Re-publish")), {})
         bump = next((row for row in steps if row.get("name", "").startswith("Bump VERSION")), {})
         self.assertEqual(replay.get("if"), "steps.decide.outputs.mode == 'republish'")
         self.assertEqual(replay.get("env", {}).get("TAG"), "v${{ steps.decide.outputs.cur_ver }}")
         for step in (replay, bump):
-            self.assertEqual(step.get("env", {}).get("GH_TOKEN"), "${{ steps.app.outputs.token }}")
+            self.assertNotIn("GH_TOKEN", step.get("env", {}))
+        self.assertEqual(bump.get("name"), "Bump VERSION, commit, tag")
         self.assertEqual(bump.get("if"), "steps.decide.outputs.mode == 'bump'")
-        self.assertEqual([line.strip() for line in text.splitlines() if "gh workflow run publish.yml" in line],
-                         [self.DISPATCH + '"$TAG"', self.DISPATCH + '"v${RELEASE}"', self.DISPATCH + '"v${next}"'])
-        self.assertIn(self.DISPATCH + '"$TAG"', replay.get("run", ""))
+        summary = 'printf \'%s\\n\' "$line" >> "$GITHUB_STEP_SUMMARY"'
+        replay_run = replay.get("run", "")
+        self.assertIn(self.OPERATOR_COMMAND + '${TAG}"', replay_run)
+        self.assertIn('echo "::warning title=pineforge publish needed::${line}"', replay_run)
+        self.assertIn(summary, replay_run)
+        self.assertEqual(replay_run.splitlines()[-1], "exit 0")
         run = bump.get("run", "")
         commands = [line.strip() for line in run.splitlines()]
         for variable in ("RELEASE", "next"):
-            # Both the retag early-exit path and a new release dispatch after the successful push.
+            # Both paths print the operator command only after the tag push succeeds.
             push = 'git push origin "v${' + variable + '}"'
             self.assertIn(push, commands)
             at = commands.index(push)
-            self.assertLess(at + 1, len(commands))
-            self.assertEqual(commands[at + 1], self.DISPATCH + '"v${' + variable + '}"')
-        self.assertLess(run.index(self.DISPATCH + '"v${RELEASE}"'), run.index("exit 0"))
+            self.assertLess(at + 3, len(commands))
+            self.assertTrue(commands[at + 1].startswith('line="pushed v${' + variable + '}'))
+            self.assertIn(self.OPERATOR_COMMAND + 'v${' + variable + '}"', commands[at + 1])
+            self.assertEqual(commands[at + 2], 'echo "::notice title=pineforge publish needed::${line}"')
+            self.assertEqual(commands[at + 3], summary)
+            if variable == "RELEASE":
+                self.assertLess(at + 4, len(commands))
+                self.assertEqual(commands[at + 4], "exit 0")
 
     def assert_release_triggers(self, text):
         wf = self.parse(text)
@@ -443,9 +470,42 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             self.assertEqual(push.get("branches"), ["main"])
             self.assertLessEqual(set(push), {"branches", "paths", "paths-ignore"}, "no tag or branch-ignore filters")
 
-    def test_publish_and_handler_use_main_dispatch_with_an_explicit_validated_tag(self):
+    def test_publish_uses_operator_dispatch_and_handler_prints_the_next_command(self):
         self.assert_publish((WORKFLOWS / "publish.yml").read_text())
         self.assert_handler((WORKFLOWS / "handle-upstream.yml").read_text())
+
+    def test_no_workflow_dispatches_publish(self):
+        found = []
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix in {".yml", ".yaml"}:
+                found.append(path.name)
+                with self.subTest(workflow=path.name):
+                    self.assert_no_publish_dispatch(path.read_text())
+        self.assertIn("handle-upstream.yml", found)
+        self.assertIn("publish.yml", found)
+
+    def test_no_dispatch_pin_refuses_cli_javascript_and_api_steps_on_real_text(self):
+        text = (WORKFLOWS / "handle-upstream.yml").read_text()
+        self.assert_no_publish_dispatch(text)
+        anchor = "      - name: Report failed upstream handling\n"
+        steps = (
+            "        run: " + self.OPERATOR_COMMAND + "v1.6.2\n",
+            "        run: gh workflow run --ref main 'publish.yml' -f tag=v1.6.2\n",
+            '        env:\n          WORKFLOW: publish.yml\n        run: gh workflow run "$WORKFLOW" --ref main -f tag=v1.6.2\n',
+            "        run: |\n          gh workflow run \\\n            publish.yml --ref main -f tag=v1.6.2\n",
+            "        uses: actions/github-script@fixture\n        with:\n          script: |\n"
+            "            await github.rest.actions.createWorkflowDispatch({\n"
+            "              workflow_id: 'publish.yml', ref: 'main', inputs: {tag: 'v1.6.2'}\n"
+            "            });\n",
+            "        run: gh api --method POST repos/pineforge-4pass/pineforge-release/actions/workflows/publish.yml/dispatches -f ref=main\n",
+            "        env:\n          WORKFLOW: publish.yml\n        run: |\n"
+            '          curl --request POST "https://api.github.com/repos/pineforge-4pass/pineforge-release/actions/workflows/${WORKFLOW}/dispatches"\n',
+            '        run: |\n          line="$(' + self.OPERATOR_COMMAND + 'v1.6.2)"\n',
+        )
+        for step in steps:
+            mutant = self.mutate(text, anchor, "      - name: Forbidden publish dispatch\n" + step + anchor)
+            with self.subTest(step=step), self.assertRaises(AssertionError):
+                self.assert_no_publish_dispatch(mutant)
 
     def test_every_workflow_using_the_release_label_has_only_main_ref_trigger_types(self):
         found = []
@@ -560,32 +620,45 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_publish(late_guard)
 
-    def test_handler_refuses_tag_ref_dispatch_missing_tag_or_missing_dispatch_on_real_text(self):
+    def test_handler_pin_refuses_dispatch_permissions_tokens_or_broken_operator_notices(self):
         text = (WORKFLOWS / "handle-upstream.yml").read_text()
         self.assert_handler(text)
-        for tag in ('"$TAG"', '"v${RELEASE}"', '"v${next}"'):
-            command = self.DISPATCH + tag
-            for replacement in (command.replace("--ref main", '--ref "$TAG"'),
+        for tag in ('${TAG}', 'v${RELEASE}', 'v${next}'):
+            command = self.OPERATOR_COMMAND + tag
+            for replacement in (command.replace("--ref main", '--ref topic'),
                                 command.removesuffix(" -f tag=" + tag), ""):
                 mutant = self.mutate(text, command, replacement)
                 with self.subTest(command=command, replacement=replacement), self.assertRaises(AssertionError):
                     self.assert_handler(mutant)
-        bump_token = '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          E:'
-        mutant = self.mutate(text, bump_token, '        env:\n          E:')
-        with self.assertRaises(AssertionError):
-            self.assert_handler(mutant)
         for before, after in (
+            ("          permission-contents: write\n",
+             "          permission-contents: write\n          permission-actions: write\n"),
+            ('        env:\n          TAG: v${{ steps.decide.outputs.cur_ver }}',
+             '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          TAG: v${{ steps.decide.outputs.cur_ver }}'),
+            ('        env:\n          E:', '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          E:'),
             ("        if: steps.decide.outputs.mode == 'republish'", "        if: always()"),
             ("        if: steps.decide.outputs.mode == 'bump'", "        if: always()"),
             ("          TAG: v${{ steps.decide.outputs.cur_ver }}", "          TAG: v0.0.0"),
-            ('            git push origin "v${RELEASE}"\n            ' + self.DISPATCH + '"v${RELEASE}"',
-             '            ' + self.DISPATCH + '"v${RELEASE}"\n            git push origin "v${RELEASE}"'),
-            ('          git push origin "v${next}"\n          ' + self.DISPATCH + '"v${next}"',
-             '          ' + self.DISPATCH + '"v${next}"\n          git push origin "v${next}"'),
+            ("      - name: Bump VERSION, commit, tag\n", "      - name: Bump VERSION, commit, tag (fires publish.yml)\n"),
+            ('echo "::warning title=pineforge publish needed::${line}"', 'echo "$line"'),
         ):
             mutant = self.mutate(text, before, after)
             with self.subTest(anchor=before), self.assertRaises(AssertionError):
                 self.assert_handler(mutant)
+        for name, annotation, notices in (("Re-publish", "warning", 1), ("Bump VERSION", "notice", 2)):
+            body = _step(text, name)
+            for command, count in (
+                ('printf \'%s\\n\' "$line" >> "$GITHUB_STEP_SUMMARY"', notices),
+                ('echo "::' + annotation + ' title=pineforge publish needed::${line}"', notices),
+                ("exit 0", 1),
+            ):
+                matches = list(re.finditer(re.escape(command), body))
+                self.assertEqual(len(matches), count, "each notice mutation must have its real anchor")
+                for match in matches:
+                    changed = body[:match.start()] + body[match.end():]
+                    mutant = self.mutate(text, body, changed)
+                    with self.subTest(step=name, command=command, occurrence=match.start()), self.assertRaises(AssertionError):
+                        self.assert_handler(mutant)
 
     def test_generic_trigger_pin_refuses_forbidden_events_and_tag_pushes_in_every_real_workflow(self):
         for path in sorted(WORKFLOWS.iterdir()):
@@ -627,6 +700,7 @@ class ReleaseTagGuardGitTest(unittest.TestCase):
 
     # Literal expectations, independent of the workflow's regex/commands.
     # Commit selectors refer to fixture commits created before the guard runs.
+    # Optional trailing (branch, commit selector) fields add local clone refs.
     CASES = (
         ("v1.6.2", "true", 0, "first", ""),
         ("v1.6.3", "true", 0, "second", ""),
@@ -638,6 +712,8 @@ class ReleaseTagGuardGitTest(unittest.TestCase):
         ("v1.6.2\nextra", "true", 1, None, "expected an existing vX.Y.Z or vX.Y.Z-rc.N tag"),
         ("v1.6.2", "false", 1, None, "dispatch publish.yml on refs/heads/main"),
         ("v1.6.2", "", 1, None, "dispatch publish.yml on refs/heads/main"),
+        ("v1.6.7", "true", 1, None, "does not exist or does not peel to a commit", ("v1.6.7", "second")),
+        ("v1.6.2", "true", 0, "first", "", ("v1.6.2", "second")),
     )
 
     def setUp(self):
@@ -680,6 +756,7 @@ class ReleaseTagGuardGitTest(unittest.TestCase):
         # names main loosely would accept the side-branch tag v1.6.4.
         for decoy in ("origin/main", "main", "heads/main", "remotes/origin/main"):
             self.git(self.origin, "tag", decoy)
+        self.assertEqual(self.git(self.origin, "tag", "--list", "v1.6.7"), "", "branch-only case must have no origin tag")
         self.git(self.origin, "checkout", "main")
         self.checkout_index = 0
         self.text = (WORKFLOWS / "publish.yml").read_text(encoding="utf-8")
@@ -719,7 +796,10 @@ class ReleaseTagGuardGitTest(unittest.TestCase):
         return done, output.read_text(encoding="utf-8").splitlines()
 
     def assert_case(self, text, work, case):
-        tag, on_main, expected_code, commit, error = case
+        tag, on_main, expected_code, commit, error, *local_branches = case
+        # Extra row fields create LOCAL refs in the work clone before the guard.
+        for name, target in local_branches:
+            self.git(work, "branch", name, self.commits[target])
         done, output = self.run_guard(text, work, tag, on_main)
         self.assertEqual(done.returncode, expected_code, (case, done.stdout, done.stderr))
         if expected_code == 0:
@@ -756,6 +836,9 @@ class ReleaseTagGuardGitTest(unittest.TestCase):
         unpeeled = pins.mutate(self.text, '"refs/tags/${TAG}^{commit}"', '"refs/tags/${TAG}"')
         with self.subTest(check="annotated tag must output its commit"), self.assertRaises(AssertionError):
             self.assert_table(unpeeled)
+        bare_tag = pins.mutate(self.text, '"refs/tags/${TAG}^{commit}"', '"${TAG}^{commit}"')
+        with self.subTest(check="local branch v1.6.7 is not a release tag"), self.assertRaisesRegex(AssertionError, r"v1\.6\.7"):
+            self.assert_table(bare_tag)
         short_name = pins.mutate(
             self.text, 'is-ancestor "$TAG_COMMIT" refs/remotes/origin/main', 'is-ancestor "$TAG_COMMIT" origin/main')
         with self.subTest(check="a tag named origin/main must not stand in for main"), self.assertRaises(AssertionError):
@@ -1557,7 +1640,7 @@ class AppScopeTest(unittest.TestCase):
             self.assertIn("github-api-url: https://api.github.com", text)
         handler = (WORKFLOWS / "handle-upstream.yml").read_text()
         self.assertIn("repositories: pineforge-release", handler)
-        self.assertIn("permission-actions: write", handler)
+        self.assertNotIn("permission-actions", _step(handler, "Mint org App token"))
         self.assertNotIn('git push origin "refs/tags/${TAG}" --force', handler)
         finalizer = (WORKFLOWS / "release-finalize.yml").read_text()
         self.assertIn("repositories: ${{ env.TARGET_REPOSITORY }}", finalizer)
