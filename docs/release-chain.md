@@ -690,8 +690,84 @@ with a longer app default. Monitor these assets/issues, not green dispatch runs.
 Do not enable a role until its consumer lane has removed moving runtime defaults
 and installed PR/CI/E2E/deploy gates. Consumer App identities must not bypass
 their required branch checks, and no consumer may use an admin merge. Configure
-`release/ready` as a required hub branch/ruleset status; its exact inventory
-rejects missing/skipped/cancelled jobs and covers merge-group events too.
+`authz` and `release/ready` as REQUIRED hub branch/ruleset status checks.
+`release/ready` requires successful authz and change detection, then the complete
+suite inventory; only a verified documentation-only PR may skip suites.
+
+The hub's `python-test.yml` and `facts-validate.yml` PR checks use the literal
+`["self-hosted","pf-ci","pf-ci-x64"]` runner array, without a hosted fallback or
+`PF_CI_LABELS` environment variable. Keep `pf-ci-x64` until laneboss posts
+"pf-ci-crj live". Both workflows run on every pull request without path or
+branch filters. Their first job is the exact canonical `authz` from
+`ci-labels.md`, with `name: authz`,
+`runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]`, `permissions: {}`, no
+condition, checkout or secrets, and the canonical no-timeout comment.
+Its eight payload fields are `EVENT`, `REPO`, `HEAD_REPO`, `HEAD_IS_FORK`,
+`ASSOCIATION`, `PR_AUTHOR`, `WR_HEAD_REPO` and `WR_ACTOR`; the other two
+environment values are `GH_TOKEN` and
+`ALLOWED_BOTS: "dependabot[bot] pineforge-app[bot]"`.
+The job grants no token scopes and uses `${{ github.token }}` only for the
+`pull_request` and `workflow_run` metadata permission lookups.
+For `pull_request`, authz requires this repository's non-fork head and accepts
+an `OWNER`, `MEMBER` or `COLLABORATOR` author association, the exact author login
+`dependabot[bot]` or `pineforge-app[bot]`, or author permission `admin`, `maintain`
+or `write` read from GitHub.
+An author outside the bot allowlist reported as `CONTRIBUTOR`, including a
+member with private organization membership, passes only with `admin`,
+`maintain` or `write` permission read from GitHub; a failed lookup refuses the run.
+For `workflow_run`, authz requires this repository's head and either an
+allowlisted bot or triggering-actor permission `admin`, `maintain` or
+`write`; a failed permission lookup refuses the run.
+The allowed ordinary events are `push`, `workflow_dispatch`, `schedule`,
+`merge_group`, `release`, `workflow_call` and `repository_dispatch`;
+`pull_request_target` and unknown events fail red.
+Allowed runs are recorded in the job summary; refusals emit a GitHub error
+annotation, record the reason in the summary and exit with status 1.
+
+Every other job needs `authz`, retaining the existing documentation-only
+conditions. `release/ready` uses `if: ${{ always() }}` and starts with
+`Refuse an unauthorised run before anything else` before evaluating the job inventory.
+That first step has `if: ${{ needs.authz.result != 'success' }}` and the
+single-line command `echo "::error::authz did not pass; nothing of this run's code is checked out or run"; exit 1`.
+An unsuccessful authz result fails the job before any other step; successful
+authz skips that refusal. The existing inline
+inventory script then requires successful change detection and the expected
+result for every suite. The inventory step also has
+`if: needs.authz.result == 'success'`.
+Only the existing documentation-only PR rule accepts skipped suites; authz
+must always succeed. Ordinary jobs with a status override such as `!cancelled()`
+must also require `needs.authz.result == 'success'` in their condition; this
+enforces dependency success rather than testing a PR's repository.
+The workflow pins require the same first refusal step for every job with a
+direct authz dependency whose condition uses `always()`, `!cancelled()`,
+`failure()` or `success() || failure()`, before any checkout, action or
+repository code (SECURITY #819).
+Every subsequent step in these jobs, including third-party actions, requires
+`if: needs.authz.result == 'success'`; an existing condition follows `&&`
+inside parentheses so every branch remains guarded (#836/#837).
+The required aggregate uses `always()` so cancellation cannot skip the check:
+GitHub counts a skipped required check as success, allowing a cancelled run
+to appear green without running its tests (#838/#839).
+
+The repository setting is required because a fork can edit or delete
+`authz` in its proposed workflow.
+For private repositories, Settings > Actions > General > "Fork pull request
+workflows" must have "Run workflows from fork pull requests" OFF, and the
+setting must be read back.
+For public repositories, require approval for all external contributors
+(`all_external_contributors`); the self-hosted runner group must restrict
+access to the org's private repositories with "Allow public repositories" OFF.
+The dispatcher's identity gate decides who gets a runner; authz supplies
+the second lock and the readable red verdict.
+An outside contributor's run held for approval leaves required authz
+pending and blocks merging.
+If approved, the dispatcher refuses the runner and cancels the run;
+cancelled or failed authz blocks merging.
+A member's own fork fails the canonical authz check.
+The existing `merge_group` trigger remains
+configured and passes the canonical authz script. macOS stays hosted
+(no hardware); this repository has no macOS jobs. Credential/release jobs
+untouched: pending `pf-ci-release`, including publication workflows.
 
 | Name / setting | Scope | Purpose |
 |---|---|---|
