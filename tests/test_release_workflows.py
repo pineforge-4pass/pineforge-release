@@ -412,10 +412,12 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             + r'(?:\$\{TAG\}|v\$\{RELEASE\}|v\$\{next\})"$', "", text,
         )
         code = re.sub(r"\\\n[ \t]*", " ", code)
-        self.assertNotRegex(code, r"\bworkflow\s+run\b[^\n]*\bpublish\.yml\b")
-        if "publish.yml" in code:
-            self.assertNotRegex(code, r"\bworkflow\s+run\b|\bcreateWorkflowDispatch\b|/dispatches\b",
-                                "no dispatch may target publish.yml, including a target supplied separately")
+        # No workflow here dispatches any workflow, so the pin does not depend on
+        # how the target is named (file, display name, numeric id, variable).
+        # Plain repository_dispatch (`repos/<r>/dispatches`) stays allowed.
+        for pattern in (r"\bworkflow\s+run\b", r"\bcreateWorkflowDispatch\b",
+                        r"\bactions/workflows/[^\s/]+/dispatches\b"):
+            self.assertNotRegex(code, pattern, "no workflow may dispatch any workflow")
 
     def assert_handler(self, text):
         self.assert_no_publish_dispatch(text)
@@ -501,6 +503,13 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             "        env:\n          WORKFLOW: publish.yml\n        run: |\n"
             '          curl --request POST "https://api.github.com/repos/pineforge-4pass/pineforge-release/actions/workflows/${WORKFLOW}/dispatches"\n',
             '        run: |\n          line="$(' + self.OPERATOR_COMMAND + 'v1.6.2)"\n',
+            '        run: gh workflow run "Publish release candidate" --ref main -f tag=v1.6.2\n',
+            "        run: gh api -X POST repos/pineforge-4pass/pineforge-release/actions/workflows/123456789/dispatches -f ref=main\n",
+            "        uses: actions/github-script@fixture\n        with:\n          script: |\n"
+            "            await github.request(\n"
+            "              'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',\n"
+            "              {owner, repo, workflow_id: 123456789, ref: 'main'}\n"
+            "            );\n",
         )
         for step in steps:
             mutant = self.mutate(text, anchor, "      - name: Forbidden publish dispatch\n" + step + anchor)
