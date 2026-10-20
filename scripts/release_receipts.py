@@ -317,8 +317,9 @@ def transition(previous, current):
     return True
 
 
-def fetch_artifact(client, repo, run, policy):
-    artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
+def fetch_artifact(client, repo, run, policy, artifacts=None):
+    if artifacts is None:
+        artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
     found = [row for row in artifacts if row["name"] == policy["artifact"] and not row["expired"]]
     if not found:
         return None
@@ -357,11 +358,23 @@ def collect(client, hub_client, store, role, run_id=0):
     if run_id:
         runs = [client.api(f"repos/{repo}/actions/runs/{run_id}")]
     else:
-        runs = object_pages(client, f"repos/{repo}/actions/workflows/{policy['workflow']}/runs", "workflow_runs")
+        artifacts_by_run = {}
+        for artifact in object_pages(client, f"repos/{repo}/actions/artifacts?name={policy['artifact']}", "artifacts"):
+            if artifact["name"] == policy["artifact"] and not artifact["expired"]:
+                artifacts_by_run.setdefault(artifact["workflow_run"]["id"], {})[artifact["id"]] = artifact
+        runs = [client.api(f"repos/{repo}/actions/runs/{candidate_id}")
+                for candidate_id in sorted(artifacts_by_run)]
     for run in sorted(runs, key=lambda row: row["id"]):
         if run["path"] != ".github/workflows/" + policy["workflow"]:
-            raise Invalid("unexpected reporting workflow")
-        receipt = fetch_artifact(client, repo, run, policy)
+            # Never in the old workflow-run scope; only a callback naming such a run fails closed.
+            require(not run_id, "unexpected reporting workflow")
+            continue
+        if run_id:
+            receipt = fetch_artifact(client, repo, run, policy)
+        else:
+            if run["status"] != "completed":
+                continue
+            receipt = fetch_artifact(client, repo, run, policy, list(artifacts_by_run[run["id"]].values()))
         if receipt is None:
             require(not run_id, "callback has no receipt artifact")
             continue
@@ -465,8 +478,8 @@ def main():
                 name = f"delivery-{args.consumer}.json"
                 if store.read(row, name) is None:
                     store.put(row, name, canonical(obj))
-    except (Invalid, Pending, ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile):
-        print("::error::consumer evidence invalid or unavailable; no verified state recorded", file=sys.stderr)
+    except (Invalid, Pending, ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile) as error:
+        print(f"::error::consumer evidence invalid or unavailable; no verified state recorded: {error}", file=sys.stderr)
         return 1
     return 0
 
