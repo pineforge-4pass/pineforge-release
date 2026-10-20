@@ -727,8 +727,10 @@ annotation, record the reason in the summary and exit with status 1.
 Every other job needs `authz`, retaining the existing documentation-only
 conditions. `release/ready` uses `if: ${{ always() }}` and starts with
 `Refuse an unauthorised run before anything else` before evaluating the job inventory.
-That first step has `if: ${{ needs.authz.result != 'success' }}` and the
-single-line command `echo "::error::authz did not pass; nothing of this run's code is checked out or run"; exit 1`.
+That first step has `if: ${{ needs.authz.result != 'success' }}` and a two-line
+`run: |` block, exactly as in the canonical aggregate: an `echo` of
+`::error::authz did not pass; nothing of this run's code is checked out or run`,
+then `exit 1` on the next line.
 An unsuccessful authz result fails the job before any other step; successful
 authz skips that refusal. The existing inline
 inventory script then requires successful change detection and the expected
