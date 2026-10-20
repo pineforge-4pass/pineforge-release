@@ -6,6 +6,52 @@ the authority for semver order, lockstep and the HPO `1.6.0-rc.1` cutoff. The
 hub does not create producer versions or consumer commits, merge consumer PRs,
 or deploy consumers.
 
+## Release runner isolation
+
+LB-435 prepares these jobs for the literal `runs-on` array
+`["self-hosted","pf-ci","pf-ci-release"]`:
+
+| Workflow | Jobs |
+|---|---|
+| `facts-descriptions.yml` | `descriptions` |
+| `facts-fanout.yml` | `web`, `license` |
+| `handle-upstream.yml` | `bump` |
+| `publish.yml` | `tag-guard`, `prepare`, `publish`, `failure-report` |
+| `release-finalize.yml` | `finalize`, `notify-consumers` |
+| `release-receipts.yml` | `plan`, `verify` |
+| `release-reconcile.yml` | `producers` |
+| `release-rollback.yml` | `restore` |
+
+The class has its own runner group restricted to selected workflows at protected
+refs, its own no-role service account, and one job per runner, with nothing shared
+with PR classes. Secret-bearing jobs and jobs that build artifacts later published
+by a release job belong in this class. `prepare`, receipt `plan`, and
+`failure-report` also hold the automatic `GITHUB_TOKEN` through `github.token`,
+with Contents or Issues write access. The `publish.yml` reusable
+`notify-consumers` caller obtains its runners from `release-finalize.yml`.
+
+`pull_request` and `pull_request_target` workflows must never use this class.
+The PR jobs in `python-test.yml` and `facts-validate.yml` keep their existing
+routing. Push this migration only after laneboss posts "pf-ci-release live";
+until then jobs on that label wait. The runner group allowlist must include
+these workflows at their protected refs when the class is live.
+
+The release runner group admits runs at `refs/heads/main` only. Publication
+uses `workflow_dispatch` on `main` with an explicit existing tag input;
+`tag-guard` fails any other workflow ref and is a required dependency of every
+later job. With Contents read access and no secrets, it checks out main with
+full history and no persisted credentials. It validates the complete
+`vX.Y.Z` / `vX.Y.Z-rc.N` pattern before using the input in git, fetches tags and
+main, verifies that the tag exists and peels to a commit, and requires that
+commit to be an ancestor of `refs/remotes/origin/main` (named in full: a tag
+called `origin/main` cannot stand in for it). Both tagged checkouts use the guard's
+verified commit SHA, with no persisted credentials, so moving a tag between
+jobs cannot change the tree built. A failed or skipped guard prevents
+finalization; failure reporting first refuses to check out or run repository
+code unless the guard succeeded.
+The reusable `release-finalize.yml` call inherits the caller's main ref.
+Tag pushes, release events and `workflow_run` do not start publication.
+
 ## Receive, verify and replay
 
 `handle-upstream.yml` still accepts `engine-release`, `codegen-release` and
@@ -21,23 +67,31 @@ three fixed producer repositories, excludes drafts/prereleases/non-product tags
 and versions older than hub VERSION. It checks whether the desired stable
 version already has a hub Git tag before downloading any artifacts. Only a
 version without that tag has its artifacts verified and the **same producer
-events** sent back to the existing handler. A hub tag hands completion to
-publish/finalize, even while the release is a draft awaiting prerequisites.
+events** sent back to the existing handler. The handler pushes the hub tag;
+after the tag exists on main and `handle-upstream` is green, a user with write
+access dispatches `publish.yml` on `main` with that tag using the command below.
+Finalization then continues even while the release is a draft awaiting prerequisites.
 Older missed versions are superseded by the newest desired stable version;
 they are never replayed as downgrades after it. Duplicate notifications reuse
 the handler's existing decision. A stored candidate makes an unchanged-version
 decision a no-op even while the fixed image tag is absent. Nothing calls a
 producer's version-bump job.
 
-Recovery of an existing hub tag explicitly dispatches `publish.yml` **on that
-tag**. It never force-pushes or rewrites it. Manual replay is also available
-through Actions: select `publish`, select the existing tag as its ref, run.
+Recovery of an existing hub tag emits an operator notice and never force-pushes
+or rewrites the tag. Publication and replay use the same operator command,
+run by a user with write access after the tag exists on main and
+`handle-upstream` is green:
+`gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=<vX.Y.Z or vX.Y.Z-rc.N>`.
+Use the actual existing tag as `tag`. Pushing a tag alone publishes nothing.
+Both a new tag push and retag recovery leave publication to the operator;
+an unchanged version with an image or verified candidate keeps its existing no-op.
 Tags predating this workflow need a reviewed migration; the hub does not invent
 new manifests for historical images without candidate verification.
 
 ## Candidate and readiness
 
-`publish.yml` first reuses `release-candidate.json` if already stored. Otherwise
+`publish.yml` validates the release tag before preparation can reuse
+`release-candidate.json` if already stored. Otherwise
 it preserves the existing harness, ABI, license and Debian source-mirror gates,
 builds only a unique `candidate-<commit>-<run>-<attempt>` image tag, and verifies
 the pushed child digests on amd64 and arm64. Each child must pass an actual
@@ -774,7 +828,7 @@ untouched: pending `pf-ci-release`, including publication workflows.
 | Name / setting | Scope | Purpose |
 |---|---|---|
 | `PINEFORGE_APP_ID`, `PINEFORGE_APP_PRIVATE_KEY` (existing) | Hub `release-automation` environment | Short-lived, one-target installation tokens; no PAT fallback. |
-| App installation permissions | Hub: Contents write + Actions write; enabled consumers: Contents read/write, Actions read, Pull requests read | Hub tag/dispatch and explicit publish replay; consumer dispatch and completion evidence reads. Each mint asks only for the permissions needed by that job. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
+| App installation permissions | Hub: Contents write; enabled consumers: Contents read/write, Actions read, Pull requests read | Hub tag pushes and producer-event reconciliation; consumer dispatch and completion evidence reads. Publication and replay use the write-access operator's login. Each mint asks only for the permissions needed by that job. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
 | `RELEASE_HOSTED_MCP_REPOSITORY`, `RELEASE_APPLICATION_REPOSITORY`, `FACTS_WEB_REPOSITORY` (existing) | Hub `release-automation` environment secrets | Private short repository names for neutral hosted/application/web targets. Public offline/data/license names are fixed in workflows. |
 | `RELEASE_RECEIPT_POLICY` (new secret) | Hub repository Actions secret (read by the receipt verify job, which runs in the `release-automation` environment; do not also create it in the environment, it would shadow this one) | JSON map of each enabled role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories, plus optional application-only `post_merge`. Keep private workflow/job details out of public source. |
 | `RELEASE_READY_CONSUMERS` (new variable) | Hub repository | Explicit comma-separated upgraded product receiver roles. Empty sends nothing; disabled roles do not block aggregate completion or become overdue. Facts flags independently select web/license receipt polling and freshness. |

@@ -224,6 +224,698 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(finalizer["jobs"]["notify-consumers"]["strategy"]["fail-fast"], "false")
 
 
+class ReleaseTriggerWorkflowTest(unittest.TestCase):
+    """Pins and negative controls read/mutate the actual checked-in workflows."""
+
+    VALIDATE_RUN = textwrap.dedent(r"""
+        set -euo pipefail
+        if [ "$WORKFLOW_ON_MAIN" != true ]; then
+          echo '::error::dispatch publish.yml on refs/heads/main'; exit 1
+        fi
+        if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+          echo '::error::expected an existing vX.Y.Z or vX.Y.Z-rc.N tag'; exit 1
+        fi
+        git fetch --tags origin '+refs/heads/main:refs/remotes/origin/main'
+        if ! TAG_COMMIT="$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}")"; then
+          echo "::error::release tag ${TAG} does not exist or does not peel to a commit"; exit 1
+        fi
+        if ! [[ "$TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+          echo '::error::release tag did not resolve to a 40-character commit SHA'; exit 1
+        fi
+        if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then
+          echo "::error::release tag ${TAG} is not reachable from main"; exit 1
+        fi
+        printf 'sha=%s\n' "$TAG_COMMIT" >> "$GITHUB_OUTPUT"
+        printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+    """).lstrip("\n")
+    REFUSAL_STEP = {
+        "name": "Refuse unverified release tag",
+        "if": "${{ needs.tag-guard.result != 'success' }}",
+        "shell": "bash",
+        "run": (
+            "echo '::error::tag-guard did not pass; refusing checkout and publication failure reporting'\n"
+            "exit 1\n"
+        ),
+    }
+    FAILURE_IF = (
+        "${{ always() && !cancelled() && (needs.tag-guard.result != 'success' || "
+        "contains(needs.*.result, 'failure')) }}"
+    )
+    FINALIZE_IF = (
+        "${{ !cancelled() && needs.tag-guard.result == 'success' && "
+        "needs.prepare.result == 'success' && "
+        "(needs.publish.result == 'success' || needs.publish.result == 'skipped') }}"
+    )
+    OPERATOR_COMMAND = "gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag="
+    INPUT = (
+        '    inputs:\n'
+        '      tag:\n'
+        '        description: The existing v* tag to build\n'
+        '        required: true\n'
+        '        type: string\n'
+    )
+
+    def parse(self, text):
+        import yaml
+        return yaml.load(text, Loader=yaml.BaseLoader)
+
+    def mutate(self, text, before, after, count=1):
+        self.assertEqual(text.count(before), count, "mutation anchor must match the real workflow exactly")
+        mutant = text.replace(before, after)
+        self.assertNotEqual(mutant, text, "mutation must change the real workflow")
+        return mutant
+
+    def assert_publish(self, text):
+        wf = self.parse(text)
+        self.assertEqual(wf.get("on"), {"workflow_dispatch": {"inputs": {"tag": {
+            "description": "The existing v* tag to build", "required": "true", "type": "string",
+        }}}})
+        self.assertEqual(re.findall(r"\bgithub\.ref(?:_name)?\b|\bGITHUB_REF_NAME\b", text),
+                         ["github.ref", "github.ref"])
+        self.assertEqual(text.count("github.ref == 'refs/heads/main'"), 2)
+        self.assertNotIn("github.sha", text, "release provenance must use the verified commit")
+        self.assertEqual(wf.get("concurrency", {}).get("group"), "release-candidate-${{ inputs.tag }}")
+        jobs = wf.get("jobs", {})
+        for identity in ("tag-guard", "prepare", "publish", "notify-consumers", "failure-report"):
+            self.assertIn(identity, jobs)
+        self.assertEqual(next(iter(jobs)), "tag-guard")
+        guard = jobs["tag-guard"]
+        self.assertEqual(set(guard), {"runs-on", "permissions", "outputs", "steps"})
+        self.assertEqual(guard.get("runs-on"), ["self-hosted", "pf-ci", "pf-ci-release"])
+        self.assertEqual(guard.get("permissions"), {"contents": "read"})
+        self.assertEqual(guard.get("outputs"), {
+            "sha": "${{ steps.tag.outputs.sha }}", "tag": "${{ steps.tag.outputs.tag }}",
+        })
+        self.assertNotIn("secrets.", str(guard))
+        self.assertNotIn("github.token", str(guard))
+        guard_steps = guard.get("steps") or []
+        self.assertEqual(len(guard_steps), 2, "only main checkout precedes tag verification")
+        checkout = guard_steps[0]
+        self.assertLessEqual(set(checkout), {"name", "uses", "with"})
+        self.assertTrue(checkout.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout.get("with"), {
+            "ref": "main", "fetch-depth": "0", "persist-credentials": "false",
+        })
+        self.assertEqual(guard_steps[1], {
+            "name": "Validate release tag", "id": "tag", "shell": "bash",
+            "env": {"TAG": "${{ inputs.tag }}",
+                    "WORKFLOW_ON_MAIN": "${{ github.ref == 'refs/heads/main' }}"},
+            "run": self.VALIDATE_RUN,
+        }, "validate before any tagged checkout, secret, or repository code")
+        for identity, job in jobs.items():
+            if identity != "notify-consumers":
+                self.assertEqual(job.get("runs-on"), ["self-hosted", "pf-ci", "pf-ci-release"], identity)
+            if identity != "tag-guard":
+                needs = job.get("needs") or []
+                self.assertIn("tag-guard", [needs] if isinstance(needs, str) else needs, identity)
+        prepare = jobs["prepare"]
+        self.assertEqual(prepare.get("needs"), "tag-guard")
+        self.assertEqual(prepare.get("if"), "github.ref == 'refs/heads/main'")
+        self.assertEqual((prepare.get("outputs") or {}).get("tag"), "${{ needs.tag-guard.outputs.tag }}")
+        steps = prepare.get("steps", [])
+        self.assertEqual(jobs["publish"].get("needs"), ["tag-guard", "prepare"])
+        self.assertEqual(jobs["publish"].get("if"), "needs.prepare.outputs.exists == 'false'")
+        self.assertEqual((jobs["publish"].get("env") or {}).get("RELEASE_TAG"), "${{ needs.prepare.outputs.tag }}")
+        for identity in ("prepare", "publish"):
+            checkouts = [row for row in jobs[identity].get("steps", [])
+                         if row.get("uses", "").startswith("actions/checkout@")]
+            self.assertEqual(len(checkouts), 1)
+            self.assertEqual((checkouts[0].get("with") or {}).get("ref"),
+                             "${{ needs.tag-guard.outputs.sha }}")
+            self.assertEqual((checkouts[0].get("with") or {}).get("persist-credentials"), "false")
+            if identity == "publish":
+                self.assertEqual((checkouts[0].get("with") or {}).get("fetch-depth"), "0")
+        candidate = next((row for row in steps if row.get("id") == "candidate"), {})
+        self.assertEqual((candidate.get("env") or {}).get("TAG"), "${{ needs.tag-guard.outputs.tag }}")
+        named = {row.get("name"): row for row in jobs["publish"].get("steps", [])}
+        for name, variable in (("Assert tag matches VERSION", "TAG"), ("Read pins (from the annotated tag message; fallback = the pair version, or resolve latest on 0.x)", "REF"),
+                               ("Pairing rule + release channel", "REF"), ("Bind producer source and package bytes", "TAG"),
+                               ("Read hpo wheel digest", "REF"), ("GitHub Release", "TAG")):
+            self.assertEqual(named.get(name, {}).get("env", {}).get(variable), "${{ env.RELEASE_TAG }}", name)
+        labels = named.get("Image metadata", {}).get("with", {}).get("labels", "")
+        self.assertIn("org.opencontainers.image.version=${{ env.RELEASE_TAG }}\n", labels)
+        self.assertIn("org.opencontainers.image.revision=${{ needs.tag-guard.outputs.sha }}\n", labels)
+        self.assertEqual(named.get("Image metadata", {}).get("with", {}).get("tags"),
+                         "type=raw,value=candidate-${{ needs.tag-guard.outputs.sha }}-"
+                         "${{ github.run_id }}-${{ github.run_attempt }}\n")
+        binding = named.get("Bind producer source and package bytes", {})
+        self.assertEqual((binding.get("env") or {}).get("HUB_COMMIT"), "${{ needs.tag-guard.outputs.sha }}")
+        for name in ("Inspect release amd64", "Inspect release arm64", "Inspect hpo amd64", "Inspect hpo arm64",
+                     "Build + push (multi-arch)", "Build + push hpo (multi-arch)"):
+            self.assertIn("RELEASE_VERSION=${{ env.RELEASE_TAG }}\n",
+                          named.get(name, {}).get("with", {}).get("build-args", ""), name)
+            self.assertIn("RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}\n",
+                          named.get(name, {}).get("with", {}).get("build-args", ""), name)
+        self.assertEqual(jobs["notify-consumers"].get("needs"), ["tag-guard", "prepare", "publish"])
+        self.assertEqual(jobs["notify-consumers"].get("if"), self.FINALIZE_IF)
+        self.assertEqual(jobs["notify-consumers"].get("with", {}).get("tag"), "${{ needs.prepare.outputs.tag }}")
+        failure = jobs["failure-report"]
+        self.assertEqual(failure.get("needs"), ["tag-guard", "prepare", "publish", "notify-consumers"])
+        self.assertEqual(failure.get("if"), self.FAILURE_IF)
+        failure_steps = failure.get("steps") or []
+        self.assertEqual(len(failure_steps), 3)
+        self.assertEqual(failure_steps[0], self.REFUSAL_STEP)
+        self.assertTrue(failure_steps[1].get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(failure_steps[1].get("with"), {
+            "ref": "main", "persist-credentials": "false",
+        })
+        for row in failure_steps[1:]:
+            self.assertEqual(row.get("if"), "needs.tag-guard.result == 'success'")
+        # Only the concurrency key and the validation step's env read raw input.
+        self.assertEqual(text.count("${{ inputs.tag }}"), 2)
+        for job in jobs.values():
+            for row in job.get("steps", []):
+                self.assertNotIn("${{", row.get("run", ""), "shell reads values from env, never expression interpolation")
+                self.assertNotIn("inputs.tag", str(row.get("with", {})))
+
+    def guard_check_mutations(self, text):
+        # Remove complete conditionals so the reachability mutant stays valid
+        # bash and can actually admit a side-branch tag during the git replay.
+        starts = (
+            ("main", '          if [ "$WORKFLOW_ON_MAIN" != true ]; then\n'),
+            ("pattern", r'          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then' + "\n"),
+            ("existence", '          if ! TAG_COMMIT="$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}")"; then\n'),
+            ("sha-shape", '          if ! [[ "$TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then\n'),
+            ("reachability", '          if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then\n'),
+        )
+        for label, start in starts:
+            self.assertEqual(text.count(start), 1, label)
+            at = text.index(start)
+            end = text.index("          fi\n", at) + len("          fi\n")
+            yield label, self.mutate(text, text[at:end], "")
+
+    def assert_no_publish_dispatch(self, text):
+        # The operator command is inert notice data. Exempt only a complete
+        # quoted assignment, with no command substitution or trailing code.
+        code = re.sub(
+            r'(?m)^[ \t]*line="(?![^\n]*\$\()[^"`\\\n]*' + re.escape(self.OPERATOR_COMMAND)
+            + r'(?:\$\{TAG\}|v\$\{RELEASE\}|v\$\{next\})"$', "", text,
+        )
+        code = re.sub(r"\\\n[ \t]*", " ", code)
+        # No workflow here dispatches any workflow, so the pin does not depend on
+        # how the target is named (file, display name, numeric id, variable).
+        # Plain repository_dispatch (`repos/<r>/dispatches`) stays allowed.
+        for pattern in (r"\bworkflow\s+run\b", r"\bcreateWorkflowDispatch\b",
+                        r"\bactions/workflows/[^\s/]+/dispatches\b"):
+            self.assertNotRegex(code, pattern, "no workflow may dispatch any workflow")
+
+    def assert_handler(self, text):
+        self.assert_no_publish_dispatch(text)
+        wf = self.parse(text)
+        steps = wf.get("jobs", {}).get("bump", {}).get("steps", [])
+        app = next((row for row in steps if row.get("id") == "app"), {})
+        self.assertEqual(app.get("with", {}).get("permission-contents"), "write")
+        self.assertNotIn("permission-actions", app.get("with", {}))
+        self.assertNotRegex(_step(text, "Mint org App token"), r"(?m)^\s*permission-actions\s*:")
+        replay = next((row for row in steps if row.get("name", "").startswith("Re-publish")), {})
+        bump = next((row for row in steps if row.get("name", "").startswith("Bump VERSION")), {})
+        self.assertEqual(replay.get("if"), "steps.decide.outputs.mode == 'republish'")
+        self.assertEqual(replay.get("env", {}).get("TAG"), "v${{ steps.decide.outputs.cur_ver }}")
+        for step in (replay, bump):
+            self.assertNotIn("GH_TOKEN", step.get("env", {}))
+        self.assertEqual(bump.get("name"), "Bump VERSION, commit, tag")
+        self.assertEqual(bump.get("if"), "steps.decide.outputs.mode == 'bump'")
+        summary = 'printf \'%s\\n\' "$line" >> "$GITHUB_STEP_SUMMARY"'
+        replay_run = replay.get("run", "")
+        self.assertIn(self.OPERATOR_COMMAND + '${TAG}"', replay_run)
+        self.assertIn('echo "::warning title=pineforge publish needed::${line}"', replay_run)
+        self.assertIn(summary, replay_run)
+        self.assertEqual(replay_run.splitlines()[-1], "exit 0")
+        run = bump.get("run", "")
+        commands = [line.strip() for line in run.splitlines()]
+        for variable in ("RELEASE", "next"):
+            # Both paths print the operator command only after the tag push succeeds.
+            push = 'git push origin "v${' + variable + '}"'
+            self.assertIn(push, commands)
+            at = commands.index(push)
+            self.assertLess(at + 3, len(commands))
+            self.assertTrue(commands[at + 1].startswith('line="pushed v${' + variable + '}'))
+            self.assertIn(self.OPERATOR_COMMAND + 'v${' + variable + '}"', commands[at + 1])
+            self.assertEqual(commands[at + 2], 'echo "::notice title=pineforge publish needed::${line}"')
+            self.assertEqual(commands[at + 3], summary)
+            if variable == "RELEASE":
+                self.assertLess(at + 4, len(commands))
+                self.assertEqual(commands[at + 4], "exit 0")
+
+    def assert_release_triggers(self, text):
+        wf = self.parse(text)
+        declared = wf.get("on")
+        self.assertIsInstance(declared, (dict, list, str))
+        events = {declared} if isinstance(declared, str) else set(declared)
+        self.assertTrue(events)
+        self.assertLessEqual(events, {"workflow_dispatch", "schedule", "repository_dispatch", "workflow_call",
+                                      "push", "pull_request_target"}, "pf-ci-release needs a main-ref event")
+        if "push" in events:
+            self.assertIsInstance(declared, dict, "push requires an explicit main branch filter")
+            push = declared.get("push")
+            self.assertIsInstance(push, dict)
+            self.assertEqual(push.get("branches"), ["main"])
+            self.assertLessEqual(set(push), {"branches", "paths", "paths-ignore"}, "no tag or branch-ignore filters")
+
+    def test_publish_uses_operator_dispatch_and_handler_prints_the_next_command(self):
+        self.assert_publish((WORKFLOWS / "publish.yml").read_text())
+        self.assert_handler((WORKFLOWS / "handle-upstream.yml").read_text())
+
+    def test_no_workflow_dispatches_publish(self):
+        found = []
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix in {".yml", ".yaml"}:
+                found.append(path.name)
+                with self.subTest(workflow=path.name):
+                    self.assert_no_publish_dispatch(path.read_text())
+        self.assertIn("handle-upstream.yml", found)
+        self.assertIn("publish.yml", found)
+
+    def test_no_dispatch_pin_refuses_cli_javascript_and_api_steps_on_real_text(self):
+        text = (WORKFLOWS / "handle-upstream.yml").read_text()
+        self.assert_no_publish_dispatch(text)
+        anchor = "      - name: Report failed upstream handling\n"
+        steps = (
+            "        run: " + self.OPERATOR_COMMAND + "v1.6.2\n",
+            "        run: gh workflow run --ref main 'publish.yml' -f tag=v1.6.2\n",
+            '        env:\n          WORKFLOW: publish.yml\n        run: gh workflow run "$WORKFLOW" --ref main -f tag=v1.6.2\n',
+            "        run: |\n          gh workflow run \\\n            publish.yml --ref main -f tag=v1.6.2\n",
+            "        uses: actions/github-script@fixture\n        with:\n          script: |\n"
+            "            await github.rest.actions.createWorkflowDispatch({\n"
+            "              workflow_id: 'publish.yml', ref: 'main', inputs: {tag: 'v1.6.2'}\n"
+            "            });\n",
+            "        run: gh api --method POST repos/pineforge-4pass/pineforge-release/actions/workflows/publish.yml/dispatches -f ref=main\n",
+            "        env:\n          WORKFLOW: publish.yml\n        run: |\n"
+            '          curl --request POST "https://api.github.com/repos/pineforge-4pass/pineforge-release/actions/workflows/${WORKFLOW}/dispatches"\n',
+            '        run: |\n          line="$(' + self.OPERATOR_COMMAND + 'v1.6.2)"\n',
+            '        run: gh workflow run "Publish release candidate" --ref main -f tag=v1.6.2\n',
+            "        run: gh api -X POST repos/pineforge-4pass/pineforge-release/actions/workflows/123456789/dispatches -f ref=main\n",
+            "        uses: actions/github-script@fixture\n        with:\n          script: |\n"
+            "            await github.request(\n"
+            "              'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',\n"
+            "              {owner, repo, workflow_id: 123456789, ref: 'main'}\n"
+            "            );\n",
+        )
+        for step in steps:
+            mutant = self.mutate(text, anchor, "      - name: Forbidden publish dispatch\n" + step + anchor)
+            with self.subTest(step=step), self.assertRaises(AssertionError):
+                self.assert_no_publish_dispatch(mutant)
+
+    def test_every_workflow_using_the_release_label_has_only_main_ref_trigger_types(self):
+        found = []
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix in {".yml", ".yaml"}:
+                text = path.read_text()
+                if "pf-ci-release" in text:
+                    found.append(path.name)
+                    with self.subTest(workflow=path.name):
+                        self.assert_release_triggers(text)
+        self.assertIn("publish.yml", found, "the generic scan must inspect the real release workflows")
+
+    def test_publish_refuses_bad_triggers_and_each_broken_input_boundary_on_real_text(self):
+        text = (WORKFLOWS / "publish.yml").read_text()
+        self.assert_publish(text)
+        mutations = [
+            ("on:\n", 'on:\n  push:\n    tags: ["v*"]\n', 1),
+            ("on:\n", 'on:\n  release:\n    types: [published]\n', 1),
+            ("on:\n", 'on:\n  workflow_run:\n    workflows: [publish]\n    types: [completed]\n', 1),
+            (self.INPUT, "", 1),
+            (self.INPUT, self.INPUT + '      extra:\n        type: string\n', 1),
+            ("description: The existing v* tag to build", "description: Any ref to build", 1),
+            ("        required: true\n", "        required: false\n", 1),
+            ("        type: string\n", "        type: boolean\n", 1),
+            ("release-candidate-${{ inputs.tag }}", "release-candidate-${{ github.ref_name }}", 1),
+            ("    if: github.ref == 'refs/heads/main'\n", "", 1),
+            ("    if: github.ref == 'refs/heads/main'", "    if: startsWith(github.ref, 'refs/tags/v')", 1),
+            ("  tag-guard:\n", "  tag-guard:\n    if: github.ref == 'refs/heads/main'\n", 1),
+            ("  tag-guard:\n", "  tag-guard:\n    needs: prepare\n", 1),
+            ("  tag-guard:\n", "  tag-guard:\n    environment: release-automation\n", 1),
+            ("  tag-guard:\n", "  tag-guard:\n    env:\n      GH_TOKEN: ${{ github.token }}\n", 1),
+            ("    permissions:\n      contents: read\n    outputs:",
+             "    permissions:\n      contents: write\n    outputs:", 1),
+            ("            echo '::error::expected an existing vX.Y.Z or vX.Y.Z-rc.N tag'; exit 1",
+             "            echo '::error::expected an existing vX.Y.Z or vX.Y.Z-rc.N tag'; exit 0", 1),
+            ("          TAG: ${{ inputs.tag }}\n", "", 1),
+            ("          WORKFLOW_ON_MAIN: ${{ github.ref == 'refs/heads/main' }}\n", "", 1),
+            ("          WORKFLOW_ON_MAIN: ${{ github.ref == 'refs/heads/main' }}",
+             "          WORKFLOW_ON_MAIN: ${{ github.ref == 'refs/heads/topic' }}", 1),
+            ("      - name: Validate release tag", "      - run: echo skipped validation\n      - name: Validate release tag", 1),
+            ('          printf \'tag=%s\\n\' "$TAG"', '          printf \'tag=%s\\n\' "${{ inputs.tag }}"', 1),
+            ("      tag: ${{ steps.tag.outputs.tag }}\n", "", 1),
+            ("      sha: ${{ steps.tag.outputs.sha }}\n", "", 1),
+            ("      sha: ${{ steps.tag.outputs.sha }}", "      sha: ${{ steps.tag.outputs.tag }}", 1),
+            ("      tag: ${{ needs.tag-guard.outputs.tag }}\n", "", 1),
+            ("      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}\n", "", 1),
+            ("      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}", "      RELEASE_TAG: ${{ inputs.tag }}", 1),
+            ("          TAG: ${{ needs.tag-guard.outputs.tag }}", "          TAG: ${{ inputs.tag }}", 1),
+            ("      tag: ${{ needs.prepare.outputs.tag }}", "      tag: ${{ inputs.tag }}", 1),
+            ("    needs: tag-guard\n", "", 1),
+            ("    needs: [tag-guard, prepare]", "    needs: prepare", 1),
+            ("    if: needs.prepare.outputs.exists == 'false'", "    if: always()", 1),
+            ("    needs: [tag-guard, prepare, publish]", "    needs: [prepare, publish]", 1),
+            ("    needs: [tag-guard, prepare, publish, notify-consumers]",
+             "    needs: [prepare, publish, notify-consumers]", 1),
+            ("    if: " + self.FINALIZE_IF, "    if: ${{ always() }}", 1),
+            ("    if: " + self.FINALIZE_IF,
+             "    if: " + self.FINALIZE_IF.replace("needs.tag-guard.result == 'success' && ", ""), 1),
+            ("    if: " + self.FAILURE_IF, "    if: ${{ failure() && !cancelled() }}", 1),
+            ("      - name: Refuse unverified release tag\n",
+             "      - run: python3 scripts/release_pipeline.py alert --stage publish\n"
+             "      - name: Refuse unverified release tag\n", 1),
+            ("        if: ${{ needs.tag-guard.result != 'success' }}\n", "", 1),
+            ("        if: ${{ needs.tag-guard.result != 'success' }}",
+             "        if: ${{ needs.tag-guard.result == 'failure' }}", 1),
+            ("          exit 1\n      - uses: actions/checkout@", "          exit 0\n      - uses: actions/checkout@", 1),
+            ("          HUB_COMMIT: ${{ needs.tag-guard.outputs.sha }}",
+             "          HUB_COMMIT: ${{ github.sha }}", 1),
+            ("type=raw,value=candidate-${{ needs.tag-guard.outputs.sha }}",
+             "type=raw,value=candidate-${{ github.sha }}", 1),
+            ("org.opencontainers.image.revision=${{ needs.tag-guard.outputs.sha }}",
+             "org.opencontainers.image.revision=${{ github.sha }}", 1),
+            ("org.opencontainers.image.version=${{ env.RELEASE_TAG }}", "org.opencontainers.image.version=${{ github.ref }}", 1),
+            ("org.opencontainers.image.version=${{ env.RELEASE_TAG }}", "org.opencontainers.image.version=${{ env.GITHUB_REF_NAME }}", 1),
+        ]
+        for label, mutant in self.guard_check_mutations(text):
+            with self.subTest(check=label), self.assertRaises(AssertionError):
+                self.assert_publish(mutant)
+        # These anchors repeat: mutate each occurrence independently rather
+        # than letting the first checkout/build pin hide a later missing pin.
+        for before, after, count in (
+            ("          TAG: ${{ env.RELEASE_TAG }}", "          TAG: v0.0.0", 3),
+            ("          REF: ${{ env.RELEASE_TAG }}", "          REF: v0.0.0", 3),
+            ("RELEASE_VERSION=${{ env.RELEASE_TAG }}", "RELEASE_VERSION=v0.0.0", 6),
+            ("RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}", "RELEASE_GIT_SHA=${{ github.sha }}", 6),
+            ("          ref: ${{ needs.tag-guard.outputs.sha }}\n", "", 2),
+            ("          ref: ${{ needs.tag-guard.outputs.sha }}",
+             "          ref: refs/tags/${{ inputs.tag }}", 2),
+            ("          persist-credentials: false\n", "          persist-credentials: true\n", 4),
+            ("          fetch-depth: 0\n", "          fetch-depth: 1\n", 2),
+            ("          ref: main\n", "          ref: ${{ inputs.tag }}\n", 2),
+            ("        shell: bash\n", "", 2),
+            ("        if: needs.tag-guard.result == 'success'\n", "", 2),
+            ('    runs-on: ["self-hosted","pf-ci","pf-ci-release"]\n', "    runs-on: ubuntu-latest\n", 4),
+        ):
+            self.assertEqual(text.count(before), count, "each real tag consumer must be mutated")
+            for index in range(count):
+                # Mutate each consumer separately so the first pin cannot hide a missing later one.
+                at = [match.start() for match in re.finditer(re.escape(before), text)][index]
+                mutant = text[:at] + text[at:].replace(before, after, 1)
+                self.assertNotEqual(mutant, text)
+                with self.subTest(consumer=before, occurrence=index), self.assertRaises(AssertionError):
+                    self.assert_publish(mutant)
+        for before, after, count in mutations:
+            mutant = self.mutate(text, before, after, count)
+            with self.subTest(anchor=before), self.assertRaises(AssertionError):
+                self.assert_publish(mutant)
+        guard_start = text.index("  tag-guard:\n")
+        guard_end = text.index("  prepare:\n", guard_start)
+        guard_block = text[guard_start:guard_end]
+        late_guard = self.mutate(text, guard_block, "") + "\n" + guard_block
+        with self.assertRaises(AssertionError):
+            self.assert_publish(late_guard)
+
+    def test_handler_pin_refuses_dispatch_permissions_tokens_or_broken_operator_notices(self):
+        text = (WORKFLOWS / "handle-upstream.yml").read_text()
+        self.assert_handler(text)
+        for tag in ('${TAG}', 'v${RELEASE}', 'v${next}'):
+            command = self.OPERATOR_COMMAND + tag
+            for replacement in (command.replace("--ref main", '--ref topic'),
+                                command.removesuffix(" -f tag=" + tag), ""):
+                mutant = self.mutate(text, command, replacement)
+                with self.subTest(command=command, replacement=replacement), self.assertRaises(AssertionError):
+                    self.assert_handler(mutant)
+        for before, after in (
+            ("          permission-contents: write\n",
+             "          permission-contents: write\n          permission-actions: write\n"),
+            ('        env:\n          TAG: v${{ steps.decide.outputs.cur_ver }}',
+             '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          TAG: v${{ steps.decide.outputs.cur_ver }}'),
+            ('        env:\n          E:', '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          E:'),
+            ("        if: steps.decide.outputs.mode == 'republish'", "        if: always()"),
+            ("        if: steps.decide.outputs.mode == 'bump'", "        if: always()"),
+            ("          TAG: v${{ steps.decide.outputs.cur_ver }}", "          TAG: v0.0.0"),
+            ("      - name: Bump VERSION, commit, tag\n", "      - name: Bump VERSION, commit, tag (fires publish.yml)\n"),
+            ('echo "::warning title=pineforge publish needed::${line}"', 'echo "$line"'),
+        ):
+            mutant = self.mutate(text, before, after)
+            with self.subTest(anchor=before), self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
+        for name, annotation, notices in (("Re-publish", "warning", 1), ("Bump VERSION", "notice", 2)):
+            body = _step(text, name)
+            for command, count in (
+                ('printf \'%s\\n\' "$line" >> "$GITHUB_STEP_SUMMARY"', notices),
+                ('echo "::' + annotation + ' title=pineforge publish needed::${line}"', notices),
+                ("exit 0", 1),
+            ):
+                matches = list(re.finditer(re.escape(command), body))
+                self.assertEqual(len(matches), count, "each notice mutation must have its real anchor")
+                for match in matches:
+                    changed = body[:match.start()] + body[match.end():]
+                    mutant = self.mutate(text, body, changed)
+                    with self.subTest(step=name, command=command, occurrence=match.start()), self.assertRaises(AssertionError):
+                        self.assert_handler(mutant)
+
+    def test_generic_trigger_pin_refuses_forbidden_events_and_tag_pushes_in_every_real_workflow(self):
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix not in {".yml", ".yaml"}:
+                continue
+            text = path.read_text()
+            if "pf-ci-release" not in text:
+                continue
+            self.assert_release_triggers(text)
+            for event in ('  release:\n    types: [published]\n',
+                          '  workflow_run:\n    workflows: [publish]\n    types: [completed]\n',
+                          '  pull_request:\n', '  unknown_event:\n'):
+                mutant = self.mutate(text, "on:\n", "on:\n" + event)
+                with self.subTest(workflow=path.name, event=event), self.assertRaises(AssertionError):
+                    self.assert_release_triggers(mutant)
+            if "push" in self.parse(text)["on"]:
+                anchor = "    branches: [main]\n"
+                replacements = ('    tags: ["v*"]\n', "", '    branches: [main, other]\n',
+                                '    branches: [main]\n    tags: ["v*"]\n')
+            else:
+                anchor = "on:\n"
+                replacements = ('on:\n  push:\n    tags: ["v*"]\n', 'on:\n  push:\n',
+                                'on:\n  push:\n    branches: [other]\n')
+            for replacement in replacements:
+                mutant = self.mutate(text, anchor, replacement)
+                with self.subTest(workflow=path.name, push=replacement), self.assertRaises(AssertionError):
+                    self.assert_release_triggers(mutant)
+            on_block = re.search(r"(?ms)^on:\n.*?(?=^\S|\Z)", text)
+            self.assertIsNotNone(on_block)
+            for declaration in ("on: release\n\n", "on: [workflow_dispatch, release]\n\n",
+                                "on: push\n\n", "on: [workflow_dispatch, push]\n\n"):
+                mutant = self.mutate(text, on_block[0], declaration)
+                with self.subTest(workflow=path.name, declaration=declaration), self.assertRaises(AssertionError):
+                    self.assert_release_triggers(mutant)
+
+
+class ReleaseTagGuardGitTest(unittest.TestCase):
+    """CI executes the workflow's actual guard with real git, using file remotes."""
+
+    # Literal expectations, independent of the workflow's regex/commands.
+    # Commit selectors refer to fixture commits created before the guard runs.
+    # Optional trailing (branch, commit selector) fields add local clone refs.
+    CASES = (
+        ("v1.6.2", "true", 0, "first", ""),
+        ("v1.6.3", "true", 0, "second", ""),
+        ("not-a-release", "true", 1, None, "expected an existing vX.Y.Z or vX.Y.Z-rc.N tag"),
+        ("v9.9.9", "true", 1, None, "does not exist or does not peel to a commit"),
+        ("v1.6.4", "true", 1, None, "is not reachable from main"),
+        ("v1.6.3-rc.1", "true", 0, "second", ""),
+        ("v1.6.6", "true", 1, None, "does not exist or does not peel to a commit"),
+        ("v1.6.2\nextra", "true", 1, None, "expected an existing vX.Y.Z or vX.Y.Z-rc.N tag"),
+        ("v1.6.2", "false", 1, None, "dispatch publish.yml on refs/heads/main"),
+        ("v1.6.2", "", 1, None, "dispatch publish.yml on refs/heads/main"),
+        ("v1.6.7", "true", 1, None, "does not exist or does not peel to a commit", ("v1.6.7", "second")),
+        ("v1.6.2", "true", 0, "first", "", ("v1.6.2", "second")),
+    )
+
+    def setUp(self):
+        self.git_binary = shutil.which("git")
+        self.assertIsNotNone(self.git_binary, "CI runner cannot run git; tag-guard replay is required")
+        self.bash_binary = shutil.which("bash")
+        self.assertIsNotNone(self.bash_binary, "CI runner cannot run bash; tag-guard replay is required")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.env = {
+            "PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C",
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",
+        }
+        self.origin = self.root / "origin"
+        self.git(self.root, "init", "--initial-branch=main", "--object-format=sha1", str(self.origin))
+        self.git(self.origin, "config", "user.name", "Tag guard fixture")
+        self.git(self.origin, "config", "user.email", "tag-guard@example.invalid")
+        self.git(self.origin, "config", "commit.gpgsign", "false")
+        self.git(self.origin, "config", "tag.gpgsign", "false")
+        self.git(self.origin, "commit", "--allow-empty", "-m", "First main commit")
+        first = self.git(self.origin, "rev-parse", "HEAD")
+        self.git(self.origin, "commit", "--allow-empty", "-m", "Second main commit")
+        second = self.git(self.origin, "rev-parse", "HEAD")
+        self.commits = {"first": first, "second": second}
+        self.git(self.origin, "tag", "v1.6.2", first)
+        self.git(self.origin, "tag", "v1.6.3", second)
+        self.git(self.origin, "tag", "not-a-release", second)
+        self.git(self.origin, "tag", "-a", "v1.6.3-rc.1", second, "-m", "Annotated release")
+        self.tag_object = self.git(self.origin, "rev-parse", "refs/tags/v1.6.3-rc.1")
+        self.assertNotEqual(self.tag_object, second, "fixture must distinguish tag object from commit")
+        tree = self.git(self.origin, "rev-parse", "HEAD^{tree}")
+        self.git(self.origin, "tag", "v1.6.6", tree)
+        self.git(self.origin, "checkout", "-b", "side", first)
+        self.git(self.origin, "commit", "--allow-empty", "-m", "Unmerged side commit")
+        self.git(self.origin, "tag", "v1.6.4")
+        # Decoy tags named like main on the side commit: git resolves the short
+        # name origin/main in refs/tags/ before refs/remotes/, so a guard that
+        # names main loosely would accept the side-branch tag v1.6.4.
+        for decoy in ("origin/main", "main", "heads/main", "remotes/origin/main"):
+            self.git(self.origin, "tag", decoy)
+        self.assertEqual(self.git(self.origin, "tag", "--list", "v1.6.7"), "", "branch-only case must have no origin tag")
+        self.git(self.origin, "checkout", "main")
+        self.checkout_index = 0
+        self.text = (WORKFLOWS / "publish.yml").read_text(encoding="utf-8")
+
+    def git(self, cwd, *args):
+        done = subprocess.run(
+            [self.git_binary, *args], cwd=cwd, env=self.env,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(done.returncode, 0, (args, done.stdout, done.stderr))
+        return done.stdout.strip()
+
+    def checkout(self):
+        self.checkout_index += 1
+        work = self.root / f"work-{self.checkout_index}"
+        self.git(self.root, "clone", "--no-local", "--no-tags", "--single-branch",
+                 "--branch", "main", str(self.origin), str(work))
+        self.assertEqual(self.git(work, "rev-parse", "--is-shallow-repository"), "false")
+        self.assertEqual(self.git(work, "tag", "--list"), "", "the guard must fetch the real tags")
+        return work
+
+    def run_guard(self, text, work, tag, on_main="true"):
+        # Extract from the real YAML (or a mutation of that YAML). Do not use
+        # VALIDATE_RUN or assert_publish here: execution must kill the mutants.
+        wf = ReleaseTriggerWorkflowTest().parse(text)
+        guard = (wf.get("jobs") or {}).get("tag-guard") or {}
+        step = next((row for row in guard.get("steps", []) if row.get("id") == "tag"), {})
+        self.assertIsInstance(step.get("run"), str, "guard script must exist")
+        output = self.root / "guard-output"
+        output.write_text("", encoding="utf-8")
+        done = subprocess.run(
+            [self.bash_binary, "--noprofile", "--norc", "-c", step["run"]],
+            cwd=work, env={**self.env, "TAG": tag, "WORKFLOW_ON_MAIN": on_main,
+                           "GITHUB_OUTPUT": str(output)},
+            capture_output=True, text=True,
+        )
+        return done, output.read_text(encoding="utf-8").splitlines()
+
+    def assert_case(self, text, work, case):
+        tag, on_main, expected_code, commit, error, *local_branches = case
+        # Extra row fields create LOCAL refs in the work clone before the guard.
+        for name, target in local_branches:
+            self.git(work, "branch", name, self.commits[target])
+        done, output = self.run_guard(text, work, tag, on_main)
+        self.assertEqual(done.returncode, expected_code, (case, done.stdout, done.stderr))
+        if expected_code == 0:
+            self.assertEqual(output, ["sha=" + self.commits[commit], "tag=" + tag], case)
+            self.assertNotIn("::error::", done.stdout + done.stderr)
+            if tag == "v1.6.3-rc.1":
+                self.assertNotEqual(output[0], "sha=" + self.tag_object)
+        else:
+            self.assertEqual(output, [], "a refused tag must not emit an accepted SHA or tag")
+            self.assertIn("::error::", done.stdout, case)
+            self.assertIn(error, done.stdout, case)
+
+    def assert_table(self, text):
+        # No subTest here: the outer assertRaises must see the failed outcome
+        # of a mutant, rather than having a subTest consume the assertion.
+        work = self.checkout()
+        for case in self.CASES:
+            self.assert_case(text, work, case)
+
+    def test_actual_tag_guard_against_real_git_table(self):
+        work = self.checkout()
+        for case in self.CASES:
+            with self.subTest(tag=case[0], on_main=case[1], expected_code=case[2]):
+                self.assert_case(self.text, work, case)
+
+    def test_real_git_table_refuses_missing_pattern_existence_reachability_or_main_check(self):
+        self.assert_table(self.text)
+        pins = ReleaseTriggerWorkflowTest()
+        for label, mutant in pins.guard_check_mutations(self.text):
+            if label == "sha-shape":
+                continue  # Shape is pinned separately; real git always returns a commit SHA.
+            with self.subTest(removed_check=label), self.assertRaises(AssertionError):
+                self.assert_table(mutant)
+        unpeeled = pins.mutate(self.text, '"refs/tags/${TAG}^{commit}"', '"refs/tags/${TAG}"')
+        with self.subTest(check="annotated tag must output its commit"), self.assertRaises(AssertionError):
+            self.assert_table(unpeeled)
+        bare_tag = pins.mutate(self.text, '"refs/tags/${TAG}^{commit}"', '"${TAG}^{commit}"')
+        with self.subTest(check="local branch v1.6.7 is not a release tag"), self.assertRaisesRegex(AssertionError, r"v1\.6\.7"):
+            self.assert_table(bare_tag)
+        short_name = pins.mutate(
+            self.text, 'is-ancestor "$TAG_COMMIT" refs/remotes/origin/main', 'is-ancestor "$TAG_COMMIT" origin/main')
+        with self.subTest(check="a tag named origin/main must not stand in for main"), self.assertRaises(AssertionError):
+            self.assert_table(short_name)
+
+    def test_guard_fetches_updated_main_before_testing_reachability(self):
+        work = self.checkout()
+        self.git(self.origin, "commit", "--allow-empty", "-m", "Main advanced after checkout")
+        self.git(self.origin, "tag", "v2.0.0")
+        expected = self.git(self.origin, "rev-parse", "HEAD")
+        done, output = self.run_guard(self.text, work, "v2.0.0")
+        self.assertEqual(done.returncode, 0, (done.stdout, done.stderr))
+        self.assertEqual(output, ["sha=" + expected, "tag=v2.0.0"])
+        self.assertEqual(self.git(work, "rev-parse", "refs/remotes/origin/main"), expected)
+
+    def test_guard_fails_closed_when_fetch_cannot_read_origin(self):
+        work = self.checkout()
+        self.git(work, "remote", "set-url", "origin", str(self.root / "missing-origin"))
+        # An invalid name is refused before even attempting the broken fetch.
+        self.assert_case(self.text, work, self.CASES[2])
+        done, output = self.run_guard(self.text, work, "v1.6.2")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(output, [])
+
+
+class ReleaseTagGuardFailureReportTest(unittest.TestCase):
+    def assert_refusal(self, text):
+        wf = ReleaseTriggerWorkflowTest().parse(text)
+        job = (wf.get("jobs") or {}).get("failure-report") or {}
+        steps = job.get("steps") or []
+        self.assertTrue(steps, "failure reporting must start with a refusal")
+        step = steps[0]
+        condition = step.get("if", "").removeprefix("${{").removesuffix("}}").strip()
+        comparison = re.fullmatch(r"needs\.tag-guard\.result (==|!=) 'success'", condition)
+        self.assertIsNotNone(comparison)
+        self.assertIsInstance(step.get("run"), str)
+        operator = "=" if comparison[1] == "==" else "!="
+        script = f'if [ "$GUARD_RESULT" {operator} success ]; then\n{step["run"]}\nfi\n'
+        for status, expected_code in (
+            ("success", 0), ("failure", 1), ("skipped", 1),
+            ("cancelled", 1), ("", 1), ("unknown", 1),
+        ):
+            done = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-c", script],
+                env={"PATH": os.environ.get("PATH", os.defpath), "GUARD_RESULT": status},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(done.returncode, expected_code, (status, done.stdout, done.stderr))
+            if expected_code:
+                self.assertIn("::error::tag-guard did not pass", done.stdout)
+
+    def test_actual_first_refusal_rejects_failed_skipped_cancelled_or_missing_guard(self):
+        self.assert_refusal((WORKFLOWS / "publish.yml").read_text())
+
+    def test_executed_refusal_rejects_successful_exit_or_failure_only_condition(self):
+        text = (WORKFLOWS / "publish.yml").read_text()
+        self.assert_refusal(text)
+        pins = ReleaseTriggerWorkflowTest()
+        for before, after in (
+            ("          exit 1\n      - uses: actions/checkout@", "          exit 0\n      - uses: actions/checkout@"),
+            ("        if: ${{ needs.tag-guard.result != 'success' }}",
+             "        if: ${{ needs.tag-guard.result == 'failure' }}"),
+        ):
+            mutant = pins.mutate(text, before, after)
+            with self.subTest(anchor=before), self.assertRaises(AssertionError):
+                self.assert_refusal(mutant)
+
+
 class SourceMirrorWorkflowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -250,8 +942,8 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                          "${{ steps.pair.outputs.hpo_version_arg }}",
                          "${{ steps.binding.outputs.hpo_wheel_arg }}",
                          "${{ steps.binding.outputs.hpo_sdist_arg }}",
-                         "RELEASE_VERSION=${{ github.ref_name }}",
-                         "RELEASE_GIT_SHA=${{ github.sha }}"):
+                         "RELEASE_VERSION=${{ env.RELEASE_TAG }}",
+                         "RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}"):
             self.assertIn(existing, build["with"]["build-args"])
         self.assertLess(self.steps.index(reader), self.steps.index(build))
 
@@ -299,7 +991,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                 arguments = self.named[name]["with"]["build-args"].splitlines()
                 for expected in ("ENGINE_VERSION=${{ steps.pins.outputs.engine }}",
                                  "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
-                                 "RELEASE_VERSION=${{ github.ref_name }}"):
+                                 "RELEASE_VERSION=${{ env.RELEASE_TAG }}"):
                     self.assertIn(expected, arguments, name + " must receive " + expected)
 
     def test_guard_is_mandatory_before_every_push_and_release_including_prereleases(self):
@@ -314,7 +1006,8 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
             self.assertIn("set -euo pipefail", step["run"])
             self.assertNotIn("|| true", step["run"])
         self.assertNotIn("continue-on-error", self.job)
-        self.assertEqual(self.workflow["on"]["push"]["tags"], ["v*"])
+        self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})
+        self.assertEqual(self.workflow["on"]["workflow_dispatch"]["inputs"]["tag"]["required"], "true")
         pushes = [step for step in self.steps if step.get("with", {}).get("push") == "true"]
         self.assertEqual(len(pushes), 2, "test must find both actual publishing actions")
         releases = [step for step in self.steps if "scripts/release_pipeline.py candidate --file" in step.get("run", "")]
@@ -572,8 +1265,8 @@ class HpoWorkflowTest(unittest.TestCase):
         self.assertEqual(handler["on"]["repository_dispatch"]["types"],
                          ["engine-release", "codegen-release", "hpo-release"])
         publish = _workflow("publish.yml")
-        self.assertEqual(set(publish["on"]), {"push", "workflow_dispatch"})
-        self.assertIn("refs/tags/v", publish["jobs"]["prepare"]["if"])
+        self.assertEqual(set(publish["on"]), {"workflow_dispatch"})
+        self.assertEqual(publish["jobs"]["prepare"]["if"], "github.ref == 'refs/heads/main'")
 
     def test_hpo_payload_boundary_and_whole_value_allowlist(self):
         cutoff_note = f"hpo joins the pairing at {rp.HPO_PAIRING_FROM}"
@@ -956,7 +1649,7 @@ class AppScopeTest(unittest.TestCase):
             self.assertIn("github-api-url: https://api.github.com", text)
         handler = (WORKFLOWS / "handle-upstream.yml").read_text()
         self.assertIn("repositories: pineforge-release", handler)
-        self.assertIn("permission-actions: write", handler)
+        self.assertNotIn("permission-actions", _step(handler, "Mint org App token"))
         self.assertNotIn('git push origin "refs/tags/${TAG}" --force', handler)
         finalizer = (WORKFLOWS / "release-finalize.yml").read_text()
         self.assertIn("repositories: ${{ env.TARGET_REPOSITORY }}", finalizer)
@@ -1338,6 +2031,98 @@ class PythonTestGateTest(unittest.TestCase):
         self.assertNotIn("test_release_", fingerprint)
 
 
+class ReleaseRunnerWorkflowTest(unittest.TestCase):
+    RELEASE_JOBS = {
+        "facts-descriptions.yml": {"descriptions"},
+        "facts-fanout.yml": {"web", "license"},
+        "handle-upstream.yml": {"bump"},
+        "publish.yml": {"tag-guard", "prepare", "publish", "failure-report"},
+        "release-finalize.yml": {"finalize", "notify-consumers"},
+        "release-receipts.yml": {"plan", "verify"},
+        "release-reconcile.yml": {"producers"},
+        "release-rollback.yml": {"restore"},
+    }
+    RUNNER = ["self-hosted", "pf-ci", "pf-ci-release"]
+
+    def release_workflows(self):
+        return {name: _workflow(name) for name in self.RELEASE_JOBS}
+
+    def assert_release_runners(self, workflows):
+        for name, identities in self.RELEASE_JOBS.items():
+            workflow = workflows[name]
+            triggers = workflow["on"]
+            if isinstance(triggers, str):
+                triggers = [triggers]
+            for event in ("pull_request", "pull_request_target"):
+                self.assertNotIn(event, triggers, f"{name}: {event} cannot use pf-ci-release")
+            # The reusable caller has no runs-on; its callee's jobs are pinned above.
+            expected = identities | ({"notify-consumers"} if name == "publish.yml" else set())
+            self.assertEqual(set(workflow["jobs"]), expected, f"{name}: release job inventory")
+            for identity in sorted(identities):
+                self.assertEqual(workflow["jobs"][identity]["runs-on"], self.RUNNER,
+                                 f"{name}:{identity}: runs-on must be the isolated release array")
+
+    def test_release_jobs_pin_the_isolated_class_and_never_accept_pr_events(self):
+        self.assert_release_runners(self.release_workflows())
+
+    def test_runner_pin_refuses_hosted_labels_other_pools_and_fallbacks_on_every_job(self):
+        original = self.release_workflows()
+        old_expression = """${{ github.event_name != 'pull_request_target' &&
+            github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+            contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+            (github.event_name != 'pull_request' ||
+             (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+            fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}"""
+        invalid_runners = (
+            "ubuntu-latest",
+            "ubuntu-24.04",
+            ["self-hosted", "pf-ci", "pf-ci-x64"],
+            ["self-hosted", "pf-ci", "pf-ci-release", "ubuntu-24.04"],
+            """${{ fromJSON('["self-hosted","pf-ci","pf-ci-release"]') || 'ubuntu-24.04' }}""",
+            old_expression,
+        )
+        for name, identities in self.RELEASE_JOBS.items():
+            for identity in sorted(identities):
+                for runner in invalid_runners:
+                    with self.subTest(workflow=name, job=identity, runner=runner):
+                        mutant = copy.deepcopy(original)
+                        mutant[name]["jobs"][identity]["runs-on"] = runner
+                        with self.assertRaisesRegex(AssertionError, "runs-on"):
+                            self.assert_release_runners(mutant)
+
+    def test_runner_pin_refuses_pr_triggers_in_mapping_sequence_and_scalar_forms(self):
+        original = self.release_workflows()
+        for name in self.RELEASE_JOBS:
+            for event in ("pull_request", "pull_request_target"):
+                declarations = (
+                    {**original[name]["on"], event: {}},
+                    [*original[name]["on"], event],
+                    event,
+                )
+                for triggers in declarations:
+                    with self.subTest(workflow=name, event=event, triggers=triggers):
+                        mutant = copy.deepcopy(original)
+                        mutant[name]["on"] = triggers
+                        with self.assertRaisesRegex(AssertionError, event):
+                            self.assert_release_runners(mutant)
+
+    def test_runner_inventory_pin_refuses_missing_and_unlisted_jobs(self):
+        original = self.release_workflows()
+        for name, workflow in original.items():
+            for identity in workflow["jobs"]:
+                with self.subTest(workflow=name, missing=identity):
+                    mutant = copy.deepcopy(original)
+                    mutant[name]["jobs"].pop(identity)
+                    with self.assertRaisesRegex(AssertionError, "release job inventory"):
+                        self.assert_release_runners(mutant)
+            with self.subTest(workflow=name, extra="unreviewed-release-job"):
+                mutant = copy.deepcopy(original)
+                identity = sorted(self.RELEASE_JOBS[name])[0]
+                mutant[name]["jobs"]["unreviewed-release-job"] = copy.deepcopy(workflow["jobs"][identity])
+                with self.assertRaisesRegex(AssertionError, "release job inventory"):
+                    self.assert_release_runners(mutant)
+
+
 class PrTierWorkflowTest(unittest.TestCase):
     ROUTED_JOBS = {
         "python-test.yml": {"fingerprint-canonical", "release-rules", "description-renderer",
@@ -1431,24 +2216,31 @@ class PrTierWorkflowTest(unittest.TestCase):
           echo "::error::authz did not pass; nothing of this run's code is checked out or run"
           exit 1
 """
-    # These release/credential workflows are outside this migration. Pin their
-    # existing routes, including their old fragments, without rewriting them.
+    # Retain the old expression only as a negative-control fixture. Release
+    # workflows already use the isolated class; this migration does not route
+    # them through the PR pool.
     LEGACY_RUNNER = """${{ github.event_name != 'pull_request_target' &&
         github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
         contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
         (github.event_name != 'pull_request' ||
          (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
         fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}"""
+    RELEASE_RUNNER = ["self-hosted", "pf-ci", "pf-ci-release"]
     EXEMPT_RUNNERS = {
-        "facts-descriptions.yml": {"descriptions": "ubuntu-latest"},
-        "facts-fanout.yml": {"web": "ubuntu-latest", "license": "ubuntu-latest"},
-        "handle-upstream.yml": {"bump": "ubuntu-latest"},
-        "publish.yml": {"prepare": LEGACY_RUNNER, "publish": "ubuntu-latest",
-                        "notify-consumers": None, "failure-report": LEGACY_RUNNER},
-        "release-finalize.yml": {"finalize": "ubuntu-latest", "notify-consumers": "ubuntu-latest"},
-        "release-receipts.yml": {"plan": LEGACY_RUNNER, "verify": "ubuntu-latest"},
-        "release-reconcile.yml": {"producers": "ubuntu-latest"},
-        "release-rollback.yml": {"restore": "ubuntu-latest"},
+        "facts-descriptions.yml": {"descriptions": RELEASE_RUNNER},
+        "facts-fanout.yml": {"web": RELEASE_RUNNER, "license": RELEASE_RUNNER},
+        "handle-upstream.yml": {"bump": RELEASE_RUNNER},
+        "publish.yml": {"tag-guard": RELEASE_RUNNER, "prepare": RELEASE_RUNNER,
+                        "publish": RELEASE_RUNNER, "notify-consumers": None,
+                        "failure-report": RELEASE_RUNNER},
+        "release-finalize.yml": {"finalize": RELEASE_RUNNER, "notify-consumers": RELEASE_RUNNER},
+        "release-receipts.yml": {"plan": RELEASE_RUNNER, "verify": RELEASE_RUNNER},
+        "release-reconcile.yml": {"producers": RELEASE_RUNNER},
+        "release-rollback.yml": {"restore": RELEASE_RUNNER},
+    }
+    LEGACY_LABEL_JOBS = {
+        ("publish.yml", "prepare"), ("publish.yml", "failure-report"),
+        ("release-receipts.yml", "plan"),
     }
 
     def assert_runner(self, runner):
@@ -2357,13 +3149,11 @@ class PrTierWorkflowTest(unittest.TestCase):
     def assert_exception_runner(self, workflow, identity, job):
         expected = self.EXEMPT_RUNNERS[workflow][identity]
         actual = job.get("runs-on")
-        self.assertNotEqual(actual, self.RUNNER, "pending pf-ci-release must not join the shared pool")
-        if expected == self.LEGACY_RUNNER:
-            self.assertIsInstance(actual, str)
-            self.assertEqual(" ".join(actual.split()), " ".join(expected.split()))
-            self.assertEqual(job["env"]["PF_CI_LABELS"], '["self-hosted","pf-ci","pf-ci-x64"]')
-        else:
-            self.assertEqual(actual, expected)
+        self.assertNotEqual(actual, self.RUNNER, "pf-ci-release must not join the shared pool")
+        self.assertEqual(actual, expected)
+        if (workflow, identity) in self.LEGACY_LABEL_JOBS:
+            self.assertEqual((job.get("env") or {}).get("PF_CI_LABELS"),
+                             '["self-hosted","pf-ci","pf-ci-x64"]')
 
     def test_credential_and_release_routes_stay_unchanged_and_refuse_the_pool_array(self):
         # This repository has no macOS jobs; its complete workflow/job inventory
@@ -2380,6 +3170,11 @@ class PrTierWorkflowTest(unittest.TestCase):
                     mutant["runs-on"] = self.RUNNER.copy()
                     with self.assertRaises(AssertionError):
                         self.assert_exception_runner(name, identity, mutant)
+                    if (name, identity) in self.LEGACY_LABEL_JOBS:
+                        mutant = copy.deepcopy(job)
+                        mutant["env"].pop("PF_CI_LABELS")
+                        with self.assertRaises(AssertionError):
+                            self.assert_exception_runner(name, identity, mutant)
 
     def test_docs_only_gates_keep_existing_checks_and_main_coverage(self):
         workflow = _workflow("python-test.yml")

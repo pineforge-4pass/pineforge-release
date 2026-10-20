@@ -32,7 +32,7 @@ jobs:
   descriptions:
     if: github.ref == 'refs/heads/main'
     environment: descriptions
-    runs-on: ubuntu-latest
+    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
     env:
       FACTS_DESCRIPTIONS_APPLY_ENABLED: ${{ vars.FACTS_DESCRIPTIONS_APPLY_ENABLED }}
       DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || vars.FACTS_DESCRIPTIONS_APPLY_ENABLED != 'true' }}
