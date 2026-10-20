@@ -270,10 +270,11 @@ jobs:
             type=raw,value=candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           # The action derives the licences label from this repository's
           # Apache-2.0, and its labels override the Dockerfile's. The image also
-          # bundles the transpiler, whose LICENSE from codegen 1.3.0 is the
-          # PineForge Source License 1.2 (see README, License).
+          # bundles the transpiler, whose LICENSE is the Tunaxis Source License
+          # 1.3 (the PineForge Source License 1.2 in the images from 1.3.0 before
+          # the first release published under the Tunaxis name; see README, License).
           labels: |
-            org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2
+            org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-Tunaxis-Source-License-1.3
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
 

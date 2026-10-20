@@ -1,4 +1,6 @@
-# PineForge facts tokens
+# Tunaxis facts tokens
+
+Tunaxis was formerly PineForge.
 
 `facts.json` is the public, machine-written quantity store shared by the engine,
 codegen, corpus, website and hosted MCP. `facts.schema.json` defines its contract.
@@ -81,9 +83,10 @@ retain their published text, are checked for drift, and never receive a command.
 Nonpublic repositories are excluded from public policy, output, and artifacts.
 
 HPO is now a managed public role following its v0.11.0 release. Its original
-code uses PineForge Source License 1.2 from v0.11.0; versions through v0.10.0
-remain Apache-2.0. Personal trading and noncommercial use are free under the
-license's definitions; commercial use needs a license, shared with codegen.
+code uses the Tunaxis Source License 1.3 (published as the PineForge Source
+License 1.2 from v0.11.0); versions through v0.10.0 remain Apache-2.0.
+Personal trading and noncommercial use are free under the license's
+definitions; commercial use needs a license, shared with codegen.
 The HPO policy has its own immutable [LICENSE](https://github.com/pineforge-4pass/pineforge-hpo/blob/dab7b6775588da0f112eb363a70561c212dce80b/LICENSE) pin, verified
 against the released [README](https://github.com/pineforge-4pass/pineforge-hpo/blob/dab7b6775588da0f112eb363a70561c212dce80b/README.md#license). This changes HPO's current
 description policy only; other products' terms and historical releases retain

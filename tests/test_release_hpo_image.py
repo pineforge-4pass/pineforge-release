@@ -333,6 +333,22 @@ def _restore_original_doc_cleanup(text: str) -> str:
     return "".join(lines)
 
 
+def _restore_original_licences_label(text: str) -> str:
+    """Undo only the single approved licences label change for the old pin."""
+    new = '      org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-Tunaxis-Source-License-1.3" \\\n'
+    old = '      org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2" \\\n'
+    lines = text.splitlines(keepends=True)
+    if lines.count(new) != 1:
+        raise ValueError("expected exactly one Tunaxis licences label line")
+    lines[lines.index(new)] = old
+    return "".join(lines)
+
+
+def _restore_original_runtime(text: str) -> str:
+    """Undo both approved differences from the old runtime-stage pin, apt cleanup then licences label."""
+    return _restore_original_licences_label(_restore_original_doc_cleanup(text))
+
+
 def _pinned_packages(stage: DockerStage) -> dict[str, str]:
     packages = {}
     for instruction, body in stage.instructions:
@@ -436,11 +452,30 @@ class DockerfileTargetTest(unittest.TestCase):
 
     def test_release_stage_matches_original_runtime_without_the_marked_notice(self):
         text = _without_sources_notice(_without_stage_alias(self.named["release"]))
-        text = _restore_original_doc_cleanup(text)
+        text = _restore_original_runtime(text)
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
-                         "after restoring the one /usr/share/doc token and removing the marked "
-                         "notice, release must remain byte for byte the original runtime stage")
+                         "after restoring the one /usr/share/doc token and the one licences label "
+                         "and removing the marked notice, release must remain byte for byte the "
+                         "original runtime stage")
+
+    def test_original_licences_label_normalization_requires_one_exact_line(self):
+        text = _without_sources_notice(_without_stage_alias(self.named["release"]))
+        line = '      org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-Tunaxis-Source-License-1.3" \\\n'
+        self.assertEqual(text.count(line), 1)
+        restored = _restore_original_licences_label(text)
+        self.assertEqual(restored, text.replace("LicenseRef-Tunaxis-Source-License-1.3",
+                                                "LicenseRef-PineForge-Source-License-1.2", 1))
+        for scenario, altered in (
+                ("missing", text.replace(line, "", 1)),
+                ("duplicate", text + line),
+                ("adjacent duplicate", text.replace(line, line + line, 1)),
+                ("different leading whitespace", text.replace(line, " " + line, 1)),
+                ("other licence expression", text.replace("Source-License-1.3", "Source-License-1.4", 1)),
+                ("already the old label", restored)):
+            with self.subTest(scenario=scenario):
+                with self.assertRaisesRegex(ValueError, "expected exactly one Tunaxis licences label line"):
+                    _restore_original_licences_label(altered)
 
     def test_original_doc_cleanup_normalization_requires_one_exact_line(self):
         text = _without_sources_notice(_without_stage_alias(self.named["release"]))
@@ -462,7 +497,7 @@ class DockerfileTargetTest(unittest.TestCase):
         text = _without_stage_alias(self.named["release"])
         stripped = _without_sources_notice(text)
         self.assertNotEqual(text, stripped)
-        stripped = _restore_original_doc_cleanup(stripped)
+        stripped = _restore_original_runtime(stripped)
         self.assertNotEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
         self.assertEqual(hashlib.sha256(stripped.encode("utf-8")).hexdigest(),
@@ -492,7 +527,7 @@ class DockerfileTargetTest(unittest.TestCase):
         altered = text.replace("RUN mkdir -p /opt/pineforge/bin\n",
                                "RUN mkdir -p /opt/pineforge/bin /unexpected\n", 1)
         self.assertNotEqual(altered, text)
-        normalized = _restore_original_doc_cleanup(_without_sources_notice(altered))
+        normalized = _restore_original_runtime(_without_sources_notice(altered))
         self.assertNotEqual(hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
 
@@ -871,15 +906,15 @@ class DispatcherModuleTest(unittest.TestCase):
 
 
 class ReadmePairRuleTest(unittest.TestCase):
-    # SHA-256 of README.md lines 196-225 (the pair rule) as published on the hub's main when this change was made.
-    # A checkout in CI has no origin/main, so the rule is pinned by digest; a deliberate change of the rule changes
-    # this value in the same commit.
+    # SHA-256 of README.md lines 204-233 (the pair rule), unchanged from lines 196-225
+    # on the hub's main when this change was made. CI has no origin/main, so the rule
+    # is pinned by digest; a deliberate rule change updates this value in the same commit.
     PAIR_RULE_SHA256 = "35b72f7f5c7466cfc212a71eaf05df98f45e92411fd34a67bfff761556c61601"
 
-    def test_lines_196_to_225_are_byte_identical_to_the_published_rule(self):
+    def test_lines_204_to_233_are_byte_identical_to_the_published_rule(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
-        self.assertGreaterEqual(len(lines), 225)
-        self.assertEqual(hashlib.sha256(b"".join(lines[195:225])).hexdigest(), self.PAIR_RULE_SHA256)
+        self.assertGreaterEqual(len(lines), 233)
+        self.assertEqual(hashlib.sha256(b"".join(lines[203:233])).hexdigest(), self.PAIR_RULE_SHA256)
 
 
 if __name__ == "__main__":

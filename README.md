@@ -1,18 +1,26 @@
-# pineforge-release
+<picture><source media="(prefers-color-scheme: dark)" srcset="https://tunaxis.com/brand/v1/lockup-dark.png"><img alt="Tunaxis" src="https://tunaxis.com/brand/v1/lockup-light.png" height="40"></picture>
+
+# Tunaxis
+
+Tunaxis was formerly PineForge. This is the `pineforge-release` hub repository.
 
 The **full PineScript v6 → deterministic backtest** product image: the
 [`pineforge-engine`](https://github.com/pineforge-4pass/pineforge-engine) pure
-runtime **plus** the bundled [`pineforge-codegen`](https://pypi.org/project/pineforge-codegen/)
-transpiler. Run a `.pine` file in, get trades out — no hosted API, source never
-leaves the box.
+runtime **plus** the bundled Tunaxis transpiler
+([`pineforge-codegen`](https://pypi.org/project/pineforge-codegen/)). Run a `.pine`
+file in, get trades out — no hosted API, source never leaves the box.
 
 ```
 docker pull ghcr.io/pineforge-4pass/pineforge-release:latest
 docker run --rm \
   -v "$PWD/strategy.pine:/in/strategy.pine:ro" \
   -v "$PWD/ohlcv.csv:/in/ohlcv.csv:ro" \
-  ghcr.io/pineforge-4pass/pineforge-release > report.json
+  ghcr.io/pineforge-4pass/pineforge-release:latest > report.json
 ```
+
+Today, pull `ghcr.io/pineforge-4pass/pineforge-release`. From the Tunaxis switch
+on, `tunaxis-release` will be published beside it for new releases; `candidate-*`
+tags stay only in the existing repository (see [Image tags](#image-tags)).
 
 - **`strategy.pine`** — a PineScript v6 strategy (`//@version=6`; any other
   version is rejected with exit code 5).
@@ -128,7 +136,7 @@ symbol), warm-up history, the merge rule and its refusals.
 
 ## Why this repo exists
 
-The engine (the C++ runtime) and the transpiler (`pineforge-codegen`) are
+The engine (the C++ runtime) and the Tunaxis transpiler (`pineforge-codegen`) are
 separate products. This repo is the single place they are composed. On the 0.x
 line they have **independent version lineages**: it pins each one independently
 and owns its **own semver**. From 1.0.0 on they **share one version**: the only
@@ -232,6 +240,13 @@ combined image, package identities and measured release facts are ready.
 
 ## Image tags
 
+The following tags are published today under
+`ghcr.io/pineforge-4pass/pineforge-release`. From the Tunaxis switch on, new
+releases will also carry these tags under
+`ghcr.io/pineforge-4pass/tunaxis-release`, with matching digests once published
+beside the existing image. Historical tags, including `1.3.0`, remain under the
+existing name; `candidate-*` tags are published only to `pineforge-release`.
+
 `X.Y.Z` · `X.Y` · `latest` · `engine<E>-codegen<C>` · `sha-<short>`
 
 `latest` and `X.Y` move only for the newest stable release. A prerelease (for
@@ -282,8 +297,11 @@ terms, so that licence does not cover the whole image:
 - **`pineforge-engine`** (`libpineforge.a` and headers): Apache-2.0, with Eigen
   under MPL-2.0 — see the engine's
   [`LEGAL.md`](https://github.com/pineforge-4pass/pineforge-engine/blob/main/LEGAL.md).
-- **`pineforge-codegen`** (the transpiler): source-available. From codegen
-  1.3.0 (images from 1.3.0 on) it is under the PineForge Source License 1.2;
+- **Tunaxis transpiler** (`pineforge-codegen`): source-available. From codegen
+  1.3.0 (images from 1.3.0 on) it is under the PineForge
+  Source License 1.2 until the first release published under the Tunaxis
+  name, and under the Tunaxis Source License 1.3 from that release on (the
+  terms are those of 1.2; the licence is renamed);
   earlier releases keep the licence they shipped with: codegen 1.2.0 (the
   1.2.0 image) the PineForge Source License 1.1, and releases up to 1.1.0
   (the images up to 1.1.0) the PolyForm Noncommercial License 1.0.0 with a
@@ -297,10 +315,13 @@ terms, so that licence does not cover the whole image:
 - **Debian base image, g++, Eigen and Python**: their upstream licences.
 
 The image's `org.opencontainers.image.licenses` label names the licences of the
-PineForge components: `Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2`
-from 1.3.0 on, Apache-2.0 for the engine and this repository's files, and a
-`LicenseRef` for the transpiler's LICENSE, the PineForge Source License 1.2 (no
-SPDX identifier exists for it). The base image's packages, Eigen included, keep
+PineForge components: `Apache-2.0 AND LicenseRef-Tunaxis-Source-License-1.3`
+from the first release published under the Tunaxis name on, and
+`Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2` for the images from
+1.3.0 before it; Apache-2.0 covers the engine and this repository's files, and a
+`LicenseRef` covers the transpiler's LICENSE, the Tunaxis Source License 1.3
+(the PineForge Source License 1.2 in those earlier images; no SPDX identifier
+exists for either). The base image's packages, Eigen included, keep
 the upstream licences listed above. The 1.2.0 image carries
 `Apache-2.0 AND LicenseRef-PineForge-Source-License-1.1`, images 1.0.1 to 1.1.0
 carry
@@ -322,7 +343,7 @@ The Dockerfile refuses to build when the harness `EXPECTED_PF_ABI` differs from
 `docker build` without `--target`, using `docker/Dockerfile`, builds the
 backtest image: the last `default` stage aliases the runtime, `release`.
 The default image differs from 1.5.0 only by the source notice, the two source
-labels and the retained Debian package copyright files.
+labels, the licences label and the retained Debian package copyright files.
 Only `ENGINE_VERSION` and `CODEGEN_VERSION` are required for that build, and its
 entrypoint remains `/opt/pineforge/bin/entrypoint.sh`.
 

@@ -744,7 +744,7 @@ class SourceRetentionTest(unittest.TestCase):
         )
         self.assertIn(
             "The default image differs from 1.5.0 only by the source notice, the two source "
-            "labels and the retained Debian package copyright files.",
+            "labels, the licences label and the retained Debian package copyright files.",
             readme,
             "README must state the notice and copyright differences from the 1.5.0 default image",
         )
