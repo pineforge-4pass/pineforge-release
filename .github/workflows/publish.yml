@@ -41,6 +41,11 @@ jobs:
       sha: ${{ steps.tag.outputs.sha }}
       tag: ${{ steps.tag.outputs.tag }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service || echo "apt guard: stop failed ($?), continuing"
+          exit 0
       - name: Checkout main for tag verification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -86,6 +91,11 @@ jobs:
       exists: ${{ steps.candidate.outputs.exists }}
       tag: ${{ needs.tag-guard.outputs.tag }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service || echo "apt guard: stop failed ($?), continuing"
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.tag-guard.outputs.sha }}
@@ -110,6 +120,11 @@ jobs:
     outputs:
       prerelease: ${{ steps.pair.outputs.prerelease }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service || echo "apt guard: stop failed ($?), continuing"
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.tag-guard.outputs.sha }}
@@ -599,6 +614,11 @@ jobs:
       contents: read
       issues: write
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service || echo "apt guard: stop failed ($?), continuing"
+          exit 0
       - name: Refuse unverified release tag
         if: ${{ needs.tag-guard.result != 'success' }}
         shell: bash

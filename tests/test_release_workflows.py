@@ -257,6 +257,14 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             "exit 1\n"
         ),
     }
+    APT_GUARD_STEP = {
+        "name": "Stop automatic apt upgrades (LB-504, until the release image is rebaked)",
+        "shell": "bash",
+        "run": ("sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service "
+                "apt-daily-upgrade.service unattended-upgrades.service "
+                "|| echo \"apt guard: stop failed ($?), continuing\"\n"
+                "exit 0\n"),
+    }
     FAILURE_IF = (
         "${{ always() && !cancelled() && (needs.tag-guard.result != 'success' || "
         "contains(needs.*.result, 'failure')) }}"
@@ -296,6 +304,9 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         self.assertNotIn("github.sha", text, "release provenance must use the verified commit")
         self.assertEqual(wf.get("concurrency", {}).get("group"), "release-candidate-${{ inputs.tag }}")
         jobs = wf.get("jobs", {})
+        for identity in ("tag-guard", "prepare", "publish", "failure-report"):
+            self.assertEqual((jobs.get(identity, {}).get("steps") or [{}])[0], self.APT_GUARD_STEP,
+                             identity + " must stop the apt timers before anything else (LB-504)")
         for identity in ("tag-guard", "prepare", "publish", "notify-consumers", "failure-report"):
             self.assertIn(identity, jobs)
         self.assertEqual(next(iter(jobs)), "tag-guard")
@@ -309,14 +320,14 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         self.assertNotIn("secrets.", str(guard))
         self.assertNotIn("github.token", str(guard))
         guard_steps = guard.get("steps") or []
-        self.assertEqual(len(guard_steps), 2, "only main checkout precedes tag verification")
-        checkout = guard_steps[0]
+        self.assertEqual(len(guard_steps), 3, "apt guard, then only main checkout, precedes tag verification")
+        checkout = guard_steps[1]
         self.assertLessEqual(set(checkout), {"name", "uses", "with"})
         self.assertTrue(checkout.get("uses", "").startswith("actions/checkout@"))
         self.assertEqual(checkout.get("with"), {
             "ref": "main", "fetch-depth": "0", "persist-credentials": "false",
         })
-        self.assertEqual(guard_steps[1], {
+        self.assertEqual(guard_steps[2], {
             "name": "Validate release tag", "id": "tag", "shell": "bash",
             "env": {"TAG": "${{ inputs.tag }}",
                     "WORKFLOW_ON_MAIN": "${{ github.ref == 'refs/heads/main' }}"},
@@ -373,13 +384,13 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         self.assertEqual(failure.get("needs"), ["tag-guard", "prepare", "publish", "notify-consumers"])
         self.assertEqual(failure.get("if"), self.FAILURE_IF)
         failure_steps = failure.get("steps") or []
-        self.assertEqual(len(failure_steps), 3)
-        self.assertEqual(failure_steps[0], self.REFUSAL_STEP)
-        self.assertTrue(failure_steps[1].get("uses", "").startswith("actions/checkout@"))
-        self.assertEqual(failure_steps[1].get("with"), {
+        self.assertEqual(len(failure_steps), 4)
+        self.assertEqual(failure_steps[1], self.REFUSAL_STEP)
+        self.assertTrue(failure_steps[2].get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(failure_steps[2].get("with"), {
             "ref": "main", "persist-credentials": "false",
         })
-        for row in failure_steps[1:]:
+        for row in failure_steps[2:]:
             self.assertEqual(row.get("if"), "needs.tag-guard.result == 'success'")
         # Only the concurrency key and the validation step's env read raw input.
         self.assertEqual(text.count("${{ inputs.tag }}"), 2)
@@ -606,7 +617,8 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             ("          persist-credentials: false\n", "          persist-credentials: true\n", 4),
             ("          fetch-depth: 0\n", "          fetch-depth: 1\n", 2),
             ("          ref: main\n", "          ref: ${{ inputs.tag }}\n", 2),
-            ("        shell: bash\n", "", 2),
+            # 2 tag consumers + the 4 apt guards (LB-504); every removal must still break a pin
+            ("        shell: bash\n", "", 6),
             ("        if: needs.tag-guard.result == 'success'\n", "", 2),
             ('    runs-on: ["self-hosted","pf-ci","pf-ci-release"]\n', "    runs-on: ubuntu-latest\n", 4),
         ):
