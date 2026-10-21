@@ -44,7 +44,8 @@ jobs:
       - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
         shell: bash
         run: |
-          sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service || echo "apt guard: stop failed ($?), continuing"
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
           exit 0
       - name: Checkout main for tag verification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,7 +95,8 @@ jobs:
       - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
         shell: bash
         run: |
-          sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service || echo "apt guard: stop failed ($?), continuing"
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
           exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -123,7 +125,8 @@ jobs:
       - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
         shell: bash
         run: |
-          sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service || echo "apt guard: stop failed ($?), continuing"
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
           exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -617,7 +620,8 @@ jobs:
       - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
         shell: bash
         run: |
-          sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service || echo "apt guard: stop failed ($?), continuing"
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
           exit 0
       - name: Refuse unverified release tag
         if: ${{ needs.tag-guard.result != 'success' }}

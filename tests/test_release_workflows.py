@@ -260,9 +260,11 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
     APT_GUARD_STEP = {
         "name": "Stop automatic apt upgrades (LB-504, until the release image is rebaked)",
         "shell": "bash",
-        "run": ("sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service "
-                "apt-daily-upgrade.service unattended-upgrades.service "
-                "|| echo \"apt guard: stop failed ($?), continuing\"\n"
+        "run": ("systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true\n"
+                "if systemctl is-active --quiet apt-daily-upgrade.service || "
+                "systemctl is-active --quiet apt-daily.service; then echo \"apt guard: upgrade already running, not interrupting\"; "
+                "else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer "
+                "|| echo \"apt guard: timer stop failed ($?), continuing\"; fi\n"
                 "exit 0\n"),
     }
     FAILURE_IF = (
