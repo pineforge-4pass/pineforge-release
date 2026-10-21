@@ -2252,7 +2252,12 @@ class PrTierWorkflowTest(unittest.TestCase):
 
     def assert_pr_trigger(self, workflow):
         self.assertIn("pull_request", workflow["on"])
-        self.assertFalse(workflow["on"]["pull_request"])
+        if workflow["name"] == "python-test":
+            self.assertEqual(workflow["on"]["pull_request"], {
+                "types": ["opened", "synchronize", "reopened", "ready_for_review"],
+            })
+        else:
+            self.assertFalse(workflow["on"]["pull_request"])
         self.assertNotIn("pull_request_target", workflow["on"])
 
     def assert_no_fork_condition(self, job):
@@ -2325,12 +2330,16 @@ class PrTierWorkflowTest(unittest.TestCase):
     def assert_job_condition(self, identity, job):
         self.assert_no_fork_condition(job)
         self.assert_status_condition_requires_authz(identity, job)
-        if identity in {"changes", "validate"}:
+        if identity == "changes":
+            self.assertEqual(job.get("if"), "${{ !github.event.pull_request.draft }}")
+        elif identity == "validate":
             self.assertNotIn("if", job)
         elif identity == "release-ready":
             self.assertEqual(job["if"], "${{ always() }}")
         else:
-            self.assertEqual(job.get("if"), "needs.changes.outputs.docs-only == 'false'")
+            self.assertEqual(job.get("if"),
+                             "${{ !github.event.pull_request.draft && "
+                             "(needs.changes.outputs.docs-only == 'false') }}")
 
     def assert_authz_dependency(self, job):
         needs = job.get("needs", [])
