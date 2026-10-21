@@ -22,6 +22,7 @@ API_TIMEOUT_SECONDS = 60
 MAX_INPUT_BYTES = 2 * 1024 * 1024
 ROLES = {"engine", "codegen-oss", "corpus", "hpo", "release", "backtest-mcp"}
 PUBLIC_REPOSITORIES = {role: "pineforge-4pass/pineforge-" + role for role in ROLES}
+ORGS = ("pineforge-4pass", "tunaxis")
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 COMMIT = re.compile(r"[a-f0-9]{40}\Z")
 TOKEN = re.compile(r"\{\{(facts|license|word):([A-Za-z0-9_.-]+)(?:\|(int|grouped|decimal|text))?\}\}")
@@ -49,17 +50,22 @@ def repository_identity(value):
     return value.casefold()
 
 
+def role_identities(role):
+    return {f"{org}/pineforge-{role}" for org in ORGS}
+
+
 def source(value):
     fields(value, {"repo", "commit", "url"})
     identity = repository_identity(value["repo"])
-    if identity not in PUBLIC_REPOSITORIES.values():
+    if identity not in {repo for role in ROLES for repo in role_identities(role)}:
         raise InputError("source repository is not confirmed public")
     if not isinstance(value["commit"], str) or not COMMIT.fullmatch(value["commit"]):
         raise InputError("source must pin a full public commit")
     prefix, suffix = "https://github.com/", f"/blob/{value['commit']}/LICENSE"
     url = value["url"]
     if (not isinstance(url, str) or not url.startswith(prefix) or not url.endswith(suffix)
-            or repository_identity(url[len(prefix):-len(suffix)]) != identity):
+            or repository_identity(url[len(prefix):-len(suffix)]) not in
+            role_identities(identity.split("/pineforge-", 1)[1])):
         raise InputError("LICENSE source URL does not match its repository/commit")
 
 
@@ -149,7 +155,8 @@ def render_document(facts, policy, facts_hash, policy_hash):
         fields(row, {"role", "repo", "public", "disposition", "reason", "source"}, {"template", "approved_text"})
         source(row["source"])
         identity = repository_identity(row["repo"])
-        if identity != repository_identity(row["source"]["repo"]) or row["public"] is not True:
+        source_role = repository_identity(row["source"]["repo"]).split("/pineforge-", 1)[1]
+        if identity not in role_identities(source_role) or row["public"] is not True:
             raise InputError("unverified or nonpublic repository")
         if row["role"] not in ROLES or row["role"] in seen_roles or identity in seen_repos:
             raise InputError("unknown or duplicate repository/role")
@@ -178,7 +185,7 @@ def render_document(facts, policy, facts_hash, policy_hash):
     if seen_roles != ROLES:
         raise InputError("incomplete confirmed-public manifest")
     for row in rows:
-        if repository_identity(row["repo"]) != PUBLIC_REPOSITORIES[row["role"]]:
+        if repository_identity(row["repo"]) not in role_identities(row["role"]):
             raise InputError("role does not match its confirmed-public repository")
     return dict(schema="pineforge/repo-descriptions-render/v1", policy_version=policy["version"],
                 facts_sha256=facts_hash, policy_sha256=policy_hash, repositories=rows)
@@ -202,7 +209,7 @@ def check_live(document, executable):
                 raise InputError("GitHub response exceeds size limit")
             response = decode(process.stdout, "GitHub response")
             if (not isinstance(response, dict) or response.get("private") is not False
-                    or repository_identity(response.get("full_name")) != repository_identity(row["repo"])):
+                    or repository_identity(response.get("full_name")) not in role_identities(row["role"])):
                 raise InputError("GitHub did not confirm the exact public repository")
             if "description" not in response or not (response["description"] is None or isinstance(response["description"], str)):
                 raise InputError("GitHub description is missing or has the wrong type")

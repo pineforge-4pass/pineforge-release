@@ -22,6 +22,7 @@ MAX_INPUT_BYTES = 2 * 1024 * 1024
 MAX_SAFE_INTEGER = 2**53 - 1
 COUNTS = ("graded", "excellent", "strong", "belowStrong", "engineErrors")
 TIERS = ("excellent", "strong", "moderate", "weak", "minimal", "no-trades")
+ORGS = ("pineforge-4pass", "tunaxis")
 
 
 class InputError(ValueError):
@@ -166,7 +167,9 @@ def validate_facts(facts):
     require(("tvTradesCompared" in active) == ("tvTradesComparedSource" in active),
             "tvTradesCompared and tvTradesComparedSource must be present together")
     for version, release in facts["releases"].items():
-        require(release["source"] == f"https://github.com/pineforge-4pass/pineforge-engine/blob/v{version}/README.md#validation-scoreboard",
+        require(release["source"] in {
+            f"https://github.com/{org}/pineforge-engine/blob/v{version}/README.md#validation-scoreboard"
+            for org in ORGS},
                 "release source identity differs")
         scoreboard_invariants(release["scoreboard"])
         require("tvTradesCompared" not in release["scoreboard"] and "tvTradesComparedSource" not in release["scoreboard"],
@@ -182,10 +185,13 @@ def validate_facts(facts):
     require(inventory["closedProbes"] == inventory["communityProbes"] + inventory["probeScriptProbes"]
             == historic["closedProbes"], "historical probe sum differs")
     require(inventory["corpusScripts"] == historic["corpusProbes"], "historical corpus inventory differs")
-    prefix = ("https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/"
-              f'{inventory["sourceCommit"]}/README.md#validation-scoreboard; historical release '
-              f'{inventory["sourceRelease"]} ')
-    require(inventory["source"] == prefix + "authored-script and closed-trade inventory, independent of the active population; not registry row or slug totals.",
+    sources = {
+        (f"https://raw.githubusercontent.com/{org}/pineforge-engine/"
+         f'{inventory["sourceCommit"]}/README.md#validation-scoreboard; historical release '
+         f'{inventory["sourceRelease"]} authored-script and closed-trade inventory, '
+         "independent of the active population; not registry row or slug totals.")
+        for org in ORGS}
+    require(inventory["source"] in sources,
             "inventory source identity differs")
     return facts
 

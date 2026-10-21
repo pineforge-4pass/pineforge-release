@@ -22,6 +22,7 @@ from release_contract import (COMMIT, Invalid, Pending, canonical, decode,
 PRODUCERS = {"engine": "pineforge-4pass/pineforge-engine",
              "codegen": "pineforge-4pass/pineforge-codegen-oss",
              "hpo": "pineforge-4pass/pineforge-hpo"}
+ORGS = ("pineforge-4pass", "tunaxis")
 
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
@@ -131,7 +132,13 @@ def asset(client, obj, name, repo):
         raise Pending("required producer asset unavailable")
     require(len(found) == 1 and found[0].get("state") == "uploaded", "ambiguous or incomplete asset")
     url = f"https://github.com/{repo}/releases/download/{obj['tag_name']}/{name}"
-    require(found[0]["browser_download_url"] == url, "asset source identity differs")
+    owner, separator, repository = repo.partition("/")
+    require(owner in ORGS and separator and repository and "/" not in repository,
+            "asset source identity differs")
+    sources = {f"https://github.com/{org}/{repository}/releases/download/{obj['tag_name']}/{name}"
+               for org in ORGS}
+    require(isinstance(found[0]["browser_download_url"], str)
+            and found[0]["browser_download_url"] in sources, "asset source identity differs")
     raw = client.download(url, {"github.com"})
     require(len(raw) > 0, "empty producer artifact")
     digest = found[0].get("digest")

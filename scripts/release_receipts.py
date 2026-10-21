@@ -27,6 +27,7 @@ PRODUCT_SCHEMA = "pineforge/consumer-receipt/v1"
 FACTS_SCHEMA = "pineforge/facts-consumer-receipt/v1"
 COMMON_FIELDS = {"schema", "consumer", "attempt", "sequence", "state", "timestamp",
                  "pr", "ci", "e2e", "deploy", "preview", "deployed", "previous"}
+ORGS = ("pineforge-4pass", "tunaxis")
 
 # TEMPORARY first-adopter previous. Remove together with pineforge-data's BOOTSTRAP_PACKAGE exemption
 # (scripts/release_chain/publishing.py), only after data 0.3.1 is verified AND every retained
@@ -42,6 +43,15 @@ DATA_BOOTSTRAP_PREVIOUS = {
         "pineforge_data-0.3.0.tar.gz": "f29a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc",
     },
 }
+
+
+def repo_identities(repo):
+    if not isinstance(repo, str):
+        return set()
+    org, separator, name = repo.lower().partition("/")
+    if org not in ORGS or not separator or not name or "/" in name:
+        return set()
+    return {f"{owner}/{name}" for owner in ORGS}
 
 
 def object_pages(client, route, key):
@@ -120,9 +130,9 @@ def check_coordinator(client, repo, evidence, policy, pr, ci):
     require(run["id"] == evidence["run_id"] and run["run_attempt"] == evidence["run_attempt"],
             "coordinator run identity differs")
     metadata = client.api(f"repos/{repo}")
-    require(metadata["full_name"].lower() == repo.lower()
-            and run["repository"]["full_name"].lower() == repo.lower()
-            and run["head_repository"]["full_name"].lower() == repo.lower(),
+    require(metadata["full_name"].lower() in repo_identities(repo)
+            and run["repository"]["full_name"].lower() in repo_identities(repo)
+            and run["head_repository"]["full_name"].lower() in repo_identities(repo),
             "coordinator repository differs")
     require(run["event"] == "workflow_run" and pr["base"] == metadata["default_branch"] == "main"
             and run["head_branch"] == metadata["default_branch"], "untrusted coordinator source")
@@ -238,7 +248,7 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     require(pr["base"] == policy["base"], "PR base differs from policy")
     actual = client.api(f"repos/{repo}/pulls/{pr['number']}")
     require(actual["base"]["ref"] == pr["base"] and actual["head"]["sha"] == pr["head"], "PR head or base moved")
-    require(actual["head"]["repo"]["full_name"].lower() == repo.lower(), "receipt refers to fork PR")
+    require(actual["head"]["repo"]["full_name"].lower() in repo_identities(repo), "receipt refers to fork PR")
     if not actual["merged"]:
         require(actual["base"]["sha"] == pr["base_sha"], "PR base moved after candidate verification")
     public["pr"] = pr
@@ -354,7 +364,7 @@ def collect(client, hub_client, store, role, run_id=0):
     policy = profile(role)
     # Target identity is configuration; never accept it from a callback.
     metadata = client.api(f"repos/{repo}")
-    require(metadata["full_name"].lower() == repo.lower(), "consumer repository identity differs")
+    require(metadata["full_name"].lower() in repo_identities(repo), "consumer repository identity differs")
     if run_id:
         runs = [client.api(f"repos/{repo}/actions/runs/{run_id}")]
     else:

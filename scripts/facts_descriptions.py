@@ -17,13 +17,18 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from facts_validate import (FACTS_SCHEMA, MAX_INPUT_BYTES, InputError, decode, digest,
                             read_bytes, read_json, require)
-from repo_descriptions import (COMMIT, DEFAULT_POLICY, PUBLIC_REPOSITORIES, clean_text,
+from repo_descriptions import (COMMIT, DEFAULT_POLICY, PUBLIC_REPOSITORIES, ROLES, clean_text,
                                fields, render, render_document, repository_identity)
 
 HUB = "pineforge-4pass/pineforge-release"
+ORGS = ("pineforge-4pass", "tunaxis")
 SOURCE_FILES = ("facts/facts.json", "facts/repo-descriptions.json", "facts/facts.schema.json")
 MANAGED_ROLES = ("engine", "codegen-oss", "corpus", "hpo")
 DIGEST = re.compile(r"[a-f0-9]{64}\Z")
+
+
+def role_identities(role):
+    return {f"{org}/pineforge-{role}" for org in ORGS}
 
 
 class ApiError(ValueError):
@@ -55,7 +60,8 @@ class GitHub:
         token = self.write_token if method == "PATCH" else self.read_token
         payload = None
         if method == "PATCH":
-            require(path in {"/repos/" + PUBLIC_REPOSITORIES[role] for role in MANAGED_ROLES},
+            require(path in {"/repos/" + identity for role in MANAGED_ROLES
+                             for identity in role_identities(role)},
                     "write target is not managed")
             clean_text(description, description=True)
             require(bool(token), "a descriptions App token is required")
@@ -102,16 +108,18 @@ class GitHub:
 
     def public_repository(self, identity):
         identity = repository_identity(identity)
-        require(identity in PUBLIC_REPOSITORIES.values(), "repository is not confirmed public")
+        require(identity in {repo for role in ROLES for repo in role_identities(role)},
+                "repository is not confirmed public")
         response = self.request("/repos/" + identity)
         if (not isinstance(response, dict) or response.get("private") is not False
-                or repository_identity(response.get("full_name")) != identity):
+                or repository_identity(response.get("full_name")) not in
+                role_identities(identity.split("/pineforge-", 1)[1])):
             raise ApiError("GitHub did not confirm the exact public repository")
         return response
 
     def description(self, row):
         identity = repository_identity(row["repo"])
-        require(identity == PUBLIC_REPOSITORIES[row["role"]], "public role identity differs")
+        require(identity in role_identities(row["role"]), "public role identity differs")
         response = self.public_repository(identity)
         if "description" not in response or not (response["description"] is None
                                                   or isinstance(response["description"], str)):
