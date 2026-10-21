@@ -2077,6 +2077,18 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
     def test_release_jobs_pin_the_isolated_class_and_never_accept_pr_events(self):
         self.assert_release_runners(self.release_workflows())
 
+    def test_release_finalize_stops_the_apt_timers_before_anything_else(self):
+        # LB-504: apt-daily-upgrade.timer re-execs systemd 20-25 minutes after
+        # boot and kills the runner, and the finalizer runs hourly on
+        # pf-ci-release. Both of its jobs must stop the timers before any
+        # checkout, secret or repository code.
+        jobs = _workflow("release-finalize.yml")["jobs"]
+        for identity in ("finalize", "notify-consumers"):
+            with self.subTest(job=identity):
+                self.assertEqual((jobs.get(identity, {}).get("steps") or [{}])[0],
+                                 ReleaseTriggerWorkflowTest.APT_GUARD_STEP,
+                                 identity + " must stop the apt timers before anything else (LB-504)")
+
     def test_runner_pin_refuses_hosted_labels_other_pools_and_fallbacks_on_every_job(self):
         original = self.release_workflows()
         old_expression = """${{ github.event_name != 'pull_request_target' &&
