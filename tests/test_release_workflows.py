@@ -894,8 +894,12 @@ class ReleaseTagGuardFailureReportTest(unittest.TestCase):
         wf = ReleaseTriggerWorkflowTest().parse(text)
         job = (wf.get("jobs") or {}).get("failure-report") or {}
         steps = job.get("steps") or []
-        self.assertTrue(steps, "failure reporting must start with a refusal")
-        step = steps[0]
+        self.assertGreater(len(steps), 1, "failure reporting must start with the apt guard and a refusal")
+        # LB-504: the apt guard is steps[0]; the refusal is the first real step after it, before any checkout.
+        self.assertEqual(steps[0], ReleaseTriggerWorkflowTest.APT_GUARD_STEP, "the apt guard must be the first step")
+        step = steps[1]
+        self.assertEqual(step.get("name"), "Refuse unverified release tag", "the refusal must follow the apt guard")
+        self.assertNotIn("uses", step, "the refusal is a run step, never a checkout")
         condition = step.get("if", "").removeprefix("${{").removesuffix("}}").strip()
         comparison = re.fullmatch(r"needs\.tag-guard\.result (==|!=) 'success'", condition)
         self.assertIsNotNone(comparison)
@@ -926,9 +930,19 @@ class ReleaseTagGuardFailureReportTest(unittest.TestCase):
             ("          exit 1\n      - uses: actions/checkout@", "          exit 0\n      - uses: actions/checkout@"),
             ("        if: ${{ needs.tag-guard.result != 'success' }}",
              "        if: ${{ needs.tag-guard.result == 'failure' }}"),
+            # WEAKENED condition: an extra clause lets a failed, skipped or cancelled guard through.
+            ("        if: ${{ needs.tag-guard.result != 'success' }}",
+             "        if: ${{ needs.tag-guard.result != 'success' && needs.prepare.result == 'failure' }}"),
+            # REMOVED refusal step: the checkout would become the first real step after the apt guard.
+            ("      - name: Refuse unverified release tag\n"
+             "        if: ${{ needs.tag-guard.result != 'success' }}\n"
+             "        shell: bash\n"
+             "        run: |\n"
+             "          echo '::error::tag-guard did not pass; refusing checkout and publication failure reporting'\n"
+             "          exit 1\n", ""),
         ):
             mutant = pins.mutate(text, before, after)
-            with self.subTest(anchor=before), self.assertRaises(AssertionError):
+            with self.subTest(anchor=before + after), self.assertRaises(AssertionError):
                 self.assert_refusal(mutant)
 
 
