@@ -28,7 +28,8 @@ jobs:
     concurrency:
       group: release-finalize
       cancel-in-progress: false
-    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     environment: release-automation
     permissions:
       contents: write
@@ -83,7 +84,8 @@ jobs:
   notify-consumers:
     needs: finalize
     if: needs.finalize.outputs.deliveries != '[]'
-    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     environment: release-automation
     concurrency:
       group: release-delivery-${{ matrix.consumer }}-${{ matrix.tag }}

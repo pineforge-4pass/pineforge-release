@@ -15,7 +15,8 @@ concurrency:
 
 jobs:
   producers:
-    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     environment: release-automation
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

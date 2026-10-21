@@ -33,7 +33,8 @@ permissions:
 
 jobs:
   bump:
-    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     environment: release-automation
     steps:
       - name: Mint org App token

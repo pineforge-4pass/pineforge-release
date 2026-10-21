@@ -194,10 +194,10 @@ non-commit or side-branch tag fails before tagged checkout or publication.
 Later tagged checkouts use its verified SHA with no persisted credentials.
 Pushing a tag alone does not start publication.
 
-The release and facts-automation jobs use `["self-hosted","pf-ci","pf-ci-release"]`,
-the isolated release runner class, including candidate preparation, receipt planning
-and failure reporting. Push this runner migration only after laneboss posts
-"pf-ci-release live"; until then jobs on that label wait.
+The release and facts-automation jobs use `ubuntu-latest`,
+GitHub-hosted runners, including candidate preparation, receipt planning
+and failure reporting. Owner decision 10-21 (msg 1562390657274748981) makes this
+a standing R6/rule-B exception for pineforge-release.
 The [release runner policy](docs/release-chain.md#release-runner-isolation) lists
 the jobs and the class boundary.
 

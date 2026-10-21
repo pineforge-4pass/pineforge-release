@@ -8,8 +8,9 @@ or deploy consumers.
 
 ## Release runner isolation
 
-LB-435 prepares these jobs for the literal `runs-on` array
-`["self-hosted","pf-ci","pf-ci-release"]`:
+Owner decision 10-21 (msg 1562390657274748981) sets these release and facts-automation
+jobs to the literal `runs-on: ubuntu-latest`, a standing R6/rule-B exception
+for pineforge-release:
 
 | Workflow | Jobs |
 |---|---|
@@ -22,21 +23,20 @@ LB-435 prepares these jobs for the literal `runs-on` array
 | `release-reconcile.yml` | `producers` |
 | `release-rollback.yml` | `restore` |
 
-The class has its own runner group restricted to selected workflows at protected
+The former release class has its own runner group restricted to selected workflows at protected
 refs, its own no-role service account, and one job per runner, with nothing shared
 with PR classes. Secret-bearing jobs and jobs that build artifacts later published
-by a release job belong in this class. `prepare`, receipt `plan`, and
+by a release job formerly belonged in this class. `prepare`, receipt `plan`, and
 `failure-report` also hold the automatic `GITHUB_TOKEN` through `github.token`,
 with Contents or Issues write access. The `publish.yml` reusable
 `notify-consumers` caller obtains its runners from `release-finalize.yml`.
 
 `pull_request` and `pull_request_target` workflows must never use this class.
 The PR jobs in `python-test.yml` and `facts-validate.yml` keep their existing
-routing. Push this migration only after laneboss posts "pf-ci-release live";
-until then jobs on that label wait. The runner group allowlist must include
-these workflows at their protected refs when the class is live.
+routing. The hub runs these jobs on GitHub-hosted runners without waiting for
+the release pool. These hosted jobs do not require a release runner group allowlist.
 
-The release runner group admits runs at `refs/heads/main` only. Publication
+Publication admits runs at `refs/heads/main` only. Publication
 uses `workflow_dispatch` on `main` with an explicit existing tag input;
 `tag-guard` fails any other workflow ref and is a required dependency of every
 later job. With Contents read access and no secrets, it checks out main with
@@ -823,7 +823,7 @@ A member's own fork fails the canonical authz check.
 The existing `merge_group` trigger remains
 configured and passes the canonical authz script. macOS stays hosted
 (no hardware); this repository has no macOS jobs. Credential/release jobs
-untouched: pending `pf-ci-release`, including publication workflows.
+use `ubuntu-latest` per owner decision 10-21, including publication workflows.
 
 | Name / setting | Scope | Purpose |
 |---|---|---|
