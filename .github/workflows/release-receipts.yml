@@ -16,7 +16,8 @@ concurrency:
 
 jobs:
   plan:
-    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
@@ -42,7 +43,8 @@ jobs:
   verify:
     needs: plan
     if: needs.plan.outputs.consumers != '[]'
-    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     environment: release-automation
     permissions:
       contents: write

@@ -257,6 +257,16 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             "exit 1\n"
         ),
     }
+    APT_GUARD_STEP = {
+        "name": "Stop automatic apt upgrades (LB-504, until the release image is rebaked)",
+        "shell": "bash",
+        "run": ("systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true\n"
+                "if systemctl is-active --quiet apt-daily-upgrade.service || "
+                "systemctl is-active --quiet apt-daily.service; then echo \"apt guard: upgrade already running, not interrupting\"; "
+                "else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer "
+                "|| echo \"apt guard: timer stop failed ($?), continuing\"; fi\n"
+                "exit 0\n"),
+    }
     FAILURE_IF = (
         "${{ always() && !cancelled() && (needs.tag-guard.result != 'success' || "
         "contains(needs.*.result, 'failure')) }}"
@@ -296,12 +306,15 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         self.assertNotIn("github.sha", text, "release provenance must use the verified commit")
         self.assertEqual(wf.get("concurrency", {}).get("group"), "release-candidate-${{ inputs.tag }}")
         jobs = wf.get("jobs", {})
+        for identity in ("tag-guard", "prepare", "publish", "failure-report"):
+            self.assertEqual((jobs.get(identity, {}).get("steps") or [{}])[0], self.APT_GUARD_STEP,
+                             identity + " must stop the apt timers before anything else (LB-504)")
         for identity in ("tag-guard", "prepare", "publish", "notify-consumers", "failure-report"):
             self.assertIn(identity, jobs)
         self.assertEqual(next(iter(jobs)), "tag-guard")
         guard = jobs["tag-guard"]
         self.assertEqual(set(guard), {"runs-on", "permissions", "outputs", "steps"})
-        self.assertEqual(guard.get("runs-on"), ["self-hosted", "pf-ci", "pf-ci-release"])
+        self.assertEqual(guard.get("runs-on"), "ubuntu-latest")
         self.assertEqual(guard.get("permissions"), {"contents": "read"})
         self.assertEqual(guard.get("outputs"), {
             "sha": "${{ steps.tag.outputs.sha }}", "tag": "${{ steps.tag.outputs.tag }}",
@@ -309,22 +322,23 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         self.assertNotIn("secrets.", str(guard))
         self.assertNotIn("github.token", str(guard))
         guard_steps = guard.get("steps") or []
-        self.assertEqual(len(guard_steps), 2, "only main checkout precedes tag verification")
-        checkout = guard_steps[0]
+        self.assertEqual(len(guard_steps), 3, "apt guard, then only main checkout, precedes tag verification")
+        checkout = guard_steps[1]
         self.assertLessEqual(set(checkout), {"name", "uses", "with"})
         self.assertTrue(checkout.get("uses", "").startswith("actions/checkout@"))
         self.assertEqual(checkout.get("with"), {
             "ref": "main", "fetch-depth": "0", "persist-credentials": "false",
         })
-        self.assertEqual(guard_steps[1], {
+        self.assertEqual(guard_steps[2], {
             "name": "Validate release tag", "id": "tag", "shell": "bash",
             "env": {"TAG": "${{ inputs.tag }}",
                     "WORKFLOW_ON_MAIN": "${{ github.ref == 'refs/heads/main' }}"},
             "run": self.VALIDATE_RUN,
         }, "validate before any tagged checkout, secret, or repository code")
         for identity, job in jobs.items():
+            # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
             if identity != "notify-consumers":
-                self.assertEqual(job.get("runs-on"), ["self-hosted", "pf-ci", "pf-ci-release"], identity)
+                self.assertEqual(job.get("runs-on"), "ubuntu-latest", identity)
             if identity != "tag-guard":
                 needs = job.get("needs") or []
                 self.assertIn("tag-guard", [needs] if isinstance(needs, str) else needs, identity)
@@ -373,13 +387,13 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         self.assertEqual(failure.get("needs"), ["tag-guard", "prepare", "publish", "notify-consumers"])
         self.assertEqual(failure.get("if"), self.FAILURE_IF)
         failure_steps = failure.get("steps") or []
-        self.assertEqual(len(failure_steps), 3)
-        self.assertEqual(failure_steps[0], self.REFUSAL_STEP)
-        self.assertTrue(failure_steps[1].get("uses", "").startswith("actions/checkout@"))
-        self.assertEqual(failure_steps[1].get("with"), {
+        self.assertEqual(len(failure_steps), 4)
+        self.assertEqual(failure_steps[1], self.REFUSAL_STEP)
+        self.assertTrue(failure_steps[2].get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(failure_steps[2].get("with"), {
             "ref": "main", "persist-credentials": "false",
         })
-        for row in failure_steps[1:]:
+        for row in failure_steps[2:]:
             self.assertEqual(row.get("if"), "needs.tag-guard.result == 'success'")
         # Only the concurrency key and the validation step's env read raw input.
         self.assertEqual(text.count("${{ inputs.tag }}"), 2)
@@ -464,7 +478,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         events = {declared} if isinstance(declared, str) else set(declared)
         self.assertTrue(events)
         self.assertLessEqual(events, {"workflow_dispatch", "schedule", "repository_dispatch", "workflow_call",
-                                      "push", "pull_request_target"}, "pf-ci-release needs a main-ref event")
+                                      "push", "pull_request_target"}, "release automation needs a main-ref event")
         if "push" in events:
             self.assertIsInstance(declared, dict, "push requires an explicit main branch filter")
             push = declared.get("push")
@@ -516,12 +530,12 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             with self.subTest(step=step), self.assertRaises(AssertionError):
                 self.assert_no_publish_dispatch(mutant)
 
-    def test_every_workflow_using_the_release_label_has_only_main_ref_trigger_types(self):
+    def test_every_release_workflow_has_only_main_ref_trigger_types(self):
         found = []
         for path in sorted(WORKFLOWS.iterdir()):
             if path.suffix in {".yml", ".yaml"}:
                 text = path.read_text()
-                if "pf-ci-release" in text:
+                if path.name in ReleaseRunnerWorkflowTest.RELEASE_JOBS:
                     found.append(path.name)
                     with self.subTest(workflow=path.name):
                         self.assert_release_triggers(text)
@@ -606,9 +620,11 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             ("          persist-credentials: false\n", "          persist-credentials: true\n", 4),
             ("          fetch-depth: 0\n", "          fetch-depth: 1\n", 2),
             ("          ref: main\n", "          ref: ${{ inputs.tag }}\n", 2),
-            ("        shell: bash\n", "", 2),
+            # 2 tag consumers + the 4 apt guards (LB-504); every removal must still break a pin
+            ("        shell: bash\n", "", 6),
             ("        if: needs.tag-guard.result == 'success'\n", "", 2),
-            ('    runs-on: ["self-hosted","pf-ci","pf-ci-release"]\n', "    runs-on: ubuntu-latest\n", 4),
+            # owner 10-21 (msg 1562390657274748981): all four publish jobs must refuse the release array.
+            ("    runs-on: ubuntu-latest\n", '    runs-on: ["self-hosted","pf-ci","pf-ci-release"]\n', 4),
         ):
             self.assertEqual(text.count(before), count, "each real tag consumer must be mutated")
             for index in range(count):
@@ -674,7 +690,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             if path.suffix not in {".yml", ".yaml"}:
                 continue
             text = path.read_text()
-            if "pf-ci-release" not in text:
+            if path.name not in ReleaseRunnerWorkflowTest.RELEASE_JOBS:
                 continue
             self.assert_release_triggers(text)
             for event in ('  release:\n    types: [published]\n',
@@ -878,8 +894,12 @@ class ReleaseTagGuardFailureReportTest(unittest.TestCase):
         wf = ReleaseTriggerWorkflowTest().parse(text)
         job = (wf.get("jobs") or {}).get("failure-report") or {}
         steps = job.get("steps") or []
-        self.assertTrue(steps, "failure reporting must start with a refusal")
-        step = steps[0]
+        self.assertGreater(len(steps), 1, "failure reporting must start with the apt guard and a refusal")
+        # LB-504: the apt guard is steps[0]; the refusal is the first real step after it, before any checkout.
+        self.assertEqual(steps[0], ReleaseTriggerWorkflowTest.APT_GUARD_STEP, "the apt guard must be the first step")
+        step = steps[1]
+        self.assertEqual(step.get("name"), "Refuse unverified release tag", "the refusal must follow the apt guard")
+        self.assertNotIn("uses", step, "the refusal is a run step, never a checkout")
         condition = step.get("if", "").removeprefix("${{").removesuffix("}}").strip()
         comparison = re.fullmatch(r"needs\.tag-guard\.result (==|!=) 'success'", condition)
         self.assertIsNotNone(comparison)
@@ -910,9 +930,19 @@ class ReleaseTagGuardFailureReportTest(unittest.TestCase):
             ("          exit 1\n      - uses: actions/checkout@", "          exit 0\n      - uses: actions/checkout@"),
             ("        if: ${{ needs.tag-guard.result != 'success' }}",
              "        if: ${{ needs.tag-guard.result == 'failure' }}"),
+            # WEAKENED condition: an extra clause lets a failed, skipped or cancelled guard through.
+            ("        if: ${{ needs.tag-guard.result != 'success' }}",
+             "        if: ${{ needs.tag-guard.result != 'success' && needs.prepare.result == 'failure' }}"),
+            # REMOVED refusal step: the checkout would become the first real step after the apt guard.
+            ("      - name: Refuse unverified release tag\n"
+             "        if: ${{ needs.tag-guard.result != 'success' }}\n"
+             "        shell: bash\n"
+             "        run: |\n"
+             "          echo '::error::tag-guard did not pass; refusing checkout and publication failure reporting'\n"
+             "          exit 1\n", ""),
         ):
             mutant = pins.mutate(text, before, after)
-            with self.subTest(anchor=before), self.assertRaises(AssertionError):
+            with self.subTest(anchor=before + after), self.assertRaises(AssertionError):
                 self.assert_refusal(mutant)
 
 
@@ -2043,9 +2073,31 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         "release-rollback.yml": {"restore"},
     }
     RUNNER = ["self-hosted", "pf-ci", "pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    HOSTED_JOBS = {
+        ("facts-descriptions.yml", "descriptions"),
+        ("facts-fanout.yml", "web"),
+        ("facts-fanout.yml", "license"),
+        ("handle-upstream.yml", "bump"),
+        ("publish.yml", "tag-guard"),
+        ("publish.yml", "prepare"),
+        ("publish.yml", "publish"),
+        ("publish.yml", "failure-report"),
+        ("release-finalize.yml", "finalize"),
+        ("release-finalize.yml", "notify-consumers"),
+        ("release-receipts.yml", "plan"),
+        ("release-receipts.yml", "verify"),
+        ("release-reconcile.yml", "producers"),
+        ("release-rollback.yml", "restore"),
+    }
 
     def release_workflows(self):
         return {name: _workflow(name) for name in self.RELEASE_JOBS}
+
+    def assert_hosted_runners(self, workflows):
+        for name, identity in sorted(self.HOSTED_JOBS):
+            self.assertEqual(workflows[name]["jobs"][identity]["runs-on"], "ubuntu-latest",
+                             f"{name}:{identity}: runs-on must be ubuntu-latest")
 
     def assert_release_runners(self, workflows):
         for name, identities in self.RELEASE_JOBS.items():
@@ -2054,18 +2106,64 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
             if isinstance(triggers, str):
                 triggers = [triggers]
             for event in ("pull_request", "pull_request_target"):
-                self.assertNotIn(event, triggers, f"{name}: {event} cannot use pf-ci-release")
+                self.assertNotIn(event, triggers, f"{name}: {event} cannot run release automation")
             # The reusable caller has no runs-on; its callee's jobs are pinned above.
             expected = identities | ({"notify-consumers"} if name == "publish.yml" else set())
             self.assertEqual(set(workflow["jobs"]), expected, f"{name}: release job inventory")
             for identity in sorted(identities):
-                self.assertEqual(workflow["jobs"][identity]["runs-on"], self.RUNNER,
-                                 f"{name}:{identity}: runs-on must be the isolated release array")
+                self.assertEqual(workflow["jobs"][identity]["runs-on"], "ubuntu-latest",
+                                 f"{name}:{identity}: runs-on must be ubuntu-latest")
+        self.assert_hosted_runners(workflows)
 
-    def test_release_jobs_pin_the_isolated_class_and_never_accept_pr_events(self):
+    def test_release_jobs_pin_ubuntu_latest_and_never_accept_pr_events(self):
         self.assert_release_runners(self.release_workflows())
 
-    def test_runner_pin_refuses_hosted_labels_other_pools_and_fallbacks_on_every_job(self):
+    def test_all_fourteen_release_jobs_pin_ubuntu_latest_under_the_standing_owner_rule(self):
+        self.assert_hosted_runners(self.release_workflows())
+
+    def test_hosted_runner_pin_refuses_the_release_array_on_each_release_job(self):
+        original = self.release_workflows()
+        self.assert_hosted_runners(original)
+        for name, identity in sorted(self.HOSTED_JOBS):
+            with self.subTest(workflow=name, job=identity):
+                mutant = copy.deepcopy(original)
+                mutant[name]["jobs"][identity]["runs-on"] = self.RUNNER.copy()
+                with self.assertRaisesRegex(AssertionError, "runs-on must be ubuntu-latest"):
+                    self.assert_hosted_runners(mutant)
+
+    def assert_no_release_runner_labels(self, workflows):
+        for name, workflow in workflows.items():
+            for identity, job in workflow.get("jobs", {}).items():
+                self.assertNotIn("pf-ci-release", str(job.get("runs-on", "")),
+                                 f"{name}:{identity}: runs-on must not contain pf-ci-release")
+
+    def test_no_workflow_uses_pf_ci_release_and_pin_refuses_each_reintroduction(self):
+        original = {
+            path.name: _workflow(path.name)
+            for path in sorted(WORKFLOWS.iterdir())
+            if path.suffix in {".yml", ".yaml"}
+        }
+        self.assert_no_release_runner_labels(original)
+        for name, identity in sorted(self.HOSTED_JOBS):
+            with self.subTest(workflow=name, job=identity):
+                mutant = copy.deepcopy(original)
+                mutant[name]["jobs"][identity]["runs-on"] = self.RUNNER.copy()
+                with self.assertRaisesRegex(AssertionError, "runs-on must not contain pf-ci-release"):
+                    self.assert_no_release_runner_labels(mutant)
+
+    def test_release_finalize_stops_the_apt_timers_before_anything_else(self):
+        # LB-504: apt-daily-upgrade.timer re-execs systemd 20-25 minutes after
+        # boot and kills the runner, and the finalizer runs hourly on
+        # ubuntu-latest (owner 10-21). Both of its jobs must stop the timers before any
+        # checkout, secret or repository code.
+        jobs = _workflow("release-finalize.yml")["jobs"]
+        for identity in ("finalize", "notify-consumers"):
+            with self.subTest(job=identity):
+                self.assertEqual((jobs.get(identity, {}).get("steps") or [{}])[0],
+                                 ReleaseTriggerWorkflowTest.APT_GUARD_STEP,
+                                 identity + " must stop the apt timers before anything else (LB-504)")
+
+    def test_runner_pin_refuses_wrong_labels_other_pools_and_fallbacks_on_every_job(self):
         original = self.release_workflows()
         old_expression = """${{ github.event_name != 'pull_request_target' &&
             github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
@@ -2074,7 +2172,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
              (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
             fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}"""
         invalid_runners = (
-            "ubuntu-latest",
+            self.RUNNER.copy(),
             "ubuntu-24.04",
             ["self-hosted", "pf-ci", "pf-ci-x64"],
             ["self-hosted", "pf-ci", "pf-ci-release", "ubuntu-24.04"],
@@ -2129,19 +2227,36 @@ class PrTierWorkflowTest(unittest.TestCase):
                             "release-ready-replay", "release-ready"},
         "facts-validate.yml": {"validate"},
     }
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    HOSTED_JOBS = {
+        ("python-test.yml", "authz"),
+        ("python-test.yml", "changes"),
+        ("python-test.yml", "fingerprint-canonical"),
+        ("python-test.yml", "release-rules"),
+        ("python-test.yml", "description-renderer"),
+        ("python-test.yml", "release-ready-replay"),
+        ("python-test.yml", "release-ready"),
+        ("facts-validate.yml", "authz"),
+        ("facts-validate.yml", "validate"),
+    }
+    # Old pool labels remain negative-control fixtures.
     RUNNER = ["self-hosted", "pf-ci", "pf-ci-x64"]
-    RUNNER_LINE = '    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]'
+    RUNNER_LINE = "    runs-on: ubuntu-latest"
+    RUNNER_COUNTS = {"python-test.yml": 7, "facts-validate.yml": 2}
+    POOL_RUNNER_LINE = '    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]'
     PR_GUARD = ("github.event_name != 'pull_request' || "
                 "github.event.pull_request.head.repo.full_name == github.repository")
-    AUTHZ_RUNNER_LINE = '    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]'
+    AUTHZ_RUNNER_LINE = "    runs-on: ubuntu-latest"
+    AUTHZ_POOL_RUNNER_LINE = '    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]'
     # Literal ci-labels.md 10-20 16:02, "The `authz` job" (addendum 9).
+    # The owner 10-21 runner exception (msg 1562390657274748981) applies below.
     # Keep this independent of the workflows: every byte, including comments,
     # permissions and both permission lookups, is pinned.
     AUTHZ_TEXT = """  authz:
     name: authz
-    # Pool label (needs no toolchain or Docker). Switch to pf-ci-crj once laneboss's
-    # bulletin says the Cloud Run class is live.
-    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    # Hosted label (needs no toolchain or Docker).
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
     steps:
@@ -2216,27 +2331,26 @@ class PrTierWorkflowTest(unittest.TestCase):
           echo "::error::authz did not pass; nothing of this run's code is checked out or run"
           exit 1
 """
-    # Retain the old expression only as a negative-control fixture. Release
-    # workflows already use the isolated class; this migration does not route
-    # them through the PR pool.
+    # Retain the old expression only as a negative-control fixture.
+    # Release and PR workflows run on GitHub-hosted runners under the owner rule.
     LEGACY_RUNNER = """${{ github.event_name != 'pull_request_target' &&
         github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
         contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
         (github.event_name != 'pull_request' ||
          (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
         fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}"""
-    RELEASE_RUNNER = ["self-hosted", "pf-ci", "pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     EXEMPT_RUNNERS = {
-        "facts-descriptions.yml": {"descriptions": RELEASE_RUNNER},
-        "facts-fanout.yml": {"web": RELEASE_RUNNER, "license": RELEASE_RUNNER},
-        "handle-upstream.yml": {"bump": RELEASE_RUNNER},
-        "publish.yml": {"tag-guard": RELEASE_RUNNER, "prepare": RELEASE_RUNNER,
-                        "publish": RELEASE_RUNNER, "notify-consumers": None,
-                        "failure-report": RELEASE_RUNNER},
-        "release-finalize.yml": {"finalize": RELEASE_RUNNER, "notify-consumers": RELEASE_RUNNER},
-        "release-receipts.yml": {"plan": RELEASE_RUNNER, "verify": RELEASE_RUNNER},
-        "release-reconcile.yml": {"producers": RELEASE_RUNNER},
-        "release-rollback.yml": {"restore": RELEASE_RUNNER},
+        "facts-descriptions.yml": {"descriptions": "ubuntu-latest"},
+        "facts-fanout.yml": {"web": "ubuntu-latest", "license": "ubuntu-latest"},
+        "handle-upstream.yml": {"bump": "ubuntu-latest"},
+        "publish.yml": {"tag-guard": "ubuntu-latest", "prepare": "ubuntu-latest",
+                        "publish": "ubuntu-latest", "notify-consumers": None,
+                        "failure-report": "ubuntu-latest"},
+        "release-finalize.yml": {"finalize": "ubuntu-latest", "notify-consumers": "ubuntu-latest"},
+        "release-receipts.yml": {"plan": "ubuntu-latest", "verify": "ubuntu-latest"},
+        "release-reconcile.yml": {"producers": "ubuntu-latest"},
+        "release-rollback.yml": {"restore": "ubuntu-latest"},
     }
     LEGACY_LABEL_JOBS = {
         ("publish.yml", "prepare"), ("publish.yml", "failure-report"),
@@ -2244,11 +2358,23 @@ class PrTierWorkflowTest(unittest.TestCase):
     }
 
     def assert_runner(self, runner):
-        self.assertEqual(runner, self.RUNNER)
+        self.assertEqual(runner, "ubuntu-latest", "runs-on must be ubuntu-latest")
 
-    def assert_pool_job(self, job):
+    def assert_hosted_job(self, job):
         self.assert_runner(job.get("runs-on"))
         self.assertNotIn("PF_CI_LABELS", json.dumps(job))
+
+    def assert_hosted_runners(self, workflows):
+        for name, identity in sorted(self.HOSTED_JOBS):
+            self.assertEqual(workflows[name]["jobs"][identity]["runs-on"], "ubuntu-latest",
+                             f"{name}:{identity}: runs-on must be ubuntu-latest")
+
+    def assert_no_pr_pool_runner_labels(self, workflows):
+        for name, workflow in workflows.items():
+            for identity, job in workflow.get("jobs", {}).items():
+                for label in ("pf-ci-x64", "self-hosted"):
+                    self.assertNotIn(label, str(job.get("runs-on", "")),
+                                     f"{name}:{identity}: runs-on must not contain {label}")
 
     def assert_pr_trigger(self, workflow):
         self.assertIn("pull_request", workflow["on"])
@@ -2365,7 +2491,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         })
         self.assertEqual(job["steps"][0]["env"]["ALLOWED_BOTS"],
                          "dependabot[bot] pineforge-app[bot]")
-        self.assert_pool_job(job)
+        self.assert_hosted_job(job)
         self.assertNotIn("if", job)
         self.assertNotIn("continue-on-error", job)
         self.assertNotIn("timeout-minutes", job)
@@ -2386,10 +2512,13 @@ class PrTierWorkflowTest(unittest.TestCase):
             expected = self.AUTHZ_RUNNER_LINE if identity == "authz" else self.RUNNER_LINE
             self.assertEqual(runner_lines, [expected], identity)
 
-    def test_all_pr_jobs_pin_literal_pool_routes_conditions_and_authz(self):
+    def test_all_pr_jobs_pin_literal_hosted_routes_conditions_and_authz(self):
         pr_workflows = {path.name: _workflow(path.name) for path in WORKFLOWS.glob("*.yml")
                         if "pull_request" in _workflow(path.name)["on"]}
         self.assertEqual(set(pr_workflows), set(self.ROUTED_JOBS))
+        self.assertEqual({(name, identity) for name, workflow in pr_workflows.items()
+                          for identity in workflow["jobs"]}, self.HOSTED_JOBS)
+        self.assert_hosted_runners(pr_workflows)
         for name, workflow in pr_workflows.items():
             with self.subTest(workflow=name):
                 self.assertEqual(workflow["name"], name.removesuffix(".yml"))
@@ -2405,8 +2534,8 @@ class PrTierWorkflowTest(unittest.TestCase):
                     self.assert_no_fork_condition(job)
                     self.assertEqual(job.get("name", identity),
                                      "release/ready" if identity == "release-ready" else identity)
-                    self.assertNotIn("uses", job, "PR coverage must not hide a reusable pool job")
-                    self.assert_pool_job(job)
+                    self.assertNotIn("uses", job, "PR coverage must not hide a reusable hosted job")
+                    self.assert_hosted_job(job)
                     if identity == "authz":
                         self.assert_authz(job)
                     else:
@@ -2419,13 +2548,33 @@ class PrTierWorkflowTest(unittest.TestCase):
                 for forbidden in ("secrets.", "create-github-app-token", "id-token:", ": write"):
                     self.assertNotIn(forbidden, text)
 
-    def test_each_runner_pin_refuses_hosted_fragments_unavailable_labels_and_labels_env(self):
+    def test_no_workflow_uses_pr_pool_labels_and_pin_refuses_each_reintroduction(self):
+        original = {
+            path.name: _workflow(path.name)
+            for path in sorted(WORKFLOWS.iterdir())
+            if path.suffix in {".yml", ".yaml"}
+        }
+        self.assert_hosted_runners(original)
+        self.assert_no_pr_pool_runner_labels(original)
+        for name, identity in sorted(self.HOSTED_JOBS):
+            for runner in (self.RUNNER.copy(), ["pf-ci-x64"], ["self-hosted"]):
+                with self.subTest(workflow=name, job=identity, runner=runner):
+                    mutant = copy.deepcopy(original)
+                    mutant[name]["jobs"][identity]["runs-on"] = runner
+                    self.assertNotEqual(mutant, original)
+                    with self.assertRaisesRegex(AssertionError, "runs-on must be ubuntu-latest"):
+                        self.assert_hosted_runners(mutant)
+                    with self.assertRaisesRegex(AssertionError, "runs-on must not contain"):
+                        self.assert_no_pr_pool_runner_labels(mutant)
+
+    def test_each_runner_pin_refuses_pool_arrays_fragments_unavailable_labels_and_labels_env(self):
         for name in self.ROUTED_JOBS:
             text = (WORKFLOWS / name).read_text()
+            self.assertEqual(text.count(self.RUNNER_LINE + "\n"), self.RUNNER_COUNTS[name])
             for identity, job in _workflow(name)["jobs"].items():
-                self.assert_pool_job(job)
+                self.assert_hosted_job(job)
                 for runner in (
-                    "ubuntu-24.04", self.LEGACY_RUNNER,
+                    self.RUNNER.copy(), "ubuntu-24.04", self.LEGACY_RUNNER,
                     """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') }}""",
                     """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}""",
                     """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}""",
@@ -2438,16 +2587,17 @@ class PrTierWorkflowTest(unittest.TestCase):
                     with self.subTest(workflow=name, job=identity, runner=runner):
                         self.assertNotEqual(mutant, job)
                         with self.assertRaises(AssertionError):
-                            self.assert_pool_job(mutant)
+                            self.assert_hosted_job(mutant)
                 mutant = copy.deepcopy(job)
                 mutant.setdefault("env", {})["PF_CI_LABELS"] = json.dumps(self.RUNNER)
                 with self.subTest(workflow=name, job=identity, mutation="labels env"):
                     with self.assertRaises(AssertionError):
-                        self.assert_pool_job(mutant)
+                        self.assert_hosted_job(mutant)
                 block = re.search(rf"(?ms)^  {re.escape(identity)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
                 self.assertIsNotNone(block)
                 original = self.AUTHZ_RUNNER_LINE if identity == "authz" else self.RUNNER_LINE
-                replacement = self.RUNNER_LINE if identity == "authz" else self.AUTHZ_RUNNER_LINE
+                replacement = self.AUTHZ_POOL_RUNNER_LINE if identity == "authz" else self.POOL_RUNNER_LINE
+                self.assertEqual(block[0].count(original + "\n"), 1, identity)
                 altered = block[0].replace(original, replacement, 1)
                 mutant_text = text[:block.start()] + altered + text[block.end():]
                 self.assertNotEqual(mutant_text, text)
@@ -2810,7 +2960,7 @@ class PrTierWorkflowTest(unittest.TestCase):
                 ('          case "$EVENT" in\n',
                  '          [ "$GITHUB_ACTOR" != "dependabot[bot]" ] || exit 0\n'
                  '          case "$EVENT" in\n'),
-                (self.AUTHZ_RUNNER_LINE, self.RUNNER_LINE),
+                (self.AUTHZ_RUNNER_LINE, self.AUTHZ_POOL_RUNNER_LINE),
                 ("          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}",
                  "          HEAD_REPO: ${{ github.repository }}"),
             ]
@@ -3158,13 +3308,13 @@ class PrTierWorkflowTest(unittest.TestCase):
     def assert_exception_runner(self, workflow, identity, job):
         expected = self.EXEMPT_RUNNERS[workflow][identity]
         actual = job.get("runs-on")
-        self.assertNotEqual(actual, self.RUNNER, "pf-ci-release must not join the shared pool")
+        self.assertNotEqual(actual, self.RUNNER, "release jobs must not join the shared pool")
         self.assertEqual(actual, expected)
         if (workflow, identity) in self.LEGACY_LABEL_JOBS:
             self.assertEqual((job.get("env") or {}).get("PF_CI_LABELS"),
                              '["self-hosted","pf-ci","pf-ci-x64"]')
 
-    def test_credential_and_release_routes_stay_unchanged_and_refuse_the_pool_array(self):
+    def test_credential_and_release_routes_pin_ubuntu_latest_and_refuse_the_pool_array(self):
         # This repository has no macOS jobs; its complete workflow/job inventory
         # below also refuses adding an unreviewed macOS/pool matrix.
         self.assertEqual({path.name for path in WORKFLOWS.glob("*.yml")},

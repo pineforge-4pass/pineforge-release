@@ -8,8 +8,9 @@ or deploy consumers.
 
 ## Release runner isolation
 
-LB-435 prepares these jobs for the literal `runs-on` array
-`["self-hosted","pf-ci","pf-ci-release"]`:
+Owner decision 10-21 (msg 1562390657274748981) sets these release and facts-automation
+jobs to the literal `runs-on: ubuntu-latest`, a standing R6/rule-B exception
+for pineforge-release:
 
 | Workflow | Jobs |
 |---|---|
@@ -22,21 +23,21 @@ LB-435 prepares these jobs for the literal `runs-on` array
 | `release-reconcile.yml` | `producers` |
 | `release-rollback.yml` | `restore` |
 
-The class has its own runner group restricted to selected workflows at protected
+The former release class has its own runner group restricted to selected workflows at protected
 refs, its own no-role service account, and one job per runner, with nothing shared
 with PR classes. Secret-bearing jobs and jobs that build artifacts later published
-by a release job belong in this class. `prepare`, receipt `plan`, and
+by a release job formerly belonged in this class. `prepare`, receipt `plan`, and
 `failure-report` also hold the automatic `GITHUB_TOKEN` through `github.token`,
 with Contents or Issues write access. The `publish.yml` reusable
 `notify-consumers` caller obtains its runners from `release-finalize.yml`.
 
 `pull_request` and `pull_request_target` workflows must never use this class.
-The PR jobs in `python-test.yml` and `facts-validate.yml` keep their existing
-routing. Push this migration only after laneboss posts "pf-ci-release live";
-until then jobs on that label wait. The runner group allowlist must include
-these workflows at their protected refs when the class is live.
+The PR jobs in `python-test.yml` and `facts-validate.yml` also use
+`runs-on: ubuntu-latest` per the owner decision.
+The hub runs these jobs on GitHub-hosted runners without waiting for
+the release pool. These hosted jobs do not require a release runner group allowlist.
 
-The release runner group admits runs at `refs/heads/main` only. Publication
+Publication admits runs at `refs/heads/main` only. Publication
 uses `workflow_dispatch` on `main` with an explicit existing tag input;
 `tag-guard` fails any other workflow ref and is a required dependency of every
 later job. With Contents read access and no secrets, it checks out main with
@@ -749,12 +750,12 @@ their required branch checks, and no consumer may use an admin merge. Configure
 suite inventory; only a verified documentation-only PR may skip suites.
 
 The hub's `python-test.yml` and `facts-validate.yml` PR checks use the literal
-`["self-hosted","pf-ci","pf-ci-x64"]` runner array, without a hosted fallback or
-`PF_CI_LABELS` environment variable. Keep `pf-ci-x64` until laneboss posts
-"pf-ci-crj live". Both workflows run on every pull request without path or
-branch filters. Their first job is the exact canonical `authz` from
-`ci-labels.md`, with `name: authz`,
-`runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]`, `permissions: {}`, no
+`runs-on: ubuntu-latest` per owner decision 10-21 (msg 1562390657274748981),
+a standing R6/rule-B exception for pineforge-release, without a `PF_CI_LABELS`
+environment variable. Both workflows run on every pull request without path or
+branch filters. Their first job is the canonical `authz` from
+`ci-labels.md` with the owner-approved runner exception, `name: authz`,
+`runs-on: ubuntu-latest`, `permissions: {}`, no
 condition, checkout or secrets, and the canonical no-timeout comment.
 Its eight payload fields are `EVENT`, `REPO`, `HEAD_REPO`, `HEAD_IS_FORK`,
 `ASSOCIATION`, `PR_AUTHOR`, `WR_HEAD_REPO` and `WR_ACTOR`; the other two
@@ -823,7 +824,7 @@ A member's own fork fails the canonical authz check.
 The existing `merge_group` trigger remains
 configured and passes the canonical authz script. macOS stays hosted
 (no hardware); this repository has no macOS jobs. Credential/release jobs
-untouched: pending `pf-ci-release`, including publication workflows.
+use `ubuntu-latest` per owner decision 10-21, including publication workflows.
 
 | Name / setting | Scope | Purpose |
 |---|---|---|

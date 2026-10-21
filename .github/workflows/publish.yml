@@ -34,13 +34,20 @@ concurrency:
 
 jobs:
   tag-guard:
-    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       sha: ${{ steps.tag.outputs.sha }}
       tag: ${{ steps.tag.outputs.tag }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
       - name: Checkout main for tag verification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,7 +84,8 @@ jobs:
   prepare:
     needs: tag-guard
     if: github.ref == 'refs/heads/main'
-    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
@@ -86,6 +94,12 @@ jobs:
       exists: ${{ steps.candidate.outputs.exists }}
       tag: ${{ needs.tag-guard.outputs.tag }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.tag-guard.outputs.sha }}
@@ -100,7 +114,8 @@ jobs:
   publish:
     needs: [tag-guard, prepare]
     if: needs.prepare.outputs.exists == 'false'
-    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     environment: release-automation
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
@@ -110,6 +125,12 @@ jobs:
     outputs:
       prerelease: ${{ steps.pair.outputs.prerelease }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.tag-guard.outputs.sha }}
@@ -592,13 +613,20 @@ jobs:
   failure-report:
     needs: [tag-guard, prepare, publish, notify-consumers]
     if: ${{ always() && !cancelled() && (needs.tag-guard.result != 'success' || contains(needs.*.result, 'failure')) }}
-    runs-on: ["self-hosted","pf-ci","pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
       contents: read
       issues: write
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
       - name: Refuse unverified release tag
         if: ${{ needs.tag-guard.result != 'success' }}
         shell: bash
