@@ -8,6 +8,8 @@ on:
   push:
     branches: [main, master]
   pull_request:
+    # LB-387: ready_for_review starts the suites skipped on draft PRs.
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
 
 permissions:
@@ -84,6 +86,8 @@ jobs:
 
   changes:
     needs: authz
+    # A skipped classifier keeps release/ready red, even for docs-only drafts.
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
     outputs:
       docs-only: ${{ steps.paths.outputs.docs-only }}
@@ -131,7 +135,7 @@ jobs:
 
   fingerprint-canonical:
     needs: [authz, changes]
-    if: needs.changes.outputs.docs-only == 'false'
+    if: ${{ !github.event.pull_request.draft && (needs.changes.outputs.docs-only == 'false') }}
     runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -153,7 +157,7 @@ jobs:
 
   release-rules:
     needs: [authz, changes]
-    if: needs.changes.outputs.docs-only == 'false'
+    if: ${{ !github.event.pull_request.draft && (needs.changes.outputs.docs-only == 'false') }}
     runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -193,7 +197,7 @@ jobs:
 
   description-renderer:
     needs: [authz, changes]
-    if: needs.changes.outputs.docs-only == 'false'
+    if: ${{ !github.event.pull_request.draft && (needs.changes.outputs.docs-only == 'false') }}
     runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -208,7 +212,7 @@ jobs:
 
   release-ready-replay:
     needs: [authz, changes]
-    if: needs.changes.outputs.docs-only == 'false'
+    if: ${{ !github.event.pull_request.draft && (needs.changes.outputs.docs-only == 'false') }}
     runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
