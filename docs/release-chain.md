@@ -32,8 +32,9 @@ with Contents or Issues write access. The `publish.yml` reusable
 `notify-consumers` caller obtains its runners from `release-finalize.yml`.
 
 `pull_request` and `pull_request_target` workflows must never use this class.
-The PR jobs in `python-test.yml` and `facts-validate.yml` keep their existing
-routing. The hub runs these jobs on GitHub-hosted runners without waiting for
+The PR jobs in `python-test.yml` and `facts-validate.yml` also use
+`runs-on: ubuntu-latest` per the owner decision.
+The hub runs these jobs on GitHub-hosted runners without waiting for
 the release pool. These hosted jobs do not require a release runner group allowlist.
 
 Publication admits runs at `refs/heads/main` only. Publication
@@ -749,12 +750,12 @@ their required branch checks, and no consumer may use an admin merge. Configure
 suite inventory; only a verified documentation-only PR may skip suites.
 
 The hub's `python-test.yml` and `facts-validate.yml` PR checks use the literal
-`["self-hosted","pf-ci","pf-ci-x64"]` runner array, without a hosted fallback or
-`PF_CI_LABELS` environment variable. Keep `pf-ci-x64` until laneboss posts
-"pf-ci-crj live". Both workflows run on every pull request without path or
-branch filters. Their first job is the exact canonical `authz` from
-`ci-labels.md`, with `name: authz`,
-`runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]`, `permissions: {}`, no
+`runs-on: ubuntu-latest` per owner decision 10-21 (msg 1562390657274748981),
+a standing R6/rule-B exception for pineforge-release, without a `PF_CI_LABELS`
+environment variable. Both workflows run on every pull request without path or
+branch filters. Their first job is the canonical `authz` from
+`ci-labels.md` with the owner-approved runner exception, `name: authz`,
+`runs-on: ubuntu-latest`, `permissions: {}`, no
 condition, checkout or secrets, and the canonical no-timeout comment.
 Its eight payload fields are `EVENT`, `REPO`, `HEAD_REPO`, `HEAD_IS_FORK`,
 `ASSOCIATION`, `PR_AUTHOR`, `WR_HEAD_REPO` and `WR_ACTOR`; the other two

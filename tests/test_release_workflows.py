@@ -2213,19 +2213,36 @@ class PrTierWorkflowTest(unittest.TestCase):
                             "release-ready-replay", "release-ready"},
         "facts-validate.yml": {"validate"},
     }
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    HOSTED_JOBS = {
+        ("python-test.yml", "authz"),
+        ("python-test.yml", "changes"),
+        ("python-test.yml", "fingerprint-canonical"),
+        ("python-test.yml", "release-rules"),
+        ("python-test.yml", "description-renderer"),
+        ("python-test.yml", "release-ready-replay"),
+        ("python-test.yml", "release-ready"),
+        ("facts-validate.yml", "authz"),
+        ("facts-validate.yml", "validate"),
+    }
+    # Old pool labels remain negative-control fixtures.
     RUNNER = ["self-hosted", "pf-ci", "pf-ci-x64"]
-    RUNNER_LINE = '    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]'
+    RUNNER_LINE = "    runs-on: ubuntu-latest"
+    RUNNER_COUNTS = {"python-test.yml": 7, "facts-validate.yml": 2}
+    POOL_RUNNER_LINE = '    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]'
     PR_GUARD = ("github.event_name != 'pull_request' || "
                 "github.event.pull_request.head.repo.full_name == github.repository")
-    AUTHZ_RUNNER_LINE = '    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]'
+    AUTHZ_RUNNER_LINE = "    runs-on: ubuntu-latest"
+    AUTHZ_POOL_RUNNER_LINE = '    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]'
     # Literal ci-labels.md 10-20 16:02, "The `authz` job" (addendum 9).
+    # The owner 10-21 runner exception (msg 1562390657274748981) applies below.
     # Keep this independent of the workflows: every byte, including comments,
     # permissions and both permission lookups, is pinned.
     AUTHZ_TEXT = """  authz:
     name: authz
-    # Pool label (needs no toolchain or Docker). Switch to pf-ci-crj once laneboss's
-    # bulletin says the Cloud Run class is live.
-    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    # Hosted label (needs no toolchain or Docker).
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
     steps:
@@ -2300,9 +2317,8 @@ class PrTierWorkflowTest(unittest.TestCase):
           echo "::error::authz did not pass; nothing of this run's code is checked out or run"
           exit 1
 """
-    # Retain the old expression only as a negative-control fixture. Release
-    # workflows already use the isolated class; this migration does not route
-    # them through the PR pool.
+    # Retain the old expression only as a negative-control fixture.
+    # Release and PR workflows run on GitHub-hosted runners under the owner rule.
     LEGACY_RUNNER = """${{ github.event_name != 'pull_request_target' &&
         github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
         contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
@@ -2328,11 +2344,23 @@ class PrTierWorkflowTest(unittest.TestCase):
     }
 
     def assert_runner(self, runner):
-        self.assertEqual(runner, self.RUNNER)
+        self.assertEqual(runner, "ubuntu-latest", "runs-on must be ubuntu-latest")
 
-    def assert_pool_job(self, job):
+    def assert_hosted_job(self, job):
         self.assert_runner(job.get("runs-on"))
         self.assertNotIn("PF_CI_LABELS", json.dumps(job))
+
+    def assert_hosted_runners(self, workflows):
+        for name, identity in sorted(self.HOSTED_JOBS):
+            self.assertEqual(workflows[name]["jobs"][identity]["runs-on"], "ubuntu-latest",
+                             f"{name}:{identity}: runs-on must be ubuntu-latest")
+
+    def assert_no_pr_pool_runner_labels(self, workflows):
+        for name, workflow in workflows.items():
+            for identity, job in workflow.get("jobs", {}).items():
+                for label in ("pf-ci-x64", "self-hosted"):
+                    self.assertNotIn(label, str(job.get("runs-on", "")),
+                                     f"{name}:{identity}: runs-on must not contain {label}")
 
     def assert_pr_trigger(self, workflow):
         self.assertIn("pull_request", workflow["on"])
@@ -2449,7 +2477,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         })
         self.assertEqual(job["steps"][0]["env"]["ALLOWED_BOTS"],
                          "dependabot[bot] pineforge-app[bot]")
-        self.assert_pool_job(job)
+        self.assert_hosted_job(job)
         self.assertNotIn("if", job)
         self.assertNotIn("continue-on-error", job)
         self.assertNotIn("timeout-minutes", job)
@@ -2470,10 +2498,13 @@ class PrTierWorkflowTest(unittest.TestCase):
             expected = self.AUTHZ_RUNNER_LINE if identity == "authz" else self.RUNNER_LINE
             self.assertEqual(runner_lines, [expected], identity)
 
-    def test_all_pr_jobs_pin_literal_pool_routes_conditions_and_authz(self):
+    def test_all_pr_jobs_pin_literal_hosted_routes_conditions_and_authz(self):
         pr_workflows = {path.name: _workflow(path.name) for path in WORKFLOWS.glob("*.yml")
                         if "pull_request" in _workflow(path.name)["on"]}
         self.assertEqual(set(pr_workflows), set(self.ROUTED_JOBS))
+        self.assertEqual({(name, identity) for name, workflow in pr_workflows.items()
+                          for identity in workflow["jobs"]}, self.HOSTED_JOBS)
+        self.assert_hosted_runners(pr_workflows)
         for name, workflow in pr_workflows.items():
             with self.subTest(workflow=name):
                 self.assertEqual(workflow["name"], name.removesuffix(".yml"))
@@ -2489,8 +2520,8 @@ class PrTierWorkflowTest(unittest.TestCase):
                     self.assert_no_fork_condition(job)
                     self.assertEqual(job.get("name", identity),
                                      "release/ready" if identity == "release-ready" else identity)
-                    self.assertNotIn("uses", job, "PR coverage must not hide a reusable pool job")
-                    self.assert_pool_job(job)
+                    self.assertNotIn("uses", job, "PR coverage must not hide a reusable hosted job")
+                    self.assert_hosted_job(job)
                     if identity == "authz":
                         self.assert_authz(job)
                     else:
@@ -2503,13 +2534,33 @@ class PrTierWorkflowTest(unittest.TestCase):
                 for forbidden in ("secrets.", "create-github-app-token", "id-token:", ": write"):
                     self.assertNotIn(forbidden, text)
 
-    def test_each_runner_pin_refuses_hosted_fragments_unavailable_labels_and_labels_env(self):
+    def test_no_workflow_uses_pr_pool_labels_and_pin_refuses_each_reintroduction(self):
+        original = {
+            path.name: _workflow(path.name)
+            for path in sorted(WORKFLOWS.iterdir())
+            if path.suffix in {".yml", ".yaml"}
+        }
+        self.assert_hosted_runners(original)
+        self.assert_no_pr_pool_runner_labels(original)
+        for name, identity in sorted(self.HOSTED_JOBS):
+            for runner in (self.RUNNER.copy(), ["pf-ci-x64"], ["self-hosted"]):
+                with self.subTest(workflow=name, job=identity, runner=runner):
+                    mutant = copy.deepcopy(original)
+                    mutant[name]["jobs"][identity]["runs-on"] = runner
+                    self.assertNotEqual(mutant, original)
+                    with self.assertRaisesRegex(AssertionError, "runs-on must be ubuntu-latest"):
+                        self.assert_hosted_runners(mutant)
+                    with self.assertRaisesRegex(AssertionError, "runs-on must not contain"):
+                        self.assert_no_pr_pool_runner_labels(mutant)
+
+    def test_each_runner_pin_refuses_pool_arrays_fragments_unavailable_labels_and_labels_env(self):
         for name in self.ROUTED_JOBS:
             text = (WORKFLOWS / name).read_text()
+            self.assertEqual(text.count(self.RUNNER_LINE + "\n"), self.RUNNER_COUNTS[name])
             for identity, job in _workflow(name)["jobs"].items():
-                self.assert_pool_job(job)
+                self.assert_hosted_job(job)
                 for runner in (
-                    "ubuntu-24.04", self.LEGACY_RUNNER,
+                    self.RUNNER.copy(), "ubuntu-24.04", self.LEGACY_RUNNER,
                     """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') }}""",
                     """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}""",
                     """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}""",
@@ -2522,16 +2573,17 @@ class PrTierWorkflowTest(unittest.TestCase):
                     with self.subTest(workflow=name, job=identity, runner=runner):
                         self.assertNotEqual(mutant, job)
                         with self.assertRaises(AssertionError):
-                            self.assert_pool_job(mutant)
+                            self.assert_hosted_job(mutant)
                 mutant = copy.deepcopy(job)
                 mutant.setdefault("env", {})["PF_CI_LABELS"] = json.dumps(self.RUNNER)
                 with self.subTest(workflow=name, job=identity, mutation="labels env"):
                     with self.assertRaises(AssertionError):
-                        self.assert_pool_job(mutant)
+                        self.assert_hosted_job(mutant)
                 block = re.search(rf"(?ms)^  {re.escape(identity)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
                 self.assertIsNotNone(block)
                 original = self.AUTHZ_RUNNER_LINE if identity == "authz" else self.RUNNER_LINE
-                replacement = self.RUNNER_LINE if identity == "authz" else self.AUTHZ_RUNNER_LINE
+                replacement = self.AUTHZ_POOL_RUNNER_LINE if identity == "authz" else self.POOL_RUNNER_LINE
+                self.assertEqual(block[0].count(original + "\n"), 1, identity)
                 altered = block[0].replace(original, replacement, 1)
                 mutant_text = text[:block.start()] + altered + text[block.end():]
                 self.assertNotEqual(mutant_text, text)
@@ -2894,7 +2946,7 @@ class PrTierWorkflowTest(unittest.TestCase):
                 ('          case "$EVENT" in\n',
                  '          [ "$GITHUB_ACTOR" != "dependabot[bot]" ] || exit 0\n'
                  '          case "$EVENT" in\n'),
-                (self.AUTHZ_RUNNER_LINE, self.RUNNER_LINE),
+                (self.AUTHZ_RUNNER_LINE, self.AUTHZ_POOL_RUNNER_LINE),
                 ("          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}",
                  "          HEAD_REPO: ${{ github.repository }}"),
             ]

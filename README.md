@@ -194,7 +194,7 @@ non-commit or side-branch tag fails before tagged checkout or publication.
 Later tagged checkouts use its verified SHA with no persisted credentials.
 Pushing a tag alone does not start publication.
 
-The release and facts-automation jobs use `ubuntu-latest`,
+The release, facts-automation and PR-CI jobs use `ubuntu-latest`,
 GitHub-hosted runners, including candidate preparation, receipt planning
 and failure reporting. Owner decision 10-21 (msg 1562390657274748981) makes this
 a standing R6/rule-B exception for pineforge-release.
