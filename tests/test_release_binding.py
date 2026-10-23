@@ -128,6 +128,9 @@ def expected_pair_payload(manifest_raw, candidate_raw):
 class MemoryStore:
     def __init__(self, *manifests):
         self.rows, self.assets, self.operations = {}, {}, []
+        # Model the hub API independently of the production acceptance checker.
+        self.client = self
+        self.workflow_runs, self.run_reads = {}, []
         for obj in manifests:
             tag = "v" + obj["release_version"]
             self.rows[tag] = {"id": len(self.rows) + 1, "tag_name": tag, "draft": True,
@@ -144,6 +147,18 @@ class MemoryStore:
         return self.releases()
 
     def api(self, route, *, method="GET", data=None):
+        run_prefix = f"repos/{contract.HUB}/actions/runs/"
+        if route.startswith(run_prefix):
+            if method != "GET" or data is not None:
+                raise AssertionError("workflow confirmation must be read-only")
+            self.run_reads.append(route)
+            run = self.workflow_runs.get(int(route.removeprefix(run_prefix)))
+            if run is None:
+                # Client.request maps GitHub's HTTP 404 to Pending.
+                raise contract.Pending("published artifact unavailable")
+            if isinstance(run, Exception):
+                raise run
+            return copy.deepcopy(run)
         prefix = f"repos/{contract.HUB}/releases"
         if route == prefix and method == "POST":
             row = {**data, "id": len(self.rows) + 1, "assets": [], "created_at": "2026-10-16T00:00:00Z"}
@@ -681,12 +696,146 @@ class FinalizerTests(unittest.TestCase):
         # Asset upload order does not change a valid, contiguous repair history.
         store = MemoryStore(self.m)
         row = store.get("v1.6.0")
+        store.workflow_runs[900] = {
+            "id": 900, "path": ".github/workflows/release-redeliver.yml",
+            "head_branch": "main", "status": "completed", "conclusion": "success"}
         for attempt in (2, 1):
             store.put(row, f"delivery-redelivered-compute-{attempt}.json",
-                      contract.canonical({**audit, "attempt": attempt}))
+                      contract.canonical({**audit, "schema": "pineforge/release-redelivery/v2",
+                                          "attempt": attempt, "dispatch_status": 204}))
         status = pipeline.aggregate(store, row, event, enabled=("compute",))
         self.assertEqual(status["consumers"], {"compute": "delivered"})
         self.assertTrue(status["complete"])
+        self.assertEqual(store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"] * 2)
+
+    def test_reader_forged_v1_compute_audit_cannot_complete_exhausted_delivery(self):
+        """Mutation: return bool(evidence) without confirming the audit's run."""
+        self.store.put(self.row, contract.ASSET, contract.canonical(self.m))
+        event = self.finish()
+        self.assertEqual(event["event_id"],
+                         "sha256:12a79d3776c447b1caf9513c96db3407b1d3cd2d71a510081e6763e994c2288e")
+        # Exact reader input: canonical bytes followed by LF, not a derived v2 fixture.
+        forged = (
+            b'{"actor":"release-operator","attempt":1,"consumer":"compute",'
+            b'"event_id":"sha256:12a79d3776c447b1caf9513c96db3407b1d3cd2d71a510081e6763e994c2288e",'
+            b'"run_id":1,"schema":"pineforge/release-redelivery/v1","state":"dispatch_accepted",'
+            b'"timestamp":"2026-10-23T00:00:00Z"}\n'
+        )
+        self.assertEqual(contract.canonical(contract.decode(forged)), forged)
+        self.store.put(self.row, "delivery-redelivered-compute-1.json", forged)
+        for attempt in (1, 2, 3):
+            self.store.put(self.row, f"delivery-attempt-compute-{attempt}.json", contract.canonical({
+                "event_id": event["event_id"], "consumer": "compute", "attempt": attempt,
+                "run_id": 800 + attempt, "timestamp": "2026-10-23T00:00:00Z"}))
+        self.store.put(self.row, "delivery-failed-compute.json", contract.canonical({
+            "event_id": event["event_id"], "consumer": "compute", "state": "failed",
+            "attempts": 3, "timestamp": "2026-10-23T00:00:00Z"}))
+        before = copy.deepcopy(self.store.assets)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "GITHUB_RUN_ID": "901", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "report_issue") as report:
+            output = Path(tmp) / "deliveries.json"
+            with self.assertRaisesRegex(contract.Invalid,
+                                        "^release finalization failed; inspect release incidents$"):
+                pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0", output)
+            self.assertEqual(contract.decode(output.read_bytes()), [])
+            self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/1"])
+            self.assertEqual(self.store.assets, before)
+            self.assertEqual(report.call_args.args[2], "Release v1.6.0: readiness failed")
+            self.assertFalse(report.call_args.kwargs.get("complete", False))
+
+    def test_compute_manual_audits_require_each_workflow_run_binding(self):
+        """Mutations: omit the API lookup or any individual run comparison."""
+        event = contract.payload(contract.canonical(self.m))
+        legacy = {"schema": "pineforge/release-redelivery/v1", "event_id": event["event_id"],
+                  "consumer": "compute", "attempt": 1, "state": "dispatch_accepted",
+                  "run_id": 900, "timestamp": "2026-10-23T00:00:00Z", "actor": "release-operator"}
+        success = {"id": 900, "path": ".github/workflows/release-redeliver.yml",
+                   "head_branch": "main", "status": "completed", "conclusion": "success"}
+        cases = (
+            ("other workflow", {**success, "path": ".github/workflows/release-finalize.yml"},
+             "redelivery workflow run differs"),
+            ("other branch", {**success, "head_branch": "repair"}, "redelivery workflow run differs"),
+            ("failure", {**success, "conclusion": "failure"}, "redelivery workflow run differs"),
+            ("in progress", {**success, "status": "in_progress", "conclusion": None},
+             "redelivery workflow run differs"),
+            ("unfinished success", {**success, "status": "in_progress"}, "redelivery workflow run differs"),
+            ("other id", {**success, "id": 901}, "redelivery workflow run differs"),
+            ("boolean id", {**success, "id": True}, "redelivery workflow run differs"),
+            ("not an object", [], "redelivery workflow run differs"),
+            ("404", None, "redelivery workflow run unavailable"),
+            ("403", contract.Invalid("artifact request failed (HTTP 403)"),
+             r"artifact request failed \(HTTP 403\)"),
+            ("500", contract.Invalid("artifact request failed (HTTP 500)"),
+             r"artifact request failed \(HTTP 500\)"),
+            ("transport", contract.Invalid("artifact transport failed"), "artifact transport failed"),
+        )
+        # v1 gives each negative input a red-on-main case in the existing schema;
+        # v2 independently proves the same binding applies to new audit evidence.
+        for audit in (legacy, {**legacy, "schema": "pineforge/release-redelivery/v2", "dispatch_status": 204}):
+            for label, run, message in cases:
+                with self.subTest(schema=audit["schema"], case=label):
+                    store = MemoryStore(self.m)
+                    row = store.get("v1.6.0")
+                    if run is not None:
+                        store.workflow_runs[900] = run
+                    store.put(row, "delivery-redelivered-compute-1.json", contract.canonical(audit))
+                    before = copy.deepcopy(store.assets)
+                    with self.assertRaisesRegex(contract.Invalid, "^" + message + "$"):
+                        pipeline.aggregate(store, row, event, enabled=("compute",))
+                    self.assertEqual(store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+                    self.assertEqual(store.assets, before)
+
+    def test_confirmed_legacy_audit_is_history_only_until_a_v2_dispatch(self):
+        """Mutation: let a confirmed v1 audit without a dispatch status complete compute."""
+        event = contract.payload(contract.canonical(self.m))
+        audit = {"schema": "pineforge/release-redelivery/v1", "event_id": event["event_id"],
+                 "consumer": "compute", "attempt": 1, "state": "dispatch_accepted",
+                 "run_id": 900, "timestamp": "2026-10-23T00:00:00Z", "actor": "release-operator"}
+        self.store.workflow_runs[900] = {
+            "id": 900, "path": ".github/workflows/release-redeliver.yml",
+            "head_branch": "main", "status": "completed", "conclusion": "success"}
+        self.store.put(self.row, "delivery-redelivered-compute-1.json", contract.canonical(audit))
+        status = pipeline.aggregate(self.store, self.row, event, enabled=("compute",))
+        self.assertEqual(status["consumers"], {"compute": "pending"})
+        self.assertFalse(status["complete"])
+        self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+        self.store.workflow_runs[901] = {**self.store.workflow_runs[900], "id": 901}
+        self.store.put(self.row, "delivery-redelivered-compute-2.json", contract.canonical({
+            **audit, "schema": "pineforge/release-redelivery/v2", "attempt": 2,
+            "run_id": 901, "dispatch_status": 204}))
+        before = copy.deepcopy(self.store.assets)
+        self.store.run_reads.clear()
+        status = pipeline.aggregate(self.store, self.row, event, enabled=("compute",))
+        self.assertEqual(status["consumers"], {"compute": "delivered"})
+        self.assertTrue(status["complete"])
+        self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900",
+                                              f"repos/{contract.HUB}/actions/runs/901"])
+        self.assertEqual(self.store.assets, before)
+
+    def test_v2_compute_audit_requires_recorded_204_and_a_positive_run_id(self):
+        """Mutations: omit dispatch_status validation or accept an audit without run_id."""
+        event = contract.payload(contract.canonical(self.m))
+        audit = {"schema": "pineforge/release-redelivery/v2", "event_id": event["event_id"],
+                 "consumer": "compute", "attempt": 1, "state": "dispatch_accepted", "dispatch_status": 204,
+                 "run_id": 900, "timestamp": "2026-10-23T00:00:00Z", "actor": "release-operator"}
+        cases = [
+            ({key: value for key, value in audit.items() if key != "run_id"}, "unexpected object fields"),
+            ({key: value for key, value in audit.items() if key != "dispatch_status"}, "unexpected object fields"),
+            ({**audit, "run_id": True}, "expected positive integer"),
+            *[({**audit, "dispatch_status": status}, "redelivery dispatch status differs")
+              for status in (200, 201, 202, 400, True, "204", None)],
+        ]
+        for obj, message in cases:
+            with self.subTest(audit=obj):
+                store = MemoryStore(self.m)
+                row = store.get("v1.6.0")
+                store.put(row, "delivery-redelivered-compute-1.json", contract.canonical(obj))
+                with self.assertRaisesRegex(contract.Invalid, "^" + message + "$"):
+                    pipeline.aggregate(store, row, event, enabled=("compute",))
+                self.assertEqual(store.run_reads, [])
 
     def test_compute_is_never_superseded_before_or_after_delivery(self):
         event = self.finish()

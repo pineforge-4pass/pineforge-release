@@ -311,7 +311,18 @@ from `delivery-compute.json` or the manual `delivery-redelivered-compute-N.json`
 audit history and validating the matching `event_id`, compute consumer and
 `dispatch_accepted` state. Malformed or mismatching evidence is refused.
 Manual audits must also satisfy their schema, canonical bytes, actor, clock and
-contiguous attempt numbering. Valid acceptance counts as complete and can close
+contiguous attempt numbering. Completion from a manual audit requires a
+`pineforge/release-redelivery/v2` audit with integer `dispatch_status: 204` and
+positive integer `run_id`. Using the hub client, the finalizer confirms that run
+through `repos/pineforge-4pass/pineforge-release/actions/runs/<run_id>`: its id
+must match, workflow path must be `.github/workflows/release-redeliver.yml`,
+head branch must be `main`, status must be `completed`, and conclusion must be
+`success`. Missing runs (404), API errors, and mismatching or unfinished runs
+are refused and cannot complete compute or close its incident. Confirmed v1
+audits remain readable for contiguous history only; without a recorded dispatch
+response they cannot complete compute. A subsequent confirmed v2 audit can
+complete that history. Audits without a run id are refused.
+Valid acceptance counts as complete and can close
 a release incident. It never becomes `superseded` or `skipped_by_policy`, and a
 newer ready release does not refuse an eligible compute send or retry. `delivered` proves
 transport acceptance; it makes no deployment or served-state claim.
@@ -342,14 +353,19 @@ uses the `release-automation` environment: today that environment permits main
 and release tags and has no required reviewers, so the dispatch right is the
 only approval unless the owner gives the repair a dedicated reviewed environment.
 The consumer must be in `RELEASE_READY_CONSUMERS`; this membership and canonical
-tag are checked before minting the target App token. Compute also requires a
+tag are checked before resolving target repository secrets or minting the
+target App token. The repository guard runs after authorization and passes the
+validated repository through a step output. Compute also requires a
 nonempty canonical `RELEASE_COMPUTE_FIRST_PAIR` no greater than the pair's version
 before minting. The send repeats those authorization checks against the immutable
 manifest. It reconstructs the role's identical payload from the original
 manifest, also reading the original candidate for compute, and appends
 `delivery-redelivered-<consumer>-<n>.json` only after dispatch
 acceptance, recording the event, independent contiguous redelivery number, run,
-timestamp and `GITHUB_ACTOR` login. It never touches `delivery-<consumer>.json`,
+the actual dispatch response status, timestamp and `GITHUB_ACTOR` login.
+The v2 audit takes its run id from `GITHUB_RUN_ID` and is written only for an
+HTTP 204 dispatch response. Before another repair, the hub also confirms the
+runs named by prior v1 or v2 audits. It never touches `delivery-<consumer>.json`,
 `delivery-failed-<consumer>.json`, `delivery-attempt-*`, receipts or other release
 assets. The finalizer validates accepted manual compute audits as delivery
 completion even after automatic retries are exhausted; the original failure and
