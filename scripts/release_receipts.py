@@ -14,13 +14,15 @@ import io
 import os
 import sys
 import zipfile
+import zlib
 from pathlib import Path
 
-from release_artifacts import Client
+from release_artifacts import Client, RequestError
 from release_contract import (ASSET, COMMIT, HUB, RECEIPT_ROLES, ROLES, SHA, Invalid, Pending,
                               canonical, decode, keys, match, payload, positive,
                               require, sha256, version)
-from release_pipeline import Store, receipt_roles, receipts, report_issue, run_link
+from release_pipeline import (Store, configured_roles, finalized_version, receipt_roles,
+                              receipts, report_issue, run_link)
 
 STATES = ("pending", "pr_open", "testing", "ready", "merged", "deploying", "verified", "failed", "superseded", "skipped_by_policy")
 RANK = {state: i for i, state in enumerate(STATES[:7])}
@@ -390,10 +392,14 @@ def fetch_artifact(client, repo, run, policy, artifacts=None):
                              github=True)
     if found[0].get("digest"):
         require(found[0]["digest"] == "sha256:" + sha256(archive), "receipt archive digest differs")
-    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
-        require(zipped.namelist() == ["release-receipt.json"], "unexpected receipt archive inventory")
-        require(zipped.getinfo("release-receipt.json").file_size <= 2 * 1024 * 1024, "receipt exceeds size limit")
-        return decode(zipped.read("release-receipt.json"))
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+            require(zipped.namelist() == ["release-receipt.json"], "unexpected receipt archive inventory")
+            require(zipped.getinfo("release-receipt.json").file_size <= 2 * 1024 * 1024, "receipt exceeds size limit")
+            return decode(zipped.read("release-receipt.json"))
+    except (RuntimeError, zlib.error) as error:
+        # zipfile uses RuntimeError for encryption and unsupported compression.
+        raise Invalid("receipt archive cannot be decoded") from error
 
 
 def validate_facts_target(client, target):
@@ -406,6 +412,30 @@ def validate_facts_target(client, target):
     match(COMMIT, main)
     comparison = client.api(f"repos/{HUB}/compare/{target['commit']}...{main}")
     require(comparison["status"] in ("ahead", "identical"), "facts-only target is not canonical main history")
+
+
+def require_product_receipts(store, role):
+    enabled = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+    newest = finalized_version(store)
+    missing = []
+    for row in sorted(store.releases(), key=lambda item: item["tag_name"]):
+        names = {item["name"] for item in row["assets"]}
+        if row["draft"] or ASSET not in names or "release-rejected.json" in names:
+            continue
+        # The verifier also has the accepted-delivery audit when only the
+        # planner received RELEASE_READY_CONSUMERS.
+        if role not in enabled and f"delivery-{role}.json" not in names:
+            continue
+        event = payload(store.read(row, ASSET))
+        require(row["tag_name"] == "v" + event["release_version"], "required receipt release identity differs")
+        # Match aggregate's exemptions; collection does not demand completion.
+        if newest is not None and version(event["release_version"]) < newest:
+            continue
+        if event["prerelease"] and role in ("application", "web", "data", "license"):
+            continue
+        if receipts(store, row, event["event_id"]).get(role) is None:
+            missing.append(row["tag_name"])
+    require(not missing, f"required consumer receipt missing: role={role} releases=" + ",".join(missing))
 
 
 def collect(client, hub_client, store, role, run_id=0):
@@ -457,7 +487,9 @@ def collect(client, hub_client, store, role, run_id=0):
                     old = (previous["attempt"], previous["sequence"])
                     new = (receipt["attempt"], receipt["sequence"])
                     # Only omit work that cannot advance the stored receipt.
-                    if old > new or (old == new and previous.get("evidence_sha256") == sha256(canonical(receipt))):
+                    if old > new or (old == new
+                                     and previous.get("reporting_run_id") == run["id"]
+                                     and previous.get("evidence_sha256") == sha256(canonical(receipt))):
                         return
         public = validate_receipt(client, repo, receipt, event, policy, run)
         if facts_only:
@@ -507,6 +539,10 @@ def collect(client, hub_client, store, role, run_id=0):
         else:
             try:
                 collect_run(run)
+            except RequestError:
+                # Preserve Invalid compatibility for callers without swallowing
+                # HTTP/auth/transport failures as malformed consumer evidence.
+                raise
             except (Invalid, Pending, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
                 # The text can carry consumer-controlled bytes: no markup, mention, marker or line break reaches an issue.
                 safe_characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _.,;()'=-"
@@ -520,6 +556,8 @@ def collect(client, hub_client, store, role, run_id=0):
         report_issue(hub_client, "receipt-skipped-" + role,
                      f"Release chain: receipt artifacts skipped ({role})",
                      "\n".join(skipped_lines))
+    if not run_id:
+        require_product_receipts(store, role)
 
 
 def signal_targets(signal, enabled):
