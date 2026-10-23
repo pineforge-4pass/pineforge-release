@@ -8,6 +8,7 @@ configured repository, and its full CI/E2E inventory is checked against GitHub.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import io
 import os
@@ -194,6 +195,21 @@ def check_postmerge(client, repo, evidence, policy, pr, actual, timestamp):
 
 
 def identity(obj, *, facts_only=False, consumer=None, slot=None):
+    if type(obj) is dict and "legacy" in obj:
+        require(not facts_only and consumer == "offline" and slot == "previous",
+                "legacy identity is only valid for product offline.previous")
+        keys(obj, ("legacy", "npm_version", "npm_integrity", "git_head", "image_digest"))
+        require(obj["legacy"] is True, "legacy identity flag must be true")
+        try:
+            version(obj["npm_version"])
+        except ValueError as error:
+            raise Invalid("malformed identity") from error
+        match(r"sha512-[A-Za-z0-9+/]{86}==", obj["npm_integrity"])
+        require(len(base64.b64decode(obj["npm_integrity"][7:], validate=True)) == 64,
+                "invalid npm integrity")
+        match(COMMIT, obj["git_head"])
+        match("sha256:" + SHA, obj["image_digest"])
+        return
     if type(obj) is dict and "provenance" in obj:
         require(not facts_only and consumer == "data" and slot == "previous",
                 "bootstrap identity is only valid for product data.previous")
@@ -239,10 +255,10 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     require(reporting_run["path"] == ".github/workflows/" + policy["workflow"], "untrusted receipt workflow")
     require(reporting_run["event"] in ("push", "workflow_dispatch", "workflow_run", "repository_dispatch"),
             "receipt must come from the trusted consumer coordinator")
-    # A provenance-bearing identity must obey the temporary rule even before
-    # its evidence stage is required (including states that return early).
+    # A provenance-bearing or legacy identity must obey its temporary rule even
+    # before its evidence stage is required (including states that return early).
     for name in ("preview", "deployed", "previous"):
-        if type(receipt[name]) is dict and "provenance" in receipt[name]:
+        if type(receipt[name]) is dict and ("provenance" in receipt[name] or "legacy" in receipt[name]):
             identity(receipt[name], facts_only=facts_only, consumer=receipt["consumer"], slot=name)
     # A public receipt never contains private URLs, names, job labels or raw deployment IDs.
     public = {key: receipt[key] for key in ("schema", "consumer", "attempt", "sequence", "state", "timestamp")}
