@@ -423,6 +423,10 @@ The PR object has exactly these fields:
 | `head` | Commit, the actual PR head. |
 | `merge` | `null` before merge, then the actual merge/squash commit. |
 
+In `pr_open`, `testing`, and supported `ready` receipts, `merge` may stay `null`.
+Any non-null value must be a valid commit SHA and equal GitHub's actual merge
+commit for a merged PR; an unmerged PR cannot claim a merge.
+
 A check-evidence object has exactly these fields, for each of `ci`, `e2e`,
 `deploy`, and the conditional application `post_merge`:
 
@@ -485,10 +489,10 @@ validation refuses even an already-published verified receipt with
 "missing/ambiguous postmerge evidence". The existing stored-receipt sweep skip
 can avoid revalidation; callbacks still recheck the evidence.
 
-A `ready` receipt is refused under this policy, even with null `e2e` or an
-already merged PR. E2E must be non-null exactly in `verified`. The verifier takes
-the old coordinator path below only while the live `hosted` policy entry is the
-old coordinator policy.
+A `ready` receipt is refused under this policy before E2E is read, with either
+null or non-null `e2e`, even for an already merged PR. E2E must be non-null
+exactly in `verified`. The verifier takes the old coordinator path below only
+while the live `hosted` policy entry is the old coordinator policy.
 There is one live policy per role and no per-event or per-date policy, so after
 the `hosted` key is replaced by the post-merge policy:
 
@@ -647,7 +651,7 @@ reported state even if earlier snapshots were never collected.
 | `pending` | Target accepted by coordinator; evidence fields may all be null. |
 | `pr_open` | Current same-repository PR with tested base/head recorded. |
 | `testing` | Same PR evidence; tests are in progress, not yet sufficient for ready. |
-| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. Under the hosted post-merge policy, a `ready` receipt is not used: its E2E and preview bind to the merge commit, so the hub refuses a pre-merge `ready` receipt; `e2e` is non-null exactly in `verified`. |
+| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. Under the hosted post-merge policy, the hub refuses every `ready` receipt before reading E2E, even for an already merged PR; `e2e` is non-null exactly in `verified`. |
 | `merged` | Ready evidence plus actual merge commit, tested first parent and CI/E2E completion before merge (CI only for hosted post-merge). |
 | `deploying` | Same evidence as merged; serving has not yet been verified. |
 | `verified` | All prior gates + successful complete deploy inventory + deployed and previous identities; report source is the merge commit. Hosted post-merge requires its E2E here. Application also requires its post-merge gate when configured. |
