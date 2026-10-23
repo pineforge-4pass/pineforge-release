@@ -158,7 +158,8 @@ is the release tag, with its `v`: `v1.0.0`).
 
 ```
 {engine, codegen, HPO} releases → existing producer events → handle-upstream.yml
-  → lockstep VERSION + tag (App) → publish.yml: build and verify candidate
+  → lockstep VERSION + tag push (App) → operator dispatch on main with tag input
+  → publish.yml: guard tag shape, existence and ancestry → build verified SHA
   → release-finalize.yml: packages + measured release facts + immutable manifest
   → pineforge-release → consumer PR → own CI + E2E → merge/deploy → served receipt
   → release-receipts.yml → neutral aggregate status and owner issue
@@ -166,10 +167,12 @@ is the release tag, with its `v`: `v1.0.0`).
 
 - `handle-upstream.yml` — receives `repository_dispatch` from engine / codegen-oss / HPO
   (`{version, prerelease, run_id}`), applies the pairing rule, sets `VERSION`,
-  commits + tags (idempotent, with half-failed-release recovery and a downgrade
-  guard).
-- `publish.yml` — on the pushed tag or explicit replay: checks the pair, waits
-  for upstream artifacts, builds a multi-arch candidate and verifies both child
+  commits + pushes the tag (idempotent, with half-failed-release recovery and a
+  downgrade guard). Publication then needs the operator command below.
+- `publish.yml` — only by dispatch on `main` with a required `tag` input:
+  first checks the release tag's shape, existence and reachability from main.
+  It checks out the verified commit SHA, checks the pair, waits for upstream
+  artifacts, builds a multi-arch candidate and verifies both child
   digests. `release-finalize.yml` binds package identities and measured release
   facts before publishing the immutable manifest, fixed/moving tags and
   `pineforge-release` with the [release-ready/v1 payload](docs/release-chain.md).
@@ -181,6 +184,22 @@ is the release tag, with its `v`: `v1.0.0`).
   and no App token. Stable consumers without verified completion stay pending.
 - `release-reconcile.yml` validates and repairs missed stable producer events;
   `release-receipts.yml` validates consumer evidence and repairs dropped callbacks.
+
+After the tag exists on main and `handle-upstream` is green, a user with write access runs publication or replay:
+`gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=<vX.Y.Z or vX.Y.Z-rc.N>`.
+The first `tag-guard` job requires a main-ref dispatch, validates the complete
+release tag pattern, fetches tags and main with full history, and requires the
+tag to peel to a commit reachable from `origin/main`. A missing, malformed,
+non-commit or side-branch tag fails before tagged checkout or publication.
+Later tagged checkouts use its verified SHA with no persisted credentials.
+Pushing a tag alone does not start publication.
+
+The release, facts-automation and PR-CI jobs use `ubuntu-latest`,
+GitHub-hosted runners, including candidate preparation, receipt planning
+and failure reporting. Owner decision 10-21 (msg 1562390657274748981) makes this
+a standing R6/rule-B exception for pineforge-release.
+The [release runner policy](docs/release-chain.md#release-runner-isolation) lists
+the jobs and the class boundary.
 
 The rules live in `scripts/release_pair.py` (unit-tested in `tests/`).
 `tools/release-dry-run/` replays the current handler and readiness graph offline,
@@ -267,7 +286,10 @@ The separate box run fetches the real sources; the owner attaches them to a
 holding release. Add registry rows only after those real list
 files and their source assets are available. The registry records the 11 EN-150
 source sets, set-12 (`linux` 6.1.190-1 from bookworm-security, first in 1.6.1; its
-other 83 sources are set-02's) and the earliest release holding each bundle.
+other 83 sources are set-02's), set-13 (set-12 with `perl` 5.36.0-7+deb12u4 from
+bookworm-security, first in 1.6.2; its other 83 sources are set-12's), set-14
+(set-13 with `expat` 2.5.0-1+deb12u5 from bookworm-security, first in 1.6.3; its
+other 83 sources are set-13's) and the earliest release holding each bundle.
 A new source set (an image package set not yet in docker/SOURCE-SETS.tsv) needs
 its bundle attached to an earlier or dedicated release before its first publish,
 because the guard looks up the holding release by tag before the new tag's

@@ -16,7 +16,7 @@ on:
     branches: [main]
     paths: ['facts/facts.json']
   schedule:
-    - cron: '3,18,33,48 * * * *'
+    - cron: '3 * * * *'
 
 permissions:
   contents: read
@@ -28,6 +28,7 @@ jobs:
     concurrency:
       group: release-finalize
       cancel-in-progress: false
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
     environment: release-automation
     permissions:
@@ -38,6 +39,12 @@ jobs:
       deliveries: ${{ steps.ready.outputs.deliveries }}
       compute_configuration_error: ${{ steps.ready.outputs.compute_configuration_error }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
@@ -79,8 +86,8 @@ jobs:
   notify-consumers:
     needs: finalize
     if: needs.finalize.outputs.deliveries != '[]'
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     environment: release-automation
     concurrency:
       group: release-delivery-${{ matrix.consumer }}-${{ matrix.tag }}
@@ -96,6 +103,12 @@ jobs:
       # Private targets never enter matrix outputs, log messages or public receipts.
       TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || matrix.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main

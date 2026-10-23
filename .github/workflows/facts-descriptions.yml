@@ -18,7 +18,7 @@ on:
         default: true
         required: true
   schedule:
-    - cron: '17,47 * * * *'
+    - cron: '17 3 * * *'
 
 permissions:
   contents: read
@@ -32,6 +32,7 @@ jobs:
   descriptions:
     if: github.ref == 'refs/heads/main'
     environment: descriptions
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
     env:
       FACTS_DESCRIPTIONS_APPLY_ENABLED: ${{ vars.FACTS_DESCRIPTIONS_APPLY_ENABLED }}

@@ -3,7 +3,7 @@ name: release-reconcile
 on:
   workflow_dispatch:
   schedule:
-    - cron: '11,26,41,56 * * * *'
+    - cron: '11 * * * *'
 
 permissions:
   contents: read
@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   producers:
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
     environment: release-automation
     steps:

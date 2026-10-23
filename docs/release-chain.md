@@ -6,6 +6,53 @@ the authority for semver order, lockstep and the HPO `1.6.0-rc.1` cutoff. The
 hub does not create producer versions or consumer commits, merge consumer PRs,
 or deploy consumers.
 
+## Release runner isolation
+
+Owner decision 10-21 (msg 1562390657274748981) sets these release and facts-automation
+jobs to the literal `runs-on: ubuntu-latest`, a standing R6/rule-B exception
+for pineforge-release:
+
+| Workflow | Jobs |
+|---|---|
+| `facts-descriptions.yml` | `descriptions` |
+| `facts-fanout.yml` | `web`, `license` |
+| `handle-upstream.yml` | `bump` |
+| `publish.yml` | `tag-guard`, `prepare`, `publish`, `failure-report` |
+| `release-finalize.yml` | `finalize`, `notify-consumers` |
+| `release-receipts.yml` | `plan`, `verify` |
+| `release-reconcile.yml` | `producers` |
+| `release-rollback.yml` | `restore` |
+
+The former release class has its own runner group restricted to selected workflows at protected
+refs, its own no-role service account, and one job per runner, with nothing shared
+with PR classes. Secret-bearing jobs and jobs that build artifacts later published
+by a release job formerly belonged in this class. `prepare`, receipt `plan`, and
+`failure-report` also hold the automatic `GITHUB_TOKEN` through `github.token`,
+with Contents or Issues write access. The `publish.yml` reusable
+`notify-consumers` caller obtains its runners from `release-finalize.yml`.
+
+`pull_request` and `pull_request_target` workflows must never use this class.
+The PR jobs in `python-test.yml` and `facts-validate.yml` also use
+`runs-on: ubuntu-latest` per the owner decision.
+The hub runs these jobs on GitHub-hosted runners without waiting for
+the release pool. These hosted jobs do not require a release runner group allowlist.
+
+Publication admits runs at `refs/heads/main` only. Publication
+uses `workflow_dispatch` on `main` with an explicit existing tag input;
+`tag-guard` fails any other workflow ref and is a required dependency of every
+later job. With Contents read access and no secrets, it checks out main with
+full history and no persisted credentials. It validates the complete
+`vX.Y.Z` / `vX.Y.Z-rc.N` pattern before using the input in git, fetches tags and
+main, verifies that the tag exists and peels to a commit, and requires that
+commit to be an ancestor of `refs/remotes/origin/main` (named in full: a tag
+called `origin/main` cannot stand in for it). Both tagged checkouts use the guard's
+verified commit SHA, with no persisted credentials, so moving a tag between
+jobs cannot change the tree built. A failed or skipped guard prevents
+finalization; failure reporting first refuses to check out or run repository
+code unless the guard succeeded.
+The reusable `release-finalize.yml` call inherits the caller's main ref.
+Tag pushes, release events and `workflow_run` do not start publication.
+
 ## Receive, verify and replay
 
 `handle-upstream.yml` still accepts `engine-release`, `codegen-release` and
@@ -16,28 +63,36 @@ own published artifacts are verified before the existing partner/pair decision.
 Incomplete lockstep waits. Invalid flags, source mismatches, authentication,
 rate limits and transport failures fail visibly.
 
-`release-reconcile.yml` wakes every 15 minutes or manually. It paginates the
+`release-reconcile.yml` wakes hourly or manually. It paginates the
 three fixed producer repositories, excludes drafts/prereleases/non-product tags
 and versions older than hub VERSION. It checks whether the desired stable
 version already has a hub Git tag before downloading any artifacts. Only a
 version without that tag has its artifacts verified and the **same producer
-events** sent back to the existing handler. A hub tag hands completion to
-publish/finalize, even while the release is a draft awaiting prerequisites.
+events** sent back to the existing handler. The handler pushes the hub tag;
+after the tag exists on main and `handle-upstream` is green, a user with write
+access dispatches `publish.yml` on `main` with that tag using the command below.
+Finalization then continues even while the release is a draft awaiting prerequisites.
 Older missed versions are superseded by the newest desired stable version;
 they are never replayed as downgrades after it. Duplicate notifications reuse
 the handler's existing decision. A stored candidate makes an unchanged-version
 decision a no-op even while the fixed image tag is absent. Nothing calls a
 producer's version-bump job.
 
-Recovery of an existing hub tag explicitly dispatches `publish.yml` **on that
-tag**. It never force-pushes or rewrites it. Manual replay is also available
-through Actions: select `publish`, select the existing tag as its ref, run.
+Recovery of an existing hub tag emits an operator notice and never force-pushes
+or rewrites the tag. Publication and replay use the same operator command,
+run by a user with write access after the tag exists on main and
+`handle-upstream` is green:
+`gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=<vX.Y.Z or vX.Y.Z-rc.N>`.
+Use the actual existing tag as `tag`. Pushing a tag alone publishes nothing.
+Both a new tag push and retag recovery leave publication to the operator;
+an unchanged version with an image or verified candidate keeps its existing no-op.
 Tags predating this workflow need a reviewed migration; the hub does not invent
 new manifests for historical images without candidate verification.
 
 ## Candidate and readiness
 
-`publish.yml` first reuses `release-candidate.json` if already stored. Otherwise
+`publish.yml` validates the release tag before preparation can reuse
+`release-candidate.json` if already stored. Otherwise
 it preserves the existing harness, ABI, license and Debian source-mirror gates,
 builds only a unique `candidate-<commit>-<run>-<attempt>` image tag, and verifies
 the pushed child digests on amd64 and arm64. Each child must pass an actual
@@ -52,7 +107,7 @@ uses the paginated releases list matched by `tag_name`, with a token that has
 Contents write/push access to see drafts. GitHub's `releases/tags/{tag}` endpoint
 exposes published releases only. Prepare, replay and finalization reuse the same
 draft and never create a second candidate for its version. The finalizer runs
-as a reusable job after publication, on facts-file changes, every 15 minutes,
+as a reusable job after publication, on facts-file changes, hourly,
 and on manual replay. It never rebuilds a stored verified candidate. It requires:
 
 - Engine's published Linux and macOS archives and matching checksums.
@@ -196,6 +251,13 @@ JSON strings; blank `hpo_tag` decodes to null. Repeating the same
 bounded delivery history and report a neutral incident to
 `RELEASE_REPORT_OWNER`. No older-pair backfill is needed for the initial rollout.
 
+The hub's `release-redeliver.yml` uses the same `release-pair` mapping for
+application and compute, fetching the original manifest and candidate bytes.
+Compute repair also requires its role selection and a valid, nonempty
+`RELEASE_COMPUTE_FIRST_PAIR` no greater than the pair's version. A newer release
+does not supersede an eligible compute repair; application keeps its existing
+prerelease skip and supersession rules.
+
 `facts-update` remains exactly `{commit, sha256, dry_run}`. The existing guarded
 web sender is retained and an independently gated license job uses the same
 validator and transport. A facts-only change sends `facts-update` to enabled
@@ -259,8 +321,27 @@ evidence can still advance progress; scheduled runs do not clear the retry
 history. Investigate and use an explicit reviewed
 recovery for an exhausted delivery.
 
-`release-receipts.yml` polls selected receipt consumers every 15 minutes and
-accepts the callback below to repair dropped notifications. It mints a target-only read
+Use `release-redeliver.yml` for an explicitly reviewed repair of one published
+release to one consumer after the three automatic attempts are spent or the
+consumer was not ready, including accepted delivery without verified completion.
+It runs only from main.
+Only operators permitted to dispatch the workflow may trigger it, and the job
+uses the `release-automation` environment: today that environment permits main
+and release tags and has no required reviewers, so the dispatch right is the
+only approval unless the owner gives the repair a dedicated reviewed environment.
+The consumer must be in `RELEASE_READY_CONSUMERS`. It resends the immutable manifest's identical
+payload and appends `delivery-redelivered-<consumer>-<n>.json` only after dispatch
+acceptance, recording the event, independent contiguous redelivery number, run,
+timestamp and `GITHUB_ACTOR` login. It never touches `delivery-<consumer>.json`,
+`delivery-failed-<consumer>.json`, `delivery-attempt-*`, receipts or other release
+assets. If dispatch succeeds but the audit write fails, the run fails; when no
+audit asset was written, the next run sends again with the same number, so a
+duplicate delivery is possible. The receipt contract is unchanged: redelivery
+keeps the same `event_id`, and the consumer's idempotence rules decide how to
+handle it.
+
+`release-receipts.yml` polls selected consumers every 30 minutes and accepts the
+callback below to repair dropped notifications. It mints a target-only read
 token, verifies the artifact and full GitHub CI/E2E/deploy evidence, then appends
 a neutral receipt. Its planner excludes `DELIVERY_ONLY` roles, so compute has
 no policy lookup, read token or workflow poll; compute callbacks and consumer
@@ -326,7 +407,7 @@ fields defined here.
 | `attempt` | Integer identifying an automation attempt, increasing per consumer/target; use the coordinator's GitHub run ID, not `GITHUB_RUN_ATTEMPT` alone. |
 | `sequence` | Integer, strictly increasing for new snapshots within that attempt. It may restart at 1 for a larger attempt. |
 | `state` | One of the ten strings in the state table below. |
-| `timestamp` | Real UTC timestamp string `YYYY-MM-DDTHH:MM:SSZ`, at most five minutes in the future; for verified, at/after the final deploy check completion and, when configured, the final post-merge check completion. |
+| `timestamp` | Real UTC timestamp string `YYYY-MM-DDTHH:MM:SSZ`, at most five minutes in the future; for verified, at/after the final deploy check completion and, when configured, the final post-merge check completion; for hosted post-merge E2E, at or after the last E2E job's completion. |
 | `pr` | PR object below, or `null` before PR evidence exists. |
 | `ci`, `e2e`, `deploy` | Each a check-evidence object below, or `null` before that evidence exists. |
 | `post_merge` | Application only: required exactly when the policy contains `post_merge`, otherwise forbidden. Same check-evidence object below; may be `null` before `verified`. |
@@ -349,14 +430,15 @@ A check-evidence object has exactly these fields, for each of `ci`, `e2e`,
 |---|---|
 | `run_id` | Integer, GitHub Actions run in the configured consumer repository. |
 | `run_attempt` | Integer, the particular GitHub attempt whose jobs are checked. |
-| `sha` | Commit; `pr.head` for CI/E2E, `pr.merge` for deploy and post-merge. Hosted `release-coordinator.yml` E2E alone uses `pr.base_sha`, subject to the binding checks below. |
+| `sha` | Commit; `pr.head` for CI/E2E, `pr.merge` for deploy and application post-merge. Hosted `release-postmerge.yml` E2E uses `pr.merge`; legacy hosted `release-coordinator.yml` E2E uses `pr.base_sha`, subject to the binding checks below. |
 | `expected` | Array of unique job-name strings, exactly the corresponding policy list, in the same order. |
 | `approved_skips` | Array of job-name strings, exactly the corresponding policy list, in the same order. |
 | `results` | Object with exactly one key per expected job; values `success`, or `skipped` only for owner-approved skips. Must equal actual GitHub jobs. |
 
 The referenced run must have completed successfully. Every expected job must
 exist exactly once and finish successfully or have its explicit approved skip;
-at least one must succeed. CI/E2E must finish before the PR's actual merge time.
+at least one must succeed. CI/E2E must finish before the PR's actual merge time,
+except hosted post-merge E2E as described below.
 The merge commit's first parent must be `base_sha`, proving the tested base
 landed. An unmerged PR must still have the tested base. Rebase/merge-queue source
 graphs need an approved adapter before enablement.
@@ -374,12 +456,30 @@ evidence is deferred. The neutral verified receipt adds `post_merge` containing
 only `run_id`, `run_attempt`, and `inventory_sha256`, the SHA-256 of the canonical
 results object, in the same form as `deploy`.
 
+**Hosted post-merge E2E.** Hosted now uses CI `release-pr.yml`, E2E
+`release-postmerge.yml` and deploy `release.yml`. E2E requires exactly
+`["authz", "build", "verified"]` with no approved skips. Its run and
+`preview.source` bind to `pr.merge`; the run must use `workflow_dispatch` on
+`main`, also the repository default branch and PR base. Its jobs must finish
+at or after the PR's actual `merged_at` and at or before the receipt timestamp;
+CI still finishes before merge. The run must retain exactly one non-expired
+`postmerge-evidence-<run_id>-<run_attempt>` artifact; the hub checks its name and
+existence, while its contents remain the hosted repository's private contract.
+E2E must be non-null exactly in `verified`. The verifier takes the old coordinator
+path below only while the live `hosted` policy entry is the old coordinator policy.
+There is one live policy per role and no per-event or per-date policy, so after
+the `hosted` key is replaced by the post-merge policy, a retained coordinator-shape
+`verified` receipt is refused with "required check inventory differs from owner policy".
+Retained receipts whose evidence is null (`pending`, `failed`, `superseded`,
+`skipped_by_policy`) are unaffected.
+
 **Hosted coordinator binding.** Only consumer `hosted`, with CI workflow
 `release-pr.yml` and E2E workflow `release-coordinator.yml`, can use the base-code
 adapter in [`check_coordinator`](../scripts/release_receipts.py). Its E2E
 inventory is exactly `["candidate", "release/ready"]` in that order, with no
 approved skips. CI still runs at `pr.head`; deploy still runs at `pr.merge`.
-All other E2E workflows retain the exact PR-head check in `check_run`.
+Other E2E workflows, apart from hosted post-merge above, retain the exact
+PR-head check in `check_run`.
 
 The coordinator run must be completed successfully at the recorded E2E run ID
 and attempt, with `head_sha == pr.base_sha`. Its event must be `workflow_run`;
@@ -410,17 +510,21 @@ root `binding.json`. That JSON has exactly `schema`, `pr`, `head`, `base`,
 Binding PR/run/artifact IDs and attempts must be positive JSON integers;
 booleans, numeric strings and floats are refused.
 
-Only `candidate` and `release/ready` are the required hosted E2E jobs.
+For the legacy coordinator policy, only `candidate` and `release/ready` are
+the required hosted E2E jobs.
 `pending`, `policy` and `merge` are orchestration jobs, not additions to that
-inventory. Hosted CI requires `validate`, `checks`, `container`, `candidate`;
-hosted deploy requires `deploy`. Neither inventory permits skips. The public
+inventory. The legacy coordinator policy's hosted CI requires `validate`, `checks`,
+`container`, `candidate`; its deploy requires `deploy`. Neither inventory permits
+skips. The post-merge policy's inventories (CI `authz, validate, checks, container`;
+E2E `authz, build, verified`; deploy `decide, deploy`) are in the policy example
+below. The public
 receipt and callback schemas remain v1; the binding stays consumer-side.
 
 An ordinary served-identity object has exactly these five fields:
 
 | Field | Type and allowed value |
 |---|---|
-| `source` | Commit; `pr.head` for preview, `pr.merge` for deployed, previous deployed source for previous. |
+| `source` | Commit; `pr.head` for preview (hosted post-merge uses `pr.merge`), `pr.merge` for deployed, previous deployed source for previous. |
 | `image_digest` | Digest string; preview and deployed equal the product manifest's index digest. Facts-only may use `null` when no product image is consumed. |
 | `facts_commit` | Commit, actually consumed canonical hub facts source. |
 | `facts_sha256` | SHA-256 of the exact facts bytes consumed. |
@@ -487,9 +591,10 @@ as a later release's previous is a real identity.
 and the data exemption only after (1) data 0.3.1 is verified AND (2) every
 stored `release-receipt-data` artifact whose receipt carries the bootstrap
 `previous` has expired (data uploads it with 90-day retention): the scheduled
-collector re-validates every retained receipt artifact, so dropping the form
-earlier makes the whole data sweep fail until they expire. If the form must go
-sooner, first make the collector skip receipts already stored byte-identically.
+collector re-validates every retained receipt artifact that the hub has not
+already stored, so dropping the form earlier makes each such artifact fail
+validation; in a sweep it is reported and skipped (see the collector skip rules
+below), and a callback naming that run still fails closed.
 
 **State machine.** Ordered progress is
 `pending → pr_open → testing → ready → merged → deploying → verified`.
@@ -501,10 +606,10 @@ reported state even if earlier snapshots were never collected.
 | `pending` | Target accepted by coordinator; evidence fields may all be null. |
 | `pr_open` | Current same-repository PR with tested base/head recorded. |
 | `testing` | Same PR evidence; tests are in progress, not yet sufficient for ready. |
-| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. |
-| `merged` | Ready evidence plus actual merge commit, tested first parent and CI/E2E completion before merge. |
+| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. Under the hosted post-merge policy, a `ready` receipt is not used: its E2E and preview bind to the merge commit, so the hub refuses a pre-merge `ready` receipt; `e2e` is non-null exactly in `verified`. |
+| `merged` | Ready evidence plus actual merge commit, tested first parent and CI/E2E completion before merge (CI only for hosted post-merge). |
 | `deploying` | Same evidence as merged; serving has not yet been verified. |
-| `verified` | All prior gates + successful complete deploy inventory + deployed and previous identities; report source is the merge commit. Application also requires its post-merge gate when configured. |
+| `verified` | All prior gates + successful complete deploy inventory + deployed and previous identities; report source is the merge commit. Hosted post-merge requires its E2E here. Application also requires its post-merge gate when configured. |
 | `failed` | Terminal failure in this attempt; evidence may be null, details stay in the consumer report. |
 | `superseded` | Terminal obsolete target in this attempt; evidence may be null. |
 | `skipped_by_policy` | Terminal policy skip, accepted only for product prereleases, never stable or facts-only. |
@@ -773,8 +878,8 @@ examples against its own validator, including the documented JSON.
 Both complete examples and the synthetic builder use the ordinary five-key
 form; the data bootstrap above is a separate, literal documented example.
 Use `--consumer hosted` for a synthetic hosted receipt with CI at the PR head
-and coordinator E2E at the tested base. Its example policy is the exact hosted
-entry below; a real coordinator must also publish its verified binding artifact.
+and post-merge E2E and preview at the merge commit. Its example policy is the
+exact hosted entry below; the E2E run must retain its post-merge evidence artifact.
 Use `--consumer application` for a synthetic application receipt with base `dev`
 and `post_merge` evidence at the merge commit. Its policy matches the application
 example below; replace all `example-*` values with APP's real workflows and
@@ -803,12 +908,12 @@ their required branch checks, and no consumer may use an admin merge. Configure
 suite inventory; only a verified documentation-only PR may skip suites.
 
 The hub's `python-test.yml` and `facts-validate.yml` PR checks use the literal
-`["self-hosted","pf-ci","pf-ci-x64"]` runner array, without a hosted fallback or
-`PF_CI_LABELS` environment variable. Keep `pf-ci-x64` until laneboss posts
-"pf-ci-crj live". Both workflows run on every pull request without path or
-branch filters. Their first job is the exact canonical `authz` from
-`ci-labels.md`, with `name: authz`,
-`runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]`, `permissions: {}`, no
+`runs-on: ubuntu-latest` per owner decision 10-21 (msg 1562390657274748981),
+a standing R6/rule-B exception for pineforge-release, without a `PF_CI_LABELS`
+environment variable. Both workflows run on every pull request without path or
+branch filters. Their first job is the canonical `authz` from
+`ci-labels.md` with the owner-approved runner exception, `name: authz`,
+`runs-on: ubuntu-latest`, `permissions: {}`, no
 condition, checkout or secrets, and the canonical no-timeout comment.
 Its eight payload fields are `EVENT`, `REPO`, `HEAD_REPO`, `HEAD_IS_FORK`,
 `ASSOCIATION`, `PR_AUTHOR`, `WR_HEAD_REPO` and `WR_ACTOR`; the other two
@@ -877,12 +982,12 @@ A member's own fork fails the canonical authz check.
 The existing `merge_group` trigger remains
 configured and passes the canonical authz script. macOS stays hosted
 (no hardware); this repository has no macOS jobs. Credential/release jobs
-untouched: pending `pf-ci-release`, including publication workflows.
+use `ubuntu-latest` per owner decision 10-21, including publication workflows.
 
 | Name / setting | Scope | Purpose |
 |---|---|---|
 | `PINEFORGE_APP_ID`, `PINEFORGE_APP_PRIVATE_KEY` (existing) | Hub `release-automation` environment | Short-lived, one-target installation tokens; no PAT fallback. |
-| App installation permissions | The App's full permission set on every installed repository, including the private compute repository | Confirm the full set in the App's settings before the owner decides O-1. The App already holds Actions write for the hub; installing it on compute grants that and every other App permission there. The mint uses `owner: github.repository_owner` and joins the same owner's installation. Hub tag/dispatch and explicit publish replay; consumer dispatch and completion evidence reads. Each mint asks only for the permissions needed by that job; delivery-only compute uses only the existing Contents-write dispatch mint. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
+| App installation permissions | The App's full permission set on every installed repository, including the private compute repository | Confirm the full set in the App's settings before the owner decides O-1. The App already holds Actions write for the hub; installing it on compute grants that and every other App permission there. The mint uses `owner: github.repository_owner` and joins the same owner's installation. Hub tag pushes and producer-event reconciliation; consumer dispatch and completion evidence reads. Publication and replay use the write-access operator's login. Each mint asks only for the permissions needed by that job: hub Contents write; receipt consumers Contents read/write, Actions read and Pull requests read; delivery-only compute uses only the existing Contents-write dispatch mint. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
 | `RELEASE_HOSTED_MCP_REPOSITORY`, `RELEASE_APPLICATION_REPOSITORY`, `FACTS_WEB_REPOSITORY` (existing) | Hub `release-automation` environment secrets | Private short repository names for neutral hosted/application/web targets. Public offline/data/license names are fixed in workflows. |
 | `RELEASE_COMPUTE_REPOSITORY` (new secret) | Hub `release-automation` environment secrets | Private short name of the compute target repository; the application target likewise lives in `RELEASE_APPLICATION_REPOSITORY`. Both reuse the existing one-target App mint. No values belong in source or public audit assets. |
 | `RELEASE_RECEIPT_POLICY` (new secret) | Hub repository Actions secret (read by the receipt verify job, which runs in the `release-automation` environment; do not also create it in the environment, it would shadow this one) | JSON map of each enabled receipt role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories, plus optional application-only `post_merge`. Compute needs no entry. Keep private workflow/job details out of public source. |
@@ -917,8 +1022,9 @@ Outside Actions, the same `compute_configuration_error` key and fixed text are
 printed as a `key=value` line on stdout when `GITHUB_OUTPUT` is unavailable.
 
 Policy example: the `offline` entry remains a synthetic structure, not a
-production inventory. The `hosted` entry is the exact policy from the reviewed
-hosted credential-isolation contract. Merge that hosted entry into the existing
+production inventory. The `hosted` entry is the exact policy from hosted
+`receipt.mjs` at `0a1c82c8`, following the 2026-10-21 post-merge change.
+Merge that hosted entry into the existing
 `RELEASE_RECEIPT_POLICY` only after installing this hub adapter, preserving every
 other consumer entry. The supervisor applies the live policy; this change does
 not alter GitHub settings.
@@ -944,17 +1050,17 @@ names. Do not use the example E2E/deploy inventories as production gates.
     "base": "main",
     "ci": {
       "workflow": "release-pr.yml",
-      "expected": ["validate", "checks", "container", "candidate"],
+      "expected": ["authz", "validate", "checks", "container"],
       "approved_skips": []
     },
     "e2e": {
-      "workflow": "release-coordinator.yml",
-      "expected": ["candidate", "release/ready"],
+      "workflow": "release-postmerge.yml",
+      "expected": ["authz", "build", "verified"],
       "approved_skips": []
     },
     "deploy": {
       "workflow": "release.yml",
-      "expected": ["deploy"],
+      "expected": ["decide", "deploy"],
       "approved_skips": []
     }
   },
@@ -1001,11 +1107,29 @@ must never be used to omit existing required checks.
 
 Rollout order for the application `post_merge` section: a receipt must carry
 `post_merge` exactly when the policy has it, and `collect` re-checks every
-retained application reporting artifact and stops at the first invalid one.
+retained application reporting artifact that the hub has not already stored.
 Put the policy with `post_merge` in place together with the application
-emitter change. While an artifact of the old shape is retained, application
-polling stays blocked until it expires. Changing any inventory has the same
-effect.
+emitter change. While an artifact of the old shape is retained and not yet
+stored, each sweep reports and skips it (collector skip rules below) until it
+expires. Changing any inventory has the same effect.
+
+**Hosted rollout order.**
+`collect` re-validates every retained `release-receipt-hosted` artifact in ascending
+run-id order, except an artifact the hub already stored (collector skip rules below).
+After the `hosted` policy swap, a retained coordinator-shape `verified` artifact that
+the hub has NOT already stored is refused by validation ("required check inventory
+differs from owner policy"); in a sweep (the scheduled sweep and a manual `--run-id 0`
+sweep) it is reported with a `::warning::` line and one incident issue per role
+(`Release chain: receipt artifacts skipped (hosted)`) and skipped, and the sweep
+continues with the remaining artifacts. One that the hub already stored with the
+same or a greater `(attempt, sequence)` is not validated at all. A collection
+triggered by a callback names one run id, checks only that run and still fails
+closed, so a new post-merge receipt verifies through its callback either way.
+Removing the retained coordinator-shape artifacts from the hosted repository before
+the swap is no longer required; the stored public form is recorded on the hub
+release as `consumer-hosted-<run>-<sequence>.json`.
+
+**Collector skip rules.** In a sweep, a bad or old-shape artifact is reported with a `::warning::` line and one stable incident issue per role, then skipped. An artifact is not re-validated when the hub already stored a receipt for that role and release with a greater `(attempt, sequence)`, or the same key and the same canonical-evidence digest. Facts-only artifacts are still validated. A callback names one run and still fails closed; `OSError` stays fatal, while `Pending` (unknown release, unavailable artifact) is reported and skipped in a sweep. The incident issue lists at most 50 runs and a count of any additional skipped runs, reasons are reduced to a fixed safe character set, and the issue is not closed automatically when the artifacts expire.
 
 ## Rollback and validation
 

@@ -8,6 +8,8 @@ on:
   push:
     branches: [main, master]
   pull_request:
+    # LB-387: ready_for_review starts the suites skipped on draft PRs.
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
 
 permissions:
@@ -21,9 +23,9 @@ concurrency:
 jobs:
   authz:
     name: authz
-    # Pool label (needs no toolchain or Docker). Switch to pf-ci-crj once laneboss's
-    # bulletin says the Cloud Run class is live.
-    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]
+    # Hosted label (needs no toolchain or Docker).
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
     steps:
@@ -84,7 +86,10 @@ jobs:
 
   changes:
     needs: authz
-    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
+    # A skipped classifier keeps release/ready red, even for docs-only drafts.
+    if: ${{ !github.event.pull_request.draft }}
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     outputs:
       docs-only: ${{ steps.paths.outputs.docs-only }}
     steps:
@@ -131,8 +136,9 @@ jobs:
 
   fingerprint-canonical:
     needs: [authz, changes]
-    if: needs.changes.outputs.docs-only == 'false'
-    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
+    if: ${{ !github.event.pull_request.draft && (needs.changes.outputs.docs-only == 'false') }}
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -153,8 +159,9 @@ jobs:
 
   release-rules:
     needs: [authz, changes]
-    if: needs.changes.outputs.docs-only == 'false'
-    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
+    if: ${{ !github.event.pull_request.draft && (needs.changes.outputs.docs-only == 'false') }}
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -193,8 +200,9 @@ jobs:
 
   description-renderer:
     needs: [authz, changes]
-    if: needs.changes.outputs.docs-only == 'false'
-    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
+    if: ${{ !github.event.pull_request.draft && (needs.changes.outputs.docs-only == 'false') }}
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -208,8 +216,9 @@ jobs:
 
   release-ready-replay:
     needs: [authz, changes]
-    if: needs.changes.outputs.docs-only == 'false'
-    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
+    if: ${{ !github.event.pull_request.draft && (needs.changes.outputs.docs-only == 'false') }}
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -225,7 +234,8 @@ jobs:
     name: release/ready
     if: ${{ always() }}
     needs: [authz, changes, fingerprint-canonical, release-rules, description-renderer, release-ready-replay]
-    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     steps:
       - name: Refuse an unauthorised run before anything else
         if: ${{ needs.authz.result != 'success' }}

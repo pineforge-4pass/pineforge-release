@@ -2,8 +2,8 @@ name: publish
 
 # Build and verify a candidate; the separate finalizer binds measured facts
 # and all package identities before moving aliases and dispatching consumers.
-# Fires on the v* tag that handle-upstream.yml pushes with the App
-# token (or a manual tag). The tag value equals VERSION (asserted below).
+# Dispatched on main with the existing v* tag that handle-upstream.yml pushes
+# (or a manual tag). The tag value equals VERSION (asserted below).
 # From 1.0.0 on the image pairs engine and codegen at the release version
 # (scripts/release_pair.py check). The hpo cutoff also lives in that script:
 # from it, the tag must explicitly pin hpo and the checked pin goes to the build.
@@ -13,10 +13,13 @@ name: publish
 # the moving `X.Y` follow the newest stable release only.
 
 on:
-  push:
-    tags: ["v*"]
-  # Explicit replay runs on the existing tag; no tag rewrite is required.
+  # Build an existing tag from a run on main; no tag rewrite is required.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: The existing v* tag to build
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,50 +29,113 @@ env:
   IMAGE: ${{ github.repository }}   # pineforge-4pass/pineforge-release
 
 concurrency:
-  group: release-candidate-${{ github.ref_name }}
+  group: release-candidate-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
+  tag-guard:
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.tag.outputs.sha }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
+      - name: Checkout main for tag verification
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release tag
+        id: tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          WORKFLOW_ON_MAIN: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          set -euo pipefail
+          if [ "$WORKFLOW_ON_MAIN" != true ]; then
+            echo '::error::dispatch publish.yml on refs/heads/main'; exit 1
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo '::error::expected an existing vX.Y.Z or vX.Y.Z-rc.N tag'; exit 1
+          fi
+          git fetch --tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! TAG_COMMIT="$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}")"; then
+            echo "::error::release tag ${TAG} does not exist or does not peel to a commit"; exit 1
+          fi
+          if ! [[ "$TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::release tag did not resolve to a 40-character commit SHA'; exit 1
+          fi
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then
+            echo "::error::release tag ${TAG} is not reachable from main"; exit 1
+          fi
+          printf 'sha=%s\n' "$TAG_COMMIT" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+
   prepare:
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    needs: tag-guard
+    if: github.ref == 'refs/heads/main'
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
       contents: write  # GitHub lists draft candidates only with push access
     outputs:
       exists: ${{ steps.candidate.outputs.exists }}
+      tag: ${{ needs.tag-guard.outputs.tag }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.tag-guard.outputs.sha }}
           persist-credentials: false
       - name: Reuse an already verified candidate
         id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.tag-guard.outputs.tag }}
         run: python3 scripts/release_pipeline.py candidate-exists "$TAG" >> "$GITHUB_OUTPUT"
 
   publish:
-    needs: prepare
+    needs: [tag-guard, prepare]
     if: needs.prepare.outputs.exists == 'false'
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
     environment: release-automation
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
     permissions:
       contents: write   # append verified candidate to its draft release
       packages: write   # push to GHCR
     outputs:
       prerelease: ${{ steps.pair.outputs.prerelease }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.tag-guard.outputs.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -78,7 +144,7 @@ jobs:
 
       - name: Assert tag matches VERSION
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           set -euo pipefail
           file="$(tr -d '[:space:]' < VERSION)"
@@ -88,7 +154,7 @@ jobs:
         id: pins
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REF: ${{ github.ref_name }}
+          REF: ${{ env.RELEASE_TAG }}
         run: |
           set -euo pipefail
           semver() { printf '%s' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'; }
@@ -139,7 +205,7 @@ jobs:
       - name: Pairing rule + release channel
         id: pair
         env:
-          REF: ${{ github.ref_name }}
+          REF: ${{ env.RELEASE_TAG }}
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
           H: ${{ steps.pins.outputs.hpo }}
@@ -201,11 +267,11 @@ jobs:
         id: binding
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.RELEASE_TAG }}
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
           H: ${{ steps.pins.outputs.hpo }}
-          HUB_COMMIT: ${{ github.sha }}
+          HUB_COMMIT: ${{ needs.tag-guard.outputs.sha }}
         run: |
           set -euo pipefail
           python3 scripts/release_pipeline.py bindings --release-version="${TAG#v}" \
@@ -227,7 +293,7 @@ jobs:
         if: steps.pair.outputs.target == 'hpo'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REF: ${{ github.ref_name }}
+          REF: ${{ env.RELEASE_TAG }}
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
           H: ${{ steps.pair.outputs.hpo }}
@@ -267,15 +333,15 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+            type=raw,value=candidate-${{ needs.tag-guard.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           # The action derives the licences label from this repository's
           # Apache-2.0, and its labels override the Dockerfile's. The image also
           # bundles the transpiler, whose LICENSE from codegen 1.3.0 is the
           # PineForge Source License 1.2 (see README, License).
           labels: |
             org.opencontainers.image.licenses=Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2
-            org.opencontainers.image.version=${{ github.ref_name }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.revision=${{ needs.tag-guard.outputs.sha }}
 
       # Inspect the selected target on both architectures before any publish.
       # Keep target and arguments identical to the push steps; the cache scope is per architecture and shared with them.
@@ -293,8 +359,8 @@ jobs:
           build-args: |
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
-            RELEASE_VERSION=${{ github.ref_name }}
-            RELEASE_GIT_SHA=${{ github.sha }}
+            RELEASE_VERSION=${{ env.RELEASE_TAG }}
+            RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: type=gha,scope=release-amd64
           cache-to: type=gha,scope=release-amd64,mode=max
 
@@ -312,8 +378,8 @@ jobs:
           build-args: |
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
-            RELEASE_VERSION=${{ github.ref_name }}
-            RELEASE_GIT_SHA=${{ github.sha }}
+            RELEASE_VERSION=${{ env.RELEASE_TAG }}
+            RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: type=gha,scope=release-arm64
           cache-to: type=gha,scope=release-arm64,mode=max
 
@@ -336,8 +402,8 @@ jobs:
             ${{ steps.binding.outputs.hpo_wheel_arg }}
             ${{ steps.binding.outputs.hpo_sdist_arg }}
             ${{ steps.toolchain.outputs.args }}
-            RELEASE_VERSION=${{ github.ref_name }}
-            RELEASE_GIT_SHA=${{ github.sha }}
+            RELEASE_VERSION=${{ env.RELEASE_TAG }}
+            RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: type=gha,scope=hpo-amd64
           cache-to: type=gha,scope=hpo-amd64,mode=max
 
@@ -360,8 +426,8 @@ jobs:
             ${{ steps.binding.outputs.hpo_wheel_arg }}
             ${{ steps.binding.outputs.hpo_sdist_arg }}
             ${{ steps.toolchain.outputs.args }}
-            RELEASE_VERSION=${{ github.ref_name }}
-            RELEASE_GIT_SHA=${{ github.sha }}
+            RELEASE_VERSION=${{ env.RELEASE_TAG }}
+            RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: type=gha,scope=hpo-arm64
           cache-to: type=gha,scope=hpo-arm64,mode=max
 
@@ -415,8 +481,8 @@ jobs:
           build-args: |
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
-            RELEASE_VERSION=${{ github.ref_name }}
-            RELEASE_GIT_SHA=${{ github.sha }}
+            RELEASE_VERSION=${{ env.RELEASE_TAG }}
+            RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: |
             type=gha,scope=release-amd64
             type=gha,scope=release-arm64
@@ -443,8 +509,8 @@ jobs:
             ${{ steps.binding.outputs.hpo_wheel_arg }}
             ${{ steps.binding.outputs.hpo_sdist_arg }}
             ${{ steps.toolchain.outputs.args }}
-            RELEASE_VERSION=${{ github.ref_name }}
-            RELEASE_GIT_SHA=${{ github.sha }}
+            RELEASE_VERSION=${{ env.RELEASE_TAG }}
+            RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: |
             type=gha,scope=hpo-amd64
             type=gha,scope=hpo-arm64
@@ -515,7 +581,7 @@ jobs:
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.RELEASE_TAG }}
           E: ${{ steps.pins.outputs.engine }}
           C: ${{ steps.pins.outputs.codegen }}
           H: ${{ steps.pins.outputs.hpo }}
@@ -533,11 +599,11 @@ jobs:
             --amd64 "$RUNNER_TEMP/pushed-debian-amd64.tsv" --arm64 "$RUNNER_TEMP/pushed-debian-arm64.tsv"
 
   notify-consumers:
-    needs: [prepare, publish]
-    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    needs: [tag-guard, prepare, publish]
+    if: ${{ !cancelled() && needs.tag-guard.result == 'success' && needs.prepare.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
     uses: ./.github/workflows/release-finalize.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ needs.prepare.outputs.tag }}
     secrets: inherit
     permissions:
       contents: write
@@ -545,26 +611,35 @@ jobs:
       issues: write
 
   failure-report:
-    needs: [prepare, publish, notify-consumers]
-    if: ${{ failure() && !cancelled() }}
-    runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    needs: [tag-guard, prepare, publish, notify-consumers]
+    if: ${{ always() && !cancelled() && (needs.tag-guard.result != 'success' || contains(needs.*.result, 'failure')) }}
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
       contents: read
       issues: write
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
+      - name: Refuse unverified release tag
+        if: ${{ needs.tag-guard.result != 'success' }}
+        shell: bash
+        run: |
+          echo '::error::tag-guard did not pass; refusing checkout and publication failure reporting'
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.tag-guard.result == 'success'
         with:
           ref: main
           persist-credentials: false
       - name: Report failed publication
+        if: needs.tag-guard.result == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}

@@ -105,6 +105,7 @@ def check_run(client, repo, evidence, policy, expected_sha):
     require(evidence["results"] == checked, "reported checks differ from GitHub")
     require(bool(finished), "required inventory contains no successful checks")
     run["checked_finished_at"] = max(finished)
+    run["checked_first_finished_at"] = min(finished)
     return run
 
 
@@ -168,6 +169,30 @@ def check_coordinator(client, repo, evidence, policy, pr, ci):
     return run
 
 
+def check_postmerge(client, repo, evidence, policy, pr, actual, timestamp):
+    """Hosted E2E on merged main; private evidence content stays consumer-side."""
+    require(policy["e2e"]["expected"] == ["authz", "build", "verified"] and policy["e2e"]["approved_skips"] == [],
+            "postmerge inventory differs")
+    run = check_run(client, repo, evidence, policy["e2e"], pr["merge"])
+    require(run["id"] == evidence["run_id"] and run["run_attempt"] == evidence["run_attempt"],
+            "postmerge run identity differs")
+    metadata = client.api(f"repos/{repo}")
+    require(metadata["full_name"].lower() == repo.lower()
+            and run["repository"]["full_name"].lower() == repo.lower()
+            and run["head_repository"]["full_name"].lower() == repo.lower(),
+            "postmerge repository differs")
+    require(run["event"] == "workflow_dispatch" and run["head_branch"] == metadata["default_branch"] == "main" == pr["base"],
+            "untrusted postmerge source")
+    require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
+    require(run["checked_first_finished_at"] >= actual["merged_at"], "postmerge E2E completed before merge")
+    require(timestamp >= run["checked_finished_at"], "receipt predates postmerge verification")
+    artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
+    name = f"postmerge-evidence-{run['id']}-{run['run_attempt']}"
+    found = [a for a in artifacts if a["name"] == name and not a["expired"]]
+    require(len(found) == 1, "missing/ambiguous postmerge evidence")
+    return run
+
+
 def identity(obj, *, facts_only=False, consumer=None, slot=None):
     if type(obj) is dict and "provenance" in obj:
         require(not facts_only and consumer == "data" and slot == "previous",
@@ -228,6 +253,12 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     public["evidence_sha256"] = sha256(canonical(receipt))
     public["reporting_run_id"] = reporting_run["id"]
     state = receipt["state"]
+    postmerge = policy["e2e"]["workflow"] == "release-postmerge.yml"
+    if postmerge:
+        require(receipt["consumer"] == "hosted" and policy["ci"]["workflow"] == "release-pr.yml"
+                and policy["deploy"]["workflow"] == "release.yml", "unexpected postmerge consumer")
+        require((state == "verified") == (receipt["e2e"] is not None),
+                "postmerge E2E is required exactly in verified state")
     if state in ("pending", "failed", "superseded", "skipped_by_policy"):
         require(state != "skipped_by_policy" or (not facts_only and event["prerelease"]), "consumer cannot skip by policy")
         return public
@@ -245,25 +276,38 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     public["pr"] = pr
     if state in ("ready", "merged", "deploying", "verified"):
         ci_run = check_run(client, repo, receipt["ci"], policy["ci"], pr["head"])
-        if policy["e2e"]["workflow"] == "release-coordinator.yml":
+        if postmerge:
+            if state == "verified":
+                e2e_run = check_postmerge(client, repo, receipt["e2e"], policy, pr, actual, receipt["timestamp"])
+        elif policy["e2e"]["workflow"] == "release-coordinator.yml":
             require(receipt["consumer"] == "hosted" and policy["ci"]["workflow"] == "release-pr.yml", "unexpected coordinator consumer")
             e2e_run = check_coordinator(client, repo, receipt["e2e"], policy["e2e"], pr, receipt["ci"])
         else:
             e2e_run = check_run(client, repo, receipt["e2e"], policy["e2e"], pr["head"])
         identity(receipt["preview"], facts_only=facts_only, consumer=receipt["consumer"], slot="preview")
-        require(receipt["preview"]["source"] == pr["head"]
-                and (facts_only or receipt["preview"]["image_digest"] == event["image"]["digest"]),
-                "preview did not exercise the candidate source/image")
+        if postmerge:
+            require(receipt["preview"]["source"] == pr["merge"]
+                    and (facts_only or receipt["preview"]["image_digest"] == event["image"]["digest"]),
+                    "preview did not exercise the candidate source/image")
+        else:
+            require(receipt["preview"]["source"] == pr["head"]
+                    and (facts_only or receipt["preview"]["image_digest"] == event["image"]["digest"]),
+                    "preview did not exercise the candidate source/image")
         for name in ("ci", "e2e"):
+            if postmerge and state != "verified" and name == "e2e":
+                continue
             public[name] = {"run_id": receipt[name]["run_id"], "run_attempt": receipt[name]["run_attempt"],
                             "inventory_sha256": sha256(canonical(receipt[name]["results"]))}
         public["preview"] = receipt["preview"]
     if state in ("merged", "deploying", "verified"):
         match(COMMIT, pr["merge"])
         require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
-        # Required E2E must precede the merge; a production smoke cannot stand
-        # in for the consumer's candidate E2E gate.
-        require(ci_run["checked_finished_at"] <= actual["merged_at"] and e2e_run["checked_finished_at"] <= actual["merged_at"], "CI/E2E completed after merge")
+        if postmerge:
+            require(ci_run["checked_finished_at"] <= actual["merged_at"], "CI completed after merge")
+        else:
+            # Required E2E must precede the merge; a production smoke cannot stand
+            # in for the consumer's candidate E2E gate.
+            require(ci_run["checked_finished_at"] <= actual["merged_at"] and e2e_run["checked_finished_at"] <= actual["merged_at"], "CI/E2E completed after merge")
         merged_commit = client.api(f"repos/{repo}/commits/{pr['merge']}")
         require(merged_commit["parents"] and merged_commit["parents"][0]["sha"] == pr["base_sha"],
                 "merge inputs differ from the tested base; require updated merge/squash candidate")
@@ -318,8 +362,9 @@ def transition(previous, current):
     return True
 
 
-def fetch_artifact(client, repo, run, policy):
-    artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
+def fetch_artifact(client, repo, run, policy, artifacts=None):
+    if artifacts is None:
+        artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
     found = [row for row in artifacts if row["name"] == policy["artifact"] and not row["expired"]]
     if not found:
         return None
@@ -360,14 +405,26 @@ def collect(client, hub_client, store, role, run_id=0):
     if run_id:
         runs = [client.api(f"repos/{repo}/actions/runs/{run_id}")]
     else:
-        runs = object_pages(client, f"repos/{repo}/actions/workflows/{policy['workflow']}/runs", "workflow_runs")
-    for run in sorted(runs, key=lambda row: row["id"]):
+        artifacts_by_run = {}
+        for artifact in object_pages(client, f"repos/{repo}/actions/artifacts?name={policy['artifact']}", "artifacts"):
+            if artifact["name"] == policy["artifact"] and not artifact["expired"]:
+                artifacts_by_run.setdefault(artifact["workflow_run"]["id"], {})[artifact["id"]] = artifact
+        runs = [client.api(f"repos/{repo}/actions/runs/{candidate_id}")
+                for candidate_id in sorted(artifacts_by_run)]
+    def collect_run(run):
         if run["path"] != ".github/workflows/" + policy["workflow"]:
-            raise Invalid("unexpected reporting workflow")
-        receipt = fetch_artifact(client, repo, run, policy)
+            # Never in the old workflow-run scope; only a callback naming such a run fails closed.
+            require(not run_id, "unexpected reporting workflow")
+            return
+        if run_id:
+            receipt = fetch_artifact(client, repo, run, policy)
+        else:
+            if run["status"] != "completed":
+                return
+            receipt = fetch_artifact(client, repo, run, policy, list(artifacts_by_run[run["id"]].values()))
         if receipt is None:
             require(not run_id, "callback has no receipt artifact")
-            continue
+            return
         require(receipt["consumer"] == role, "receipt role differs from scoped target")
         facts_only = receipt["schema"] == FACTS_SCHEMA
         event = None
@@ -376,6 +433,16 @@ def collect(client, hub_client, store, role, run_id=0):
             raw = store.read(row, ASSET)
             require(raw is not None and not row["draft"], "receipt has no ready release")
             event = payload(raw)
+            if not run_id:
+                positive(receipt["attempt"])
+                positive(receipt["sequence"])
+                previous = receipts(store, row, event["event_id"]).get(role)
+                if previous is not None:
+                    old = (previous["attempt"], previous["sequence"])
+                    new = (receipt["attempt"], receipt["sequence"])
+                    # Only omit work that cannot advance the stored receipt.
+                    if old > new or (old == new and previous.get("evidence_sha256") == sha256(canonical(receipt))):
+                        return
         public = validate_receipt(client, repo, receipt, event, policy, run)
         if facts_only:
             facts_target = receipt["facts"]
@@ -399,16 +466,44 @@ def collect(client, hub_client, store, role, run_id=0):
                     obj = decode(store.read(row, item["name"]))
                     if previous is None or (obj["attempt"], obj["sequence"]) > (previous["attempt"], previous["sequence"]):
                         previous = obj
-        else:
+        elif run_id:
             previous = receipts(store, row, event["event_id"]).get(role)
         if transition(previous, public):
             stem = prefix + role + "-" + (facts_target["commit"] + "-" + facts_target["sha256"] + "-" if facts_only else "")
-            store.put(row, f"{stem}{public['attempt']}-{public['sequence']}.json", canonical(public))
+            name = f"{stem}{public['attempt']}-{public['sequence']}.json"
+            receipt_raw = canonical(public)
+            if run_id:
+                store.put(row, name, receipt_raw)
             if public["state"] == "failed":
                 incident = "facts-" + facts_target["sha256"] if facts_only else row["tag_name"]
                 title = "Facts consumer failed" if facts_only else f"Release {event['release_version']}: consumer failed"
                 report_issue(hub_client, incident, title,
                              f"Consumer role: {role}; failed stage evidence retained in the consumer's private report.\n\n" + run_link())
+            if not run_id:
+                # Keep the sweep's only receipt write last, after every other fallible step.
+                store.put(row, name, receipt_raw)
+
+    skipped = []
+    for run in sorted(runs, key=lambda row: row["id"]):
+        if run_id:
+            # Callbacks retain their fail-closed behavior outside the sweep handler.
+            collect_run(run)
+        else:
+            try:
+                collect_run(run)
+            except (Invalid, Pending, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
+                # The text can carry consumer-controlled bytes: no markup, mention, marker or line break reaches an issue.
+                safe_characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _.,;()'=-"
+                reason = "".join(char if char in safe_characters else "?" for char in str(error))[:200]
+                skipped.append((run["id"], reason))
+                print(f"::warning::receipt artifact skipped: role={role} run={run['id']}: {reason}", file=sys.stderr)
+    if skipped:
+        skipped_lines = [f"run={candidate_id}: {reason}" for candidate_id, reason in sorted(skipped)[:50]]
+        if len(skipped) > 50:
+            skipped_lines.append(f"and {len(skipped) - 50} more skipped")
+        report_issue(hub_client, "receipt-skipped-" + role,
+                     f"Release chain: receipt artifacts skipped ({role})",
+                     "\n".join(skipped_lines))
 
 
 def signal_targets(signal, enabled):
@@ -469,8 +564,8 @@ def main():
                 name = f"delivery-{args.consumer}.json"
                 if store.read(row, name) is None:
                     store.put(row, name, canonical(obj))
-    except (Invalid, Pending, ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile):
-        print("::error::consumer evidence invalid or unavailable; no verified state recorded", file=sys.stderr)
+    except (Invalid, Pending, ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile) as error:
+        print(f"::error::consumer evidence invalid or unavailable; no verified state recorded: {error}", file=sys.stderr)
         return 1
     return 0
 

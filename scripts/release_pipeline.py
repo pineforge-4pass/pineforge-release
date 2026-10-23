@@ -17,7 +17,7 @@ import release_pair as pair
 from release_artifacts import Client, PRODUCERS, command, npm, producer
 from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYPES,
                               HUB, IMAGE, RECEIPT_ROLES, ROLES, SCHEMA, SHA, Invalid,
-                              Pending, bind_facts, canonical, decode, match,
+                              Pending, bind_facts, canonical, decode, keys, match,
                               pair_payload, payload, positive, require, sha256,
                               validate, validate_candidate, version)
 
@@ -340,6 +340,88 @@ def plan_delivery(store, row, event, role):
     return {"consumer": role, "tag": row["tag_name"], "attempt": attempt}, False
 
 
+def redeliver(client, store, tag, consumer, output):
+    """Manually resend one public event; append one audit only after acceptance."""
+    require(consumer in configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", "")),
+            "redelivery consumer is not configured")
+    require(tag == "v" + str(version(tag.removeprefix("v"))), "redelivery tag must be canonical vX.Y.Z")
+    # The dispatch client has a target-only App token. Release checks and exact
+    # manifest reads use a public client; the injected store appends audit.
+    public = Client(token="")
+    row = public.api(f"repos/{HUB}/releases/tags/{tag}")
+    require(row["tag_name"] == tag and not row["draft"], "cannot redeliver a draft or different release")
+    require(not any(a["name"] == "release-rejected.json" for a in row["assets"]), "release rejected")
+    raw = public.download(f"https://github.com/{HUB}/releases/download/{tag}/{ASSET}", {"github.com"})
+    event = payload(raw)
+    require(tag == "v" + event["release_version"], "redelivery release differs")
+    # Mirror aggregate()'s prerelease policy role tuple.
+    require(not (event["prerelease"] and consumer in ("application", "web", "data", "license")),
+            "redelivery consumer is skipped by policy for a prerelease")
+    if consumer in DELIVERY_ONLY:
+        first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
+        require(first and version(event["release_version"]) >= version(first),
+                "redelivery consumer is not enabled for this pair")
+    else:
+        # Keep dispatch's channel-aware newer-release rule, including its exclusions.
+        newer = [pair.parse(r["tag_name"]) for r in public.pages(f"repos/{HUB}/releases")
+                 if not r["draft"] and (event["prerelease"] or not r["prerelease"])
+                 and any(a["name"] == ASSET for a in r["assets"])
+                 and not any(a["name"] == "release-rejected.json" for a in r["assets"])]
+        require(not newer or version(event["release_version"]) >= max(newer), "release superseded before redelivery")
+    event_type = EVENT_TYPES[consumer]
+    client_payload = event
+    if event_type == "release-pair":
+        candidate_raw = public.download(f"https://github.com/{HUB}/releases/download/{tag}/{CANDIDATE}", {"github.com"})
+        client_payload = pair_payload(raw, candidate_raw)
+    public_store = Store(public)
+    accepted = public_store.read(row, f"delivery-{consumer}.json")
+    if accepted is not None:
+        obj = decode(accepted)
+        require(obj["event_id"] == event["event_id"] and obj["consumer"] == consumer
+                and obj["state"] == "dispatch_accepted", "accepted delivery identity differs")
+        by_role = receipts(public_store, row, event["event_id"])
+        require(by_role.get(consumer, {}).get("state") != "verified", "consumer already verified")
+
+    prefix = f"delivery-redelivered-{consumer}-"
+    actor_pattern = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?"
+    attempts = []
+    for asset in public_store.get(tag)["assets"]:
+        if not asset["name"].startswith(prefix):
+            continue
+        previous = public_store.read(row, asset["name"])
+        obj = decode(previous)
+        keys(obj, ("schema", "event_id", "consumer", "attempt", "state", "run_id", "timestamp", "actor"))
+        require(obj["schema"] == "pineforge/release-redelivery/v1"
+                and obj["event_id"] == event["event_id"] and obj["consumer"] == consumer
+                and obj["state"] == "dispatch_accepted", "redelivery history identity differs")
+        positive(obj["attempt"])
+        positive(obj["run_id"])
+        require(asset["name"] == f"{prefix}{obj['attempt']}.json" and canonical(obj) == previous,
+                "redelivery history asset differs")
+        match(actor_pattern, obj["actor"])
+        match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
+        dt.datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00"))
+        attempts.append(obj["attempt"])
+    attempts.sort()
+    require(attempts == list(range(1, len(attempts) + 1)), "invalid redelivery attempt history")
+    attempt = len(attempts) + 1
+    positive(attempt)
+    run_id = int(os.environ["GITHUB_RUN_ID"])
+    positive(run_id)
+    actor = match(actor_pattern, os.environ["GITHUB_ACTOR"])
+    target = os.environ.get("TARGET_REPOSITORY", "")
+    match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", target)
+    client.api(f"repos/pineforge-4pass/{target}/dispatches", method="POST",
+               data={"event_type": event_type, "client_payload": client_payload})
+    audit = canonical({"schema": "pineforge/release-redelivery/v1", "event_id": event["event_id"],
+                       "consumer": consumer, "attempt": attempt, "state": "dispatch_accepted",
+                       "run_id": run_id, "timestamp": now(), "actor": actor})
+    # No reservation or planner/receipt updates. An unsuccessful append fails
+    # this run; absent an audit asset, the next run sends the same event again.
+    store.put(row, f"{prefix}{attempt}.json", audit)
+    Path(output).write_bytes(audit)
+
+
 def facts_freshness(client, store, roles):
     """30 minutes from the actual facts file change, independent of main's age."""
     roles = [role for role in roles if role in ("web", "license")]
@@ -526,6 +608,10 @@ def main():
     p.add_argument("--consumer", choices=ROLES, required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--attempt", type=int, default=1)
+    p = sub.add_parser("redeliver")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--consumer", choices=ROLES, required=True)
+    p.add_argument("--output", required=True)
     p = sub.add_parser("alert")
     p.add_argument("--stage", required=True, choices=("publish", "producer", "finalize", "dispatch", "receipt"))
     args = parser.parse_args()
@@ -555,6 +641,10 @@ def main():
             finalize_all(client, store, Registry(), args.tag, args.output)
         elif args.cmd == "reconcile":
             reconcile(client, store)
+        elif args.cmd == "redeliver":
+            # App token: dispatch to one consumer. Hub token: append audit only.
+            redeliver(client, Store(Client(token=os.environ["HUB_TOKEN"])),
+                      args.tag, args.consumer, args.output)
         elif args.cmd == "dispatch":
             require(1 <= args.attempt <= len(DELIVERY_BACKOFF_MINUTES), "invalid delivery attempt")
             # The App token here is scoped ONLY to the target. Read the public

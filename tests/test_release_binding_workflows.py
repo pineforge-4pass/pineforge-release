@@ -36,6 +36,8 @@ def assert_ready_wiring(case, publish, finalizer):
     named = {row.get("name"): row for row in steps}
     order = ["Check Debian source mirror", "Check pushed Debian source mirror",
              "Verify real candidate runtime on both architectures", "GitHub Release"]
+    for name in order:
+        case.assertIn(name, named, "required readiness step must exist")
     positions = [steps.index(named[name]) for name in order]
     case.assertEqual(positions, sorted(positions))
     for name in order:
@@ -44,8 +46,10 @@ def assert_ready_wiring(case, publish, finalizer):
     tags = named["Image metadata"]["with"]["tags"].splitlines()
     case.assertEqual(len(tags), 1)
     case.assertTrue(tags[0].startswith("type=raw,value=candidate-"))
-    case.assertIn("org.opencontainers.image.version=${{ github.ref_name }}", named["Image metadata"]["with"]["labels"])
-    case.assertIn("org.opencontainers.image.revision=${{ github.sha }}", named["Image metadata"]["with"]["labels"])
+    case.assertEqual((publish["jobs"]["publish"].get("env") or {}).get("RELEASE_TAG"), "${{ needs.prepare.outputs.tag }}")
+    case.assertIn("org.opencontainers.image.version=${{ env.RELEASE_TAG }}", named["Image metadata"]["with"]["labels"])
+    case.assertIn("org.opencontainers.image.revision=${{ needs.tag-guard.outputs.sha }}",
+                  named["Image metadata"]["with"]["labels"])
     case.assertEqual(publish["jobs"]["notify-consumers"]["uses"], "./.github/workflows/release-finalize.yml")
     finalize = finalizer["jobs"]["finalize"]
     case.assertTrue(any("scripts/release_pipeline.py finalize" in row.get("run", "") for row in finalize["steps"]))
@@ -114,6 +118,25 @@ class ReadyWiringTests(unittest.TestCase):
     def test_actual_workflows_require_verified_candidate_before_ready_fanout(self):
         assert_ready_wiring(self, workflow("publish.yml"), workflow("release-finalize.yml"))
 
+    def test_dispatch_origin_and_validated_tag_are_pinned_alongside_readiness(self):
+        pins = wiring.ReleaseTriggerWorkflowTest()
+        pins.assert_publish((ROOT / ".github/workflows/publish.yml").read_text())
+        pins.assert_handler((ROOT / ".github/workflows/handle-upstream.yml").read_text())
+
+    def test_readiness_refuses_lost_validated_tag_or_ref_based_version_label_on_real_text(self):
+        pins = wiring.ReleaseTriggerWorkflowTest()
+        text = (ROOT / ".github/workflows/publish.yml").read_text()
+        for before, after in (
+            ("      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}\n", ""),
+            ("org.opencontainers.image.version=${{ env.RELEASE_TAG }}",
+             "org.opencontainers.image.version=${{ github.ref_name }}"),
+            ("org.opencontainers.image.revision=${{ needs.tag-guard.outputs.sha }}",
+             "org.opencontainers.image.revision=${{ github.sha }}"),
+        ):
+            mutant = pins.mutate(text, before, after)
+            with self.subTest(anchor=before), self.assertRaises(AssertionError):
+                assert_ready_wiring(self, pins.parse(mutant), workflow("release-finalize.yml"))
+
     def test_real_decide_shell_reuses_a_draft_candidate_without_an_image_probe(self):
         handler = (ROOT / ".github/workflows/handle-upstream.yml").read_text()
         runner = wiring.HpoWorkflowTest()
@@ -144,7 +167,7 @@ class ReadyWiringTests(unittest.TestCase):
                 step["with"]["tags"] += "\ntype=raw,value=latest"
             else:
                 finalizer["jobs"]["notify-consumers"]["needs"] = "publish"
-            with self.subTest(mutation=mutation), self.assertRaises((AssertionError, KeyError)):
+            with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
                 assert_ready_wiring(self, obj, finalizer)
 
     def test_required_aggregate_always_runs_and_rejects_failed_cancelled_skipped_or_missing_job(self):
