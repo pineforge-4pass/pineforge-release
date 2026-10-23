@@ -216,9 +216,11 @@ Use `release-redeliver.yml` for an explicitly reviewed repair of one published
 release to one consumer after the three automatic attempts are spent or the
 consumer was not ready, including accepted delivery without verified completion.
 It runs only from main.
-Only operators permitted to dispatch the workflow and approved by the
-`release-automation` environment protection may trigger it; the consumer must
-be in `RELEASE_READY_CONSUMERS`. It resends the immutable manifest's identical
+Only operators permitted to dispatch the workflow may trigger it, and the job
+uses the `release-automation` environment: today that environment permits main
+and release tags and has no required reviewers, so the dispatch right is the
+only approval unless the owner gives the repair a dedicated reviewed environment.
+The consumer must be in `RELEASE_READY_CONSUMERS`. It resends the immutable manifest's identical
 payload and appends `delivery-redelivered-<consumer>-<n>.json` only after dispatch
 acceptance, recording the event, independent contiguous redelivery number, run,
 timestamp and `GITHUB_ACTOR` login. It never touches `delivery-<consumer>.json`,
