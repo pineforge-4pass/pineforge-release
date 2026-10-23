@@ -1715,6 +1715,95 @@ class NotifyConsumersTest(unittest.TestCase):
                 pipeline.configured_roles(bad)
 
 
+class RedeliverWorkflowTest(unittest.TestCase):
+    def test_manual_inputs_protected_single_job_and_serialized_permissions(self):
+        """Mutation: add on.schedule to release-redeliver.yml."""
+        wf = _workflow("release-redeliver.yml")
+        self.assertEqual(set(wf["on"]), {"workflow_dispatch"})
+        inputs = wf["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(set(inputs), {"tag", "consumer"})
+        self.assertEqual(inputs["tag"]["type"], "string")
+        self.assertEqual(inputs["tag"]["required"], "true")
+        self.assertIn("vX.Y.Z", inputs["tag"]["description"])
+        self.assertEqual(inputs["consumer"], {
+            "description": "One configured release consumer to repair",
+            "type": "choice", "required": "true",
+            "options": ["offline", "hosted", "application", "web", "data", "license"],
+        })
+        self.assertEqual(wf["permissions"], {"contents": "read"})
+        self.assertEqual(set(wf["jobs"]), {"redeliver"})
+        job = wf["jobs"]["redeliver"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["environment"], "release-automation")
+        self.assertEqual(job["permissions"], {"contents": "write", "issues": "write"})
+        self.assertEqual(job["concurrency"], {
+            "group": "release-delivery-${{ inputs.consumer }}-${{ inputs.tag }}",
+            "cancel-in-progress": "false",
+        })
+        self.assertNotIn("strategy", job)
+
+    def test_one_target_app_scope_public_reads_and_hub_audit_token(self):
+        """Mutation: change the App's repositories to an organization-wide list."""
+        wf = _workflow("release-redeliver.yml")
+        job = wf["jobs"]["redeliver"]
+        sibling = _workflow("release-finalize.yml")["jobs"]["notify-consumers"]
+        target = (
+            "${{ inputs.consumer == 'offline' && 'pineforge-backtest-mcp' || "
+            "inputs.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || "
+            "inputs.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || "
+            "inputs.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || "
+            "inputs.consumer == 'data' && 'pineforge-data' || "
+            "inputs.consumer == 'license' && 'pineforge-license' || '' }}"
+        )
+        self.assertEqual(job["env"], {"TARGET_REPOSITORY": target})
+        self.assertEqual(target, sibling["env"]["TARGET_REPOSITORY"].replace("matrix.consumer", "inputs.consumer"))
+        steps = job["steps"]
+        self.assertEqual(steps[0], ReleaseTriggerWorkflowTest.APT_GUARD_STEP)
+        self.assertEqual(len([step for step in steps if "uses" in step]), 2)
+        actions = {step["uses"]: step for step in steps if "uses" in step}
+        checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        mint = "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
+        self.assertEqual(set(actions), {checkout, mint})
+        self.assertEqual(actions[checkout]["with"], {"ref": "main", "persist-credentials": "false"})
+        self.assertEqual(actions[mint]["with"], {
+            "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
+            "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
+            "owner": "${{ github.repository_owner }}",
+            "repositories": "${{ env.TARGET_REPOSITORY }}",
+            "permission-contents": "write", "github-api-url": "https://api.github.com",
+        })
+        guard = next(step for step in steps if step.get("name") == "Require one configured consumer repository")
+        self.assertIn('[[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]', guard["run"])
+        self.assertLess(steps.index(guard), steps.index(actions[mint]))
+        sends = [step for step in steps if "release_pipeline.py redeliver " in step.get("run", "")]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0]["env"], {
+            "GH_TOKEN": "${{ steps.app.outputs.token }}", "HUB_TOKEN": "${{ github.token }}",
+            "TAG": "${{ inputs.tag }}", "CONSUMER": "${{ inputs.consumer }}",
+            "RELEASE_READY_CONSUMERS": "${{ vars.RELEASE_READY_CONSUMERS }}",
+        })
+        self.assertEqual(sends[0]["run"],
+                         'python3 scripts/release_pipeline.py redeliver --tag "$TAG" --consumer "$CONSUMER" \\\n'
+                         '  --output "$RUNNER_TEMP/redelivery.json"\n')
+        self.assertNotIn("release_receipts.py", str(steps))
+        self.assertNotIn("client_payload", str(steps))
+
+    def test_docs_explain_append_only_repair_and_post_send_audit_failure(self):
+        """Mutation: remove the duplicate-delivery warning from the new paragraph."""
+        text = (REPO / "docs/release-chain.md").read_text()
+        start = text.index("Delivery acceptance is recorded once")
+        end = text.index("`release-receipts.yml` polls", start)
+        delivery, repair = text[start:end].strip().split("\n\n")
+        self.assertIn("three total attempts", delivery)
+        for required in ("release-redeliver.yml", "release-automation", "environment",
+                         "RELEASE_READY_CONSUMERS", "delivery-redelivered-<consumer>-<n>.json",
+                         "GITHUB_ACTOR", "delivery-<consumer>.json", "delivery-failed-<consumer>.json",
+                         "delivery-attempt-*", "receipt contract is unchanged", "event_id",
+                         "idempotence", "audit write fails", "next run sends again", "duplicate delivery"):
+            with self.subTest(required=required):
+                self.assertIn(required, repair)
+
+
 class HarnessSyncTest(unittest.TestCase):
     """The release image carries exactly the engine's eight runtime harness files. One script holds
     the list and syncs it from the pinned engine tag; the Dockerfile installs that list and checks
@@ -2068,6 +2157,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         "handle-upstream.yml": {"bump"},
         "publish.yml": {"tag-guard", "prepare", "publish", "failure-report"},
         "release-finalize.yml": {"finalize", "notify-consumers"},
+        "release-redeliver.yml": {"redeliver"},
         "release-receipts.yml": {"plan", "verify"},
         "release-reconcile.yml": {"producers"},
         "release-rollback.yml": {"restore"},
@@ -2085,6 +2175,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         ("publish.yml", "failure-report"),
         ("release-finalize.yml", "finalize"),
         ("release-finalize.yml", "notify-consumers"),
+        ("release-redeliver.yml", "redeliver"),
         ("release-receipts.yml", "plan"),
         ("release-receipts.yml", "verify"),
         ("release-reconcile.yml", "producers"),
@@ -2348,6 +2439,7 @@ class PrTierWorkflowTest(unittest.TestCase):
                         "publish": "ubuntu-latest", "notify-consumers": None,
                         "failure-report": "ubuntu-latest"},
         "release-finalize.yml": {"finalize": "ubuntu-latest", "notify-consumers": "ubuntu-latest"},
+        "release-redeliver.yml": {"redeliver": "ubuntu-latest"},
         "release-receipts.yml": {"plan": "ubuntu-latest", "verify": "ubuntu-latest"},
         "release-reconcile.yml": {"producers": "ubuntu-latest"},
         "release-rollback.yml": {"restore": "ubuntu-latest"},
