@@ -1138,7 +1138,34 @@ Removing the retained coordinator-shape artifacts from the hosted repository bef
 the swap is no longer required; the stored public form is recorded on the hub
 release as `consumer-hosted-<run>-<sequence>.json`.
 
-**Collector skip rules.** In a sweep, a bad or old-shape artifact is reported with a `::warning::` line and one stable incident issue per role, then skipped. An artifact is not re-validated when the hub already stored a receipt for that role and release with a greater `(attempt, sequence)`, or the same key and the same canonical-evidence digest. Facts-only artifacts are still validated. A callback names one run and still fails closed; `OSError` stays fatal, while `Pending` (unknown release, unavailable artifact) is reported and skipped in a sweep. The incident issue lists at most 50 runs and a count of any additional skipped runs, reasons are reduced to a fixed safe character set, and the issue is not closed automatically when the artifacts expire.
+**Collector skip rules.** In a sweep, a bad or old-shape artifact is reported
+with a `::warning::` line and one stable incident issue per role, then skipped.
+This includes encrypted ZIP entries, unsupported compression and corrupt
+compressed data. An artifact is not re-validated when the hub already stored a
+receipt for that role and release with a greater `(attempt, sequence)`, or the
+same key, canonical-evidence digest **and reporting run ID**. Equal evidence
+from a different reporting run is validated and refused as receipt identity
+reuse. Facts-only artifacts are still validated. A callback names one run and
+still fails closed. Non-404 HTTP errors (including authentication, rate limits
+and server failures) and transport errors from the real client stay fatal;
+`OSError` also stays fatal. `Pending` (unknown release, unavailable artifact)
+is reported and skipped in a sweep. The incident issue lists at most 50 runs
+and a count of any additional skipped runs, reasons are reduced to a fixed safe
+character set, and the issue is not closed automatically when the artifacts
+expire.
+
+After processing all candidates and reporting skips, the sweep checks the
+required product targets for its role. A published, manifest-backed release
+requires a stored receipt when the role is in `RELEASE_READY_CONSUMERS` or the
+release has an accepted `delivery-<role>.json` audit. The audit preserves this
+requirement when only the workflow planner received the product configuration.
+Draft and rejected releases, releases superseded by a newer stable release,
+and the aggregate's prerelease policy skips are exempt. A missing required
+receipt fails the collector, including when no artifact was discovered or
+every candidate was skipped. A valid receipt of an intermediate state
+satisfies collection; aggregate completion still requires its terminal
+completion states. Facts-only polling creates no product delivery requirement
+and retains its separate canonical-history and freshness checks.
 
 ## Rollback and validation
 
