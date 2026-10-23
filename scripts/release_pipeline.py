@@ -358,6 +358,9 @@ def redeliver(client, store, tag, consumer, output):
     raw = public.download(f"https://github.com/{HUB}/releases/download/{tag}/{ASSET}", {"github.com"})
     event = payload(raw)
     require(tag == "v" + event["release_version"], "redelivery release differs")
+    # Mirror aggregate()'s prerelease policy role tuple.
+    require(not (event["prerelease"] and consumer in ("application", "web", "data", "license")),
+            "redelivery consumer is skipped by policy for a prerelease")
     # Keep dispatch's channel-aware newer-release rule, including its exclusions.
     newer = [pair.parse(r["tag_name"]) for r in public.pages(f"repos/{HUB}/releases")
              if not r["draft"] and (event["prerelease"] or not r["prerelease"])

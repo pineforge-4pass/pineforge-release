@@ -215,6 +215,7 @@ recovery for an exhausted delivery.
 Use `release-redeliver.yml` for an explicitly reviewed repair of one published
 release to one consumer after the three automatic attempts are spent or the
 consumer was not ready, including accepted delivery without verified completion.
+It runs only from main.
 Only operators permitted to dispatch the workflow and approved by the
 `release-automation` environment protection may trigger it; the consumer must
 be in `RELEASE_READY_CONSUMERS`. It resends the immutable manifest's identical
