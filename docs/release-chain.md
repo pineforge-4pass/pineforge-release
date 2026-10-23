@@ -460,9 +460,10 @@ as a later release's previous is a real identity.
 and the data exemption only after (1) data 0.3.1 is verified AND (2) every
 stored `release-receipt-data` artifact whose receipt carries the bootstrap
 `previous` has expired (data uploads it with 90-day retention): the scheduled
-collector re-validates every retained receipt artifact, so dropping the form
-earlier makes the whole data sweep fail until they expire. If the form must go
-sooner, first make the collector skip receipts already stored byte-identically.
+collector re-validates every retained receipt artifact that the hub has not
+already stored, so dropping the form earlier makes each such artifact fail
+validation; in a sweep it is reported and skipped (see the collector skip rules
+below), and a callback naming that run still fails closed.
 
 **State machine.** Ordered progress is
 `pending → pr_open → testing → ready → merged → deploying → verified`.
@@ -952,26 +953,29 @@ must never be used to omit existing required checks.
 
 Rollout order for the application `post_merge` section: a receipt must carry
 `post_merge` exactly when the policy has it, and `collect` re-checks every
-retained application reporting artifact and stops at the first invalid one.
+retained application reporting artifact that the hub has not already stored.
 Put the policy with `post_merge` in place together with the application
-emitter change. While an artifact of the old shape is retained, application
-polling stays blocked until it expires. Changing any inventory has the same
-effect.
+emitter change. While an artifact of the old shape is retained and not yet
+stored, each sweep reports and skips it (collector skip rules below) until it
+expires. Changing any inventory has the same effect.
 
 **Hosted rollout order.**
 `collect` re-validates every retained `release-receipt-hosted` artifact in ascending
-run-id order and stops at the first invalid one. After the `hosted` policy swap,
-while a coordinator-shape `verified` artifact is retained, hosted collection (the
-scheduled sweep and a manual `--run-id 0` sweep) stays blocked and the incident
-issue "Release chain: receipt failed" reopens on every scheduled run. A collection
-triggered by a callback names one run id and checks only that run, so a new
-post-merge receipt still verifies through its callback while the sweep is blocked.
-Before the owner replaces the `hosted` key, either remove the retained
-coordinator-shape `verified` `release-receipt-hosted` artifacts from the hosted
-repository (their neutral public form is already recorded on the hub release as
-`consumer-hosted-<run>-<attempt>.json`), or first land a collector change that skips
-receipts already stored byte-identically, the same change named in the data
-bootstrap removal note above.
+run-id order, except an artifact the hub already stored (collector skip rules below).
+After the `hosted` policy swap, a retained coordinator-shape `verified` artifact that
+the hub has NOT already stored is refused by validation ("required check inventory
+differs from owner policy"); in a sweep (the scheduled sweep and a manual `--run-id 0`
+sweep) it is reported with a `::warning::` line and one incident issue per role
+(`Release chain: receipt artifacts skipped (hosted)`) and skipped, and the sweep
+continues with the remaining artifacts. One that the hub already stored with the
+same or a greater `(attempt, sequence)` is not validated at all. A collection
+triggered by a callback names one run id, checks only that run and still fails
+closed, so a new post-merge receipt verifies through its callback either way.
+Removing the retained coordinator-shape artifacts from the hosted repository before
+the swap is no longer required; the stored public form is recorded on the hub
+release as `consumer-hosted-<run>-<sequence>.json`.
+
+**Collector skip rules.** In a sweep, a bad or old-shape artifact is reported with a `::warning::` line and one stable incident issue per role, then skipped. An artifact is not re-validated when the hub already stored a receipt for that role and release with a greater `(attempt, sequence)`, or the same key and the same canonical-evidence digest. Facts-only artifacts are still validated. A callback names one run and still fails closed; `OSError` stays fatal, while `Pending` (unknown release, unavailable artifact) is reported and skipped in a sweep. The incident issue lists at most 50 runs and a count of any additional skipped runs, reasons are reduced to a fixed safe character set, and the issue is not closed automatically when the artifacts expire.
 
 ## Rollback and validation
 

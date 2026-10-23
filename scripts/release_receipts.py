@@ -408,20 +408,20 @@ def collect(client, hub_client, store, role, run_id=0):
                 artifacts_by_run.setdefault(artifact["workflow_run"]["id"], {})[artifact["id"]] = artifact
         runs = [client.api(f"repos/{repo}/actions/runs/{candidate_id}")
                 for candidate_id in sorted(artifacts_by_run)]
-    for run in sorted(runs, key=lambda row: row["id"]):
+    def collect_run(run):
         if run["path"] != ".github/workflows/" + policy["workflow"]:
             # Never in the old workflow-run scope; only a callback naming such a run fails closed.
             require(not run_id, "unexpected reporting workflow")
-            continue
+            return
         if run_id:
             receipt = fetch_artifact(client, repo, run, policy)
         else:
             if run["status"] != "completed":
-                continue
+                return
             receipt = fetch_artifact(client, repo, run, policy, list(artifacts_by_run[run["id"]].values()))
         if receipt is None:
             require(not run_id, "callback has no receipt artifact")
-            continue
+            return
         require(receipt["consumer"] == role, "receipt role differs from scoped target")
         facts_only = receipt["schema"] == FACTS_SCHEMA
         event = None
@@ -430,6 +430,16 @@ def collect(client, hub_client, store, role, run_id=0):
             raw = store.read(row, ASSET)
             require(raw is not None and not row["draft"], "receipt has no ready release")
             event = payload(raw)
+            if not run_id:
+                positive(receipt["attempt"])
+                positive(receipt["sequence"])
+                previous = receipts(store, row, event["event_id"]).get(role)
+                if previous is not None:
+                    old = (previous["attempt"], previous["sequence"])
+                    new = (receipt["attempt"], receipt["sequence"])
+                    # Only omit work that cannot advance the stored receipt.
+                    if old > new or (old == new and previous.get("evidence_sha256") == sha256(canonical(receipt))):
+                        return
         public = validate_receipt(client, repo, receipt, event, policy, run)
         if facts_only:
             facts_target = receipt["facts"]
@@ -453,16 +463,44 @@ def collect(client, hub_client, store, role, run_id=0):
                     obj = decode(store.read(row, item["name"]))
                     if previous is None or (obj["attempt"], obj["sequence"]) > (previous["attempt"], previous["sequence"]):
                         previous = obj
-        else:
+        elif run_id:
             previous = receipts(store, row, event["event_id"]).get(role)
         if transition(previous, public):
             stem = prefix + role + "-" + (facts_target["commit"] + "-" + facts_target["sha256"] + "-" if facts_only else "")
-            store.put(row, f"{stem}{public['attempt']}-{public['sequence']}.json", canonical(public))
+            name = f"{stem}{public['attempt']}-{public['sequence']}.json"
+            receipt_raw = canonical(public)
+            if run_id:
+                store.put(row, name, receipt_raw)
             if public["state"] == "failed":
                 incident = "facts-" + facts_target["sha256"] if facts_only else row["tag_name"]
                 title = "Facts consumer failed" if facts_only else f"Release {event['release_version']}: consumer failed"
                 report_issue(hub_client, incident, title,
                              f"Consumer role: {role}; failed stage evidence retained in the consumer's private report.\n\n" + run_link())
+            if not run_id:
+                # Keep the sweep's only receipt write last, after every other fallible step.
+                store.put(row, name, receipt_raw)
+
+    skipped = []
+    for run in sorted(runs, key=lambda row: row["id"]):
+        if run_id:
+            # Callbacks retain their fail-closed behavior outside the sweep handler.
+            collect_run(run)
+        else:
+            try:
+                collect_run(run)
+            except (Invalid, Pending, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
+                # The text can carry consumer-controlled bytes: no markup, mention, marker or line break reaches an issue.
+                safe_characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _.,;()'=-"
+                reason = "".join(char if char in safe_characters else "?" for char in str(error))[:200]
+                skipped.append((run["id"], reason))
+                print(f"::warning::receipt artifact skipped: role={role} run={run['id']}: {reason}", file=sys.stderr)
+    if skipped:
+        skipped_lines = [f"run={candidate_id}: {reason}" for candidate_id, reason in sorted(skipped)[:50]]
+        if len(skipped) > 50:
+            skipped_lines.append(f"and {len(skipped) - 50} more skipped")
+        report_issue(hub_client, "receipt-skipped-" + role,
+                     f"Release chain: receipt artifacts skipped ({role})",
+                     "\n".join(skipped_lines))
 
 
 def signal_targets(signal, enabled):
