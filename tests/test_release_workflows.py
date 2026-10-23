@@ -3107,6 +3107,17 @@ class PrTierWorkflowTest(unittest.TestCase):
                               if line.lstrip().startswith('[ "$HEAD_IS_FORK"'))
             workflow_run_check = next(line for line in block.splitlines(keepends=True)
                                       if line.lstrip().startswith('[ "$WR_HEAD_REPO"'))
+            workflow_run_lines = workflow_run_arm.splitlines(keepends=True)
+            workflow_run_head_guard = next(line for line in workflow_run_lines
+                                           if line.lstrip().startswith('[ -n "${WR_HEAD_REPO:-}" ]'))
+            workflow_run_actor_guard = next(line for line in workflow_run_lines
+                                            if line.lstrip().startswith('[ -n "${WR_ACTOR:-}" ]'))
+            workflow_run_bots = next(line for line in workflow_run_lines
+                                     if line.lstrip().startswith('"pineforge-app[bot]"|'))
+            workflow_run_bot_refusal = next(line for line in workflow_run_lines
+                                            if line.lstrip().startswith('*"[bot]")'))
+            workflow_run_permission_case = next(line for line in workflow_run_lines
+                                                if line.lstrip().startswith('case "$perm"'))
             permission_lookup = next(line for line in workflow_run_arm.splitlines(keepends=True)
                                      if line.lstrip().startswith("perm=$(gh api"))
             pr_permission_lookup = next(line for line in pull_request_arm.splitlines(keepends=True)
@@ -3120,9 +3131,19 @@ class PrTierWorkflowTest(unittest.TestCase):
                 (pull_request_arm, ""),
                 (default_arm, ""),
                 (workflow_run_check, ""),
+                (workflow_run_head_guard, ""),
+                (workflow_run_actor_guard, ""),
+                (workflow_run_bots, workflow_run_bots.replace('|"pineforge-ci-dispatcher[bot]"', "", 1)),
+                (workflow_run_bot_refusal, ""),
+                (workflow_run_permission_case, workflow_run_permission_case.replace(
+                    "admin|maintain|write", "admin|maintain|write|read", 1)),
+                (workflow_run_permission_case, workflow_run_permission_case.replace(
+                    "admin|maintain|write", "admin|write", 1)),
                 (permission_lookup, ""),
                 (permission_lookup, permission_lookup.replace(
                     '|| fail "workflow_run permission lookup failed"', "|| perm=write", 1)),
+                (permission_lookup, permission_lookup.replace(
+                    '|| fail "workflow_run permission lookup failed"', "|| perm=none", 1)),
                 (pr_permission_lookup, ""),
                 (pr_permission_lookup, pr_permission_lookup.replace("|| echo none)", "|| echo write)", 1)),
                 (pr_permission_case, pr_permission_case.replace("admin|maintain|write", "admin|maintain|write|read", 1)),
@@ -3244,6 +3265,37 @@ class PrTierWorkflowTest(unittest.TestCase):
             fork_arm = re.search(r"(?ms)^  pull_request\)\n.*?(?=^  \*\) fail)", script)[0]
             workflow_run_arm = re.search(
                 r"(?ms)^  workflow_run\)\n.*?(?=^  pull_request\)\n)", script)[0]
+            workflow_run_lines = workflow_run_arm.splitlines(keepends=True)
+            workflow_run_head_guard = next(line for line in workflow_run_lines
+                                           if line.lstrip().startswith('[ -n "${WR_HEAD_REPO:-}" ]'))
+            workflow_run_actor_guard = next(line for line in workflow_run_lines
+                                            if line.lstrip().startswith('[ -n "${WR_ACTOR:-}" ]'))
+            workflow_run_bots = next(line for line in workflow_run_lines
+                                     if line.lstrip().startswith('"pineforge-app[bot]"|'))
+            workflow_run_bot_refusal = next(line for line in workflow_run_lines
+                                            if line.lstrip().startswith('*"[bot]")'))
+            workflow_run_lookup = next(line for line in workflow_run_lines
+                                       if line.lstrip().startswith("perm=$(gh api"))
+            workflow_run_permission_case = next(line for line in workflow_run_lines
+                                                if line.lstrip().startswith('case "$perm"'))
+            for original, replacement in (
+                (workflow_run_head_guard, ""),
+                (workflow_run_actor_guard, ""),
+                (workflow_run_bots, workflow_run_bots.replace('|"pineforge-ci-dispatcher[bot]"', "", 1)),
+                (workflow_run_bot_refusal, ""),
+                (workflow_run_lookup, ""),
+                (workflow_run_lookup, workflow_run_lookup.replace(
+                    '|| fail "workflow_run permission lookup failed"', "|| perm=none", 1)),
+                (workflow_run_permission_case, workflow_run_permission_case.replace(
+                    "admin|maintain|write", "admin|maintain|write|read", 1)),
+                (workflow_run_permission_case, workflow_run_permission_case.replace(
+                    "admin|maintain|write", "admin|write", 1)),
+            ):
+                self.assertEqual(workflow_run_arm.count(original), 1, original)
+                self.assertEqual(script.count(original), 1, original)
+                mutant = copy.deepcopy(job)
+                mutant["steps"][0]["run"] = script.replace(original, replacement, 1)
+                mutants.append(mutant)
             default_arm = next(line for line in script.splitlines(keepends=True)
                                if line.lstrip().startswith('*) fail "event'))
             fail_line = next(line for line in script.splitlines(keepends=True)
@@ -3343,11 +3395,28 @@ class PrTierWorkflowTest(unittest.TestCase):
             self.assertTrue(done.stdout.startswith("::error title=authz::"), done.stdout)
             self.assertTrue(summary.startswith("authz: REFUSED: "), summary)
             self.assertNotIn("authz: allowed", summary)
+            reason = None
             if expect_lookup and event == "pull_request":
                 association = values.get("ASSOCIATION", "MEMBER") or "NONE"
                 reported_permission = "none" if lookup_fails else permission
                 reason = (f"author {author or 'unknown'} ({association}) has permission "
                           f"'{reported_permission}', not write, and is not an allowlisted bot")
+            elif event == "workflow_run":
+                head = values.get("WR_HEAD_REPO", "")
+                actor = values.get("WR_ACTOR", "")
+                if not head:
+                    reason = "workflow_run head repository is missing"
+                elif not actor:
+                    reason = "workflow_run triggering actor is missing"
+                elif head != values.get("REPO", "pineforge-4pass/pineforge-release"):
+                    reason = "workflow_run head repository does not match this repository"
+                elif actor.endswith("[bot]"):
+                    reason = "workflow_run bot is not on the canon allowlist"
+                elif lookup_fails:
+                    reason = "workflow_run permission lookup failed"
+                else:
+                    reason = "workflow_run triggering actor does not have write permission"
+            if reason is not None:
                 self.assertEqual(done.stdout, f"::error title=authz::{reason}\n")
                 self.assertEqual(summary, f"authz: REFUSED: {reason}\n")
         expected_lookup = ""
@@ -3370,6 +3439,10 @@ class PrTierWorkflowTest(unittest.TestCase):
                   for association in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "")]
         cases.append(("other bot", {"PR_AUTHOR": "another[bot]", "ASSOCIATION": "NONE"}, False,
                       {"permission": "read", "expect_lookup": True}))
+        cases.append(("dispatcher bot requires PR author permission", {
+            "EVENT": "pull_request", "PR_AUTHOR": "pineforge-ci-dispatcher[bot]",
+            "WR_ACTOR": "pineforge-ci-dispatcher[bot]", "ASSOCIATION": "NONE",
+        }, False, {"permission": "read", "expect_lookup": True}))
         contributor = {"PR_AUTHOR": "private-member", "ASSOCIATION": "CONTRIBUTOR"}
         for permission in ("admin", "maintain", "write", "read", "triage", "none", "", "unknown"):
             cases.append(("CONTRIBUTOR permission " + permission, contributor,
@@ -3412,10 +3485,15 @@ class PrTierWorkflowTest(unittest.TestCase):
                       {"permission": "write", "lookup_fails": True, "expect_lookup": True}))
         cases.append(("non-member actor", {**workflow_run, "WR_ACTOR": "outsider"}, False,
                       {"permission": "read", "expect_lookup": True}))
-        for actor in ("dependabot[bot]", "pineforge-app[bot]"):
+        for actor in ("dependabot[bot]", "pineforge-app[bot]", "pineforge-ci-dispatcher[bot]"):
             cases.append(("workflow_run bot policy", {**workflow_run, "WR_ACTOR": actor},
-                          actor == "pineforge-app[bot]",
+                          actor in {"pineforge-app[bot]", "pineforge-ci-dispatcher[bot]"},
                           {"permission": "none", "lookup_fails": True}))
+        cases.append(("workflow_run missing actor", {**workflow_run, "WR_ACTOR": ""}, False,
+                      {"permission": "write", "lookup_fails": False}))
+        cases.append(("workflow_run unlisted bot cannot use write permission",
+                      {**workflow_run, "WR_ACTOR": "dependabot[bot]"}, False,
+                      {"permission": "write", "lookup_fails": False}))
         for head in ("outside/fork", ""):
             for actor in ("member", "dependabot[bot]", "pineforge-app[bot]"):
                 cases.append(("workflow_run foreign or missing head",
@@ -3484,6 +3562,296 @@ class PrTierWorkflowTest(unittest.TestCase):
                     self.assert_authz_decision(script, values, accepted, expect_lookup=True, **options)
                     with self.assertRaises(AssertionError):
                         self.assert_authz_decision(mutant, values, accepted, expect_lookup=True, **options)
+
+    def test_actual_workflow_run_cases_detect_identity_bot_and_lookup_mutations(self):
+        values = {"EVENT": "workflow_run", "PR_AUTHOR": "",
+                  "WR_HEAD_REPO": "pineforge-4pass/pineforge-release", "WR_ACTOR": "member"}
+        for name in self.ROUTED_JOBS:
+            step = _workflow(name)["jobs"]["authz"]["steps"][0]
+            script = step["run"]
+            workflow_run_arm = re.search(
+                r"(?ms)^  workflow_run\)\n.*?(?=^  pull_request\)\n)", script)[0]
+            lines = workflow_run_arm.splitlines(keepends=True)
+            head_check = next(line for line in lines
+                              if line.lstrip().startswith('[ -n "${WR_HEAD_REPO:-}" ]'))
+            actor_check = next(line for line in lines
+                               if line.lstrip().startswith('[ -n "${WR_ACTOR:-}" ]'))
+            bot_allowlist = next(line for line in lines
+                                 if line.lstrip().startswith('"pineforge-app[bot]"|'))
+            bot_refusal = next(line for line in lines
+                               if line.lstrip().startswith('*"[bot]")'))
+            lookup = next(line for line in lines
+                          if line.lstrip().startswith("perm=$(gh api"))
+            permission_case = next(line for line in lines
+                                   if line.lstrip().startswith('case "$perm"'))
+            mutations = (
+                ("A: remove dispatcher bot", bot_allowlist,
+                 bot_allowlist.replace('|"pineforge-ci-dispatcher[bot]"', "", 1),
+                 {"WR_ACTOR": "pineforge-ci-dispatcher[bot]"}, True,
+                 {"lookup_fails": True}),
+                ("B: remove missing actor guard", actor_check, "",
+                 {"WR_ACTOR": ""}, False, {"permission": "write", "lookup_fails": False}),
+                ("C: remove unlisted bot refusal", bot_refusal, "",
+                 {"WR_ACTOR": "dependabot[bot]"}, False,
+                 {"permission": "write", "lookup_fails": False}),
+                ("D: replace lookup failure with none", lookup,
+                 lookup.replace('|| fail "workflow_run permission lookup failed"', "|| perm=none", 1),
+                 {}, False, {"permission": "write", "lookup_fails": True, "expect_lookup": True}),
+                ("remove missing head guard", head_check, "",
+                 {"WR_HEAD_REPO": ""}, False, {}),
+                ("allow read", permission_case,
+                 permission_case.replace("admin|maintain|write", "admin|maintain|write|read", 1),
+                 {}, False, {"permission": "read", "expect_lookup": True}),
+                ("refuse maintain", permission_case,
+                 permission_case.replace("admin|maintain|write", "admin|write", 1),
+                 {}, True, {"permission": "maintain", "expect_lookup": True}),
+            )
+            for label, original, replacement, overrides, accepted, options in mutations:
+                self.assertEqual(workflow_run_arm.count(original), 1, label)
+                self.assertEqual(script.count(original), 1, label)
+                mutant = script.replace(original, replacement, 1)
+                inputs = {**values, **overrides, "ALLOWED_BOTS": step["env"]["ALLOWED_BOTS"]}
+                with self.subTest(workflow=name, mutation=label):
+                    self.assertNotEqual(mutant, script)
+                    self.assert_authz_decision(script, inputs, accepted, **options)
+                    with self.assertRaises(AssertionError):
+                        self.assert_authz_decision(mutant, inputs, accepted, **options)
+
+    def assert_authz_runner_documentation(self, chain, readme, workflows):
+        introduction, supervisor = chain.split("## Supervisor configuration\n", 1)
+        canonical_descriptions = re.findall(
+            r"Their first job is (.*?)Its eight payload fields", " ".join(supervisor.split()))
+        self.assertTrue(canonical_descriptions, "document the canonical authz job")
+        for description in canonical_descriptions:
+            self.assertNotIn("exception", description,
+                             "canonical authz uses the standard runner without an exception")
+        canonical_runners = re.findall(r"`name: authz`,\s*`runs-on: ([^`]+)`", supervisor)
+        self.assertTrue(canonical_runners, "document the canonical authz runner")
+        for runner in canonical_runners:
+            for name, workflow in workflows.items():
+                self.assertEqual(runner, workflow["jobs"]["authz"]["runs-on"], name)
+        for label, text in (("release runner policy", introduction),
+                            ("supervisor policy", supervisor), ("README", readme)):
+            normalized = " ".join(text.split())
+            authz_runners = re.findall(
+                r"`authz`(?: jobs)? uses? `runs-on: ([^`]+)`", normalized)
+            for runner in authz_runners:
+                for name, workflow in workflows.items():
+                    self.assertEqual(runner, workflow["jobs"]["authz"]["runs-on"],
+                                     f"{label}: {name}: authz runner statement")
+            runner_pairs = re.findall(
+                r"`authz`(?: jobs)? uses? `runs-on: ([^`]+)`; "
+                r"the other (?:PR )?jobs use `runs-on: ([^`]+)`", normalized)
+            self.assertTrue(runner_pairs, f"{label}: distinguish authz from the other hosted jobs")
+            for runners in runner_pairs:
+                for name, workflow in workflows.items():
+                    for identity, job in workflow["jobs"].items():
+                        self.assertEqual(runners[0 if identity == "authz" else 1], job["runs-on"],
+                                         f"{label}: {name}:{identity}")
+
+    def test_authz_runner_documentation_matches_workflows_and_refuses_stale_runners(self):
+        documents = {"chain": (REPO / "docs/release-chain.md").read_text(),
+                     "readme": (REPO / "README.md").read_text()}
+        workflows = {name: _workflow(name) for name in self.ROUTED_JOBS}
+        self.assert_authz_runner_documentation(documents["chain"], documents["readme"], workflows)
+        mutations = (
+            ("chain", "Their `authz` jobs use `runs-on: ubuntu-24.04`"),
+            ("chain", "`authz` uses `runs-on: ubuntu-24.04`"),
+            ("chain", "`name: authz`,\n`runs-on: ubuntu-24.04`"),
+            ("readme", "The `authz` jobs use `runs-on: ubuntu-24.04`"),
+        )
+        for document, original in mutations:
+            self.assertEqual(documents[document].count(original), 1, original)
+            mutant = dict(documents)
+            mutant[document] = mutant[document].replace(
+                original, original.replace("ubuntu-24.04", "ubuntu-latest", 1), 1)
+            with self.subTest(document=document, mutation=original):
+                self.assertNotEqual(mutant, documents)
+                with self.assertRaises(AssertionError):
+                    self.assert_authz_runner_documentation(mutant["chain"], mutant["readme"], workflows)
+
+    def test_authz_runner_documentation_refuses_the_reported_exception_clause(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        readme = (REPO / "README.md").read_text()
+        workflows = {name: _workflow(name) for name in self.ROUTED_JOBS}
+        # On #107 this substitution leaves the reported stale sentence intact;
+        # after the fix it restores precisely that sentence.
+        stale, count = re.subn(
+            r"(`ci-labels\.md`)(?: with the owner-approved runner exception)?"
+            r"(?=, `name: authz`,)",
+            r"\1 with the owner-approved runner exception", chain)
+        self.assertEqual(count, 1)
+        with self.assertRaisesRegex(AssertionError, "canonical authz.*exception"):
+            self.assert_authz_runner_documentation(stale, readme, workflows)
+
+    def test_authz_runner_documentation_refuses_additional_contradictory_statements(self):
+        documents = {"chain": (REPO / "docs/release-chain.md").read_text(),
+                     "readme": (REPO / "README.md").read_text()}
+        workflows = {name: _workflow(name) for name in self.ROUTED_JOBS}
+        for document in documents:
+            mutant = dict(documents)
+            mutant[document] += "\n`authz` uses `runs-on: ubuntu-latest`.\n"
+            with self.subTest(document=document):
+                with self.assertRaisesRegex(AssertionError, "authz runner statement"):
+                    self.assert_authz_runner_documentation(mutant["chain"], mutant["readme"], workflows)
+
+    def assert_workflow_run_documentation(self, chain):
+        supervisor = chain.split("## Supervisor configuration\n", 1)[1]
+        policy = supervisor.split("For `workflow_run`,", 1)[1].split("The allowed ordinary events", 1)[0]
+        policy = " ".join(policy.split())
+        for statement in (
+            "non-empty `WR_HEAD_REPO` and `WR_ACTOR`",
+            "`WR_HEAD_REPO` must equal `REPO`",
+            "`ALLOWED_BOTS` applies only to `pull_request`",
+            "a failed permission lookup refuses the run",
+        ):
+            self.assertIn(statement, policy)
+        documented_bots = re.findall(r"The only bots accepted are ([^.]+)\.", policy)
+        documented_permissions = re.findall(
+            r"non-bot actors require ([^.]+?) permission read from GitHub;", policy)
+        documented_globs = re.findall(
+            r"`dependabot\[bot\]` and every other `([^`]+)` login are refused without a permission lookup",
+            policy)
+        self.assertTrue(documented_bots, "document the workflow_run bot allowlist")
+        self.assertTrue(documented_permissions, "document the workflow_run permission rule")
+        self.assertTrue(documented_globs, "document the workflow_run bot refusal pattern")
+        for name in self.ROUTED_JOBS:
+            script = _workflow(name)["jobs"]["authz"]["steps"][0]["run"]
+            arm = re.search(r"(?ms)^  workflow_run\)\n.*?(?=^  pull_request\)\n)", script)
+            self.assertIsNotNone(arm, f"{name}: document the actual workflow_run arm")
+            bot_rules = re.findall(
+                r'(?m)^[ \t]+((?:"[^"\n]+"\|)*"[^"\n]+")\) ;;$', arm[0])
+            permission_rules = re.findall(r'case "\$perm" in ([a-z|]+)\) ;;', arm[0])
+            bot_globs = re.findall(
+                r'(?m)^[ \t]+(\*"[^"\n]+")\) fail "[^"\n]+" ;;$', arm[0])
+            self.assertEqual(len(bot_rules), 1, f"{name}: workflow_run bot allowlist")
+            self.assertEqual(len(permission_rules), 1, f"{name}: workflow_run permission rule")
+            self.assertEqual(len(bot_globs), 1, f"{name}: workflow_run bot refusal pattern")
+            for statement in documented_bots:
+                self.assertEqual(re.findall(r"`([^`]+)`", statement),
+                                 re.findall(r'"([^"]+)"', bot_rules[0]),
+                                 f"{name}: workflow_run bot allowlist")
+            for statement in documented_permissions:
+                self.assertEqual(re.findall(r"`([^`]+)`", statement), permission_rules[0].split("|"),
+                                 f"{name}: workflow_run permission rule")
+            for pattern in documented_globs:
+                self.assertEqual(pattern, bot_globs[0], f"{name}: workflow_run bot refusal pattern")
+
+    def test_workflow_run_documentation_names_fixed_policy_and_refuses_omissions(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        self.assert_workflow_run_documentation(chain)
+        mutations = (
+            ("pineforge-ci-dispatcher[bot]", "dependabot[bot]"),
+            ("non-empty `WR_HEAD_REPO` and `WR_ACTOR`", "a head repository"),
+            ("`WR_HEAD_REPO` must equal `REPO`", "`WR_HEAD_REPO` may differ from `REPO`"),
+            ("`ALLOWED_BOTS` applies only to `pull_request`", "`ALLOWED_BOTS` applies to every event"),
+            ("refused without a permission lookup", "checked with a permission lookup"),
+            ("non-bot actors\nrequire", "all actors\nrequire"),
+            ("`admin`, `maintain` or `write` permission read from GitHub; a failed\npermission lookup",
+             "`admin`, `maintain` or `write` permission read from GitHub; a failed\nmetadata lookup"),
+        )
+        for original, replacement in mutations:
+            self.assertEqual(chain.count(original), 1, original)
+            mutant = chain.replace(original, replacement, 1)
+            with self.subTest(mutation=original):
+                self.assertNotEqual(mutant, chain)
+                with self.assertRaises(AssertionError):
+                    self.assert_workflow_run_documentation(mutant)
+
+    def test_workflow_run_documentation_detects_the_reported_third_bot_drift(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        workflows = {name: _workflow(name) for name in self.ROUTED_JOBS}
+        unchanged = copy.deepcopy(workflows)
+        original = '"pineforge-app[bot]"|"pineforge-ci-dispatcher[bot]"'
+        replacement = original + '|"pineforge-release[bot]"'
+        self.assertEqual(self.AUTHZ_TEXT.count(original), 1)
+        pin = self.AUTHZ_TEXT.replace(original, replacement, 1)
+        for workflow in workflows.values():
+            step = workflow["jobs"]["authz"]["steps"][0]
+            self.assertEqual(step["run"].count(original), 1)
+            step["run"] = step["run"].replace(original, replacement, 1)
+        # Only the file-reader boundary supplies mutated, real parsed workflow
+        # data. The documentation checker and canonical-job check both run.
+        with patch(f"{__name__}._workflow", side_effect=workflows.__getitem__), \
+                patch.object(self, "AUTHZ_TEXT", pin):
+            for workflow in workflows.values():
+                self.assert_authz(workflow["jobs"]["authz"])
+            with self.assertRaisesRegex(AssertionError, "workflow_run bot allowlist"):
+                self.assert_workflow_run_documentation(chain)
+            documented = "`pineforge-app[bot]` or `pineforge-ci-dispatcher[bot]`"
+            self.assertEqual(chain.count(documented), 1)
+            synchronized = chain.replace(
+                documented,
+                "`pineforge-app[bot]`, `pineforge-ci-dispatcher[bot]` or `pineforge-release[bot]`",
+                1)
+            self.assert_workflow_run_documentation(synchronized)
+        for name in self.ROUTED_JOBS:
+            mutant = copy.deepcopy(unchanged)
+            step = mutant[name]["jobs"]["authz"]["steps"][0]
+            step["run"] = step["run"].replace(original, replacement, 1)
+            with self.subTest(workflow=name), \
+                    patch(f"{__name__}._workflow", side_effect=mutant.__getitem__):
+                with self.assertRaisesRegex(AssertionError, "workflow_run bot allowlist"):
+                    self.assert_workflow_run_documentation(chain)
+
+    def test_workflow_run_documentation_detects_permission_rule_drift_in_either_workflow(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        workflows = {name: _workflow(name) for name in self.ROUTED_JOBS}
+        original = 'case "$perm" in admin|maintain|write)'
+        self.assertEqual(self.AUTHZ_TEXT.count(original), 2)
+        for workflow in workflows.values():
+            self.assertEqual(workflow["jobs"]["authz"]["steps"][0]["run"].count(original), 2)
+        documented = "require `admin`, `maintain` or `write` permission"
+        self.assertEqual(chain.count(documented), 1)
+        for replacement, permissions in (
+            ("admin|maintain|write|read", "`admin`, `maintain`, `write` or `read`"),
+            ("admin|write", "`admin` or `write`"),
+        ):
+            for name in self.ROUTED_JOBS:
+                mutant = copy.deepcopy(workflows)
+                step = mutant[name]["jobs"]["authz"]["steps"][0]
+                step["run"] = step["run"].replace(original, f'case "$perm" in {replacement})', 1)
+                self.assertNotEqual(mutant, workflows)
+                with self.subTest(workflow=name, permissions=replacement), \
+                        patch(f"{__name__}._workflow", side_effect=mutant.__getitem__):
+                    with self.assertRaisesRegex(AssertionError, "workflow_run permission rule"):
+                        self.assert_workflow_run_documentation(chain)
+            mutant = copy.deepcopy(workflows)
+            for workflow in mutant.values():
+                step = workflow["jobs"]["authz"]["steps"][0]
+                step["run"] = step["run"].replace(original, f'case "$perm" in {replacement})', 1)
+            self.assertNotEqual(mutant, workflows)
+            pin = self.AUTHZ_TEXT.replace(original, f'case "$perm" in {replacement})', 1)
+            with self.subTest(workflow="both", permissions=replacement), \
+                    patch(f"{__name__}._workflow", side_effect=mutant.__getitem__), \
+                    patch.object(self, "AUTHZ_TEXT", pin):
+                for workflow in mutant.values():
+                    self.assert_authz(workflow["jobs"]["authz"])
+                with self.assertRaisesRegex(AssertionError, "workflow_run permission rule"):
+                    self.assert_workflow_run_documentation(chain)
+                synchronized = chain.replace(documented, f"require {permissions} permission", 1)
+                self.assert_workflow_run_documentation(synchronized)
+
+    def test_workflow_run_documentation_refuses_additional_contradictory_statements(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        boundary = "The allowed ordinary events"
+        self.assertEqual(chain.count(boundary), 1)
+        for statement, reason in (
+            ("The only bots accepted are `dependabot[bot]`.", "workflow_run bot allowlist"),
+            ("Other, non-bot actors require `read` permission read from GitHub;",
+             "workflow_run permission rule"),
+        ):
+            mutant = chain.replace(boundary, statement + "\n" + boundary, 1)
+            with self.subTest(statement=statement):
+                with self.assertRaisesRegex(AssertionError, reason):
+                    self.assert_workflow_run_documentation(mutant)
+
+    def test_workflow_run_documentation_refuses_the_reported_unquoted_bot_glob(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        stale, count = re.subn(r'`\*(?:"\[bot\]"|\[bot\])`', "`*[bot]`", chain)
+        self.assertEqual(count, 1)
+        with self.assertRaisesRegex(AssertionError, "workflow_run bot refusal pattern"):
+            self.assert_workflow_run_documentation(stale)
 
     def assert_exception_runner(self, workflow, identity, job):
         expected = self.EXEMPT_RUNNERS[workflow][identity]
