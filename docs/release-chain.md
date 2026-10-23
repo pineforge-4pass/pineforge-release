@@ -466,8 +466,10 @@ at or after the PR's actual `merged_at` and at or before the receipt timestamp;
 CI still finishes before merge. The run must retain exactly one non-expired
 `postmerge-evidence-<run_id>-<run_attempt>` artifact; the hub checks its name and
 existence, while its contents remain the hosted repository's private contract.
-E2E must be non-null exactly in `verified`. The verifier takes the old coordinator
-path below only while the live `hosted` policy entry is the old coordinator policy.
+A `ready` receipt is refused under this policy, even with null `e2e` or an
+already merged PR. E2E must be non-null exactly in `verified`. The verifier takes
+the old coordinator path below only while the live `hosted` policy entry is the
+old coordinator policy.
 There is one live policy per role and no per-event or per-date policy, so after
 the `hosted` key is replaced by the post-merge policy, a retained coordinator-shape
 `verified` receipt is refused with "required check inventory differs from owner policy".
@@ -602,9 +604,9 @@ record a predecessor that has no `release-lock.json`, and only in `previous`; th
 object is refused in `preview`, `deployed`, every other consumer and every
 facts-only receipt. It has exactly five keys: `legacy` (the boolean `true`),
 `npm_version` (bare canonical semver, no leading `v`), `npm_integrity` (`sha512-`
-plus 86 base64 characters and `==`), `git_head` (a 40-hex commit) and `image_digest`
-(`sha256:` plus 64 hex, never `null`). The hub checks shape only; it does not pin
-the values to a particular release.
+plus the canonical base64 encoding of 64 bytes: 86 base64 characters and `==`),
+`git_head` (a commit) and `image_digest` (a digest, never `null`). The hub checks
+shape only; it does not pin the values to a particular release.
 
 **State machine.** Ordered progress is
 `pending → pr_open → testing → ready → merged → deploying → verified`.
