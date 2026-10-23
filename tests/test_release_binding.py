@@ -340,6 +340,34 @@ class PairPayloadTests(unittest.TestCase):
         self.assertEqual(set(actual["build"]), {"prerelease", "hub_commit", "run_id", "image",
                                               "candidate_url", "candidate_sha256"})
 
+    def test_noncanonical_npm_integrity_is_rejected_before_dispatch(self):
+        manifest = fixture_manifest()
+        manifest["versions"]["codegen"]["npm_integrity"] = (
+            "sha512-o1hmSb6FwjkF8lIwLhENJV+YPbYqSwG1KPvHyViPj5Yan3aHoNRC"
+            "pM5uINaYbjZKjGS95VDClmASOUSD6ZktVx==")
+        raw = contract.canonical(manifest)
+        candidate_raw = contract.canonical(candidate(manifest))
+        for entry_point, args in ((contract.payload, (raw,)),
+                                  (contract.pair_payload, (raw, candidate_raw))):
+            with self.subTest(entry_point=entry_point.__name__):
+                with self.assertRaisesRegex(contract.Invalid, "^invalid npm integrity$"):
+                    entry_point(*args)
+
+    def test_canonical_npm_integrity_is_preserved_by_dispatch_payloads(self):
+        manifest = fixture_manifest()
+        integrity = (
+            "sha512-o1hmSb6FwjkF8lIwLhENJV+YPbYqSwG1KPvHyViPj5Yan3aHoNRC"
+            "pM5uINaYbjZKjGS95VDClmASOUSD6ZktVw==")
+        manifest["versions"]["codegen"]["npm_integrity"] = integrity
+        raw = contract.canonical(manifest)
+        candidate_raw = contract.canonical(candidate(manifest))
+        event = contract.payload(raw)
+        self.assertEqual(event["versions"]["codegen"]["npm_integrity"], integrity)
+        self.assertEqual(event["event_id"], "sha256:" + hashlib.sha256(raw).hexdigest())
+        contract.validate_payload(event, raw)
+        self.assertEqual(contract.pair_payload(raw, candidate_raw),
+                         expected_pair_payload(raw, candidate_raw))
+
     def test_pair_payload_preserves_cutoff_and_prerelease_tag_spellings(self):
         for release in ("1.5.9", "1.6.0-beta.1", "1.6.0-rc.1", "1.6.0"):
             with self.subTest(release=release):

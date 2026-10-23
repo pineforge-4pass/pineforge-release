@@ -290,6 +290,7 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
                 and policy["deploy"]["workflow"] == "release.yml", "unexpected postmerge consumer")
         require((state == "verified") == (receipt["e2e"] is not None),
                 "postmerge E2E is required exactly in verified state")
+        require(state != "ready", "postmerge policy does not accept ready state")
     if state in ("pending", "failed", "superseded", "skipped_by_policy"):
         require(state != "skipped_by_policy" or (not facts_only and event["prerelease"]), "consumer cannot skip by policy")
         return public
