@@ -212,6 +212,22 @@ evidence can still advance progress; scheduled runs do not clear the retry
 history. Investigate and use an explicit reviewed
 recovery for an exhausted delivery.
 
+Use `release-redeliver.yml` for an explicitly reviewed repair of one published
+release to one consumer after the three automatic attempts are spent or the
+consumer was not ready, including accepted delivery without verified completion.
+Only operators permitted to dispatch the workflow and approved by the
+`release-automation` environment protection may trigger it; the consumer must
+be in `RELEASE_READY_CONSUMERS`. It resends the immutable manifest's identical
+payload and appends `delivery-redelivered-<consumer>-<n>.json` only after dispatch
+acceptance, recording the event, independent contiguous redelivery number, run,
+timestamp and `GITHUB_ACTOR` login. It never touches `delivery-<consumer>.json`,
+`delivery-failed-<consumer>.json`, `delivery-attempt-*`, receipts or other release
+assets. If dispatch succeeds but the audit write fails, the run fails; when no
+audit asset was written, the next run sends again with the same number, so a
+duplicate delivery is possible. The receipt contract is unchanged: redelivery
+keeps the same `event_id`, and the consumer's idempotence rules decide how to
+handle it.
+
 `release-receipts.yml` polls selected consumers every 30 minutes and accepts the
 callback below to repair dropped notifications. It mints a target-only read
 token, verifies the artifact and full GitHub CI/E2E/deploy evidence, then appends
