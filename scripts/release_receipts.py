@@ -187,6 +187,14 @@ def check_postmerge(client, repo, evidence, policy, pr, actual, timestamp):
     require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
     require(run["checked_first_finished_at"] >= actual["merged_at"], "postmerge E2E completed before merge")
     require(timestamp >= run["checked_finished_at"], "receipt predates postmerge verification")
+    # The released PR must not supply a different definition of its own gate.
+    workflow_route = f"repos/{repo}/contents/.github/workflows/{policy['e2e']['workflow']}"
+    blobs = []
+    for ref in (pr["base_sha"], pr["merge"]):
+        contents = client.api(f"{workflow_route}?ref={ref}")
+        require(type(contents) is dict and contents.get("type") == "file", "postmerge workflow is not a file")
+        blobs.append(match(COMMIT, contents.get("sha")))
+    require(blobs[0] == blobs[1], "postmerge workflow differs from tested base")
     artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
     name = f"postmerge-evidence-{run['id']}-{run['run_attempt']}"
     found = [a for a in artifacts if a["name"] == name and not a["expired"]]
