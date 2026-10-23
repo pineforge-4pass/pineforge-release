@@ -284,8 +284,11 @@ class ReceiptCollectionTests(unittest.TestCase):
 
     def test_duplicate_receipt_artifacts_on_one_run_are_still_ambiguous(self):
         self.client.artifacts.append({**self.client.artifact_by_run[1007], "id": 8000})
-        with self.assertRaisesRegex(contract.Invalid, "ambiguous consumer receipt artifact"):
+        output = io.StringIO()
+        with redirect_stderr(output), patch.object(receipts, "report_issue"):
             self.collect()
+        self.assertIn("::warning::receipt artifact skipped: role=license run=1007: ambiguous consumer receipt artifact",
+                      output.getvalue())
         self.assertEqual(self.store.assets, {})
         self.assertFalse(any(route.endswith("/zip") for route in self.client.routes))
 
@@ -302,8 +305,13 @@ class ReceiptCollectionTests(unittest.TestCase):
                 else:
                     self.client.documents[1007]["consumer"] = "web"
                     self.client.seal(1007)
-                with self.assertRaisesRegex(contract.Invalid, message):
+                output = io.StringIO()
+                with redirect_stderr(output), patch.object(receipts, "report_issue"):
                     self.collect()
+                self.assertIn(f"::warning::receipt artifact skipped: role=license run=1007: {message}", output.getvalue())
+                self.assertEqual(self.store.assets, {})
+                with self.assertRaisesRegex(contract.Invalid, message):
+                    self.collect(1007)
                 self.assertEqual(self.store.assets, {})
 
     def test_callback_keeps_its_per_run_lookup_and_existing_in_flight_behavior(self):
