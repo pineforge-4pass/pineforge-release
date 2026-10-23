@@ -598,14 +598,33 @@ already stored, so dropping the form earlier makes each such artifact fail
 validation; in a sweep it is reported and skipped (see the collector skip rules
 below), and a callback naming that run still fails closed.
 
-**Legacy offline `previous`.** Only a product receipt with `consumer: offline` may
-record a predecessor that has no `release-lock.json`, and only in `previous`; the
-object is refused in `preview`, `deployed`, every other consumer and every
-facts-only receipt. It has exactly five keys: `legacy` (the boolean `true`),
-`npm_version` (bare canonical semver, no leading `v`), `npm_integrity` (`sha512-`
-plus the canonical base64 encoding of 64 bytes: 86 base64 characters and `==`),
-`git_head` (a commit) and `image_digest` (a digest, never `null`). The hub checks
-shape only; it does not pin the values to a particular release.
+**Legacy offline `previous` (temporary).** Only a product receipt with
+`consumer: offline` may record the real `@pineforge/backtest-mcp` 0.9.40
+predecessor in this form, and only in `previous`; it is refused in `preview`,
+`deployed`, every other consumer and every facts-only receipt. That predecessor
+has no `release-lock.json`. The object has exactly five keys, and every value
+must equal this pin:
+
+```json
+{
+  "legacy": true,
+  "npm_version": "0.9.40",
+  "npm_integrity": "sha512-o1hmSb6FwjkF8lIwLhENJV+YPbYqSwG1KPvHyViPj5Yan3aHoNRCpM5uINaYbjZKjGS95VDClmASOUSD6ZktVw==",
+  "git_head": "b988217f2aa21b6b772fb723adbc89bd4130c3f5",
+  "image_digest": "sha256:129aa9cb5db4400523d1fc12a11671cfb820f934d893e4ee8945cd25c5bc202d"
+}
+```
+
+`legacy` must be the boolean `true`; `npm_version` is bare canonical semver;
+`npm_integrity` is `sha512-` plus the canonical base64 encoding of 64 bytes
+(86 base64 characters and `==`); `git_head` is a commit and `image_digest` is a
+digest, never `null`. The image digest is the multi-architecture OCI index of
+`ghcr.io/pineforge-4pass/pineforge-backtest-mcp:v0.9.40`. The hub enforces the
+exact identity and scope. The receipt's `release_version` identifies the hub
+release, so it does not establish the current offline package version.
+
+**Removal:** remove this legacy exception in the first hub release after offline
+MCP ships its first non-legacy release through the new chain (0.9.43 or later).
 
 **State machine.** Ordered progress is
 `pending → pr_open → testing → ready → merged → deploying → verified`.
