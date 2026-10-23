@@ -26,8 +26,16 @@ import release_pipeline as pipeline  # noqa: E402
 import release_receipts as receipts  # noqa: E402
 
 
-# Independently transcribed from the reviewed mcp-public policy at 84a48bf.
+# Independently transcribed from hosted receipt.mjs at 0a1c82c8.
 HOSTED_POLICY = {
+    "workflow": "release-report.yml", "artifact": "release-receipt-hosted", "base": "main",
+    "ci": {"workflow": "release-pr.yml", "expected": ["authz", "validate", "checks", "container"], "approved_skips": []},
+    "e2e": {"workflow": "release-postmerge.yml", "expected": ["authz", "build", "verified"], "approved_skips": []},
+    "deploy": {"workflow": "release.yml", "expected": ["decide", "deploy"], "approved_skips": []},
+}
+
+# Independently transcribed from the reviewed mcp-public policy at 84a48bf.
+OLD_HOSTED_COORDINATOR_POLICY = {
     "workflow": "release-report.yml", "artifact": "release-receipt-hosted", "base": "main",
     "ci": {"workflow": "release-pr.yml", "expected": ["validate", "checks", "container", "candidate"], "approved_skips": []},
     "e2e": {"workflow": "release-coordinator.yml", "expected": ["candidate", "release/ready"], "approved_skips": []},
@@ -54,7 +62,7 @@ class ReceiptFixture:
 
     def __init__(self, consumer="hosted", policy=None):
         self.policy = copy.deepcopy(policy if policy is not None else (
-            HOSTED_POLICY if consumer == "hosted" else example.example_policy(consumer)))
+            OLD_HOSTED_COORDINATOR_POLICY if consumer == "hosted" else example.example_policy(consumer)))
         self.event = contract.payload((ROOT / "tests/fixtures/release-manifest.json").read_bytes())
         self.receipt = example.build_receipt(self.event, consumer=consumer)
         # An explicit legacy policy still exercises a receipt without post_merge.
@@ -62,6 +70,7 @@ class ReceiptFixture:
             self.receipt.pop("post_merge", None)
         self.pr = self.receipt["pr"]
         self.pr["base"] = self.policy["base"]
+        self.receipt["preview"]["source"] = self.pr["head"]
         self.actual_pr = {"base": {"ref": self.pr["base"], "sha": self.pr["base_sha"]},
                           "head": {"sha": self.pr["head"], "repo": {"full_name": self.repo}},
                           "merged": True, "merge_commit_sha": self.pr["merge"], "merged_at": "2020-01-01T00:05:00Z"}
@@ -198,9 +207,10 @@ class HostedCoordinatorReceiptTests(unittest.TestCase):
         self.assertEqual(example.example_policy("hosted"), HOSTED_POLICY)
         f = ReceiptFixture()
         built = example.build_receipt(f.event, consumer="hosted")
-        for stage, source in (("ci", "head"), ("e2e", "base_sha"), ("deploy", "merge")):
+        for stage, source in (("ci", "head"), ("e2e", "merge"), ("deploy", "merge")):
             self.assertEqual(built[stage]["sha"], built["pr"][source])
             self.assertEqual(built[stage]["expected"], HOSTED_POLICY[stage]["expected"])
+        self.assertEqual(built["preview"]["source"], built["pr"]["merge"])
         doc = (ROOT / "docs/release-chain.md").read_text().split("## Supervisor configuration\n", 1)[1]
         policies = [json.loads(raw) for raw in re.findall(r"```json\n(.*?)\n```", doc, re.S)]
         documented = next(policy for policy in policies if "hosted" in policy)
@@ -453,7 +463,7 @@ class HostedCoordinatorReceiptTests(unittest.TestCase):
 
     def test_adapter_rejects_every_non_hosted_consumer_before_calling_the_helper(self):
         for consumer in (role for role in contract.ROLES if role != "hosted"):
-            f = ReceiptFixture(consumer, HOSTED_POLICY)
+            f = ReceiptFixture(consumer, OLD_HOSTED_COORDINATOR_POLICY)
             with self.subTest(consumer=consumer), patch.object(receipts, "check_coordinator") as adapter:
                 with self.assertRaisesRegex(contract.Invalid, "unexpected coordinator consumer"):
                     f.verify()
