@@ -329,7 +329,11 @@ Only operators permitted to dispatch the workflow may trigger it, and the job
 uses the `release-automation` environment: today that environment permits main
 and release tags and has no required reviewers, so the dispatch right is the
 only approval unless the owner gives the repair a dedicated reviewed environment.
-The consumer must be in `RELEASE_READY_CONSUMERS`. It resends the immutable manifest's identical
+The consumer must be in `RELEASE_READY_CONSUMERS`. Before minting the target App
+token, `redeliver-check` validates the canonical tag, configured consumer, public
+release eligibility and latest receipts using unauthenticated reads. Redelivery
+repeats those checks before sending. An already verified consumer is refused even
+when `delivery-<consumer>.json` is absent. It resends the immutable manifest's identical
 payload and appends `delivery-redelivered-<consumer>-<n>.json` only after dispatch
 acceptance, recording the event, independent contiguous redelivery number, run,
 timestamp and `GITHUB_ACTOR` login. It never touches `delivery-<consumer>.json`,

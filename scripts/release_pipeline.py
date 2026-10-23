@@ -340,13 +340,13 @@ def plan_delivery(store, row, event, role):
     return {"consumer": role, "tag": row["tag_name"], "attempt": attempt}, False
 
 
-def redeliver(client, store, tag, consumer, output):
-    """Manually resend one public event; append one audit only after acceptance."""
+def redelivery_source(tag, consumer):
+    """Validate eligibility and read the payload without write credentials."""
     require(consumer in configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", "")),
             "redelivery consumer is not configured")
     require(tag == "v" + str(version(tag.removeprefix("v"))), "redelivery tag must be canonical vX.Y.Z")
-    # The dispatch client has a target-only App token. Release checks and exact
-    # manifest reads use a public client; the injected store appends audit.
+    # The workflow runs these public checks before minting its target-only App
+    # token. Redelivery repeats them before sending instead of trusting a cache.
     public = Client(token="")
     row = public.api(f"repos/{HUB}/releases/tags/{tag}")
     require(row["tag_name"] == tag and not row["draft"], "cannot redeliver a draft or different release")
@@ -379,9 +379,15 @@ def redeliver(client, store, tag, consumer, output):
         obj = decode(accepted)
         require(obj["event_id"] == event["event_id"] and obj["consumer"] == consumer
                 and obj["state"] == "dispatch_accepted", "accepted delivery identity differs")
-        by_role = receipts(public_store, row, event["event_id"])
-        require(by_role.get(consumer, {}).get("state") != "verified", "consumer already verified")
+    by_role = receipts(public_store, row, event["event_id"])
+    require(by_role.get(consumer, {}).get("state") != "verified", "consumer already verified")
+    return public_store, row, event, client_payload
 
+
+def redeliver(client, store, tag, consumer, output):
+    """Manually resend one public event; append one audit only after acceptance."""
+    public_store, row, event, client_payload = redelivery_source(tag, consumer)
+    event_type = EVENT_TYPES[consumer]
     prefix = f"delivery-redelivered-{consumer}-"
     actor_pattern = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?"
     attempts = []
@@ -608,6 +614,9 @@ def main():
     p.add_argument("--consumer", choices=ROLES, required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--attempt", type=int, default=1)
+    p = sub.add_parser("redeliver-check")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--consumer", choices=ROLES, required=True)
     p = sub.add_parser("redeliver")
     p.add_argument("--tag", required=True)
     p.add_argument("--consumer", choices=ROLES, required=True)
@@ -615,9 +624,12 @@ def main():
     p = sub.add_parser("alert")
     p.add_argument("--stage", required=True, choices=("publish", "producer", "finalize", "dispatch", "receipt"))
     args = parser.parse_args()
-    client = Client()
-    store = Store(client)
     try:
+        if args.cmd == "redeliver-check":
+            redelivery_source(args.tag, args.consumer)
+            return 0
+        client = Client()
+        store = Store(client)
         if args.cmd == "producer":
             producer(client, args.component, args.version)
         elif args.cmd == "bindings":
