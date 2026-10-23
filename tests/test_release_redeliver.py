@@ -22,7 +22,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import release_artifacts as artifacts  # noqa: E402
 import release_contract as contract  # noqa: E402
 import release_pipeline as pipeline  # noqa: E402
-from test_release_binding import MemoryStore, expected_pair_payload, fixture_manifest  # noqa: E402
+from test_release_binding import (FinalizeClient, MemoryRegistry, MemoryStore,  # noqa: E402
+                                  expected_pair_payload, fixture_manifest)
 
 TAG = "v1.6.0"
 CONSUMER = "hosted"
@@ -127,7 +128,9 @@ class RedeliverTest(unittest.TestCase):
             raise urllib.error.URLError("dispatch transport unavailable")
         self.accepted.append(request.data)
         self.effects.append("send")
-        return io.BytesIO(b"")
+        response = io.BytesIO(b"")
+        response.status = 204
+        return response
 
     def put(self, row, name, raw):
         self.puts.append((row["tag_name"], name, raw))
@@ -161,13 +164,13 @@ class RedeliverTest(unittest.TestCase):
             "attempt": attempt, "sequence": sequence, "timestamp": CLOCK,
             "evidence_sha256": "a" * 64, "reporting_run_id": 700}))
 
-    def seed_planner(self):
+    def seed_planner(self, *, consumer=CONSUMER):
         for number in (1, 2, 3):
-            self.seed(self.row, f"delivery-attempt-{CONSUMER}-{number}.json", contract.canonical({
-                "event_id": self.event["event_id"], "consumer": CONSUMER, "attempt": number,
+            self.seed(self.row, f"delivery-attempt-{consumer}-{number}.json", contract.canonical({
+                "event_id": self.event["event_id"], "consumer": consumer, "attempt": number,
                 "run_id": 800 + number, "timestamp": CLOCK}))
-        self.seed(self.row, f"delivery-failed-{CONSUMER}.json", contract.canonical({
-            "event_id": self.event["event_id"], "consumer": CONSUMER,
+        self.seed(self.row, f"delivery-failed-{consumer}.json", contract.canonical({
+            "event_id": self.event["event_id"], "consumer": consumer,
             "state": "failed", "attempts": 3, "timestamp": CLOCK}))
 
     def use_prerelease_manifest(self):
@@ -389,6 +392,55 @@ class RedeliverTest(unittest.TestCase):
                     "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": floor}):
                 self.assert_refused(consumer="compute",
                                     message="redelivery consumer is not enabled for this pair")
+
+    def test_accepted_compute_repair_completes_finalization_and_preserves_exhaustion(self):
+        """Mutation: aggregate reads only delivery-compute.json after repair."""
+        self.seed_planner(consumer="compute")
+        client, registry = FinalizeClient(self.manifest), MemoryRegistry()
+        deliveries = self.output.with_name("deliveries.json")
+        with patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "GITHUB_RUN_ID": "899", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "age_minutes", return_value=1000), \
+                patch.object(pipeline, "report_issue") as report:
+            pipeline.finalize_all(client, self.store, registry, TAG, deliveries)
+            failed = contract.decode(self.store.read(self.row, "release-status-899-1.json"))
+            self.assertEqual(failed["consumers"], {"compute": "failed"})
+            self.assertFalse(failed["complete"])
+            self.assertEqual(contract.decode(deliveries.read_bytes()), [])
+            self.assertFalse(report.call_args.kwargs["complete"])
+            before = copy.deepcopy(self.store.assets)
+            self.puts.clear()
+            os.environ["GITHUB_RUN_ID"] = "900"
+            self.assertEqual(self.cli(consumer="compute"), 0)
+            expected_body = contract.canonical({
+                "event_type": "release-pair",
+                "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE)),
+            })
+            self.assertEqual(self.requests, [expected_body])
+            self.assertEqual(self.accepted, [expected_body])
+            audit_raw = contract.canonical(self.audit(1, consumer="compute"))
+            name = "delivery-redelivered-compute-1.json"
+            self.assertEqual(self.puts, [(TAG, name, audit_raw)])
+            self.assertEqual(self.output.read_bytes(), audit_raw)
+            self.assertEqual(self.store.assets, {**before, (TAG, name): audit_raw})
+            self.assertIsNone(self.store.read(self.row, "delivery-compute.json"))
+            os.environ["GITHUB_RUN_ID"] = "901"
+            report.reset_mock()
+            pipeline.finalize_all(client, self.store, registry, TAG, deliveries)
+            latest = max((asset for asset in self.row["assets"] if asset["name"].startswith("release-status-")),
+                         key=lambda asset: asset["id"])
+            status = contract.decode(self.store.read(self.row, latest["name"]))
+            self.assertEqual(status["consumers"], {"compute": "delivered"})
+            self.assertTrue(status["complete"])
+            self.assertEqual(latest["name"], "release-status-901-1.json")
+            self.assertEqual(status["stale"], [])
+            self.assertEqual(contract.decode(deliveries.read_bytes()), [])
+            self.assertTrue(report.call_args.kwargs["complete"])
+            for key, raw in before.items():
+                self.assertEqual(self.store.assets[key], raw)
+            self.assertFalse(any(name.startswith("consumer-") for _, name in self.store.assets))
 
     def test_malformed_compute_floor_fails_without_a_send_or_audit(self):
         """Mutation: treat a malformed compute floor as enabled."""

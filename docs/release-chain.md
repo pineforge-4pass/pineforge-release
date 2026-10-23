@@ -298,10 +298,14 @@ receiver is merged, then the supervisor sets the agreed current application/
 hosted pair. There is no automatic backfill below that floor.
 
 `DELIVERY_ONLY = ("compute",)` explicitly separates delivery roles from the six
-`RECEIPT_ROLES`. Before `delivery-compute.json`, compute is `pending`; after that
-asset it is `delivered`, which counts as complete and can close a release
-incident. It never becomes `superseded` or `skipped_by_policy`, and a newer ready
-release does not refuse an eligible compute send or retry. `delivered` proves
+`RECEIPT_ROLES`. Compute is `delivered` only after decoding acceptance evidence
+from `delivery-compute.json` or the manual `delivery-redelivered-compute-N.json`
+audit history and validating the matching `event_id`, compute consumer and
+`dispatch_accepted` state. Malformed or mismatching evidence is refused.
+Manual audits must also satisfy their schema, canonical bytes, actor, clock and
+contiguous attempt numbering. Valid acceptance counts as complete and can close
+a release incident. It never becomes `superseded` or `skipped_by_policy`, and a
+newer ready release does not refuse an eligible compute send or retry. `delivered` proves
 transport acceptance; it makes no deployment or served-state claim.
 
 Delivery acceptance is recorded once as `delivery-<consumer>.json`, independently
@@ -329,12 +333,19 @@ Only operators permitted to dispatch the workflow may trigger it, and the job
 uses the `release-automation` environment: today that environment permits main
 and release tags and has no required reviewers, so the dispatch right is the
 only approval unless the owner gives the repair a dedicated reviewed environment.
-The consumer must be in `RELEASE_READY_CONSUMERS`. It resends the immutable manifest's identical
+The consumer must be in `RELEASE_READY_CONSUMERS`; this membership and canonical
+tag are checked before minting the target App token. Compute also requires a
+nonempty canonical `RELEASE_COMPUTE_FIRST_PAIR` no greater than the pair's version
+before minting. The send repeats those authorization checks against the immutable
+manifest. It resends the immutable manifest's identical
 payload and appends `delivery-redelivered-<consumer>-<n>.json` only after dispatch
 acceptance, recording the event, independent contiguous redelivery number, run,
 timestamp and `GITHUB_ACTOR` login. It never touches `delivery-<consumer>.json`,
 `delivery-failed-<consumer>.json`, `delivery-attempt-*`, receipts or other release
-assets. If dispatch succeeds but the audit write fails, the run fails; when no
+assets. The finalizer validates accepted manual compute audits as delivery
+completion even after automatic retries are exhausted; the original failure and
+attempt assets remain unchanged. Receipt roles still require consumer evidence.
+If dispatch succeeds but the audit write fails, the run fails; when no
 audit asset was written, the next run sends again with the same number, so a
 duplicate delivery is possible. The receipt contract is unchanged: redelivery
 keeps the same `event_id`, and the consumer's idempotence rules decide how to
