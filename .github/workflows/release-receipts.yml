@@ -87,6 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           HUB_TOKEN: ${{ github.token }}
+          RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
           RELEASE_RECEIPT_POLICY: ${{ secrets.RELEASE_RECEIPT_POLICY }}
           RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
           CONSUMER: ${{ matrix.consumer }}
