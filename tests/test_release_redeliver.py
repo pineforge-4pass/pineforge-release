@@ -10,10 +10,12 @@ from __future__ import annotations
 import copy
 import io
 import os
+import shlex
 import sys
 import tempfile
 import unittest
 import urllib.error
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -199,6 +201,101 @@ class RedeliverTest(unittest.TestCase):
             self.invoke(tag=tag, consumer=consumer)
         if message is not None:
             self.assertEqual(str(refused.exception), message)
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertFalse(self.output.exists())
+
+    def workflow_before_target_mint(self, *, tag=TAG, consumer=CONSUMER, configured=CONSUMER):
+        """Run the workflow's Python checks, stopping on failure or the token action.
+
+        Checkout, the apt guard and repository-name setup are covered by the
+        workflow wiring tests; this fixture supplies a valid target repository.
+        No App action or shell command is executed by this walk.
+        """
+        from test_release_workflows import _workflow
+        bindings = {
+            "${{ inputs.tag }}": tag,
+            "${{ inputs.consumer }}": consumer,
+            "${{ vars.RELEASE_READY_CONSUMERS }}": configured,
+            "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}": os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", ""),
+        }
+        result, diagnostic = None, ""
+        for step in _workflow("release-redeliver.yml")["jobs"]["redeliver"]["steps"]:
+            if "create-github-app-token@" in step.get("uses", ""):
+                return "mint", result, diagnostic
+            if "release_pipeline.py" not in step.get("run", ""):
+                continue
+            words = shlex.split(step["run"])
+            self.assertEqual(words[:2], ["python3", "scripts/release_pipeline.py"])
+            env = {name: bindings[value] for name, value in step.get("env", {}).items()}
+            stderr = io.StringIO()
+            with patch.dict(os.environ, env, clear=True), redirect_stderr(stderr):
+                argv = [os.path.expandvars(word) for word in words[1:]]
+                with patch.object(sys, "argv", argv):
+                    result = pipeline.main()
+            diagnostic = stderr.getvalue()
+            if result != 0:
+                return "refused", result, diagnostic
+        self.fail("redelivery workflow never reached a target token mint")
+
+    def test_workflow_refuses_prerelease_application_before_target_token_mint(self):
+        """Mutation: move the public eligibility check after the App token mint."""
+        self.use_prerelease_manifest()
+        before = copy.deepcopy(self.store.assets)
+        outcome, result, stderr = self.workflow_before_target_mint(
+            tag="v1.6.0-rc.1", consumer="application", configured="application")
+        self.assertEqual((outcome, result), ("refused", 1))
+        self.assertIn("::error::", stderr)
+        self.assertEqual(self.tokens, [""])
+        # The same prerelease is eligible for hosted; the check must allow it
+        # through to the mint without sending or appending anything itself.
+        self.assertEqual(self.workflow_before_target_mint(
+            tag="v1.6.0-rc.1", consumer="hosted", configured="hosted"), ("mint", 0, ""))
+        self.assertEqual(self.tokens, ["", ""])
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertFalse(self.output.exists())
+
+    def test_workflow_refuses_unconfigured_consumer_before_target_token_mint(self):
+        """Mutation: omit the public eligibility check before minting."""
+        before = copy.deepcopy(self.store.assets)
+        outcome, result, stderr = self.workflow_before_target_mint(
+            tag="not-a-semver-tag", consumer="license", configured="offline")
+        self.assertEqual((outcome, result), ("refused", 1))
+        self.assertIn("::error::", stderr)
+        self.assertEqual(self.tokens, [])
+        self.assertEqual(self.public.reads, [])
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertFalse(self.output.exists())
+
+    def test_workflow_refuses_noncanonical_tag_before_target_token_mint(self):
+        """Mutation: bypass the canonical-tag check in the shared eligibility check."""
+        before = copy.deepcopy(self.store.assets)
+        outcome, result, stderr = self.workflow_before_target_mint(
+            tag="not-a-semver-tag", consumer="license", configured="license")
+        self.assertEqual((outcome, result), ("refused", 1))
+        self.assertIn("::error::", stderr)
+        self.assertEqual(self.tokens, [])
+        self.assertEqual(self.public.reads, [])
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertFalse(self.output.exists())
+
+    def test_workflow_refuses_verified_consumer_before_target_token_mint(self):
+        """Mutation: omit receipt verification from the public eligibility check."""
+        self.seed_planner()
+        self.seed_audit(1)
+        self.seed_receipt("verified", attempt=2, sequence=1)
+        before = copy.deepcopy(self.store.assets)
+        outcome, result, stderr = self.workflow_before_target_mint()
+        self.assertEqual((outcome, result), ("refused", 1))
+        self.assertIn("::error::", stderr)
+        self.assertEqual(self.tokens, [""])
         self.assertEqual(self.store.assets, before)
         self.assertEqual(self.requests, [])
         self.assertEqual(self.puts, [])
@@ -466,6 +563,14 @@ class RedeliverTest(unittest.TestCase):
         self.seed_receipt("verified", attempt=2, sequence=1)
         self.seed_receipt("failed", attempt=1, sequence=9)
         self.assert_refused()
+
+    def test_refuses_verified_consumer_without_delivery_acceptance(self):
+        """Mutation: put receipt verification back inside the acceptance branch."""
+        self.seed_planner()
+        self.seed_audit(1)
+        self.seed_receipt("verified", attempt=2, sequence=1)
+        self.assertIsNone(self.store.read(self.row, f"delivery-{CONSUMER}.json"))
+        self.assert_refused(message="consumer already verified")
 
     def test_accepted_but_unverified_consumer_can_be_repaired(self):
         """Mutation: refuse whenever delivery-<consumer>.json exists."""

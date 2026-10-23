@@ -1793,6 +1793,30 @@ class NotifyConsumersTest(unittest.TestCase):
 
 
 class RedeliverWorkflowTest(unittest.TestCase):
+    def test_public_eligibility_is_checked_before_target_token_mint(self):
+        """Mutation: move or remove the public redelivery eligibility step."""
+        steps = _workflow("release-redeliver.yml")["jobs"]["redeliver"]["steps"]
+        checks = [step for step in steps
+                  if "release_pipeline.py redeliver-check " in step.get("run", "")]
+        self.assertEqual(len(checks), 1)
+        check = checks[0]
+        checkout = next(step for step in steps if "actions/checkout@" in step.get("uses", ""))
+        mint = next(step for step in steps if "create-github-app-token@" in step.get("uses", ""))
+        send = next(step for step in steps if "release_pipeline.py redeliver " in step.get("run", ""))
+        self.assertLess(steps.index(checkout), steps.index(check))
+        self.assertLess(steps.index(check), steps.index(mint))
+        self.assertLess(steps.index(mint), steps.index(send))
+        self.assertEqual(check["env"], {
+            "TAG": "${{ inputs.tag }}", "CONSUMER": "${{ inputs.consumer }}",
+            "RELEASE_READY_CONSUMERS": "${{ vars.RELEASE_READY_CONSUMERS }}",
+            "RELEASE_COMPUTE_FIRST_PAIR": "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}",
+        })
+        self.assertEqual(check["run"],
+                         'python3 scripts/release_pipeline.py redeliver-check --tag "$TAG" --consumer "$CONSUMER"\n')
+        for step in (check, mint, send):
+            self.assertNotIn("if", step)
+            self.assertNotIn("continue-on-error", step)
+
     def test_manual_inputs_protected_single_job_and_serialized_permissions(self):
         """Mutation: delete the redeliver job's main-ref if."""
         wf = _workflow("release-redeliver.yml")

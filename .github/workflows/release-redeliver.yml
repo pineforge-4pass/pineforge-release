@@ -55,6 +55,14 @@ jobs:
           if ! [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
             echo '::error::Missing or malformed consumer repository setup'; exit 1
           fi
+      - name: Validate public redelivery eligibility
+        env:
+          TAG: ${{ inputs.tag }}
+          CONSUMER: ${{ inputs.consumer }}
+          RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
+        run: |
+          python3 scripts/release_pipeline.py redeliver-check --tag "$TAG" --consumer "$CONSUMER"
       - name: Mint App token (scoped to one target)
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
