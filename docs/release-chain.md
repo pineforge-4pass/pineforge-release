@@ -465,8 +465,10 @@ at or after the PR's actual `merged_at` and at or before the receipt timestamp;
 CI still finishes before merge. The run must retain exactly one non-expired
 `postmerge-evidence-<run_id>-<run_attempt>` artifact; the hub checks its name and
 existence, while its contents remain the hosted repository's private contract.
-E2E must be non-null exactly in `verified`. The verifier takes the old coordinator
-path below only while the live `hosted` policy entry is the old coordinator policy.
+A `ready` receipt is refused under this policy, even with null `e2e` or an
+already merged PR. E2E must be non-null exactly in `verified`. The verifier takes
+the old coordinator path below only while the live `hosted` policy entry is the
+old coordinator policy.
 There is one live policy per role and no per-event or per-date policy, so after
 the `hosted` key is replaced by the post-merge policy, a retained coordinator-shape
 `verified` receipt is refused with "required check inventory differs from owner policy".
