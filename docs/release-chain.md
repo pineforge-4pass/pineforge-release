@@ -452,6 +452,17 @@ a neutral receipt. Its planner excludes `DELIVERY_ONLY` roles, so compute has
 no policy lookup, read token or workflow poll; compute callbacks and consumer
 receipts are refused. Acceptance of a dispatch or callback never means verified.
 
+The planner and collector both receive `RELEASE_READY_CONSUMERS`. A configured
+product consumer requires an event-bound receipt even before delivery acceptance,
+after automatic retries are exhausted, or after manual redelivery; a missing
+`delivery-<consumer>.json` does not exempt it. A sweep reports skipped invalid
+artifacts before failing for missing required receipts. Supersession follows
+dispatch and redelivery: a stable release yields to a newer stable release,
+while a prerelease yields to any newer published, non-rejected manifest-backed
+release. Drafts and releases without a manifest cannot supersede a target.
+Receipt ZIP entries are read with a bounded decompressed-byte limit of 2 MiB;
+malformed entry streams are invalid evidence.
+
 ## Consumer receipt contract v1
 
 This is the single consumer-to-hub contract for the six receipt lanes;
