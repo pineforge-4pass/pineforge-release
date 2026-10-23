@@ -155,6 +155,71 @@ class ReceiptFixture:
         return receipts.validate_receipt(self, self.repo, self.receipt, self.event, self.policy, self.reporting_run)
 
 
+class PremergeReceiptTests(unittest.TestCase):
+    def fixtures(self):
+        policies = [("hosted", OLD_HOSTED_COORDINATOR_POLICY), ("application", APPLICATION_POLICY)]
+        policies.extend((role, example.example_policy(role)) for role in ("offline", "web", "data", "license"))
+        for consumer, policy in policies:
+            for state in ("pr_open", "testing", "ready"):
+                f = ReceiptFixture(consumer, policy)
+                f.receipt.update(state=state, deploy=None, deployed=None, previous=None)
+                if "post_merge" in f.receipt:
+                    f.receipt["post_merge"] = None
+                if state in ("pr_open", "testing"):
+                    f.receipt.update(ci=None, e2e=None, preview=None)
+                yield consumer, state, f
+
+    def test_premerge_states_refuse_forged_merge(self):
+        for consumer, state, f in self.fixtures():
+            with self.subTest(consumer=consumer, state=state):
+                f.pr["merge"] = "f" * 40
+                with self.assertRaisesRegex(contract.Invalid, "^PR is not the recorded merge$"):
+                    f.verify()
+
+    def test_premerge_states_refuse_malformed_merge(self):
+        for merge in (7, "f" * 39, "F" * 40):
+            for consumer, state, f in self.fixtures():
+                with self.subTest(consumer=consumer, state=state, merge=merge):
+                    f.pr["merge"] = merge
+                    with self.assertRaisesRegex(contract.Invalid, "^malformed identity$"):
+                        f.verify()
+
+    def test_premerge_states_refuse_merge_for_unmerged_pr(self):
+        for actual_merge in (None, "2" * 40):
+            for consumer, state, f in self.fixtures():
+                with self.subTest(consumer=consumer, state=state, actual_merge=actual_merge):
+                    f.actual_pr.update(merged=False, merge_commit_sha=actual_merge, merged_at=None)
+                    with self.assertRaisesRegex(contract.Invalid, "^PR is not the recorded merge$"):
+                        f.verify()
+
+    def test_premerge_states_accept_null_merge(self):
+        for merged in (False, True):
+            for consumer, state, f in self.fixtures():
+                with self.subTest(consumer=consumer, state=state, merged=merged):
+                    f.pr["merge"] = None
+                    if not merged:
+                        f.actual_pr.update(merged=False, merge_commit_sha=None, merged_at=None)
+                    public = f.verify()
+                    self.assertEqual(public["state"], state)
+                    self.assertIsNone(public["pr"]["merge"])
+                    self.assertIn(f"repos/{f.repo}/pulls/9", f.queries)
+                    if state == "ready":
+                        self.assertIn("ci", public)
+                        self.assertIn("e2e", public)
+
+    def test_premerge_states_accept_actual_merge(self):
+        for consumer, state, f in self.fixtures():
+            with self.subTest(consumer=consumer, state=state):
+                expected_pr = copy.deepcopy(f.pr)
+                public = f.verify()
+                self.assertEqual(public["state"], state)
+                self.assertEqual(public["pr"], expected_pr)
+                self.assertIn(f"repos/{f.repo}/pulls/9", f.queries)
+                if state == "ready":
+                    self.assertIn("ci", public)
+                    self.assertIn("e2e", public)
+
+
 class HostedCoordinatorReceiptTests(unittest.TestCase):
     def test_artifact_zip_downloads_use_default_github_accept_not_octet_stream(self):
         f = ReceiptFixture()
