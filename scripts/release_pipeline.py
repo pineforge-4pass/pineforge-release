@@ -187,6 +187,18 @@ def finalized_version(store):
     return max(ready) if ready else None
 
 
+def release_superseded(event, rows):
+    """Stable targets yield to stable releases; prereleases yield to either channel."""
+    ready = []
+    for row in rows:
+        names = {asset["name"] for asset in row["assets"]}
+        if row["draft"] or ASSET not in names or "release-rejected.json" in names:
+            continue
+        if event["prerelease"] or not row["prerelease"]:
+            ready.append(pair.parse(row["tag_name"]))
+    return bool(ready and version(event["release_version"]) < max(ready))
+
+
 def finalize(client, store, registry, row):
     """No image rebuild and no alias or fan-out until every ready prerequisite exists."""
     if store.read(row, "release-rejected.json") is not None:
@@ -362,12 +374,8 @@ def redeliver(client, store, tag, consumer, output):
         require(first and version(event["release_version"]) >= version(first),
                 "redelivery consumer is not enabled for this pair")
     else:
-        # Keep dispatch's channel-aware newer-release rule, including its exclusions.
-        newer = [pair.parse(r["tag_name"]) for r in public.pages(f"repos/{HUB}/releases")
-                 if not r["draft"] and (event["prerelease"] or not r["prerelease"])
-                 and any(a["name"] == ASSET for a in r["assets"])
-                 and not any(a["name"] == "release-rejected.json" for a in r["assets"])]
-        require(not newer or version(event["release_version"]) >= max(newer), "release superseded before redelivery")
+        require(not release_superseded(event, public.pages(f"repos/{HUB}/releases")),
+                "release superseded before redelivery")
     event_type = EVENT_TYPES[consumer]
     client_payload = event
     if event_type == "release-pair":
@@ -668,11 +676,8 @@ def main():
             require(args.tag == "v" + event["release_version"], "dispatch release differs")
             # Delivery-only compute records each pair; a newer pair cannot cancel it.
             if args.consumer not in DELIVERY_ONLY:
-                newer = [pair.parse(r["tag_name"]) for r in public.pages(f"repos/{HUB}/releases")
-                         if not r["draft"] and (event["prerelease"] or not r["prerelease"])
-                         and any(a["name"] == ASSET for a in r["assets"])
-                         and not any(a["name"] == "release-rejected.json" for a in r["assets"])]
-                require(not newer or version(event["release_version"]) >= max(newer), "release superseded before dispatch")
+                require(not release_superseded(event, public.pages(f"repos/{HUB}/releases")),
+                        "release superseded before dispatch")
             event_type = EVENT_TYPES[args.consumer]
             client_payload = event
             if event_type == "release-pair":
