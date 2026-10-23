@@ -292,6 +292,82 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
             with self.subTest(state=state):
                 self.assert_refused("postmerge E2E is required exactly in verified state")
 
+    def test_ready_without_e2e_is_refused(self):
+        self.f.receipt["state"] = "ready"
+        self.f.receipt["e2e"] = None
+        self.assert_refused("^postmerge policy does not accept ready state$")
+
+    def test_ready_with_unmerged_pr_and_forged_merge_is_refused(self):
+        self.f.receipt["state"] = "ready"
+        self.f.receipt["e2e"] = None
+        self.f.actual_pr["merged"] = False
+        self.f.actual_pr["merge_commit_sha"] = None
+        self.f.actual_pr["merged_at"] = None
+        self.f.pr["merge"] = "f" * 40
+        self.f.receipt["preview"]["source"] = "f" * 40
+        self.assert_refused("^postmerge policy does not accept ready state$")
+
+    def test_ready_with_merged_pr_and_forged_merge_is_refused(self):
+        self.f.receipt["state"] = "ready"
+        self.f.receipt["e2e"] = None
+        self.f.actual_pr["merged"] = True
+        self.f.actual_pr["merge_commit_sha"] = "2" * 40
+        self.f.pr["merge"] = "f" * 40
+        self.f.receipt["preview"]["source"] = "f" * 40
+        self.assert_refused("^postmerge policy does not accept ready state$")
+
+    def test_other_non_verified_states_without_e2e_are_accepted(self):
+        for state in ("pending", "pr_open", "testing", "merged", "deploying", "failed", "superseded", "skipped_by_policy"):
+            with self.subTest(state=state):
+                self.f = HostedPostmergeFixture()
+                self.f.receipt["state"] = state
+                self.f.receipt["e2e"] = None
+                for name in ("deploy", "deployed", "previous"):
+                    self.f.receipt[name] = None
+                if state in ("pending", "failed", "superseded", "skipped_by_policy"):
+                    for name in ("pr", "ci", "preview"):
+                        self.f.receipt[name] = None
+                elif state in ("pr_open", "testing"):
+                    self.f.receipt["ci"] = self.f.receipt["preview"] = None
+                    self.f.pr["merge"] = None
+                    self.f.actual_pr.update(merged=False, merge_commit_sha=None, merged_at=None)
+                if state == "skipped_by_policy":
+                    self.f.event["prerelease"] = True
+                public = self.f.verify()
+                self.assertEqual(public["state"], state)
+                self.assertNotIn("e2e", public)
+                self.assertNotIn(self.f.artifacts_route, self.f.queries)
+                if state in ("pr_open", "testing", "merged", "deploying"):
+                    self.assertEqual(public["pr"], self.f.pr)
+                if state in ("merged", "deploying"):
+                    self.assertEqual(public["pr"]["merge"], self.f.actual_pr["merge_commit_sha"])
+                    self.assertEqual(public["preview"], self.f.receipt["preview"])
+                    self.assertEqual(public["ci"]["run_id"], self.f.receipt["ci"]["run_id"])
+
+    def test_stable_policy_skip_without_e2e_is_refused(self):
+        self.f.receipt["state"] = "skipped_by_policy"
+        self.f.receipt["e2e"] = None
+        self.assert_refused("^consumer cannot skip by policy$")
+
+    def test_merged_states_without_e2e_refuse_unmerged_pr(self):
+        for state in ("merged", "deploying"):
+            with self.subTest(state=state):
+                self.f = HostedPostmergeFixture()
+                self.f.receipt["state"] = state
+                self.f.receipt["e2e"] = None
+                self.f.actual_pr.update(merged=False, merge_commit_sha=None, merged_at=None)
+                self.assert_refused("^PR is not the recorded merge$")
+
+    def test_merged_states_without_e2e_refuse_forged_merge(self):
+        for state in ("merged", "deploying"):
+            with self.subTest(state=state):
+                self.f = HostedPostmergeFixture()
+                self.f.receipt["state"] = state
+                self.f.receipt["e2e"] = None
+                self.f.pr["merge"] = "f" * 40
+                self.f.receipt["preview"]["source"] = "f" * 40
+                self.assert_refused("^PR is not the recorded merge$")
+
     def test_verified_without_e2e_is_refused(self):
         self.f.receipt["e2e"] = None
         self.assert_refused("postmerge E2E is required exactly in verified state")
