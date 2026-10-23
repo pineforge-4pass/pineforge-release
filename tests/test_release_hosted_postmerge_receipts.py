@@ -92,6 +92,11 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
         self.f.jobs["e2e"][-1]["completed_at"] = self.f.receipt["timestamp"]
         self.assertEqual(self.f.verify()["state"], "verified")
 
+    def test_e2e_all_required_jobs_finished_at_merge_is_accepted(self):
+        for job in self.f.jobs["e2e"]:
+            job["completed_at"] = self.f.actual_pr["merged_at"]
+        self.assertEqual(self.f.verify()["state"], "verified")
+
     def test_e2e_run_at_pr_head_is_refused(self):
         self.f.runs["e2e"]["head_sha"] = self.f.pr["head"]
         self.assert_refused("unexpected checks workflow or head")
@@ -112,6 +117,14 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
         self.f.runs["e2e"]["event"] = "schedule"
         self.assert_refused("untrusted postmerge source")
 
+    def test_e2e_workflow_run_event_is_refused(self):
+        self.f.runs["e2e"]["event"] = "workflow_run"
+        self.assert_refused("untrusted postmerge source")
+
+    def test_e2e_repository_dispatch_event_is_refused(self):
+        self.f.runs["e2e"]["event"] = "repository_dispatch"
+        self.assert_refused("untrusted postmerge source")
+
     def test_e2e_branch_other_than_main_is_refused(self):
         self.f.runs["e2e"]["head_branch"] = "feature"
         self.assert_refused("untrusted postmerge source")
@@ -120,8 +133,16 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
         self.f.metadata["default_branch"] = "dev"
         self.assert_refused("untrusted postmerge source")
 
+    def test_dev_base_postmerge_policy_is_refused(self):
+        self.f.policy["base"] = self.f.pr["base"] = self.f.actual_pr["base"]["ref"] = "dev"
+        self.assert_refused("untrusted postmerge source")
+
     def test_e2e_finished_before_merge_is_refused(self):
         self.f.actual_pr["merged_at"] = "2020-01-01T00:05:31Z"
+        self.assert_refused("postmerge E2E completed before merge")
+
+    def test_e2e_one_required_job_finished_before_merge_is_refused(self):
+        self.f.jobs["e2e"][0]["completed_at"] = "2020-01-01T00:04:59Z"
         self.assert_refused("postmerge E2E completed before merge")
 
     def test_e2e_finished_after_receipt_is_refused(self):
@@ -282,6 +303,11 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
     def test_preview_image_differs_is_refused(self):
         self.f.receipt["preview"]["image_digest"] = "sha256:" + "f" * 64
         self.assert_refused("preview did not exercise the candidate source/image")
+
+    def test_docs_state_the_true_coordinator_rollout_behaviour(self):
+        doc = (ROOT / "docs/release-chain.md").read_text()
+        self.assertNotIn("still accepted under its old policy for events whose receipts predate 2026-10-21", doc)
+        self.assertIn("**Hosted rollout order.**", doc)
 
     def test_documentation_policy_and_example_match_the_hosted_contract(self):
         doc = (ROOT / "docs/release-chain.md").read_text().split("## Supervisor configuration\n", 1)[1]
