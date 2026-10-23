@@ -276,7 +276,7 @@ fields defined here.
 | `attempt` | Integer identifying an automation attempt, increasing per consumer/target; use the coordinator's GitHub run ID, not `GITHUB_RUN_ATTEMPT` alone. |
 | `sequence` | Integer, strictly increasing for new snapshots within that attempt. It may restart at 1 for a larger attempt. |
 | `state` | One of the ten strings in the state table below. |
-| `timestamp` | Real UTC timestamp string `YYYY-MM-DDTHH:MM:SSZ`, at most five minutes in the future; for verified, at/after the final deploy check completion and, when configured, the final post-merge check completion. |
+| `timestamp` | Real UTC timestamp string `YYYY-MM-DDTHH:MM:SSZ`, at most five minutes in the future; for verified, at/after the final deploy check completion and, when configured, the final post-merge check completion; for hosted post-merge E2E, at or after the last E2E job's completion. |
 | `pr` | PR object below, or `null` before PR evidence exists. |
 | `ci`, `e2e`, `deploy` | Each a check-evidence object below, or `null` before that evidence exists. |
 | `post_merge` | Application only: required exactly when the policy contains `post_merge`, otherwise forbidden. Same check-evidence object below; may be `null` before `verified`. |
@@ -334,8 +334,13 @@ at or after the PR's actual `merged_at` and at or before the receipt timestamp;
 CI still finishes before merge. The run must retain exactly one non-expired
 `postmerge-evidence-<run_id>-<run_attempt>` artifact; the hub checks its name and
 existence, while its contents remain the hosted repository's private contract.
-E2E must be non-null exactly in `verified`. The old coordinator shape below is
-still accepted under its old policy for events whose receipts predate 2026-10-21.
+E2E must be non-null exactly in `verified`. The verifier takes the old coordinator
+path below only while the live `hosted` policy entry is the old coordinator policy.
+There is one live policy per role and no per-event or per-date policy, so after
+the `hosted` key is replaced by the post-merge policy, a retained coordinator-shape
+`verified` receipt is refused with "required check inventory differs from owner policy".
+Retained receipts whose evidence is null (`pending`, `failed`, `superseded`,
+`skipped_by_policy`) are unaffected.
 
 **Hosted coordinator binding.** Only consumer `hosted`, with CI workflow
 `release-pr.yml` and E2E workflow `release-coordinator.yml`, can use the base-code
@@ -377,8 +382,11 @@ booleans, numeric strings and floats are refused.
 For the legacy coordinator policy, only `candidate` and `release/ready` are
 the required hosted E2E jobs.
 `pending`, `policy` and `merge` are orchestration jobs, not additions to that
-inventory. Hosted CI requires `validate`, `checks`, `container`, `candidate`;
-hosted deploy requires `deploy`. Neither inventory permits skips. The public
+inventory. The legacy coordinator policy's hosted CI requires `validate`, `checks`,
+`container`, `candidate`; its deploy requires `deploy`. Neither inventory permits
+skips. The post-merge policy's inventories (CI `authz, validate, checks, container`;
+E2E `authz, build, verified`; deploy `decide, deploy`) are in the policy example
+below. The public
 receipt and callback schemas remain v1; the binding stays consumer-side.
 
 An ordinary served-identity object has exactly these five fields:
@@ -466,7 +474,7 @@ reported state even if earlier snapshots were never collected.
 | `pending` | Target accepted by coordinator; evidence fields may all be null. |
 | `pr_open` | Current same-repository PR with tested base/head recorded. |
 | `testing` | Same PR evidence; tests are in progress, not yet sufficient for ready. |
-| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. Hosted post-merge E2E is deferred to verified. |
+| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. Under the hosted post-merge policy, a `ready` receipt is not used: its E2E and preview bind to the merge commit, so the hub refuses a pre-merge `ready` receipt; `e2e` is non-null exactly in `verified`. |
 | `merged` | Ready evidence plus actual merge commit, tested first parent and CI/E2E completion before merge (CI only for hosted post-merge). |
 | `deploying` | Same evidence as merged; serving has not yet been verified. |
 | `verified` | All prior gates + successful complete deploy inventory + deployed and previous identities; report source is the merge commit. Hosted post-merge requires its E2E here. Application also requires its post-merge gate when configured. |
@@ -949,6 +957,21 @@ Put the policy with `post_merge` in place together with the application
 emitter change. While an artifact of the old shape is retained, application
 polling stays blocked until it expires. Changing any inventory has the same
 effect.
+
+**Hosted rollout order.**
+`collect` re-validates every retained `release-receipt-hosted` artifact in ascending
+run-id order and stops at the first invalid one. After the `hosted` policy swap,
+while a coordinator-shape `verified` artifact is retained, hosted collection (the
+scheduled sweep and a manual `--run-id 0` sweep) stays blocked and the incident
+issue "Release chain: receipt failed" reopens on every scheduled run. A collection
+triggered by a callback names one run id and checks only that run, so a new
+post-merge receipt still verifies through its callback while the sweep is blocked.
+Before the owner replaces the `hosted` key, either remove the retained
+coordinator-shape `verified` `release-receipt-hosted` artifacts from the hosted
+repository (their neutral public form is already recorded on the hub release as
+`consumer-hosted-<run>-<attempt>.json`), or first land a collector change that skips
+receipts already stored byte-identically, the same change named in the data
+bootstrap removal note above.
 
 ## Rollback and validation
 

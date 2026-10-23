@@ -104,6 +104,7 @@ def check_run(client, repo, evidence, policy, expected_sha):
     require(evidence["results"] == checked, "reported checks differ from GitHub")
     require(bool(finished), "required inventory contains no successful checks")
     run["checked_finished_at"] = max(finished)
+    run["checked_first_finished_at"] = min(finished)
     return run
 
 
@@ -182,7 +183,7 @@ def check_postmerge(client, repo, evidence, policy, pr, actual, timestamp):
     require(run["event"] == "workflow_dispatch" and run["head_branch"] == metadata["default_branch"] == "main" == pr["base"],
             "untrusted postmerge source")
     require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
-    require(run["checked_finished_at"] >= actual["merged_at"], "postmerge E2E completed before merge")
+    require(run["checked_first_finished_at"] >= actual["merged_at"], "postmerge E2E completed before merge")
     require(timestamp >= run["checked_finished_at"], "receipt predates postmerge verification")
     artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
     name = f"postmerge-evidence-{run['id']}-{run['run_attempt']}"
