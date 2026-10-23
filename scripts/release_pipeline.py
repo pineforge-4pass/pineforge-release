@@ -492,12 +492,14 @@ def facts_freshness(client, store, roles):
 def finalize_all(client, store, registry, tag, output):
     enabled = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
     compute_first_pair = None
+    compute_configuration_error = False
     if "compute" in enabled:
         first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
         if first:
             try:
                 compute_first_pair = version(first)
             except ValueError:
+                compute_configuration_error = True
                 # Preserve the diagnostic even if later row/facts work fails.
                 # The workflow reports it after sending the other roles.
                 configuration_output = (
@@ -520,10 +522,17 @@ def finalize_all(client, store, registry, tag, output):
             if event is None:
                 continue
             newest = finalized_version(store)
+            planned_roles = delivery_roles(event["release_version"], enabled, compute_first_pair)
+            # A typo stops compute sends, but cannot remove its completion obligation.
+            status_roles = enabled if compute_configuration_error else planned_roles
             status = aggregate(store, row, event,
-                               enabled=delivery_roles(event["release_version"], enabled, compute_first_pair), newest=newest)
+                               enabled=status_roles, newest=newest)
             for role, state in status["consumers"].items():
                 if state == "pending":
+                    if role not in planned_roles:
+                        if store.read(row, f"delivery-failed-{role}.json") is not None:
+                            status["consumers"][role] = "failed"
+                        continue
                     delivery, failed = plan_delivery(store, row, event, role)
                     if delivery:
                         deliveries.append(delivery)

@@ -218,7 +218,7 @@ class PublishTest(unittest.TestCase):
     def test_prerelease_flag_is_in_every_dispatch_payload(self):
         finalizer = _workflow("release-finalize.yml")
         steps = finalizer["jobs"]["notify-consumers"]["steps"]
-        # Application/compute use release-pair, whose flag is inside build.
+        # Compute uses release-pair, whose flag is inside build.
         # Both payload contracts and channel policies are checked in binding tests.
         send = next(step for step in steps if step.get("name", "").startswith("Dispatch pineforge-release"))
         self.assertIn("scripts/release_pipeline.py dispatch", send["run"])
