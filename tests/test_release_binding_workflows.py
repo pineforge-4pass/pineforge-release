@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -35,6 +36,8 @@ def assert_ready_wiring(case, publish, finalizer):
     named = {row.get("name"): row for row in steps}
     order = ["Check Debian source mirror", "Check pushed Debian source mirror",
              "Verify real candidate runtime on both architectures", "GitHub Release"]
+    for name in order:
+        case.assertIn(name, named, "required readiness step must exist")
     positions = [steps.index(named[name]) for name in order]
     case.assertEqual(positions, sorted(positions))
     for name in order:
@@ -43,8 +46,10 @@ def assert_ready_wiring(case, publish, finalizer):
     tags = named["Image metadata"]["with"]["tags"].splitlines()
     case.assertEqual(len(tags), 1)
     case.assertTrue(tags[0].startswith("type=raw,value=candidate-"))
-    case.assertIn("org.opencontainers.image.version=${{ github.ref_name }}", named["Image metadata"]["with"]["labels"])
-    case.assertIn("org.opencontainers.image.revision=${{ github.sha }}", named["Image metadata"]["with"]["labels"])
+    case.assertEqual((publish["jobs"]["publish"].get("env") or {}).get("RELEASE_TAG"), "${{ needs.prepare.outputs.tag }}")
+    case.assertIn("org.opencontainers.image.version=${{ env.RELEASE_TAG }}", named["Image metadata"]["with"]["labels"])
+    case.assertIn("org.opencontainers.image.revision=${{ needs.tag-guard.outputs.sha }}",
+                  named["Image metadata"]["with"]["labels"])
     case.assertEqual(publish["jobs"]["notify-consumers"]["uses"], "./.github/workflows/release-finalize.yml")
     finalize = finalizer["jobs"]["finalize"]
     case.assertTrue(any("scripts/release_pipeline.py finalize" in row.get("run", "") for row in finalize["steps"]))
@@ -58,8 +63,79 @@ def assert_ready_wiring(case, publish, finalizer):
 
 
 class ReadyWiringTests(unittest.TestCase):
+    def aggregate_shell(self, script, results, event="pull_request", *, authz_ok=None):
+        import subprocess
+        if authz_ok is None:
+            authz_ok = str(results.get("authz", {}).get("result") == "success").lower()
+        return subprocess.run(
+            ["bash", "--noprofile", "--norc", "-e", "-c", script],
+            env={"PATH": os.environ.get("PATH", ""), "RESULTS": json.dumps(results),
+                 "EVENT_NAME": event, "AUTHZ_OK": authz_ok,
+                 "AUTHZ_STATUS": results.get("authz", {}).get("result", "")},
+            capture_output=True, text=True,
+        )
+
+    def aggregate_steps_shell(self, job, results, *, first_only=False):
+        # Translate the workflow's actual step comparisons for this shell
+        # replay. The separate inventory replays below bypass these wrappers
+        # so a correct first refusal cannot hide a broken inventory program.
+        programs = []
+        steps = job["steps"][:1] if first_only else job["steps"]
+        for step in steps:
+            condition = step.get("if", "").removeprefix("${{").removesuffix("}}").strip()
+            comparison = re.fullmatch(r"needs\.authz\.result (==|!=) 'success'", condition)
+            self.assertIsNotNone(comparison, step)
+            operator = "=" if comparison[1] == "==" else "!="
+            programs.append(f'if [ "$AUTHZ_STATUS" {operator} success ]; then\n{step["run"]}\nfi')
+        return self.aggregate_shell("\n".join(programs), results)
+
+    def test_security_819_actual_first_refusal_and_full_aggregate_reject_non_success_authz(self):
+        job = workflow("python-test.yml")["jobs"]["release-ready"]
+        self.assertEqual(job["steps"][0], wiring.PrTierWorkflowTest.AUTHZ_REFUSAL_STEP)
+        self.assertEqual(job["steps"][1]["if"], "needs.authz.result == 'success'")
+        for docs_only in ("false", "true"):
+            expected = {name: {"result": "skipped" if docs_only == "true" else "success"}
+                        for name in job["needs"]}
+            expected["changes"] = {"result": "success", "outputs": {"docs-only": docs_only}}
+            for status in ("success", "skipped", "failure", "cancelled", "", "unknown", "missing"):
+                results = copy.deepcopy(expected)
+                if status == "missing":
+                    results.pop("authz")
+                else:
+                    results["authz"] = {"result": status}
+                for label, first_only in (("first refusal", True), ("complete aggregate", False)):
+                    with self.subTest(program=label, docs_only=docs_only, authz=status):
+                        done = self.aggregate_steps_shell(job, results, first_only=first_only)
+                        self.assertEqual(done.returncode, 0 if status == "success" else 1,
+                                         (done.stdout, done.stderr))
+                        expected_output = (
+                            "" if status == "success" else
+                            "::error::authz did not pass; nothing of this run's code is checked out or run\n"
+                        )
+                        self.assertEqual(done.stdout, expected_output)
+                        self.assertEqual(done.stderr, "")
+
     def test_actual_workflows_require_verified_candidate_before_ready_fanout(self):
         assert_ready_wiring(self, workflow("publish.yml"), workflow("release-finalize.yml"))
+
+    def test_dispatch_origin_and_validated_tag_are_pinned_alongside_readiness(self):
+        pins = wiring.ReleaseTriggerWorkflowTest()
+        pins.assert_publish((ROOT / ".github/workflows/publish.yml").read_text())
+        pins.assert_handler((ROOT / ".github/workflows/handle-upstream.yml").read_text())
+
+    def test_readiness_refuses_lost_validated_tag_or_ref_based_version_label_on_real_text(self):
+        pins = wiring.ReleaseTriggerWorkflowTest()
+        text = (ROOT / ".github/workflows/publish.yml").read_text()
+        for before, after in (
+            ("      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}\n", ""),
+            ("org.opencontainers.image.version=${{ env.RELEASE_TAG }}",
+             "org.opencontainers.image.version=${{ github.ref_name }}"),
+            ("org.opencontainers.image.revision=${{ needs.tag-guard.outputs.sha }}",
+             "org.opencontainers.image.revision=${{ github.sha }}"),
+        ):
+            mutant = pins.mutate(text, before, after)
+            with self.subTest(anchor=before), self.assertRaises(AssertionError):
+                assert_ready_wiring(self, pins.parse(mutant), workflow("release-finalize.yml"))
 
     def test_real_decide_shell_reuses_a_draft_candidate_without_an_image_probe(self):
         handler = (ROOT / ".github/workflows/handle-upstream.yml").read_text()
@@ -91,18 +167,19 @@ class ReadyWiringTests(unittest.TestCase):
                 step["with"]["tags"] += "\ntype=raw,value=latest"
             else:
                 finalizer["jobs"]["notify-consumers"]["needs"] = "publish"
-            with self.subTest(mutation=mutation), self.assertRaises((AssertionError, KeyError)):
+            with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
                 assert_ready_wiring(self, obj, finalizer)
 
-    def test_aggregate_inventory_rejects_failed_cancelled_skipped_or_missing_job(self):
+    def test_required_aggregate_always_runs_and_rejects_failed_cancelled_skipped_or_missing_job(self):
         wf = workflow("python-test.yml")
         job = wf["jobs"]["release-ready"]
         self.assertEqual(job["name"], "release/ready")
-        self.assertEqual(set(job["needs"]), {"changes", "fingerprint-canonical", "release-rules",
+        # Cancellation must not skip a required check and count as success.
+        self.assertEqual(job.get("if"), "${{ always() }}")
+        self.assertEqual(set(job["needs"]), {"authz", "changes", "fingerprint-canonical", "release-rules",
                                             "description-renderer", "release-ready-replay"})
-        script = job["steps"][0]["run"]
+        script = job["steps"][1]["run"]
         # Execute the workflow's actual aggregate program in a child process.
-        import subprocess
         expected = {name: {"result": "success"} for name in job["needs"]}
         expected["changes"]["outputs"] = {"docs-only": "false"}
         for bad in (None, "failure", "cancelled", "skipped", "missing"):
@@ -113,22 +190,20 @@ class ReadyWiringTests(unittest.TestCase):
                 results["release-rules"]["result"] = bad
             for event in ("pull_request", "push", "merge_group"):
                 with self.subTest(result=bad, event=event):
-                    done = subprocess.run(["bash", "--noprofile", "--norc", "-c", script],
-                                          env={"PATH": os.environ.get("PATH", ""), "RESULTS": json.dumps(results),
-                                               "EVENT_NAME": event},
-                                          capture_output=True, text=True)
+                    done = self.aggregate_shell(script, results, event)
                     self.assertEqual(done.returncode == 0, bad is None, (bad, done.stderr))
 
     def test_aggregate_accepts_only_verified_docs_pr_skips_and_rejects_detector_failures(self):
-        import subprocess
         job = workflow("python-test.yml")["jobs"]["release-ready"]
         expected = {name: {"result": "skipped"} for name in job["needs"]}
+        expected["authz"] = {"result": "success"}
         expected["changes"] = {"result": "success", "outputs": {"docs-only": "true"}}
         cases = [("docs PR", "pull_request", expected, True)]
         for event in ("push", "merge_group", "schedule", "workflow_dispatch", "release"):
             cases.append((event, event, copy.deepcopy(expected), False))
         for name in job["needs"]:
-            for bad in ("failure", "cancelled", "missing", "success" if name != "changes" else "skipped"):
+            for bad in ("failure", "cancelled", "missing",
+                        "skipped" if name in {"authz", "changes"} else "success"):
                 results = copy.deepcopy(expected)
                 if bad == "missing":
                     results.pop(name)
@@ -144,11 +219,88 @@ class ReadyWiringTests(unittest.TestCase):
         cases.append(("extra job", "pull_request", results, False))
         for label, event, results, accepted in cases:
             with self.subTest(case=label):
-                done = subprocess.run(["bash", "--noprofile", "--norc", "-c", job["steps"][0]["run"]],
-                                      env={"PATH": os.environ.get("PATH", ""), "RESULTS": json.dumps(results),
-                                           "EVENT_NAME": event},
-                                      capture_output=True, text=True)
+                done = self.aggregate_shell(job["steps"][1]["run"], results, event)
                 self.assertEqual(done.returncode == 0, accepted, done.stderr)
+
+    def assert_aggregate_requires_authz_success(self, job):
+        self.assertEqual(job.get("if"), "${{ always() }}")
+        self.assertEqual(set(job["needs"]), {
+            "authz", "changes", "fingerprint-canonical", "release-rules",
+            "description-renderer", "release-ready-replay",
+        })
+        self.assertEqual(job["steps"][0], wiring.PrTierWorkflowTest.AUTHZ_REFUSAL_STEP)
+        step = job["steps"][1]
+        self.assertEqual(step.get("if"), "needs.authz.result == 'success'")
+        self.assertEqual(step["env"]["AUTHZ_OK"], "${{ needs.authz.result == 'success' }}")
+        for docs_only in ("false", "true"):
+            expected = {name: {"result": "skipped" if docs_only == "true" else "success"}
+                        for name in job["needs"]}
+            expected["changes"] = {"result": "success", "outputs": {"docs-only": docs_only}}
+            for status in ("success", "skipped", "failure", "cancelled", "", "unknown", "missing"):
+                results = copy.deepcopy(expected)
+                if status == "missing":
+                    results.pop("authz", None)
+                else:
+                    results["authz"] = {"result": status}
+                done = self.aggregate_shell(step["run"], results)
+                self.assertEqual(done.returncode == 0, status == "success",
+                                 (docs_only, status, done.stdout, done.stderr))
+                if status not in {"success", "missing"}:
+                    done = self.aggregate_shell(step["run"], results, authz_ok="true")
+                    self.assertNotEqual(done.returncode, 0, (docs_only, status, done.stderr))
+            expected["authz"] = {"result": "success"}
+            for authz_ok in ("false", "", "skipped"):
+                done = self.aggregate_shell(step["run"], expected, authz_ok=authz_ok)
+                self.assertNotEqual(done.returncode, 0, (docs_only, authz_ok, done.stderr))
+
+    def test_actual_aggregate_shell_requires_authz_success_and_refuses_skipped_authz_mutations(self):
+        job = workflow("python-test.yml")["jobs"]["release-ready"]
+        self.assert_aggregate_requires_authz_success(job)
+        condition = "if os.environ['AUTHZ_OK'] != 'true' or results['authz']['result'] != 'success':"
+        script = job["steps"][1]["run"]
+        self.assertIn(condition, script)
+        mutants = []
+        for replacement in (
+            "if results['authz']['result'] not in {'success', 'skipped'}:",
+            "if os.environ['AUTHZ_OK'] != 'true':",
+            "if results['authz']['result'] != 'success':",
+            "if False:",
+        ):
+            mutant = copy.deepcopy(job)
+            mutant["steps"][1]["run"] = script.replace(condition, replacement, 1)
+            mutants.append(mutant)
+        mutant = copy.deepcopy(job)
+        mutant["steps"][1]["env"]["AUTHZ_OK"] = (
+            "${{ needs.authz.result == 'success' || needs.authz.result == 'skipped' }}"
+        )
+        mutants.append(mutant)
+        for condition in (
+            None, "success()", "always()", "!cancelled()", "failure()",
+            "${{ !cancelled() }}", "${{ success() }}", "${{ failure() }}",
+            "always() && needs.authz.result == 'success'",
+            "${{ always() && needs.authz.result == 'success' }}",
+        ):
+            mutant = copy.deepcopy(job)
+            if condition is None:
+                mutant.pop("if")
+            else:
+                mutant["if"] = condition
+            mutants.append(mutant)
+        mutant = copy.deepcopy(job)
+        mutant["steps"][1].pop("if")
+        mutants.append(mutant)
+        mutant = copy.deepcopy(job)
+        mutant["steps"][1]["if"] = "needs.authz.result != 'success'"
+        mutants.append(mutant)
+        for missing_need in job["needs"]:
+            mutant = copy.deepcopy(job)
+            mutant["needs"] = [name for name in job["needs"] if name != missing_need]
+            mutants.append(mutant)
+        for index, mutant in enumerate(mutants):
+            with self.subTest(mutation=index):
+                self.assertNotEqual(mutant, job)
+                with self.assertRaises(AssertionError):
+                    self.assert_aggregate_requires_authz_success(mutant)
 
     def test_facts_license_extension_keeps_exact_three_field_payload(self):
         wf = workflow("facts-fanout.yml")

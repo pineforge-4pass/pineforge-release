@@ -16,7 +16,7 @@ on:
     branches: [main]
     paths: ['facts/facts.json']
   schedule:
-    - cron: '3,18,33,48 * * * *'
+    - cron: '3 * * * *'
 
 permissions:
   contents: read
@@ -28,6 +28,7 @@ jobs:
     concurrency:
       group: release-finalize
       cancel-in-progress: false
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
     environment: release-automation
     permissions:
@@ -36,7 +37,14 @@ jobs:
       issues: write
     outputs:
       deliveries: ${{ steps.ready.outputs.deliveries }}
+      compute_configuration_error: ${{ steps.ready.outputs.compute_configuration_error }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
@@ -57,6 +65,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
           FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
           FACTS_LICENSE_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}
           RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
@@ -77,8 +86,8 @@ jobs:
   notify-consumers:
     needs: finalize
     if: needs.finalize.outputs.deliveries != '[]'
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     environment: release-automation
     concurrency:
       group: release-delivery-${{ matrix.consumer }}-${{ matrix.tag }}
@@ -92,8 +101,14 @@ jobs:
         include: ${{ fromJSON(needs.finalize.outputs.deliveries) }}
     env:
       # Private targets never enter matrix outputs, log messages or public receipts.
-      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || '' }}
+      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || matrix.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}
     steps:
+      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+        shell: bash
+        run: |
+          systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
+          if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then echo "apt guard: upgrade already running, not interrupting"; else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer || echo "apt guard: timer stop failed ($?), continuing"; fi
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
@@ -144,3 +159,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
         run: python3 scripts/release_pipeline.py alert --stage dispatch
+
+  report-compute-configuration-error:
+    needs: [finalize, notify-consumers]
+    if: ${{ always() && needs.finalize.outputs.compute_configuration_error != '' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Report rejected compute configuration
+        run: |
+          echo '::error::RELEASE_COMPUTE_FIRST_PAIR value was not accepted; compute is off for this run'
+          exit 1

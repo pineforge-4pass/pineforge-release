@@ -9,6 +9,7 @@ directories). The source mirror wiring checks use PyYAML to parse the workflows.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import os
@@ -217,10 +218,734 @@ class PublishTest(unittest.TestCase):
     def test_prerelease_flag_is_in_every_dispatch_payload(self):
         finalizer = _workflow("release-finalize.yml")
         steps = finalizer["jobs"]["notify-consumers"]["steps"]
+        # Application/compute use release-pair, whose flag is inside build.
+        # Both payload contracts and channel policies are checked in binding tests.
         send = next(step for step in steps if step.get("name", "").startswith("Dispatch pineforge-release"))
         self.assertIn("scripts/release_pipeline.py dispatch", send["run"])
         self.assertNotIn("client_payload[", send["run"])
         self.assertEqual(finalizer["jobs"]["notify-consumers"]["strategy"]["fail-fast"], "false")
+
+
+class ReleaseTriggerWorkflowTest(unittest.TestCase):
+    """Pins and negative controls read/mutate the actual checked-in workflows."""
+
+    VALIDATE_RUN = textwrap.dedent(r"""
+        set -euo pipefail
+        if [ "$WORKFLOW_ON_MAIN" != true ]; then
+          echo '::error::dispatch publish.yml on refs/heads/main'; exit 1
+        fi
+        if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+          echo '::error::expected an existing vX.Y.Z or vX.Y.Z-rc.N tag'; exit 1
+        fi
+        git fetch --tags origin '+refs/heads/main:refs/remotes/origin/main'
+        if ! TAG_COMMIT="$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}")"; then
+          echo "::error::release tag ${TAG} does not exist or does not peel to a commit"; exit 1
+        fi
+        if ! [[ "$TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+          echo '::error::release tag did not resolve to a 40-character commit SHA'; exit 1
+        fi
+        if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then
+          echo "::error::release tag ${TAG} is not reachable from main"; exit 1
+        fi
+        printf 'sha=%s\n' "$TAG_COMMIT" >> "$GITHUB_OUTPUT"
+        printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+    """).lstrip("\n")
+    REFUSAL_STEP = {
+        "name": "Refuse unverified release tag",
+        "if": "${{ needs.tag-guard.result != 'success' }}",
+        "shell": "bash",
+        "run": (
+            "echo '::error::tag-guard did not pass; refusing checkout and publication failure reporting'\n"
+            "exit 1\n"
+        ),
+    }
+    APT_GUARD_STEP = {
+        "name": "Stop automatic apt upgrades (LB-504, until the release image is rebaked)",
+        "shell": "bash",
+        "run": ("systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true\n"
+                "if systemctl is-active --quiet apt-daily-upgrade.service || "
+                "systemctl is-active --quiet apt-daily.service; then echo \"apt guard: upgrade already running, not interrupting\"; "
+                "else sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer "
+                "|| echo \"apt guard: timer stop failed ($?), continuing\"; fi\n"
+                "exit 0\n"),
+    }
+    FAILURE_IF = (
+        "${{ always() && !cancelled() && (needs.tag-guard.result != 'success' || "
+        "contains(needs.*.result, 'failure')) }}"
+    )
+    FINALIZE_IF = (
+        "${{ !cancelled() && needs.tag-guard.result == 'success' && "
+        "needs.prepare.result == 'success' && "
+        "(needs.publish.result == 'success' || needs.publish.result == 'skipped') }}"
+    )
+    OPERATOR_COMMAND = "gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag="
+    INPUT = (
+        '    inputs:\n'
+        '      tag:\n'
+        '        description: The existing v* tag to build\n'
+        '        required: true\n'
+        '        type: string\n'
+    )
+
+    def parse(self, text):
+        import yaml
+        return yaml.load(text, Loader=yaml.BaseLoader)
+
+    def mutate(self, text, before, after, count=1):
+        self.assertEqual(text.count(before), count, "mutation anchor must match the real workflow exactly")
+        mutant = text.replace(before, after)
+        self.assertNotEqual(mutant, text, "mutation must change the real workflow")
+        return mutant
+
+    def assert_publish(self, text):
+        wf = self.parse(text)
+        self.assertEqual(wf.get("on"), {"workflow_dispatch": {"inputs": {"tag": {
+            "description": "The existing v* tag to build", "required": "true", "type": "string",
+        }}}})
+        self.assertEqual(re.findall(r"\bgithub\.ref(?:_name)?\b|\bGITHUB_REF_NAME\b", text),
+                         ["github.ref", "github.ref"])
+        self.assertEqual(text.count("github.ref == 'refs/heads/main'"), 2)
+        self.assertNotIn("github.sha", text, "release provenance must use the verified commit")
+        self.assertEqual(wf.get("concurrency", {}).get("group"), "release-candidate-${{ inputs.tag }}")
+        jobs = wf.get("jobs", {})
+        for identity in ("tag-guard", "prepare", "publish", "failure-report"):
+            self.assertEqual((jobs.get(identity, {}).get("steps") or [{}])[0], self.APT_GUARD_STEP,
+                             identity + " must stop the apt timers before anything else (LB-504)")
+        for identity in ("tag-guard", "prepare", "publish", "notify-consumers", "failure-report"):
+            self.assertIn(identity, jobs)
+        self.assertEqual(next(iter(jobs)), "tag-guard")
+        guard = jobs["tag-guard"]
+        self.assertEqual(set(guard), {"runs-on", "permissions", "outputs", "steps"})
+        self.assertEqual(guard.get("runs-on"), "ubuntu-latest")
+        self.assertEqual(guard.get("permissions"), {"contents": "read"})
+        self.assertEqual(guard.get("outputs"), {
+            "sha": "${{ steps.tag.outputs.sha }}", "tag": "${{ steps.tag.outputs.tag }}",
+        })
+        self.assertNotIn("secrets.", str(guard))
+        self.assertNotIn("github.token", str(guard))
+        guard_steps = guard.get("steps") or []
+        self.assertEqual(len(guard_steps), 3, "apt guard, then only main checkout, precedes tag verification")
+        checkout = guard_steps[1]
+        self.assertLessEqual(set(checkout), {"name", "uses", "with"})
+        self.assertTrue(checkout.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout.get("with"), {
+            "ref": "main", "fetch-depth": "0", "persist-credentials": "false",
+        })
+        self.assertEqual(guard_steps[2], {
+            "name": "Validate release tag", "id": "tag", "shell": "bash",
+            "env": {"TAG": "${{ inputs.tag }}",
+                    "WORKFLOW_ON_MAIN": "${{ github.ref == 'refs/heads/main' }}"},
+            "run": self.VALIDATE_RUN,
+        }, "validate before any tagged checkout, secret, or repository code")
+        for identity, job in jobs.items():
+            # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+            if identity != "notify-consumers":
+                self.assertEqual(job.get("runs-on"), "ubuntu-latest", identity)
+            if identity != "tag-guard":
+                needs = job.get("needs") or []
+                self.assertIn("tag-guard", [needs] if isinstance(needs, str) else needs, identity)
+        prepare = jobs["prepare"]
+        self.assertEqual(prepare.get("needs"), "tag-guard")
+        self.assertEqual(prepare.get("if"), "github.ref == 'refs/heads/main'")
+        self.assertEqual((prepare.get("outputs") or {}).get("tag"), "${{ needs.tag-guard.outputs.tag }}")
+        steps = prepare.get("steps", [])
+        self.assertEqual(jobs["publish"].get("needs"), ["tag-guard", "prepare"])
+        self.assertEqual(jobs["publish"].get("if"), "needs.prepare.outputs.exists == 'false'")
+        self.assertEqual((jobs["publish"].get("env") or {}).get("RELEASE_TAG"), "${{ needs.prepare.outputs.tag }}")
+        for identity in ("prepare", "publish"):
+            checkouts = [row for row in jobs[identity].get("steps", [])
+                         if row.get("uses", "").startswith("actions/checkout@")]
+            self.assertEqual(len(checkouts), 1)
+            self.assertEqual((checkouts[0].get("with") or {}).get("ref"),
+                             "${{ needs.tag-guard.outputs.sha }}")
+            self.assertEqual((checkouts[0].get("with") or {}).get("persist-credentials"), "false")
+            if identity == "publish":
+                self.assertEqual((checkouts[0].get("with") or {}).get("fetch-depth"), "0")
+        candidate = next((row for row in steps if row.get("id") == "candidate"), {})
+        self.assertEqual((candidate.get("env") or {}).get("TAG"), "${{ needs.tag-guard.outputs.tag }}")
+        named = {row.get("name"): row for row in jobs["publish"].get("steps", [])}
+        for name, variable in (("Assert tag matches VERSION", "TAG"), ("Read pins (from the annotated tag message; fallback = the pair version, or resolve latest on 0.x)", "REF"),
+                               ("Pairing rule + release channel", "REF"), ("Bind producer source and package bytes", "TAG"),
+                               ("Read hpo wheel digest", "REF"), ("GitHub Release", "TAG")):
+            self.assertEqual(named.get(name, {}).get("env", {}).get(variable), "${{ env.RELEASE_TAG }}", name)
+        labels = named.get("Image metadata", {}).get("with", {}).get("labels", "")
+        self.assertIn("org.opencontainers.image.version=${{ env.RELEASE_TAG }}\n", labels)
+        self.assertIn("org.opencontainers.image.revision=${{ needs.tag-guard.outputs.sha }}\n", labels)
+        self.assertEqual(named.get("Image metadata", {}).get("with", {}).get("tags"),
+                         "type=raw,value=candidate-${{ needs.tag-guard.outputs.sha }}-"
+                         "${{ github.run_id }}-${{ github.run_attempt }}\n")
+        binding = named.get("Bind producer source and package bytes", {})
+        self.assertEqual((binding.get("env") or {}).get("HUB_COMMIT"), "${{ needs.tag-guard.outputs.sha }}")
+        for name in ("Inspect release amd64", "Inspect release arm64", "Inspect hpo amd64", "Inspect hpo arm64",
+                     "Build + push (multi-arch)", "Build + push hpo (multi-arch)"):
+            self.assertIn("RELEASE_VERSION=${{ env.RELEASE_TAG }}\n",
+                          named.get(name, {}).get("with", {}).get("build-args", ""), name)
+            self.assertIn("RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}\n",
+                          named.get(name, {}).get("with", {}).get("build-args", ""), name)
+        self.assertEqual(jobs["notify-consumers"].get("needs"), ["tag-guard", "prepare", "publish"])
+        self.assertEqual(jobs["notify-consumers"].get("if"), self.FINALIZE_IF)
+        self.assertEqual(jobs["notify-consumers"].get("with", {}).get("tag"), "${{ needs.prepare.outputs.tag }}")
+        failure = jobs["failure-report"]
+        self.assertEqual(failure.get("needs"), ["tag-guard", "prepare", "publish", "notify-consumers"])
+        self.assertEqual(failure.get("if"), self.FAILURE_IF)
+        failure_steps = failure.get("steps") or []
+        self.assertEqual(len(failure_steps), 4)
+        self.assertEqual(failure_steps[1], self.REFUSAL_STEP)
+        self.assertTrue(failure_steps[2].get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(failure_steps[2].get("with"), {
+            "ref": "main", "persist-credentials": "false",
+        })
+        for row in failure_steps[2:]:
+            self.assertEqual(row.get("if"), "needs.tag-guard.result == 'success'")
+        # Only the concurrency key and the validation step's env read raw input.
+        self.assertEqual(text.count("${{ inputs.tag }}"), 2)
+        for job in jobs.values():
+            for row in job.get("steps", []):
+                self.assertNotIn("${{", row.get("run", ""), "shell reads values from env, never expression interpolation")
+                self.assertNotIn("inputs.tag", str(row.get("with", {})))
+
+    def guard_check_mutations(self, text):
+        # Remove complete conditionals so the reachability mutant stays valid
+        # bash and can actually admit a side-branch tag during the git replay.
+        starts = (
+            ("main", '          if [ "$WORKFLOW_ON_MAIN" != true ]; then\n'),
+            ("pattern", r'          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then' + "\n"),
+            ("existence", '          if ! TAG_COMMIT="$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}")"; then\n'),
+            ("sha-shape", '          if ! [[ "$TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then\n'),
+            ("reachability", '          if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then\n'),
+        )
+        for label, start in starts:
+            self.assertEqual(text.count(start), 1, label)
+            at = text.index(start)
+            end = text.index("          fi\n", at) + len("          fi\n")
+            yield label, self.mutate(text, text[at:end], "")
+
+    def assert_no_publish_dispatch(self, text):
+        # The operator command is inert notice data. Exempt only a complete
+        # quoted assignment, with no command substitution or trailing code.
+        code = re.sub(
+            r'(?m)^[ \t]*line="(?![^\n]*\$\()[^"`\\\n]*' + re.escape(self.OPERATOR_COMMAND)
+            + r'(?:\$\{TAG\}|v\$\{RELEASE\}|v\$\{next\})"$', "", text,
+        )
+        code = re.sub(r"\\\n[ \t]*", " ", code)
+        # No workflow here dispatches any workflow, so the pin does not depend on
+        # how the target is named (file, display name, numeric id, variable).
+        # Plain repository_dispatch (`repos/<r>/dispatches`) stays allowed.
+        for pattern in (r"\bworkflow\s+run\b", r"\bcreateWorkflowDispatch\b",
+                        r"\bactions/workflows/[^\s/]+/dispatches\b"):
+            self.assertNotRegex(code, pattern, "no workflow may dispatch any workflow")
+
+    def assert_handler(self, text):
+        self.assert_no_publish_dispatch(text)
+        wf = self.parse(text)
+        steps = wf.get("jobs", {}).get("bump", {}).get("steps", [])
+        app = next((row for row in steps if row.get("id") == "app"), {})
+        self.assertEqual(app.get("with", {}).get("permission-contents"), "write")
+        self.assertNotIn("permission-actions", app.get("with", {}))
+        self.assertNotRegex(_step(text, "Mint org App token"), r"(?m)^\s*permission-actions\s*:")
+        replay = next((row for row in steps if row.get("name", "").startswith("Re-publish")), {})
+        bump = next((row for row in steps if row.get("name", "").startswith("Bump VERSION")), {})
+        self.assertEqual(replay.get("if"), "steps.decide.outputs.mode == 'republish'")
+        self.assertEqual(replay.get("env", {}).get("TAG"), "v${{ steps.decide.outputs.cur_ver }}")
+        for step in (replay, bump):
+            self.assertNotIn("GH_TOKEN", step.get("env", {}))
+        self.assertEqual(bump.get("name"), "Bump VERSION, commit, tag")
+        self.assertEqual(bump.get("if"), "steps.decide.outputs.mode == 'bump'")
+        summary = 'printf \'%s\\n\' "$line" >> "$GITHUB_STEP_SUMMARY"'
+        replay_run = replay.get("run", "")
+        self.assertIn(self.OPERATOR_COMMAND + '${TAG}"', replay_run)
+        self.assertIn('echo "::warning title=pineforge publish needed::${line}"', replay_run)
+        self.assertIn(summary, replay_run)
+        self.assertEqual(replay_run.splitlines()[-1], "exit 0")
+        run = bump.get("run", "")
+        commands = [line.strip() for line in run.splitlines()]
+        for variable in ("RELEASE", "next"):
+            # Both paths print the operator command only after the tag push succeeds.
+            push = 'git push origin "v${' + variable + '}"'
+            self.assertIn(push, commands)
+            at = commands.index(push)
+            self.assertLess(at + 3, len(commands))
+            self.assertTrue(commands[at + 1].startswith('line="pushed v${' + variable + '}'))
+            self.assertIn(self.OPERATOR_COMMAND + 'v${' + variable + '}"', commands[at + 1])
+            self.assertEqual(commands[at + 2], 'echo "::notice title=pineforge publish needed::${line}"')
+            self.assertEqual(commands[at + 3], summary)
+            if variable == "RELEASE":
+                self.assertLess(at + 4, len(commands))
+                self.assertEqual(commands[at + 4], "exit 0")
+
+    def assert_release_triggers(self, text):
+        wf = self.parse(text)
+        declared = wf.get("on")
+        self.assertIsInstance(declared, (dict, list, str))
+        events = {declared} if isinstance(declared, str) else set(declared)
+        self.assertTrue(events)
+        self.assertLessEqual(events, {"workflow_dispatch", "schedule", "repository_dispatch", "workflow_call",
+                                      "push", "pull_request_target"}, "release automation needs a main-ref event")
+        if "push" in events:
+            self.assertIsInstance(declared, dict, "push requires an explicit main branch filter")
+            push = declared.get("push")
+            self.assertIsInstance(push, dict)
+            self.assertEqual(push.get("branches"), ["main"])
+            self.assertLessEqual(set(push), {"branches", "paths", "paths-ignore"}, "no tag or branch-ignore filters")
+
+    def test_publish_uses_operator_dispatch_and_handler_prints_the_next_command(self):
+        self.assert_publish((WORKFLOWS / "publish.yml").read_text())
+        self.assert_handler((WORKFLOWS / "handle-upstream.yml").read_text())
+
+    def test_no_workflow_dispatches_publish(self):
+        found = []
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix in {".yml", ".yaml"}:
+                found.append(path.name)
+                with self.subTest(workflow=path.name):
+                    self.assert_no_publish_dispatch(path.read_text())
+        self.assertIn("handle-upstream.yml", found)
+        self.assertIn("publish.yml", found)
+
+    def test_no_dispatch_pin_refuses_cli_javascript_and_api_steps_on_real_text(self):
+        text = (WORKFLOWS / "handle-upstream.yml").read_text()
+        self.assert_no_publish_dispatch(text)
+        anchor = "      - name: Report failed upstream handling\n"
+        steps = (
+            "        run: " + self.OPERATOR_COMMAND + "v1.6.2\n",
+            "        run: gh workflow run --ref main 'publish.yml' -f tag=v1.6.2\n",
+            '        env:\n          WORKFLOW: publish.yml\n        run: gh workflow run "$WORKFLOW" --ref main -f tag=v1.6.2\n',
+            "        run: |\n          gh workflow run \\\n            publish.yml --ref main -f tag=v1.6.2\n",
+            "        uses: actions/github-script@fixture\n        with:\n          script: |\n"
+            "            await github.rest.actions.createWorkflowDispatch({\n"
+            "              workflow_id: 'publish.yml', ref: 'main', inputs: {tag: 'v1.6.2'}\n"
+            "            });\n",
+            "        run: gh api --method POST repos/pineforge-4pass/pineforge-release/actions/workflows/publish.yml/dispatches -f ref=main\n",
+            "        env:\n          WORKFLOW: publish.yml\n        run: |\n"
+            '          curl --request POST "https://api.github.com/repos/pineforge-4pass/pineforge-release/actions/workflows/${WORKFLOW}/dispatches"\n',
+            '        run: |\n          line="$(' + self.OPERATOR_COMMAND + 'v1.6.2)"\n',
+            '        run: gh workflow run "Publish release candidate" --ref main -f tag=v1.6.2\n',
+            "        run: gh api -X POST repos/pineforge-4pass/pineforge-release/actions/workflows/123456789/dispatches -f ref=main\n",
+            "        uses: actions/github-script@fixture\n        with:\n          script: |\n"
+            "            await github.request(\n"
+            "              'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',\n"
+            "              {owner, repo, workflow_id: 123456789, ref: 'main'}\n"
+            "            );\n",
+        )
+        for step in steps:
+            mutant = self.mutate(text, anchor, "      - name: Forbidden publish dispatch\n" + step + anchor)
+            with self.subTest(step=step), self.assertRaises(AssertionError):
+                self.assert_no_publish_dispatch(mutant)
+
+    def test_every_release_workflow_has_only_main_ref_trigger_types(self):
+        found = []
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix in {".yml", ".yaml"}:
+                text = path.read_text()
+                if path.name in ReleaseRunnerWorkflowTest.RELEASE_JOBS:
+                    found.append(path.name)
+                    with self.subTest(workflow=path.name):
+                        self.assert_release_triggers(text)
+        self.assertIn("publish.yml", found, "the generic scan must inspect the real release workflows")
+
+    def test_publish_refuses_bad_triggers_and_each_broken_input_boundary_on_real_text(self):
+        text = (WORKFLOWS / "publish.yml").read_text()
+        self.assert_publish(text)
+        mutations = [
+            ("on:\n", 'on:\n  push:\n    tags: ["v*"]\n', 1),
+            ("on:\n", 'on:\n  release:\n    types: [published]\n', 1),
+            ("on:\n", 'on:\n  workflow_run:\n    workflows: [publish]\n    types: [completed]\n', 1),
+            (self.INPUT, "", 1),
+            (self.INPUT, self.INPUT + '      extra:\n        type: string\n', 1),
+            ("description: The existing v* tag to build", "description: Any ref to build", 1),
+            ("        required: true\n", "        required: false\n", 1),
+            ("        type: string\n", "        type: boolean\n", 1),
+            ("release-candidate-${{ inputs.tag }}", "release-candidate-${{ github.ref_name }}", 1),
+            ("    if: github.ref == 'refs/heads/main'\n", "", 1),
+            ("    if: github.ref == 'refs/heads/main'", "    if: startsWith(github.ref, 'refs/tags/v')", 1),
+            ("  tag-guard:\n", "  tag-guard:\n    if: github.ref == 'refs/heads/main'\n", 1),
+            ("  tag-guard:\n", "  tag-guard:\n    needs: prepare\n", 1),
+            ("  tag-guard:\n", "  tag-guard:\n    environment: release-automation\n", 1),
+            ("  tag-guard:\n", "  tag-guard:\n    env:\n      GH_TOKEN: ${{ github.token }}\n", 1),
+            ("    permissions:\n      contents: read\n    outputs:",
+             "    permissions:\n      contents: write\n    outputs:", 1),
+            ("            echo '::error::expected an existing vX.Y.Z or vX.Y.Z-rc.N tag'; exit 1",
+             "            echo '::error::expected an existing vX.Y.Z or vX.Y.Z-rc.N tag'; exit 0", 1),
+            ("          TAG: ${{ inputs.tag }}\n", "", 1),
+            ("          WORKFLOW_ON_MAIN: ${{ github.ref == 'refs/heads/main' }}\n", "", 1),
+            ("          WORKFLOW_ON_MAIN: ${{ github.ref == 'refs/heads/main' }}",
+             "          WORKFLOW_ON_MAIN: ${{ github.ref == 'refs/heads/topic' }}", 1),
+            ("      - name: Validate release tag", "      - run: echo skipped validation\n      - name: Validate release tag", 1),
+            ('          printf \'tag=%s\\n\' "$TAG"', '          printf \'tag=%s\\n\' "${{ inputs.tag }}"', 1),
+            ("      tag: ${{ steps.tag.outputs.tag }}\n", "", 1),
+            ("      sha: ${{ steps.tag.outputs.sha }}\n", "", 1),
+            ("      sha: ${{ steps.tag.outputs.sha }}", "      sha: ${{ steps.tag.outputs.tag }}", 1),
+            ("      tag: ${{ needs.tag-guard.outputs.tag }}\n", "", 1),
+            ("      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}\n", "", 1),
+            ("      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}", "      RELEASE_TAG: ${{ inputs.tag }}", 1),
+            ("          TAG: ${{ needs.tag-guard.outputs.tag }}", "          TAG: ${{ inputs.tag }}", 1),
+            ("      tag: ${{ needs.prepare.outputs.tag }}", "      tag: ${{ inputs.tag }}", 1),
+            ("    needs: tag-guard\n", "", 1),
+            ("    needs: [tag-guard, prepare]", "    needs: prepare", 1),
+            ("    if: needs.prepare.outputs.exists == 'false'", "    if: always()", 1),
+            ("    needs: [tag-guard, prepare, publish]", "    needs: [prepare, publish]", 1),
+            ("    needs: [tag-guard, prepare, publish, notify-consumers]",
+             "    needs: [prepare, publish, notify-consumers]", 1),
+            ("    if: " + self.FINALIZE_IF, "    if: ${{ always() }}", 1),
+            ("    if: " + self.FINALIZE_IF,
+             "    if: " + self.FINALIZE_IF.replace("needs.tag-guard.result == 'success' && ", ""), 1),
+            ("    if: " + self.FAILURE_IF, "    if: ${{ failure() && !cancelled() }}", 1),
+            ("      - name: Refuse unverified release tag\n",
+             "      - run: python3 scripts/release_pipeline.py alert --stage publish\n"
+             "      - name: Refuse unverified release tag\n", 1),
+            ("        if: ${{ needs.tag-guard.result != 'success' }}\n", "", 1),
+            ("        if: ${{ needs.tag-guard.result != 'success' }}",
+             "        if: ${{ needs.tag-guard.result == 'failure' }}", 1),
+            ("          exit 1\n      - uses: actions/checkout@", "          exit 0\n      - uses: actions/checkout@", 1),
+            ("          HUB_COMMIT: ${{ needs.tag-guard.outputs.sha }}",
+             "          HUB_COMMIT: ${{ github.sha }}", 1),
+            ("type=raw,value=candidate-${{ needs.tag-guard.outputs.sha }}",
+             "type=raw,value=candidate-${{ github.sha }}", 1),
+            ("org.opencontainers.image.revision=${{ needs.tag-guard.outputs.sha }}",
+             "org.opencontainers.image.revision=${{ github.sha }}", 1),
+            ("org.opencontainers.image.version=${{ env.RELEASE_TAG }}", "org.opencontainers.image.version=${{ github.ref }}", 1),
+            ("org.opencontainers.image.version=${{ env.RELEASE_TAG }}", "org.opencontainers.image.version=${{ env.GITHUB_REF_NAME }}", 1),
+        ]
+        for label, mutant in self.guard_check_mutations(text):
+            with self.subTest(check=label), self.assertRaises(AssertionError):
+                self.assert_publish(mutant)
+        # These anchors repeat: mutate each occurrence independently rather
+        # than letting the first checkout/build pin hide a later missing pin.
+        for before, after, count in (
+            ("          TAG: ${{ env.RELEASE_TAG }}", "          TAG: v0.0.0", 3),
+            ("          REF: ${{ env.RELEASE_TAG }}", "          REF: v0.0.0", 3),
+            ("RELEASE_VERSION=${{ env.RELEASE_TAG }}", "RELEASE_VERSION=v0.0.0", 6),
+            ("RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}", "RELEASE_GIT_SHA=${{ github.sha }}", 6),
+            ("          ref: ${{ needs.tag-guard.outputs.sha }}\n", "", 2),
+            ("          ref: ${{ needs.tag-guard.outputs.sha }}",
+             "          ref: refs/tags/${{ inputs.tag }}", 2),
+            ("          persist-credentials: false\n", "          persist-credentials: true\n", 4),
+            ("          fetch-depth: 0\n", "          fetch-depth: 1\n", 2),
+            ("          ref: main\n", "          ref: ${{ inputs.tag }}\n", 2),
+            # 2 tag consumers + the 4 apt guards (LB-504); every removal must still break a pin
+            ("        shell: bash\n", "", 6),
+            ("        if: needs.tag-guard.result == 'success'\n", "", 2),
+            # owner 10-21 (msg 1562390657274748981): all four publish jobs must refuse the release array.
+            ("    runs-on: ubuntu-latest\n", '    runs-on: ["self-hosted","pf-ci","pf-ci-release"]\n', 4),
+        ):
+            self.assertEqual(text.count(before), count, "each real tag consumer must be mutated")
+            for index in range(count):
+                # Mutate each consumer separately so the first pin cannot hide a missing later one.
+                at = [match.start() for match in re.finditer(re.escape(before), text)][index]
+                mutant = text[:at] + text[at:].replace(before, after, 1)
+                self.assertNotEqual(mutant, text)
+                with self.subTest(consumer=before, occurrence=index), self.assertRaises(AssertionError):
+                    self.assert_publish(mutant)
+        for before, after, count in mutations:
+            mutant = self.mutate(text, before, after, count)
+            with self.subTest(anchor=before), self.assertRaises(AssertionError):
+                self.assert_publish(mutant)
+        guard_start = text.index("  tag-guard:\n")
+        guard_end = text.index("  prepare:\n", guard_start)
+        guard_block = text[guard_start:guard_end]
+        late_guard = self.mutate(text, guard_block, "") + "\n" + guard_block
+        with self.assertRaises(AssertionError):
+            self.assert_publish(late_guard)
+
+    def test_handler_pin_refuses_dispatch_permissions_tokens_or_broken_operator_notices(self):
+        text = (WORKFLOWS / "handle-upstream.yml").read_text()
+        self.assert_handler(text)
+        for tag in ('${TAG}', 'v${RELEASE}', 'v${next}'):
+            command = self.OPERATOR_COMMAND + tag
+            for replacement in (command.replace("--ref main", '--ref topic'),
+                                command.removesuffix(" -f tag=" + tag), ""):
+                mutant = self.mutate(text, command, replacement)
+                with self.subTest(command=command, replacement=replacement), self.assertRaises(AssertionError):
+                    self.assert_handler(mutant)
+        for before, after in (
+            ("          permission-contents: write\n",
+             "          permission-contents: write\n          permission-actions: write\n"),
+            ('        env:\n          TAG: v${{ steps.decide.outputs.cur_ver }}',
+             '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          TAG: v${{ steps.decide.outputs.cur_ver }}'),
+            ('        env:\n          E:', '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          E:'),
+            ("        if: steps.decide.outputs.mode == 'republish'", "        if: always()"),
+            ("        if: steps.decide.outputs.mode == 'bump'", "        if: always()"),
+            ("          TAG: v${{ steps.decide.outputs.cur_ver }}", "          TAG: v0.0.0"),
+            ("      - name: Bump VERSION, commit, tag\n", "      - name: Bump VERSION, commit, tag (fires publish.yml)\n"),
+            ('echo "::warning title=pineforge publish needed::${line}"', 'echo "$line"'),
+        ):
+            mutant = self.mutate(text, before, after)
+            with self.subTest(anchor=before), self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
+        for name, annotation, notices in (("Re-publish", "warning", 1), ("Bump VERSION", "notice", 2)):
+            body = _step(text, name)
+            for command, count in (
+                ('printf \'%s\\n\' "$line" >> "$GITHUB_STEP_SUMMARY"', notices),
+                ('echo "::' + annotation + ' title=pineforge publish needed::${line}"', notices),
+                ("exit 0", 1),
+            ):
+                matches = list(re.finditer(re.escape(command), body))
+                self.assertEqual(len(matches), count, "each notice mutation must have its real anchor")
+                for match in matches:
+                    changed = body[:match.start()] + body[match.end():]
+                    mutant = self.mutate(text, body, changed)
+                    with self.subTest(step=name, command=command, occurrence=match.start()), self.assertRaises(AssertionError):
+                        self.assert_handler(mutant)
+
+    def test_generic_trigger_pin_refuses_forbidden_events_and_tag_pushes_in_every_real_workflow(self):
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix not in {".yml", ".yaml"}:
+                continue
+            text = path.read_text()
+            if path.name not in ReleaseRunnerWorkflowTest.RELEASE_JOBS:
+                continue
+            self.assert_release_triggers(text)
+            for event in ('  release:\n    types: [published]\n',
+                          '  workflow_run:\n    workflows: [publish]\n    types: [completed]\n',
+                          '  pull_request:\n', '  unknown_event:\n'):
+                mutant = self.mutate(text, "on:\n", "on:\n" + event)
+                with self.subTest(workflow=path.name, event=event), self.assertRaises(AssertionError):
+                    self.assert_release_triggers(mutant)
+            if "push" in self.parse(text)["on"]:
+                anchor = "    branches: [main]\n"
+                replacements = ('    tags: ["v*"]\n', "", '    branches: [main, other]\n',
+                                '    branches: [main]\n    tags: ["v*"]\n')
+            else:
+                anchor = "on:\n"
+                replacements = ('on:\n  push:\n    tags: ["v*"]\n', 'on:\n  push:\n',
+                                'on:\n  push:\n    branches: [other]\n')
+            for replacement in replacements:
+                mutant = self.mutate(text, anchor, replacement)
+                with self.subTest(workflow=path.name, push=replacement), self.assertRaises(AssertionError):
+                    self.assert_release_triggers(mutant)
+            on_block = re.search(r"(?ms)^on:\n.*?(?=^\S|\Z)", text)
+            self.assertIsNotNone(on_block)
+            for declaration in ("on: release\n\n", "on: [workflow_dispatch, release]\n\n",
+                                "on: push\n\n", "on: [workflow_dispatch, push]\n\n"):
+                mutant = self.mutate(text, on_block[0], declaration)
+                with self.subTest(workflow=path.name, declaration=declaration), self.assertRaises(AssertionError):
+                    self.assert_release_triggers(mutant)
+
+
+class ReleaseTagGuardGitTest(unittest.TestCase):
+    """CI executes the workflow's actual guard with real git, using file remotes."""
+
+    # Literal expectations, independent of the workflow's regex/commands.
+    # Commit selectors refer to fixture commits created before the guard runs.
+    # Optional trailing (branch, commit selector) fields add local clone refs.
+    CASES = (
+        ("v1.6.2", "true", 0, "first", ""),
+        ("v1.6.3", "true", 0, "second", ""),
+        ("not-a-release", "true", 1, None, "expected an existing vX.Y.Z or vX.Y.Z-rc.N tag"),
+        ("v9.9.9", "true", 1, None, "does not exist or does not peel to a commit"),
+        ("v1.6.4", "true", 1, None, "is not reachable from main"),
+        ("v1.6.3-rc.1", "true", 0, "second", ""),
+        ("v1.6.6", "true", 1, None, "does not exist or does not peel to a commit"),
+        ("v1.6.2\nextra", "true", 1, None, "expected an existing vX.Y.Z or vX.Y.Z-rc.N tag"),
+        ("v1.6.2", "false", 1, None, "dispatch publish.yml on refs/heads/main"),
+        ("v1.6.2", "", 1, None, "dispatch publish.yml on refs/heads/main"),
+        ("v1.6.7", "true", 1, None, "does not exist or does not peel to a commit", ("v1.6.7", "second")),
+        ("v1.6.2", "true", 0, "first", "", ("v1.6.2", "second")),
+    )
+
+    def setUp(self):
+        self.git_binary = shutil.which("git")
+        self.assertIsNotNone(self.git_binary, "CI runner cannot run git; tag-guard replay is required")
+        self.bash_binary = shutil.which("bash")
+        self.assertIsNotNone(self.bash_binary, "CI runner cannot run bash; tag-guard replay is required")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.env = {
+            "PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C",
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",
+        }
+        self.origin = self.root / "origin"
+        self.git(self.root, "init", "--initial-branch=main", "--object-format=sha1", str(self.origin))
+        self.git(self.origin, "config", "user.name", "Tag guard fixture")
+        self.git(self.origin, "config", "user.email", "tag-guard@example.invalid")
+        self.git(self.origin, "config", "commit.gpgsign", "false")
+        self.git(self.origin, "config", "tag.gpgsign", "false")
+        self.git(self.origin, "commit", "--allow-empty", "-m", "First main commit")
+        first = self.git(self.origin, "rev-parse", "HEAD")
+        self.git(self.origin, "commit", "--allow-empty", "-m", "Second main commit")
+        second = self.git(self.origin, "rev-parse", "HEAD")
+        self.commits = {"first": first, "second": second}
+        self.git(self.origin, "tag", "v1.6.2", first)
+        self.git(self.origin, "tag", "v1.6.3", second)
+        self.git(self.origin, "tag", "not-a-release", second)
+        self.git(self.origin, "tag", "-a", "v1.6.3-rc.1", second, "-m", "Annotated release")
+        self.tag_object = self.git(self.origin, "rev-parse", "refs/tags/v1.6.3-rc.1")
+        self.assertNotEqual(self.tag_object, second, "fixture must distinguish tag object from commit")
+        tree = self.git(self.origin, "rev-parse", "HEAD^{tree}")
+        self.git(self.origin, "tag", "v1.6.6", tree)
+        self.git(self.origin, "checkout", "-b", "side", first)
+        self.git(self.origin, "commit", "--allow-empty", "-m", "Unmerged side commit")
+        self.git(self.origin, "tag", "v1.6.4")
+        # Decoy tags named like main on the side commit: git resolves the short
+        # name origin/main in refs/tags/ before refs/remotes/, so a guard that
+        # names main loosely would accept the side-branch tag v1.6.4.
+        for decoy in ("origin/main", "main", "heads/main", "remotes/origin/main"):
+            self.git(self.origin, "tag", decoy)
+        self.assertEqual(self.git(self.origin, "tag", "--list", "v1.6.7"), "", "branch-only case must have no origin tag")
+        self.git(self.origin, "checkout", "main")
+        self.checkout_index = 0
+        self.text = (WORKFLOWS / "publish.yml").read_text(encoding="utf-8")
+
+    def git(self, cwd, *args):
+        done = subprocess.run(
+            [self.git_binary, *args], cwd=cwd, env=self.env,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(done.returncode, 0, (args, done.stdout, done.stderr))
+        return done.stdout.strip()
+
+    def checkout(self):
+        self.checkout_index += 1
+        work = self.root / f"work-{self.checkout_index}"
+        self.git(self.root, "clone", "--no-local", "--no-tags", "--single-branch",
+                 "--branch", "main", str(self.origin), str(work))
+        self.assertEqual(self.git(work, "rev-parse", "--is-shallow-repository"), "false")
+        self.assertEqual(self.git(work, "tag", "--list"), "", "the guard must fetch the real tags")
+        return work
+
+    def run_guard(self, text, work, tag, on_main="true"):
+        # Extract from the real YAML (or a mutation of that YAML). Do not use
+        # VALIDATE_RUN or assert_publish here: execution must kill the mutants.
+        wf = ReleaseTriggerWorkflowTest().parse(text)
+        guard = (wf.get("jobs") or {}).get("tag-guard") or {}
+        step = next((row for row in guard.get("steps", []) if row.get("id") == "tag"), {})
+        self.assertIsInstance(step.get("run"), str, "guard script must exist")
+        output = self.root / "guard-output"
+        output.write_text("", encoding="utf-8")
+        done = subprocess.run(
+            [self.bash_binary, "--noprofile", "--norc", "-c", step["run"]],
+            cwd=work, env={**self.env, "TAG": tag, "WORKFLOW_ON_MAIN": on_main,
+                           "GITHUB_OUTPUT": str(output)},
+            capture_output=True, text=True,
+        )
+        return done, output.read_text(encoding="utf-8").splitlines()
+
+    def assert_case(self, text, work, case):
+        tag, on_main, expected_code, commit, error, *local_branches = case
+        # Extra row fields create LOCAL refs in the work clone before the guard.
+        for name, target in local_branches:
+            self.git(work, "branch", name, self.commits[target])
+        done, output = self.run_guard(text, work, tag, on_main)
+        self.assertEqual(done.returncode, expected_code, (case, done.stdout, done.stderr))
+        if expected_code == 0:
+            self.assertEqual(output, ["sha=" + self.commits[commit], "tag=" + tag], case)
+            self.assertNotIn("::error::", done.stdout + done.stderr)
+            if tag == "v1.6.3-rc.1":
+                self.assertNotEqual(output[0], "sha=" + self.tag_object)
+        else:
+            self.assertEqual(output, [], "a refused tag must not emit an accepted SHA or tag")
+            self.assertIn("::error::", done.stdout, case)
+            self.assertIn(error, done.stdout, case)
+
+    def assert_table(self, text):
+        # No subTest here: the outer assertRaises must see the failed outcome
+        # of a mutant, rather than having a subTest consume the assertion.
+        work = self.checkout()
+        for case in self.CASES:
+            self.assert_case(text, work, case)
+
+    def test_actual_tag_guard_against_real_git_table(self):
+        work = self.checkout()
+        for case in self.CASES:
+            with self.subTest(tag=case[0], on_main=case[1], expected_code=case[2]):
+                self.assert_case(self.text, work, case)
+
+    def test_real_git_table_refuses_missing_pattern_existence_reachability_or_main_check(self):
+        self.assert_table(self.text)
+        pins = ReleaseTriggerWorkflowTest()
+        for label, mutant in pins.guard_check_mutations(self.text):
+            if label == "sha-shape":
+                continue  # Shape is pinned separately; real git always returns a commit SHA.
+            with self.subTest(removed_check=label), self.assertRaises(AssertionError):
+                self.assert_table(mutant)
+        unpeeled = pins.mutate(self.text, '"refs/tags/${TAG}^{commit}"', '"refs/tags/${TAG}"')
+        with self.subTest(check="annotated tag must output its commit"), self.assertRaises(AssertionError):
+            self.assert_table(unpeeled)
+        bare_tag = pins.mutate(self.text, '"refs/tags/${TAG}^{commit}"', '"${TAG}^{commit}"')
+        with self.subTest(check="local branch v1.6.7 is not a release tag"), self.assertRaisesRegex(AssertionError, r"v1\.6\.7"):
+            self.assert_table(bare_tag)
+        short_name = pins.mutate(
+            self.text, 'is-ancestor "$TAG_COMMIT" refs/remotes/origin/main', 'is-ancestor "$TAG_COMMIT" origin/main')
+        with self.subTest(check="a tag named origin/main must not stand in for main"), self.assertRaises(AssertionError):
+            self.assert_table(short_name)
+
+    def test_guard_fetches_updated_main_before_testing_reachability(self):
+        work = self.checkout()
+        self.git(self.origin, "commit", "--allow-empty", "-m", "Main advanced after checkout")
+        self.git(self.origin, "tag", "v2.0.0")
+        expected = self.git(self.origin, "rev-parse", "HEAD")
+        done, output = self.run_guard(self.text, work, "v2.0.0")
+        self.assertEqual(done.returncode, 0, (done.stdout, done.stderr))
+        self.assertEqual(output, ["sha=" + expected, "tag=v2.0.0"])
+        self.assertEqual(self.git(work, "rev-parse", "refs/remotes/origin/main"), expected)
+
+    def test_guard_fails_closed_when_fetch_cannot_read_origin(self):
+        work = self.checkout()
+        self.git(work, "remote", "set-url", "origin", str(self.root / "missing-origin"))
+        # An invalid name is refused before even attempting the broken fetch.
+        self.assert_case(self.text, work, self.CASES[2])
+        done, output = self.run_guard(self.text, work, "v1.6.2")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(output, [])
+
+
+class ReleaseTagGuardFailureReportTest(unittest.TestCase):
+    def assert_refusal(self, text):
+        wf = ReleaseTriggerWorkflowTest().parse(text)
+        job = (wf.get("jobs") or {}).get("failure-report") or {}
+        steps = job.get("steps") or []
+        self.assertGreater(len(steps), 1, "failure reporting must start with the apt guard and a refusal")
+        # LB-504: the apt guard is steps[0]; the refusal is the first real step after it, before any checkout.
+        self.assertEqual(steps[0], ReleaseTriggerWorkflowTest.APT_GUARD_STEP, "the apt guard must be the first step")
+        step = steps[1]
+        self.assertEqual(step.get("name"), "Refuse unverified release tag", "the refusal must follow the apt guard")
+        self.assertNotIn("uses", step, "the refusal is a run step, never a checkout")
+        condition = step.get("if", "").removeprefix("${{").removesuffix("}}").strip()
+        comparison = re.fullmatch(r"needs\.tag-guard\.result (==|!=) 'success'", condition)
+        self.assertIsNotNone(comparison)
+        self.assertIsInstance(step.get("run"), str)
+        operator = "=" if comparison[1] == "==" else "!="
+        script = f'if [ "$GUARD_RESULT" {operator} success ]; then\n{step["run"]}\nfi\n'
+        for status, expected_code in (
+            ("success", 0), ("failure", 1), ("skipped", 1),
+            ("cancelled", 1), ("", 1), ("unknown", 1),
+        ):
+            done = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-c", script],
+                env={"PATH": os.environ.get("PATH", os.defpath), "GUARD_RESULT": status},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(done.returncode, expected_code, (status, done.stdout, done.stderr))
+            if expected_code:
+                self.assertIn("::error::tag-guard did not pass", done.stdout)
+
+    def test_actual_first_refusal_rejects_failed_skipped_cancelled_or_missing_guard(self):
+        self.assert_refusal((WORKFLOWS / "publish.yml").read_text())
+
+    def test_executed_refusal_rejects_successful_exit_or_failure_only_condition(self):
+        text = (WORKFLOWS / "publish.yml").read_text()
+        self.assert_refusal(text)
+        pins = ReleaseTriggerWorkflowTest()
+        for before, after in (
+            ("          exit 1\n      - uses: actions/checkout@", "          exit 0\n      - uses: actions/checkout@"),
+            ("        if: ${{ needs.tag-guard.result != 'success' }}",
+             "        if: ${{ needs.tag-guard.result == 'failure' }}"),
+            # WEAKENED condition: an extra clause lets a failed, skipped or cancelled guard through.
+            ("        if: ${{ needs.tag-guard.result != 'success' }}",
+             "        if: ${{ needs.tag-guard.result != 'success' && needs.prepare.result == 'failure' }}"),
+            # REMOVED refusal step: the checkout would become the first real step after the apt guard.
+            ("      - name: Refuse unverified release tag\n"
+             "        if: ${{ needs.tag-guard.result != 'success' }}\n"
+             "        shell: bash\n"
+             "        run: |\n"
+             "          echo '::error::tag-guard did not pass; refusing checkout and publication failure reporting'\n"
+             "          exit 1\n", ""),
+        ):
+            mutant = pins.mutate(text, before, after)
+            with self.subTest(anchor=before + after), self.assertRaises(AssertionError):
+                self.assert_refusal(mutant)
 
 
 class SourceMirrorWorkflowTest(unittest.TestCase):
@@ -249,8 +974,8 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                          "${{ steps.pair.outputs.hpo_version_arg }}",
                          "${{ steps.binding.outputs.hpo_wheel_arg }}",
                          "${{ steps.binding.outputs.hpo_sdist_arg }}",
-                         "RELEASE_VERSION=${{ github.ref_name }}",
-                         "RELEASE_GIT_SHA=${{ github.sha }}"):
+                         "RELEASE_VERSION=${{ env.RELEASE_TAG }}",
+                         "RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}"):
             self.assertIn(existing, build["with"]["build-args"])
         self.assertLess(self.steps.index(reader), self.steps.index(build))
 
@@ -298,7 +1023,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                 arguments = self.named[name]["with"]["build-args"].splitlines()
                 for expected in ("ENGINE_VERSION=${{ steps.pins.outputs.engine }}",
                                  "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
-                                 "RELEASE_VERSION=${{ github.ref_name }}"):
+                                 "RELEASE_VERSION=${{ env.RELEASE_TAG }}"):
                     self.assertIn(expected, arguments, name + " must receive " + expected)
 
     def test_guard_is_mandatory_before_every_push_and_release_including_prereleases(self):
@@ -313,7 +1038,8 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
             self.assertIn("set -euo pipefail", step["run"])
             self.assertNotIn("|| true", step["run"])
         self.assertNotIn("continue-on-error", self.job)
-        self.assertEqual(self.workflow["on"]["push"]["tags"], ["v*"])
+        self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})
+        self.assertEqual(self.workflow["on"]["workflow_dispatch"]["inputs"]["tag"]["required"], "true")
         pushes = [step for step in self.steps if step.get("with", {}).get("push") == "true"]
         self.assertEqual(len(pushes), 2, "test must find both actual publishing actions")
         releases = [step for step in self.steps if "scripts/release_pipeline.py candidate --file" in step.get("run", "")]
@@ -571,8 +1297,8 @@ class HpoWorkflowTest(unittest.TestCase):
         self.assertEqual(handler["on"]["repository_dispatch"]["types"],
                          ["engine-release", "codegen-release", "hpo-release"])
         publish = _workflow("publish.yml")
-        self.assertEqual(set(publish["on"]), {"push", "workflow_dispatch"})
-        self.assertIn("refs/tags/v", publish["jobs"]["prepare"]["if"])
+        self.assertEqual(set(publish["on"]), {"workflow_dispatch"})
+        self.assertEqual(publish["jobs"]["prepare"]["if"], "github.ref == 'refs/heads/main'")
 
     def test_hpo_payload_boundary_and_whole_value_allowlist(self):
         cutoff_note = f"hpo joins the pairing at {rp.HPO_PAIRING_FROM}"
@@ -955,7 +1681,7 @@ class AppScopeTest(unittest.TestCase):
             self.assertIn("github-api-url: https://api.github.com", text)
         handler = (WORKFLOWS / "handle-upstream.yml").read_text()
         self.assertIn("repositories: pineforge-release", handler)
-        self.assertIn("permission-actions: write", handler)
+        self.assertNotIn("permission-actions", _step(handler, "Mint org App token"))
         self.assertNotIn('git push origin "refs/tags/${TAG}" --force', handler)
         finalizer = (WORKFLOWS / "release-finalize.yml").read_text()
         self.assertIn("repositories: ${{ env.TARGET_REPOSITORY }}", finalizer)
@@ -982,13 +1708,181 @@ class NotifyConsumersTest(unittest.TestCase):
         self.assertNotIn("client_payload[", send["run"])
 
     def test_all_consumer_roles_have_explicit_registry_and_policy(self):
+        import release_contract as contract
         import release_pipeline as pipeline
-        expected = {"offline", "hosted", "application", "web", "data", "license"}
+        expected = {"offline", "hosted", "application", "web", "data", "license", "compute"}
+        self.assertEqual(set(contract.ROLES), expected)
+        self.assertEqual(contract.DELIVERY_ONLY, ("compute",))
+        self.assertEqual(set(contract.RECEIPT_ROLES), expected - {"compute"})
         self.assertEqual(set(pipeline.configured_roles(",".join(sorted(expected)))), expected)
         self.assertEqual(pipeline.configured_roles(""), [])
         for bad in ("unknown", "offline,offline", "offline, hosted", "offline\nhosted"):
             with self.subTest(bad=bad), self.assertRaises(pipeline.Invalid):
                 pipeline.configured_roles(bad)
+
+    def test_compute_target_reuses_the_exact_single_target_app_mint(self):
+        text = (WORKFLOWS / "release-finalize.yml").read_text()
+        job = _workflow("release-finalize.yml")["jobs"]["notify-consumers"]
+        target = job["env"]["TARGET_REPOSITORY"]
+        self.assertEqual(target.count("secrets.RELEASE_COMPUTE_REPOSITORY"), 1)
+        self.assertEqual(text.count("secrets.RELEASE_COMPUTE_REPOSITORY"), 1)
+        self.assertIn("matrix.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY", target)
+        mints = [step for step in job["steps"] if "create-github-app-token@" in step.get("uses", "")]
+        self.assertEqual(len(mints), 1)
+        self.assertEqual(mints[0]["uses"],
+                         "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510")
+        self.assertEqual(mints[0]["with"], {
+            "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
+            "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
+            "owner": "${{ github.repository_owner }}",
+            "repositories": "${{ env.TARGET_REPOSITORY }}",
+            "permission-contents": "write", "github-api-url": "https://api.github.com",
+        })
+        self.assertEqual(set(re.findall(r"secrets\.([A-Z_]+)", text)), {
+            "PINEFORGE_APP_ID", "PINEFORGE_APP_PRIVATE_KEY", "RELEASE_HOSTED_MCP_REPOSITORY",
+            "RELEASE_APPLICATION_REPOSITORY", "FACTS_WEB_REPOSITORY", "RELEASE_COMPUTE_REPOSITORY",
+        })
+
+    def test_compute_first_pair_is_explicit_and_receipt_workflow_stays_receipt_only(self):
+        finalize = _workflow("release-finalize.yml")["jobs"]["finalize"]
+        step = next(s for s in finalize["steps"] if s.get("id") == "ready")
+        self.assertEqual(step["env"]["RELEASE_COMPUTE_FIRST_PAIR"], "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}")
+        self.assertEqual(step["env"]["RELEASE_READY_CONSUMERS"], "${{ vars.RELEASE_READY_CONSUMERS }}")
+        text = (WORKFLOWS / "release-receipts.yml").read_text()
+        self.assertNotIn("RELEASE_COMPUTE_REPOSITORY", text)
+        self.assertNotIn("matrix.consumer == 'compute'", text)
+        planner = _workflow("release-receipts.yml")["jobs"]["plan"]
+        self.assertTrue(any("release_receipts.py signal" in s.get("run", "") for s in planner["steps"]))
+
+    def test_compute_configuration_error_is_reported_after_consumer_delivery(self):
+        jobs = _workflow("release-finalize.yml")["jobs"]
+        finalize = jobs["finalize"]
+        self.assertEqual(finalize["outputs"]["compute_configuration_error"],
+                         "${{ steps.ready.outputs.compute_configuration_error }}")
+        self.assertEqual(finalize["outputs"]["deliveries"], "${{ steps.ready.outputs.deliveries }}")
+        ready = next(step for step in finalize["steps"] if step.get("id") == "ready")
+        self.assertEqual(ready["run"].splitlines(), [
+            "set -euo pipefail",
+            'python3 scripts/release_pipeline.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"',
+            'echo "deliveries=$(cat "$RUNNER_TEMP/deliveries.json")" >> "$GITHUB_OUTPUT"',
+        ])
+        notify = jobs["notify-consumers"]
+        self.assertEqual(notify["needs"], "finalize")
+        self.assertEqual(notify["if"], "needs.finalize.outputs.deliveries != '[]'")
+        self.assertNotIn("compute_configuration_error", notify["if"])
+        self.assertEqual(notify["strategy"]["matrix"]["include"],
+                         "${{ fromJSON(needs.finalize.outputs.deliveries) }}")
+
+        reporter = jobs["report-compute-configuration-error"]
+        self.assertEqual(reporter["needs"], ["finalize", "notify-consumers"])
+        self.assertEqual(reporter["if"],
+                         "${{ always() && needs.finalize.outputs.compute_configuration_error != '' }}")
+        self.assertEqual(reporter["permissions"], {})
+        self.assertEqual(set(reporter), {"needs", "if", "runs-on", "permissions", "steps"})
+        self.assertEqual(len(reporter["steps"]), 1)
+        step = reporter["steps"][0]
+        self.assertEqual(set(step), {"name", "run"})
+        self.assertEqual(step["run"].splitlines(), [
+            "echo '::error::RELEASE_COMPUTE_FIRST_PAIR value was not accepted; compute is off for this run'",
+            "exit 1",
+        ])
+        # Exact job/step shapes exclude checkout, environments, credentials and token mints.
+        text = json.dumps(reporter)
+        for forbidden in ("checkout", "secrets.", "github.token", "create-github-app-token"):
+            self.assertNotIn(forbidden, text)
+
+
+class RedeliverWorkflowTest(unittest.TestCase):
+    def test_manual_inputs_protected_single_job_and_serialized_permissions(self):
+        """Mutation: delete the redeliver job's main-ref if."""
+        wf = _workflow("release-redeliver.yml")
+        self.assertEqual(set(wf["on"]), {"workflow_dispatch"})
+        inputs = wf["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(set(inputs), {"tag", "consumer"})
+        self.assertEqual(inputs["tag"]["type"], "string")
+        self.assertEqual(inputs["tag"]["required"], "true")
+        self.assertIn("vX.Y.Z", inputs["tag"]["description"])
+        self.assertEqual(inputs["consumer"], {
+            "description": "One configured release consumer to repair",
+            "type": "choice", "required": "true",
+            "options": ["offline", "hosted", "application", "web", "data", "license", "compute"],
+        })
+        self.assertEqual(wf["permissions"], {"contents": "read"})
+        self.assertEqual(set(wf["jobs"]), {"redeliver"})
+        job = wf["jobs"]["redeliver"]
+        self.assertEqual(job.get("if"), "github.ref == 'refs/heads/main'")
+        self.assertNotIn("needs", job)
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["environment"], "release-automation")
+        self.assertEqual(job["permissions"], {"contents": "write", "issues": "write"})
+        self.assertEqual(job["concurrency"], {
+            "group": "release-delivery-${{ inputs.consumer }}-${{ inputs.tag }}",
+            "cancel-in-progress": "false",
+        })
+        self.assertNotIn("strategy", job)
+
+    def test_one_target_app_scope_public_reads_and_hub_audit_token(self):
+        """Mutation: change the App's repositories to an organization-wide list."""
+        wf = _workflow("release-redeliver.yml")
+        job = wf["jobs"]["redeliver"]
+        sibling = _workflow("release-finalize.yml")["jobs"]["notify-consumers"]
+        target = (
+            "${{ inputs.consumer == 'offline' && 'pineforge-backtest-mcp' || "
+            "inputs.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || "
+            "inputs.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || "
+            "inputs.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || "
+            "inputs.consumer == 'data' && 'pineforge-data' || "
+            "inputs.consumer == 'license' && 'pineforge-license' || "
+            "inputs.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}"
+        )
+        self.assertEqual(job["env"], {"TARGET_REPOSITORY": target})
+        self.assertEqual(target, sibling["env"]["TARGET_REPOSITORY"].replace("matrix.consumer", "inputs.consumer"))
+        steps = job["steps"]
+        self.assertEqual(steps[0], ReleaseTriggerWorkflowTest.APT_GUARD_STEP)
+        self.assertEqual(len([step for step in steps if "uses" in step]), 2)
+        actions = {step["uses"]: step for step in steps if "uses" in step}
+        checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        mint = "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
+        self.assertEqual(set(actions), {checkout, mint})
+        self.assertEqual(actions[checkout]["with"], {"ref": "main", "persist-credentials": "false"})
+        self.assertEqual(actions[mint]["with"], {
+            "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
+            "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
+            "owner": "${{ github.repository_owner }}",
+            "repositories": "${{ env.TARGET_REPOSITORY }}",
+            "permission-contents": "write", "github-api-url": "https://api.github.com",
+        })
+        guard = next(step for step in steps if step.get("name") == "Require one configured consumer repository")
+        self.assertIn('[[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]', guard["run"])
+        self.assertLess(steps.index(guard), steps.index(actions[mint]))
+        sends = [step for step in steps if "release_pipeline.py redeliver " in step.get("run", "")]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0]["env"], {
+            "GH_TOKEN": "${{ steps.app.outputs.token }}", "HUB_TOKEN": "${{ github.token }}",
+            "TAG": "${{ inputs.tag }}", "CONSUMER": "${{ inputs.consumer }}",
+            "RELEASE_READY_CONSUMERS": "${{ vars.RELEASE_READY_CONSUMERS }}",
+            "RELEASE_COMPUTE_FIRST_PAIR": "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}",
+        })
+        self.assertEqual(sends[0]["run"],
+                         'python3 scripts/release_pipeline.py redeliver --tag "$TAG" --consumer "$CONSUMER" \\\n'
+                         '  --output "$RUNNER_TEMP/redelivery.json"\n')
+        self.assertNotIn("release_receipts.py", str(steps))
+        self.assertNotIn("client_payload", str(steps))
+
+    def test_docs_explain_append_only_repair_and_post_send_audit_failure(self):
+        """Mutation: remove the duplicate-delivery warning from the new paragraph."""
+        text = (REPO / "docs/release-chain.md").read_text()
+        start = text.index("Delivery acceptance is recorded once")
+        end = text.index("`release-receipts.yml` polls", start)
+        delivery, repair = text[start:end].strip().split("\n\n")
+        self.assertIn("three total attempts", delivery)
+        for required in ("release-redeliver.yml", "release-automation", "environment",
+                         "RELEASE_READY_CONSUMERS", "delivery-redelivered-<consumer>-<n>.json",
+                         "GITHUB_ACTOR", "delivery-<consumer>.json", "delivery-failed-<consumer>.json",
+                         "delivery-attempt-*", "receipt contract is unchanged", "event_id",
+                         "idempotence", "audit write fails", "next run sends again", "duplicate delivery"):
+            with self.subTest(required=required):
+                self.assertIn(required, repair)
 
 
 class HarnessSyncTest(unittest.TestCase):
@@ -1338,24 +2232,469 @@ class PythonTestGateTest(unittest.TestCase):
         self.assertNotIn("test_release_", fingerprint)
 
 
+class ReleaseRunnerWorkflowTest(unittest.TestCase):
+    RELEASE_JOBS = {
+        "facts-descriptions.yml": {"descriptions"},
+        "facts-fanout.yml": {"web", "license"},
+        "handle-upstream.yml": {"bump"},
+        "publish.yml": {"tag-guard", "prepare", "publish", "failure-report"},
+        "release-finalize.yml": {"finalize", "notify-consumers", "report-compute-configuration-error"},
+        "release-redeliver.yml": {"redeliver"},
+        "release-receipts.yml": {"plan", "verify"},
+        "release-reconcile.yml": {"producers"},
+        "release-rollback.yml": {"restore"},
+    }
+    RUNNER = ["self-hosted", "pf-ci", "pf-ci-release"]
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    HOSTED_JOBS = {
+        ("facts-descriptions.yml", "descriptions"),
+        ("facts-fanout.yml", "web"),
+        ("facts-fanout.yml", "license"),
+        ("handle-upstream.yml", "bump"),
+        ("publish.yml", "tag-guard"),
+        ("publish.yml", "prepare"),
+        ("publish.yml", "publish"),
+        ("publish.yml", "failure-report"),
+        ("release-finalize.yml", "finalize"),
+        ("release-finalize.yml", "notify-consumers"),
+        ("release-finalize.yml", "report-compute-configuration-error"),
+        ("release-redeliver.yml", "redeliver"),
+        ("release-receipts.yml", "plan"),
+        ("release-receipts.yml", "verify"),
+        ("release-reconcile.yml", "producers"),
+        ("release-rollback.yml", "restore"),
+    }
+
+    def release_workflows(self):
+        return {name: _workflow(name) for name in self.RELEASE_JOBS}
+
+    def assert_hosted_runners(self, workflows):
+        for name, identity in sorted(self.HOSTED_JOBS):
+            self.assertEqual(workflows[name]["jobs"][identity]["runs-on"], "ubuntu-latest",
+                             f"{name}:{identity}: runs-on must be ubuntu-latest")
+
+    def assert_release_runners(self, workflows):
+        for name, identities in self.RELEASE_JOBS.items():
+            workflow = workflows[name]
+            triggers = workflow["on"]
+            if isinstance(triggers, str):
+                triggers = [triggers]
+            for event in ("pull_request", "pull_request_target"):
+                self.assertNotIn(event, triggers, f"{name}: {event} cannot run release automation")
+            # The reusable caller has no runs-on; its callee's jobs are pinned above.
+            expected = identities | ({"notify-consumers"} if name == "publish.yml" else set())
+            self.assertEqual(set(workflow["jobs"]), expected, f"{name}: release job inventory")
+            for identity in sorted(identities):
+                self.assertEqual(workflow["jobs"][identity]["runs-on"], "ubuntu-latest",
+                                 f"{name}:{identity}: runs-on must be ubuntu-latest")
+        self.assert_hosted_runners(workflows)
+
+    def test_release_jobs_pin_ubuntu_latest_and_never_accept_pr_events(self):
+        self.assert_release_runners(self.release_workflows())
+
+    def test_all_fourteen_release_jobs_pin_ubuntu_latest_under_the_standing_owner_rule(self):
+        self.assert_hosted_runners(self.release_workflows())
+
+    def test_hosted_runner_pin_refuses_the_release_array_on_each_release_job(self):
+        original = self.release_workflows()
+        self.assert_hosted_runners(original)
+        for name, identity in sorted(self.HOSTED_JOBS):
+            with self.subTest(workflow=name, job=identity):
+                mutant = copy.deepcopy(original)
+                mutant[name]["jobs"][identity]["runs-on"] = self.RUNNER.copy()
+                with self.assertRaisesRegex(AssertionError, "runs-on must be ubuntu-latest"):
+                    self.assert_hosted_runners(mutant)
+
+    def assert_no_release_runner_labels(self, workflows):
+        for name, workflow in workflows.items():
+            for identity, job in workflow.get("jobs", {}).items():
+                self.assertNotIn("pf-ci-release", str(job.get("runs-on", "")),
+                                 f"{name}:{identity}: runs-on must not contain pf-ci-release")
+
+    def test_no_workflow_uses_pf_ci_release_and_pin_refuses_each_reintroduction(self):
+        original = {
+            path.name: _workflow(path.name)
+            for path in sorted(WORKFLOWS.iterdir())
+            if path.suffix in {".yml", ".yaml"}
+        }
+        self.assert_no_release_runner_labels(original)
+        for name, identity in sorted(self.HOSTED_JOBS):
+            with self.subTest(workflow=name, job=identity):
+                mutant = copy.deepcopy(original)
+                mutant[name]["jobs"][identity]["runs-on"] = self.RUNNER.copy()
+                with self.assertRaisesRegex(AssertionError, "runs-on must not contain pf-ci-release"):
+                    self.assert_no_release_runner_labels(mutant)
+
+    def test_release_finalize_stops_the_apt_timers_before_anything_else(self):
+        # LB-504: apt-daily-upgrade.timer re-execs systemd 20-25 minutes after
+        # boot and kills the runner, and the finalizer runs hourly on
+        # ubuntu-latest (owner 10-21). Both of its jobs must stop the timers before any
+        # checkout, secret or repository code.
+        jobs = _workflow("release-finalize.yml")["jobs"]
+        for identity in ("finalize", "notify-consumers"):
+            with self.subTest(job=identity):
+                self.assertEqual((jobs.get(identity, {}).get("steps") or [{}])[0],
+                                 ReleaseTriggerWorkflowTest.APT_GUARD_STEP,
+                                 identity + " must stop the apt timers before anything else (LB-504)")
+
+    def test_runner_pin_refuses_wrong_labels_other_pools_and_fallbacks_on_every_job(self):
+        original = self.release_workflows()
+        old_expression = """${{ github.event_name != 'pull_request_target' &&
+            github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
+            contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+            (github.event_name != 'pull_request' ||
+             (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
+            fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}"""
+        invalid_runners = (
+            self.RUNNER.copy(),
+            "ubuntu-24.04",
+            ["self-hosted", "pf-ci", "pf-ci-x64"],
+            ["self-hosted", "pf-ci", "pf-ci-release", "ubuntu-24.04"],
+            """${{ fromJSON('["self-hosted","pf-ci","pf-ci-release"]') || 'ubuntu-24.04' }}""",
+            old_expression,
+        )
+        for name, identities in self.RELEASE_JOBS.items():
+            for identity in sorted(identities):
+                for runner in invalid_runners:
+                    with self.subTest(workflow=name, job=identity, runner=runner):
+                        mutant = copy.deepcopy(original)
+                        mutant[name]["jobs"][identity]["runs-on"] = runner
+                        with self.assertRaisesRegex(AssertionError, "runs-on"):
+                            self.assert_release_runners(mutant)
+
+    def test_runner_pin_refuses_pr_triggers_in_mapping_sequence_and_scalar_forms(self):
+        original = self.release_workflows()
+        for name in self.RELEASE_JOBS:
+            for event in ("pull_request", "pull_request_target"):
+                declarations = (
+                    {**original[name]["on"], event: {}},
+                    [*original[name]["on"], event],
+                    event,
+                )
+                for triggers in declarations:
+                    with self.subTest(workflow=name, event=event, triggers=triggers):
+                        mutant = copy.deepcopy(original)
+                        mutant[name]["on"] = triggers
+                        with self.assertRaisesRegex(AssertionError, event):
+                            self.assert_release_runners(mutant)
+
+    def test_runner_inventory_pin_refuses_missing_and_unlisted_jobs(self):
+        original = self.release_workflows()
+        for name, workflow in original.items():
+            for identity in workflow["jobs"]:
+                with self.subTest(workflow=name, missing=identity):
+                    mutant = copy.deepcopy(original)
+                    mutant[name]["jobs"].pop(identity)
+                    with self.assertRaisesRegex(AssertionError, "release job inventory"):
+                        self.assert_release_runners(mutant)
+            with self.subTest(workflow=name, extra="unreviewed-release-job"):
+                mutant = copy.deepcopy(original)
+                identity = sorted(self.RELEASE_JOBS[name])[0]
+                mutant[name]["jobs"]["unreviewed-release-job"] = copy.deepcopy(workflow["jobs"][identity])
+                with self.assertRaisesRegex(AssertionError, "release job inventory"):
+                    self.assert_release_runners(mutant)
+
+
 class PrTierWorkflowTest(unittest.TestCase):
     ROUTED_JOBS = {
         "python-test.yml": {"fingerprint-canonical", "release-rules", "description-renderer",
                             "release-ready-replay", "release-ready"},
         "facts-validate.yml": {"validate"},
     }
-    RUNNER = """${{ github.event_name != 'pull_request_target' &&
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    HOSTED_JOBS = {
+        ("python-test.yml", "authz"),
+        ("python-test.yml", "changes"),
+        ("python-test.yml", "fingerprint-canonical"),
+        ("python-test.yml", "release-rules"),
+        ("python-test.yml", "description-renderer"),
+        ("python-test.yml", "release-ready-replay"),
+        ("python-test.yml", "release-ready"),
+        ("facts-validate.yml", "authz"),
+        ("facts-validate.yml", "validate"),
+    }
+    # Old pool labels remain negative-control fixtures.
+    RUNNER = ["self-hosted", "pf-ci", "pf-ci-x64"]
+    RUNNER_LINE = "    runs-on: ubuntu-latest"
+    RUNNER_COUNTS = {"python-test.yml": 6, "facts-validate.yml": 1}
+    POOL_RUNNER_LINE = '    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]'
+    PR_GUARD = ("github.event_name != 'pull_request' || "
+                "github.event.pull_request.head.repo.full_name == github.repository")
+    AUTHZ_RUNNER_LINE = "    runs-on: ubuntu-24.04"
+    AUTHZ_POOL_RUNNER_LINE = '    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]'
+    # Literal current ci-labels.md hosted authz (owner #1050, LB-437).
+    # Keep this independent of the workflows: every byte, including comments,
+    # permissions and both permission lookups, is pinned.
+    AUTHZ_TEXT = """  authz:
+    name: authz
+    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
+    runs-on: ubuntu-24.04
+    permissions: {}
+    # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
+    steps:
+      - name: Only our own pull requests and our own events run CI
+        env:
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          WR_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
+          GH_TOKEN: ${{ github.token }}   # read-only use: one permission lookup for workflow_run
+          # Bot logins whose same-repository pull requests count as ours: dependabot[bot] (CI-DEPBOT A)
+          # and the org's own GitHub App bot logins by name (space-separated), nothing else.
+          ALLOWED_BOTS: "dependabot[bot] pineforge-app[bot]"
+        run: |
+          set -eu
+          fail() { echo "::error title=authz::$1"; echo "authz: REFUSED: $1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          case "$EVENT" in
+            push|workflow_dispatch|schedule|merge_group|release|workflow_call|repository_dispatch)
+              # Only someone with write access to this repository (or our App's token) can cause these
+              # events; none of them runs pull-request code.
+              ;;
+            workflow_run)
+              # LB-437: bind identity to the triggering run and its re-runner.
+              # These two App bots are fixed canon policy; ALLOWED_BOTS is PR-only.
+              [ -n "${WR_HEAD_REPO:-}" ] || fail "workflow_run head repository is missing"
+              [ -n "${WR_ACTOR:-}" ] || fail "workflow_run triggering actor is missing"
+              [ "$WR_HEAD_REPO" = "$REPO" ] || fail "workflow_run head repository does not match this repository"
+              case "$WR_ACTOR" in
+                "pineforge-app[bot]"|"pineforge-ci-dispatcher[bot]") ;;
+                *"[bot]") fail "workflow_run bot is not on the canon allowlist" ;;
+                *)
+                  perm=$(gh api "repos/$REPO/collaborators/$WR_ACTOR/permission" --jq .permission 2>/dev/null) || fail "workflow_run permission lookup failed"
+                  case "$perm" in admin|maintain|write) ;; *) fail "workflow_run triggering actor does not have write permission" ;; esac ;;
+              esac ;;
+            pull_request)
+              [ "$HEAD_REPO" = "$REPO" ] || fail "pull request from another repository (${HEAD_REPO:-unknown})"
+              [ "$HEAD_IS_FORK" = "false" ] || fail "pull request from a fork"
+              case "$ASSOCIATION" in
+                OWNER|MEMBER|COLLABORATOR) ;;
+                *)
+                  case " $ALLOWED_BOTS " in
+                    *" $PR_AUTHOR "*) ;;
+                    *)
+                      # A member whose org membership is private shows as CONTRIBUTOR: ask GitHub for the
+                      # author's permission on this repository; anything but admin/maintain/write (or a
+                      # failed call) refuses.
+                      perm=$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" --jq .permission 2>/dev/null || echo none)
+                      case "$perm" in admin|maintain|write) ;; *) fail "author ${PR_AUTHOR:-unknown} (${ASSOCIATION:-NONE}) has permission '$perm', not write, and is not an allowlisted bot" ;; esac ;;
+                  esac ;;
+              esac ;;
+            *) fail "event $EVENT does not run CI (pull_request_target and other events are not allowed)" ;;
+          esac
+          echo "authz: allowed ($EVENT${PR_AUTHOR:+ by $PR_AUTHOR})" >> "$GITHUB_STEP_SUMMARY"
+"""
+    STATUS_OVERRIDE = re.compile(r"\b(?:always|cancelled|failure)\s*\(\s*\)")
+    AUTHZ_SUCCESS = "needs.authz.result == 'success'"
+    AUTHZ_REFUSAL_STEP = {
+        "name": "Refuse an unauthorised run before anything else",
+        "if": "${{ needs.authz.result != 'success' }}",
+        "run": (
+            'echo "::error::authz did not pass; nothing of this run\'s code is checked out or run"\n'
+            "exit 1\n"
+        ),
+    }
+    AUTHZ_REFUSAL_TEXT = """      - name: Refuse an unauthorised run before anything else
+        if: ${{ needs.authz.result != 'success' }}
+        run: |
+          echo "::error::authz did not pass; nothing of this run's code is checked out or run"
+          exit 1
+"""
+    # Retain the old expression only as a negative-control fixture.
+    # Release and PR workflows run on GitHub-hosted runners under the owner rule.
+    LEGACY_RUNNER = """${{ github.event_name != 'pull_request_target' &&
         github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-        contains(fromJSON('["push","workflow_dispatch","schedule","release"]'), github.event_name) &&
+        contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
+        (github.event_name != 'pull_request' ||
+         (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
         fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}"""
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    EXEMPT_RUNNERS = {
+        "facts-descriptions.yml": {"descriptions": "ubuntu-latest"},
+        "facts-fanout.yml": {"web": "ubuntu-latest", "license": "ubuntu-latest"},
+        "handle-upstream.yml": {"bump": "ubuntu-latest"},
+        "publish.yml": {"tag-guard": "ubuntu-latest", "prepare": "ubuntu-latest",
+                        "publish": "ubuntu-latest", "notify-consumers": None,
+                        "failure-report": "ubuntu-latest"},
+        "release-finalize.yml": {"finalize": "ubuntu-latest", "notify-consumers": "ubuntu-latest",
+                                 "report-compute-configuration-error": "ubuntu-latest"},
+        "release-redeliver.yml": {"redeliver": "ubuntu-latest"},
+        "release-receipts.yml": {"plan": "ubuntu-latest", "verify": "ubuntu-latest"},
+        "release-reconcile.yml": {"producers": "ubuntu-latest"},
+        "release-rollback.yml": {"restore": "ubuntu-latest"},
+    }
+    LEGACY_LABEL_JOBS = {
+        ("publish.yml", "prepare"), ("publish.yml", "failure-report"),
+        ("release-receipts.yml", "plan"),
+    }
 
-    def assert_runner(self, expression):
-        self.assertEqual(" ".join(expression.split()), " ".join(self.RUNNER.split()))
+    def assert_runner(self, runner, identity):
+        expected = "ubuntu-24.04" if identity == "authz" else "ubuntu-latest"
+        self.assertEqual(runner, expected, f"runs-on must be {expected}")
 
-    def test_all_pr_jobs_pin_hosted_pr_and_preserve_non_pr_pool_guards(self):
+    def assert_hosted_job(self, job, identity):
+        self.assert_runner(job.get("runs-on"), identity)
+        self.assertNotIn("PF_CI_LABELS", json.dumps(job))
+
+    def assert_hosted_runners(self, workflows):
+        for name, identity in sorted(self.HOSTED_JOBS):
+            expected = "ubuntu-24.04" if identity == "authz" else "ubuntu-latest"
+            self.assertEqual(workflows[name]["jobs"][identity]["runs-on"], expected,
+                             f"{name}:{identity}: runs-on must be {expected}")
+
+    def assert_no_pr_pool_runner_labels(self, workflows):
+        for name, workflow in workflows.items():
+            for identity, job in workflow.get("jobs", {}).items():
+                for label in ("pf-ci-x64", "self-hosted"):
+                    self.assertNotIn(label, str(job.get("runs-on", "")),
+                                     f"{name}:{identity}: runs-on must not contain {label}")
+
+    def assert_pr_trigger(self, workflow):
+        self.assertIn("pull_request", workflow["on"])
+        if workflow["name"] == "python-test":
+            self.assertEqual(workflow["on"]["pull_request"], {
+                "types": ["opened", "synchronize", "reopened", "ready_for_review"],
+            })
+        else:
+            self.assertFalse(workflow["on"]["pull_request"])
+        self.assertNotIn("pull_request_target", workflow["on"])
+
+    def assert_no_fork_condition(self, job):
+        condition = job.get("if", "")
+        for forbidden in ("head.repo.full_name", "github.repository"):
+            self.assertNotIn(forbidden, condition)
+
+    def assert_status_condition_requires_authz(self, identity, job):
+        condition = job.get("if", "")
+        if identity == "release-ready":
+            # A skipped required check counts as success; report cancelled needs.
+            self.assertEqual(condition, "${{ always() }}")
+            self.assert_authz_refusal_first(job)
+            self.assert_authz_success_steps(job)
+        elif self.STATUS_OVERRIDE.search(condition):
+            self.assertIn("needs.authz.result == 'success'", condition)
+
+    def assert_authz_refusal_first(self, job):
+        self.assertNotIn("continue-on-error", job)
+        self.assertTrue(job.get("steps"), "authz status overrides must have a refusal step")
+        # Exact shape pins the failure comparison and exit, and rejects
+        # continue-on-error or any action/code inserted before the gate.
+        self.assertEqual(job["steps"][0], self.AUTHZ_REFUSAL_STEP)
+
+    def assert_authz_success_steps(self, job):
+        # R5b also covers third-party actions here. An existing condition may
+        # follow the mandatory success term only inside one balanced group.
+        for index, step in enumerate(job["steps"][1:], start=2):
+            condition = step.get("if", "")
+            self.assertIsInstance(condition, str, f"step {index}")
+            if condition == self.AUTHZ_SUCCESS:
+                continue
+            prefix = self.AUTHZ_SUCCESS + " && "
+            self.assertTrue(condition.startswith(prefix), f"step {index}: {condition}")
+            remainder = condition[len(prefix):]
+            self.assertTrue(remainder.startswith("(") and remainder.endswith(")"),
+                            f"step {index}: {condition}")
+            tokens = re.findall(r"'(?:[^']|'')*'|[()]|[^'()]+", remainder)
+            self.assertEqual("".join(tokens), remainder)
+            depth = 0
+            for offset, token in enumerate(tokens):
+                if token == "(":
+                    depth += 1
+                elif token == ")":
+                    depth -= 1
+                if offset == len(tokens) - 1:
+                    self.assertEqual(depth, 0, condition)
+                else:
+                    self.assertGreater(depth, 0, condition)
+
+    def assert_status_override_refusals(self, workflow):
+        protected = set()
+        for identity, job in workflow["jobs"].items():
+            needs = job.get("needs", [])
+            needs = [needs] if isinstance(needs, str) else needs
+            if "authz" in needs and self.STATUS_OVERRIDE.search(job.get("if", "")):
+                self.assert_authz_refusal_first(job)
+                self.assert_authz_success_steps(job)
+                protected.add(identity)
+        return protected
+
+    def assert_authz_refusal_text(self, text, identities):
+        for identity in identities:
+            block = re.search(rf"(?ms)^  {re.escape(identity)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
+            self.assertIsNotNone(block, identity)
+            steps = block[1].split("    steps:\n", 1)
+            self.assertEqual(len(steps), 2, identity)
+            self.assertTrue(steps[1].startswith(self.AUTHZ_REFUSAL_TEXT), identity)
+
+    def assert_job_condition(self, identity, job):
+        self.assert_no_fork_condition(job)
+        self.assert_status_condition_requires_authz(identity, job)
+        if identity == "changes":
+            self.assertEqual(job.get("if"), "${{ !github.event.pull_request.draft }}")
+        elif identity == "validate":
+            self.assertNotIn("if", job)
+        elif identity == "release-ready":
+            self.assertEqual(job["if"], "${{ always() }}")
+        else:
+            self.assertEqual(job.get("if"),
+                             "${{ !github.event.pull_request.draft && "
+                             "(needs.changes.outputs.docs-only == 'false') }}")
+
+    def assert_authz_dependency(self, job):
+        needs = job.get("needs", [])
+        self.assertIn("authz", [needs] if isinstance(needs, str) else needs)
+
+    def assert_job_inventory(self, name, workflow):
+        expected = self.ROUTED_JOBS[name] | {"authz"} | ({"changes"} if name == "python-test.yml" else set())
+        self.assertEqual(set(workflow["jobs"]), expected)
+        self.assertEqual(next(iter(workflow["jobs"])), "authz")
+        self.assert_authz(workflow["jobs"]["authz"])
+        return expected
+
+    def assert_authz(self, job):
+        import yaml
+        expected = yaml.load(self.AUTHZ_TEXT, Loader=yaml.BaseLoader)["authz"]
+        self.assertEqual(job, expected)
+        self.assertEqual(set(job), {"name", "runs-on", "permissions", "steps"})
+        self.assertEqual(job["name"], "authz")
+        self.assertEqual(job["permissions"], {})
+        self.assertEqual(set(job["steps"][0]["env"]), {
+            "EVENT", "REPO", "HEAD_REPO", "HEAD_IS_FORK", "ASSOCIATION",
+            "PR_AUTHOR", "WR_HEAD_REPO", "WR_ACTOR", "GH_TOKEN", "ALLOWED_BOTS",
+        })
+        self.assertEqual(job["steps"][0]["env"]["ALLOWED_BOTS"],
+                         "dependabot[bot] pineforge-app[bot]")
+        self.assert_hosted_job(job, "authz")
+        self.assertNotIn("if", job)
+        self.assertNotIn("continue-on-error", job)
+        self.assertNotIn("timeout-minutes", job)
+        for forbidden in ("actions/checkout", "secrets.", "id-token", "environment",
+                          "github.actor", "github.triggering_actor"):
+            self.assertNotIn(forbidden, json.dumps(job))
+
+    def assert_authz_text(self, text):
+        block = re.search(r"(?ms)^  authz:\n.*?(?=^  [\w-]+:\n|\Z)", text)
+        self.assertIsNotNone(block)
+        self.assertEqual(block[0], self.AUTHZ_TEXT + "\n")
+
+    def assert_literal_routes(self, text, identities):
+        for identity in identities:
+            block = re.search(rf"(?ms)^  {re.escape(identity)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
+            self.assertIsNotNone(block, identity)
+            runner_lines = re.findall(r"(?m)^    runs-on:.*$", block[1])
+            expected = self.AUTHZ_RUNNER_LINE if identity == "authz" else self.RUNNER_LINE
+            self.assertEqual(runner_lines, [expected], identity)
+
+    def test_all_pr_jobs_pin_literal_hosted_routes_conditions_and_authz(self):
         pr_workflows = {path.name: _workflow(path.name) for path in WORKFLOWS.glob("*.yml")
                         if "pull_request" in _workflow(path.name)["on"]}
         self.assertEqual(set(pr_workflows), set(self.ROUTED_JOBS))
+        self.assertEqual({(name, identity) for name, workflow in pr_workflows.items()
+                          for identity in workflow["jobs"]}, self.HOSTED_JOBS)
+        self.assert_hosted_runners(pr_workflows)
         for name, workflow in pr_workflows.items():
             with self.subTest(workflow=name):
                 self.assertEqual(workflow["name"], name.removesuffix(".yml"))
@@ -1364,40 +2703,818 @@ class PrTierWorkflowTest(unittest.TestCase):
                     "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}",
                     "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
                 })
-                self.assertFalse(workflow["on"]["pull_request"])
-                self.assertNotIn("pull_request_target", workflow["on"])
-                expected = self.ROUTED_JOBS[name] | ({"changes"} if name == "python-test.yml" else set())
-                self.assertEqual(set(workflow["jobs"]), expected)
+                self.assert_pr_trigger(workflow)
+                expected = self.assert_job_inventory(name, workflow)
+                self.assert_status_override_refusals(workflow)
                 for identity, job in workflow["jobs"].items():
+                    self.assert_no_fork_condition(job)
                     self.assertEqual(job.get("name", identity),
                                      "release/ready" if identity == "release-ready" else identity)
-                    self.assertNotIn("uses", job, "PR coverage must not hide a reusable pool job")
-                    self.assertNotIn("permissions", job)
-                    if identity == "changes":
-                        self.assertEqual(job["runs-on"], "ubuntu-24.04")
+                    self.assertNotIn("uses", job, "PR coverage must not hide a reusable hosted job")
+                    self.assert_hosted_job(job, identity)
+                    if identity == "authz":
+                        self.assert_authz(job)
                     else:
-                        self.assert_runner(job["runs-on"])
+                        self.assertNotIn("permissions", job)
+                        self.assert_job_condition(identity, job)
+                        self.assert_authz_dependency(job)
                 text = (WORKFLOWS / name).read_text()
+                self.assert_literal_routes(text, expected)
+                self.assert_authz_text(text)
                 for forbidden in ("secrets.", "create-github-app-token", "id-token:", ": write"):
                     self.assertNotIn(forbidden, text)
 
-    def test_runner_pin_rejects_old_pr_pool_allowlist_and_missing_guards(self):
-        runner = _workflow("python-test.yml")["jobs"]["release-rules"]["runs-on"]
-        self.assert_runner(runner)
-        mutants = (
-            runner.replace('["push","workflow_dispatch"', '["push","pull_request","workflow_dispatch"'),
-            runner.replace("github.event_name != 'pull_request_target' &&", ""),
-            runner.replace("github.actor != 'dependabot[bot]' &&", ""),
-            runner.replace("github.triggering_actor != 'dependabot[bot]' &&", ""),
-            runner.replace(" || 'ubuntu-24.04'", ""),
-            runner.replace("'ubuntu-24.04'", """fromJSON('["self-hosted","pf-ci","pf-ci-x64"]')"""),
-            runner.replace('"schedule",', ""),
-        )
-        for mutant in mutants:
-            with self.subTest(runner=mutant):
-                self.assertNotEqual(mutant, runner)
+    def test_no_workflow_uses_pr_pool_labels_and_pin_refuses_each_reintroduction(self):
+        original = {
+            path.name: _workflow(path.name)
+            for path in sorted(WORKFLOWS.iterdir())
+            if path.suffix in {".yml", ".yaml"}
+        }
+        self.assert_hosted_runners(original)
+        self.assert_no_pr_pool_runner_labels(original)
+        for name, identity in sorted(self.HOSTED_JOBS):
+            for runner in (self.RUNNER.copy(), ["pf-ci-x64"], ["self-hosted"]):
+                with self.subTest(workflow=name, job=identity, runner=runner):
+                    mutant = copy.deepcopy(original)
+                    mutant[name]["jobs"][identity]["runs-on"] = runner
+                    self.assertNotEqual(mutant, original)
+                    expected = "ubuntu-24.04" if identity == "authz" else "ubuntu-latest"
+                    with self.assertRaisesRegex(AssertionError, f"runs-on must be {expected}"):
+                        self.assert_hosted_runners(mutant)
+                    with self.assertRaisesRegex(AssertionError, "runs-on must not contain"):
+                        self.assert_no_pr_pool_runner_labels(mutant)
+
+    def test_each_runner_pin_refuses_pool_arrays_fragments_unavailable_labels_and_labels_env(self):
+        for name in self.ROUTED_JOBS:
+            text = (WORKFLOWS / name).read_text()
+            self.assertEqual(text.count(self.RUNNER_LINE + "\n"), self.RUNNER_COUNTS[name])
+            for identity, job in _workflow(name)["jobs"].items():
+                self.assert_hosted_job(job, identity)
+                for runner in (
+                    self.RUNNER.copy(),
+                    "ubuntu-latest" if identity == "authz" else "ubuntu-24.04",
+                    self.LEGACY_RUNNER,
+                    """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') }}""",
+                    """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}""",
+                    """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-latest' }}""",
+                    ["self-hosted", "pf-ci", "pf-ci-crj"],
+                    ["self-hosted", "pf-ci", "pf-ci-x64-16"],
+                    ["self-hosted", "pf-ci"],
+                ):
+                    mutant = copy.deepcopy(job)
+                    mutant["runs-on"] = runner
+                    with self.subTest(workflow=name, job=identity, runner=runner):
+                        self.assertNotEqual(mutant, job)
+                        with self.assertRaises(AssertionError):
+                            self.assert_hosted_job(mutant, identity)
+                mutant = copy.deepcopy(job)
+                mutant.setdefault("env", {})["PF_CI_LABELS"] = json.dumps(self.RUNNER)
+                with self.subTest(workflow=name, job=identity, mutation="labels env"):
+                    with self.assertRaises(AssertionError):
+                        self.assert_hosted_job(mutant, identity)
+                block = re.search(rf"(?ms)^  {re.escape(identity)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
+                self.assertIsNotNone(block)
+                original = self.AUTHZ_RUNNER_LINE if identity == "authz" else self.RUNNER_LINE
+                replacement = self.AUTHZ_POOL_RUNNER_LINE if identity == "authz" else self.POOL_RUNNER_LINE
+                self.assertEqual(block[0].count(original + "\n"), 1, identity)
+                altered = block[0].replace(original, replacement, 1)
+                mutant_text = text[:block.start()] + altered + text[block.end():]
+                self.assertNotEqual(mutant_text, text)
                 with self.assertRaises(AssertionError):
-                    self.assert_runner(mutant)
+                    self.assert_literal_routes(mutant_text, {identity})
+
+    def test_every_job_refuses_reintroduced_job_level_fork_conditions(self):
+        for name in self.ROUTED_JOBS:
+            for identity, job in _workflow(name)["jobs"].items():
+                self.assert_no_fork_condition(job)
+                conditions = [
+                    self.PR_GUARD, "${{ " + self.PR_GUARD + " }}",
+                    f"always() && ({self.PR_GUARD})",
+                    f"!cancelled() && ({self.PR_GUARD})",
+                    "github.repository != ''",
+                    "github.event.pull_request.head.repo.full_name != ''",
+                ]
+                if "if" in job:
+                    conditions.append(f"({job['if']}) && ({self.PR_GUARD})")
+                for condition in conditions:
+                    mutant = copy.deepcopy(job)
+                    mutant["if"] = condition
+                    with self.subTest(workflow=name, job=identity, condition=condition):
+                        self.assertNotEqual(mutant, job)
+                        with self.assertRaises(AssertionError):
+                            self.assert_no_fork_condition(mutant)
+
+    def test_every_non_authz_job_pins_existing_conditions_and_requires_authz(self):
+        for name in self.ROUTED_JOBS:
+            for identity, job in _workflow(name)["jobs"].items():
+                if identity == "authz":
+                    continue
+                self.assert_job_condition(identity, job)
+                self.assert_authz_dependency(job)
+                if identity in {"changes", "validate"}:
+                    conditions = ["always()", "false"]
+                elif identity == "release-ready":
+                    conditions = [
+                        None, "success()", "always()", "!cancelled()", "failure()",
+                        "${{ !cancelled() }}", "${{ success() }}", "${{ failure() }}",
+                        "always() && needs.authz.result == 'success'",
+                        "${{ always() && needs.authz.result == 'success' }}",
+                    ]
+                else:
+                    conditions = [None, "always()", "needs.changes.outputs.docs-only == 'true'"]
+                for condition in conditions:
+                    mutant = copy.deepcopy(job)
+                    if condition is None:
+                        mutant.pop("if")
+                    else:
+                        mutant["if"] = condition
+                    with self.subTest(workflow=name, job=identity, condition=condition):
+                        self.assertNotEqual(mutant, job)
+                        with self.assertRaises(AssertionError):
+                            self.assert_job_condition(identity, mutant)
+                for missing_needs in (False, True):
+                    mutant = copy.deepcopy(job)
+                    needs = job["needs"]
+                    mutant["needs"] = [need for need in ([needs] if isinstance(needs, str) else needs)
+                                       if need != "authz"]
+                    if missing_needs:
+                        mutant.pop("needs")
+                    with self.subTest(workflow=name, job=identity, missing_needs=missing_needs):
+                        with self.assertRaises(AssertionError):
+                            self.assert_authz_dependency(mutant)
+
+    def test_status_override_conditions_require_authz_success_and_refuse_its_removal(self):
+        # Neither routed workflow currently has a non-aggregate status override.
+        # Exercise the rule on each real ordinary job so adding one cannot
+        # silently bypass a failed dependency. All overrides also refuse first.
+        for name in self.ROUTED_JOBS:
+            for identity, job in _workflow(name)["jobs"].items():
+                if identity in {"authz", "release-ready"}:
+                    continue
+                for override in ("!cancelled()", "always()", "failure()", "success() || failure()"):
+                    guarded = copy.deepcopy(job)
+                    guarded["if"] = f"({override}) && needs.authz.result == 'success'"
+                    guarded["steps"].insert(0, copy.deepcopy(self.AUTHZ_REFUSAL_STEP))
+                    for step in guarded["steps"][1:]:
+                        previous = step.get("if")
+                        step["if"] = (f"{self.AUTHZ_SUCCESS} && ({previous})"
+                                      if previous else self.AUTHZ_SUCCESS)
+                    self.assert_status_condition_requires_authz(identity, guarded)
+                    self.assertEqual(self.assert_status_override_refusals(
+                        {"jobs": {identity: guarded}}), {identity})
+                    mutant = copy.deepcopy(guarded)
+                    mutant["if"] = mutant["if"].replace(" && needs.authz.result == 'success'", "")
+                    with self.subTest(workflow=name, job=identity, override=override):
+                        self.assertNotEqual(mutant, guarded)
+                        with self.assertRaises(AssertionError):
+                            self.assert_status_condition_requires_authz(identity, mutant)
+
+    def test_security_819_all_authz_status_overrides_pin_first_refusal_and_exact_source(self):
+        expected = {"python-test.yml": {"release-ready"}, "facts-validate.yml": set()}
+        self.assertEqual(set(expected), set(self.ROUTED_JOBS))
+        for name, identities in expected.items():
+            with self.subTest(workflow=name):
+                self.assertEqual(self.assert_status_override_refusals(_workflow(name)), identities)
+                self.assert_authz_refusal_text((WORKFLOWS / name).read_text(), identities)
+
+    def test_security_819_refusal_pin_refuses_removal_reordering_bypass_and_changed_test(self):
+        for name in self.ROUTED_JOBS:
+            workflow = _workflow(name)
+            for identity in self.assert_status_override_refusals(workflow):
+                job = workflow["jobs"][identity]
+                mutants = []
+                mutant = copy.deepcopy(job)
+                mutant["steps"].pop(0)
+                mutants.append(("drop refusal", mutant))
+                mutant = copy.deepcopy(job)
+                mutant["steps"].append(mutant["steps"].pop(0))
+                mutants.append(("move after aggregate", mutant))
+                mutant = copy.deepcopy(job)
+                mutant["steps"] = []
+                mutants.append(("drop all steps", mutant))
+                for earlier in (
+                    {"uses": "actions/checkout@must-not-run"},
+                    {"uses": "./.github/actions/must-not-run"},
+                    {"uses": "actions/setup-python@must-not-run"},
+                    {"run": "python3 scripts/must-not-run.py"},
+                ):
+                    protected = copy.deepcopy(job)
+                    protected["steps"].insert(1, {**earlier, "if": self.AUTHZ_SUCCESS})
+                    self.assertEqual(self.assert_status_override_refusals(
+                        {"jobs": {identity: protected}}), {identity})
+                    mutant = copy.deepcopy(protected)
+                    mutant["steps"][0], mutant["steps"][1] = mutant["steps"][1], mutant["steps"][0]
+                    mutants.append(("move after " + str(earlier), mutant))
+                for key, value in (
+                    ("name", "Authorization is optional"),
+                    ("if", "needs.authz.result == 'success'"),
+                    ("continue-on-error", "true"),
+                    ("uses", "./.github/actions/must-not-run"),
+                    ("env", {}),
+                    ("env", {"AUTHZ_RESULT": "success"}),
+                    ("env", {"AUTHZ_RESULT": "${{ needs.changes.result }}"}),
+                    ("if", "needs.authz.result != 'skipped'"),
+                    ("if", "needs.changes.result != 'success'"),
+                    ("run", self.AUTHZ_REFUSAL_STEP["run"].replace("exit 1", "exit 0")),
+                    ("run", self.AUTHZ_REFUSAL_STEP["run"].replace("\nexit 1\n", "; exit 1")),
+                    ("run", self.AUTHZ_REFUSAL_STEP["run"].replace("\nexit 1\n", "; exit 1\n")),
+                    ("run", self.AUTHZ_REFUSAL_STEP["run"].replace("exit 1\n", "")),
+                    ("run", self.AUTHZ_REFUSAL_STEP["run"].removesuffix("\n")),
+                    ("run", self.AUTHZ_REFUSAL_STEP["run"] + "\n"),
+                    ("run", 'test "$AUTHZ_RESULT" = success || { echo "::error::authz did not succeed"; exit 1; }'),
+                    ("run", "echo ignored; exit 1"),
+                    ("run", "true"),
+                ):
+                    mutant = copy.deepcopy(job)
+                    mutant["steps"][0][key] = value
+                    mutants.append((key + ":" + str(value), mutant))
+                mutant = copy.deepcopy(job)
+                mutant["continue-on-error"] = "true"
+                mutants.append(("job continue-on-error", mutant))
+                for mutation, mutant in mutants:
+                    with self.subTest(workflow=name, job=identity, mutation=mutation):
+                        self.assertNotEqual(mutant, job)
+                        with self.assertRaises(AssertionError):
+                            self.assert_status_override_refusals({"jobs": {identity: mutant}})
+
+    def test_security_819_source_pin_refuses_missing_late_or_rewritten_refusal(self):
+        text = (WORKFLOWS / "python-test.yml").read_text()
+        identities = {"release-ready"}
+        self.assert_authz_refusal_text(text, identities)
+        for replacement in (
+            "",
+            "      - uses: actions/checkout@must-not-run\n" + self.AUTHZ_REFUSAL_TEXT,
+            "      - uses: ./.github/actions/must-not-run\n" + self.AUTHZ_REFUSAL_TEXT,
+            self.AUTHZ_REFUSAL_TEXT.replace("Refuse an unauthorised run before anything else",
+                                           "Optional authorization"),
+            self.AUTHZ_REFUSAL_TEXT.replace("needs.authz.result", "needs.changes.result"),
+            self.AUTHZ_REFUSAL_TEXT.replace("!= 'success'", "== 'success'"),
+            self.AUTHZ_REFUSAL_TEXT.replace("!= 'success'", "!= 'skipped'"),
+            self.AUTHZ_REFUSAL_TEXT.replace("exit 1", "exit 0"),
+            self.AUTHZ_REFUSAL_TEXT.replace("          exit 1\n", ""),
+            self.AUTHZ_REFUSAL_TEXT.replace("        run: |\n          ", "        run: ", 1)
+                                   .replace("\n          exit 1\n", "; exit 1\n", 1),
+            self.AUTHZ_REFUSAL_TEXT.replace("        run: |", "        run: |-", 1),
+            self.AUTHZ_REFUSAL_TEXT.replace("        run: |", "        run: |+", 1),
+            self.AUTHZ_REFUSAL_TEXT.replace("        run:", "        continue-on-error: true\n        run:"),
+        ):
+            mutant = text.replace(self.AUTHZ_REFUSAL_TEXT, replacement, 1)
+            with self.subTest(replacement=replacement):
+                self.assertNotEqual(mutant, text)
+                with self.assertRaises(AssertionError):
+                    self.assert_authz_refusal_text(mutant, identities)
+
+    def test_required_aggregate_source_refuses_skippable_conditions_and_unsafe_steps(self):
+        import yaml
+        text = (WORKFLOWS / "python-test.yml").read_text()
+        match = re.search(r"(?ms)^  release-ready:\n.*?(?=^  [\w-]+:\n|\Z)", text)
+        self.assertIsNotNone(match)
+        block = match[0]
+        condition = "    if: ${{ always() }}\n"
+        self.assertEqual(block.count(condition), 1)
+        replacements = [
+            block.replace(condition, replacement, 1)
+            for replacement in (
+                "", "    if: ${{ !cancelled() }}\n", "    if: ${{ success() }}\n",
+                "    if: ${{ failure() }}\n",
+                "    if: ${{ always() && needs.authz.result == 'success' }}\n",
+            )
+        ]
+        replacements.extend((
+            block.replace(self.AUTHZ_REFUSAL_TEXT, "", 1),
+            block.replace(self.AUTHZ_REFUSAL_TEXT,
+                          "      - uses: actions/checkout@must-not-run\n"
+                          "        if: needs.authz.result == 'success'\n" + self.AUTHZ_REFUSAL_TEXT, 1),
+            block.replace("        if: needs.authz.result == 'success'\n", "", 1),
+        ))
+        self.assert_job_condition("release-ready", _workflow("python-test.yml")["jobs"]["release-ready"])
+        for index, replacement in enumerate(replacements):
+            mutant = text[:match.start()] + replacement + text[match.end():]
+            with self.subTest(mutation=index):
+                self.assertNotEqual(mutant, text)
+                job = yaml.load(mutant, Loader=yaml.BaseLoader)["jobs"]["release-ready"]
+                with self.assertRaises(AssertionError):
+                    self.assert_job_condition("release-ready", job)
+
+    def test_security_819_first_refusal_covers_failure_and_docs_only_status_overrides(self):
+        for name in self.ROUTED_JOBS:
+            for identity, job in _workflow(name)["jobs"].items():
+                if identity == "authz":
+                    continue
+                for condition in (
+                    "always()", "!cancelled()", "failure()", "success() || failure()",
+                    "${{ failure() && !cancelled() }}",
+                    "${{ !cancelled() && needs.changes.outputs.docs-only == 'false' }}",
+                    "always () && needs.authz.result == 'success'",
+                ):
+                    guarded = copy.deepcopy(job)
+                    guarded["if"] = condition
+                    if guarded["steps"][0] != self.AUTHZ_REFUSAL_STEP:
+                        guarded["steps"].insert(0, copy.deepcopy(self.AUTHZ_REFUSAL_STEP))
+                    for step in guarded["steps"][1:]:
+                        previous = step.get("if")
+                        if previous != self.AUTHZ_SUCCESS:
+                            step["if"] = (f"{self.AUTHZ_SUCCESS} && ({previous})"
+                                          if previous else self.AUTHZ_SUCCESS)
+                    with self.subTest(workflow=name, job=identity, condition=condition):
+                        self.assertEqual(self.assert_status_override_refusals(
+                            {"jobs": {identity: guarded}}), {identity})
+                        mutant = copy.deepcopy(guarded)
+                        mutant["steps"].pop(0)
+                        self.assertNotEqual(mutant, guarded)
+                        with self.assertRaises(AssertionError):
+                            self.assert_status_override_refusals({"jobs": {identity: mutant}})
+
+    def test_r5b_every_later_action_and_run_requires_authz_success(self):
+        for name in self.ROUTED_JOBS:
+            workflow = _workflow(name)
+            for identity in self.assert_status_override_refusals(workflow):
+                job = workflow["jobs"][identity]
+                for index in range(1, len(job["steps"])):
+                    mutant = copy.deepcopy(job)
+                    mutant["steps"][index].pop("if")
+                    with self.subTest(workflow=name, job=identity, step=index + 1):
+                        with self.assertRaises(AssertionError):
+                            self.assert_status_override_refusals({"jobs": {identity: mutant}})
+                for later in (
+                    {"uses": "actions/checkout@must-not-run"},
+                    {"uses": "./.github/actions/must-not-run"},
+                    {"uses": "actions/setup-python@must-not-run"},
+                    {"uses": "actions/upload-artifact@must-not-run"},
+                    {"run": "python3 scripts/must-not-run.py"},
+                ):
+                    guarded = copy.deepcopy(job)
+                    guarded["steps"].append({**later, "if": self.AUTHZ_SUCCESS})
+                    self.assertEqual(self.assert_status_override_refusals(
+                        {"jobs": {identity: guarded}}), {identity})
+                    combined = copy.deepcopy(guarded)
+                    combined["steps"][-1]["if"] += " && (failure() || !cancelled())"
+                    self.assertEqual(self.assert_status_override_refusals(
+                        {"jobs": {identity: combined}}), {identity})
+                    for condition in (
+                        None, "failure()", "!cancelled()",
+                        "needs.authz.result != 'success'",
+                        self.AUTHZ_SUCCESS + " || failure()",
+                        self.AUTHZ_SUCCESS + " && (false) || failure()",
+                        self.AUTHZ_SUCCESS + " && (false) || (failure())",
+                        "failure() || " + self.AUTHZ_SUCCESS,
+                        "${{ always() }}",
+                    ):
+                        mutant = copy.deepcopy(guarded)
+                        if condition is None:
+                            mutant["steps"][-1].pop("if")
+                        else:
+                            mutant["steps"][-1]["if"] = condition
+                        with self.subTest(workflow=name, job=identity, step=later, condition=condition):
+                            self.assertNotEqual(mutant, guarded)
+                            with self.assertRaises(AssertionError):
+                                self.assert_status_override_refusals({"jobs": {identity: mutant}})
+
+    def test_unfiltered_pr_trigger_pin_refuses_missing_pr_target_paths_and_branches(self):
+        for name in self.ROUTED_JOBS:
+            workflow = _workflow(name)
+            self.assert_pr_trigger(workflow)
+            mutants = []
+            for key in ("paths", "paths-ignore", "branches", "branches-ignore"):
+                mutant = copy.deepcopy(workflow)
+                mutant["on"]["pull_request"] = {key: ["main" if "branches" in key else "facts/**"]}
+                mutants.append(mutant)
+            mutant = copy.deepcopy(workflow)
+            mutant["on"].pop("pull_request")
+            mutants.append(mutant)
+            mutant = copy.deepcopy(workflow)
+            mutant["on"]["pull_request_target"] = ""
+            mutants.append(mutant)
+            for index, mutant in enumerate(mutants):
+                with self.subTest(workflow=name, mutation=index):
+                    self.assertNotEqual(mutant, workflow)
+                    with self.assertRaises(AssertionError):
+                        self.assert_pr_trigger(mutant)
+
+    def test_authz_source_is_verbatim_and_refuses_canon_security_mutations(self):
+        for name in self.ROUTED_JOBS:
+            text = (WORKFLOWS / name).read_text()
+            self.assert_authz_text(text)
+            block = re.search(r"(?ms)^  authz:\n.*?(?=^  [\w-]+:\n|\Z)", text)[0]
+            workflow_run_arm = re.search(
+                r"(?ms)^            workflow_run\)\n.*?(?=^            pull_request\)\n)", block)[0]
+            pull_request_arm = re.search(
+                r"(?ms)^            pull_request\)\n.*?(?=^            \*\) fail)", block)[0]
+            fail_line = next(line for line in block.splitlines(keepends=True)
+                             if line.lstrip().startswith("fail()"))
+            default_arm = next(line for line in block.splitlines(keepends=True)
+                               if line.lstrip().startswith('*) fail "event'))
+            fork_check = next(line for line in block.splitlines(keepends=True)
+                              if line.lstrip().startswith('[ "$HEAD_IS_FORK"'))
+            workflow_run_check = next(line for line in block.splitlines(keepends=True)
+                                      if line.lstrip().startswith('[ "$WR_HEAD_REPO"'))
+            permission_lookup = next(line for line in workflow_run_arm.splitlines(keepends=True)
+                                     if line.lstrip().startswith("perm=$(gh api"))
+            pr_permission_lookup = next(line for line in pull_request_arm.splitlines(keepends=True)
+                                        if line.lstrip().startswith("perm=$(gh api"))
+            pr_permission_case = next(line for line in pull_request_arm.splitlines(keepends=True)
+                                      if line.lstrip().startswith('case "$perm"'))
+            mutations = [
+                (fail_line, "          fail() { :; }\n"),
+                (fork_check, ""),
+                (workflow_run_arm, ""),
+                (pull_request_arm, ""),
+                (default_arm, ""),
+                (workflow_run_check, ""),
+                (permission_lookup, ""),
+                (permission_lookup, permission_lookup.replace(
+                    '|| fail "workflow_run permission lookup failed"', "|| perm=write", 1)),
+                (pr_permission_lookup, ""),
+                (pr_permission_lookup, pr_permission_lookup.replace("|| echo none)", "|| echo write)", 1)),
+                (pr_permission_case, pr_permission_case.replace("admin|maintain|write", "admin|maintain|write|read", 1)),
+                (pr_permission_case, pr_permission_case.replace("admin|maintain|write", "admin|write", 1)),
+                ("push|workflow_dispatch|schedule|merge_group|release|workflow_call|repository_dispatch)",
+                 "push|workflow_dispatch|schedule|merge_group|release|workflow_call|repository_dispatch|pull_request_target)"),
+                ("    permissions: {}\n", ""),
+                ("    permissions: {}\n", "    permissions:\n      contents: write\n"),
+                ("    name: authz\n", ""),
+                ('          ALLOWED_BOTS: "dependabot[bot] pineforge-app[bot]"',
+                 '          ALLOWED_BOTS: "dependabot[bot] pineforge-app[bot] another[bot]"'),
+                ("    steps:\n", "    steps:\n      - uses: actions/checkout@must-not-run\n"),
+                ("  authz:\n", "  authz:\n    if: always()\n"),
+                ('          case "$EVENT" in\n',
+                 '          [ "$GITHUB_ACTOR" != "dependabot[bot]" ] || exit 0\n'
+                 '          case "$EVENT" in\n'),
+                (self.AUTHZ_RUNNER_LINE, self.AUTHZ_POOL_RUNNER_LINE),
+                ("          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}",
+                 "          HEAD_REPO: ${{ github.repository }}"),
+            ]
+            # Remove each of the eight payload fields, GH_TOKEN and ALLOWED_BOTS
+            # from real source, including the mandatory HEAD_IS_FORK deletion.
+            for key in ("EVENT", "REPO", "HEAD_REPO", "HEAD_IS_FORK", "ASSOCIATION",
+                        "PR_AUTHOR", "WR_HEAD_REPO", "WR_ACTOR", "GH_TOKEN", "ALLOWED_BOTS"):
+                env_line = re.search(rf"(?m)^          {key}: .*\n", block)
+                self.assertIsNotNone(env_line, key)
+                mutations.append((env_line[0], ""))
+            for original, replacement in mutations:
+                self.assertEqual(block.count(original), 1, original)
+                mutant = text.replace(original, replacement, 1)
+                with self.subTest(workflow=name, mutation=original):
+                    self.assertNotEqual(mutant, text)
+                    with self.assertRaises(AssertionError):
+                        self.assert_authz_text(mutant)
+
+    def test_authz_pins_refuse_previous_canon_without_pr_permission_lookup(self):
+        import yaml
+        # This literal is only a stale mutation fixture, never an accepted pin.
+        previous_pr_arm = """            pull_request)
+              [ "$HEAD_REPO" = "$REPO" ] || fail "pull request from another repository (${HEAD_REPO:-unknown})"
+              [ "$HEAD_IS_FORK" = "false" ] || fail "pull request from a fork"
+              case "$ASSOCIATION" in
+                OWNER|MEMBER|COLLABORATOR) ;;
+                *)
+                  case " $ALLOWED_BOTS " in
+                    *" $PR_AUTHOR "*) ;;
+                    *) fail "author ${PR_AUTHOR:-unknown} (${ASSOCIATION:-NONE}) is not an owner, member, collaborator or allowlisted bot" ;;
+                  esac ;;
+              esac ;;
+"""
+        for name in self.ROUTED_JOBS:
+            text = (WORKFLOWS / name).read_text()
+            self.assert_authz_text(text)
+            block = re.search(r"(?ms)^  authz:\n.*?(?=^  [\w-]+:\n|\Z)", text)[0]
+            current_pr_arm = re.search(
+                r"(?ms)^            pull_request\)\n.*?(?=^            \*\) fail)", block)[0]
+            self.assertEqual(block.count(current_pr_arm), 1)
+            mutant = text.replace(current_pr_arm, previous_pr_arm, 1)
+            with self.subTest(workflow=name):
+                self.assertNotEqual(mutant, text)
+                self.assertNotIn('repos/$REPO/collaborators/$PR_AUTHOR/permission', mutant)
+                with self.assertRaises(AssertionError):
+                    self.assert_authz_text(mutant)
+                stale_job = yaml.load(mutant, Loader=yaml.BaseLoader)["jobs"]["authz"]
+                with self.assertRaises(AssertionError):
+                    self.assert_authz(stale_job)
+                values = {"ASSOCIATION": "CONTRIBUTOR", "PR_AUTHOR": "private-member"}
+                script = _workflow(name)["jobs"]["authz"]["steps"][0]["run"]
+                self.assert_authz_decision(script, values, True, expect_lookup=True)
+                with self.assertRaises(AssertionError):
+                    self.assert_authz_decision(
+                        stale_job["steps"][0]["run"], values, True, expect_lookup=True)
+
+    def test_authz_pin_refuses_skips_checkout_credentials_extra_steps_and_case_changes(self):
+        for name in self.ROUTED_JOBS:
+            job = _workflow(name)["jobs"]["authz"]
+            self.assert_authz(job)
+            mutants = []
+            for key, value in (("if", "always()"), ("continue-on-error", "true"),
+                               ("timeout-minutes", "30"), ("name", "Optional authorization"),
+                               ("permissions", {"contents": "read"}),
+                               ("permissions", {"contents": "write"}),
+                               ("environment", "release-automation"), ("runs-on", "ubuntu-latest")):
+                mutant = copy.deepcopy(job)
+                mutant[key] = value
+                mutants.append(mutant)
+            for key in ("name", "permissions"):
+                mutant = copy.deepcopy(job)
+                mutant.pop(key)
+                mutants.append(mutant)
+            for key, value in (("if", "true"), ("continue-on-error", "true"),
+                               ("uses", "actions/checkout@must-not-run")):
+                mutant = copy.deepcopy(job)
+                mutant["steps"][0][key] = value
+                mutants.append(mutant)
+            mutant = copy.deepcopy(job)
+            mutant["steps"].append({"uses": "actions/checkout@must-not-run"})
+            mutants.append(mutant)
+            for key, value in (("TOKEN", "${{ secrets.GITHUB_TOKEN }}"), ("TOKEN", "${{ github.token }}")):
+                mutant = copy.deepcopy(job)
+                mutant["steps"][0]["env"][key] = value
+                mutants.append(mutant)
+            for key in ("EVENT", "REPO", "HEAD_REPO", "HEAD_IS_FORK", "ASSOCIATION",
+                        "PR_AUTHOR", "WR_HEAD_REPO", "WR_ACTOR", "GH_TOKEN", "ALLOWED_BOTS"):
+                mutant = copy.deepcopy(job)
+                mutant["steps"][0]["env"].pop(key)
+                mutants.append(mutant)
+            for key, value in (
+                ("HEAD_REPO", "${{ github.repository }}"),
+                ("REPO", "${{ github.event.pull_request.head.repo.full_name }}"),
+                ("ALLOWED_BOTS", "dependabot[bot] pineforge-app[bot] another[bot]"),
+                ("ACTOR", "${{ github.actor }}"),
+                ("OURS", "${{ github.actor == 'dependabot[bot]' }}"),
+            ):
+                mutant = copy.deepcopy(job)
+                mutant["steps"][0]["env"][key] = value
+                mutants.append(mutant)
+            script = job["steps"][0]["run"]
+            fork_arm = re.search(r"(?ms)^  pull_request\)\n.*?(?=^  \*\) fail)", script)[0]
+            workflow_run_arm = re.search(
+                r"(?ms)^  workflow_run\)\n.*?(?=^  pull_request\)\n)", script)[0]
+            default_arm = next(line for line in script.splitlines(keepends=True)
+                               if line.lstrip().startswith('*) fail "event'))
+            fail_line = next(line for line in script.splitlines(keepends=True)
+                             if line.startswith("fail()"))
+            fork_check = next(line for line in script.splitlines(keepends=True)
+                              if line.lstrip().startswith('[ "$HEAD_IS_FORK"'))
+            pr_permission_lookup = next(line for line in fork_arm.splitlines(keepends=True)
+                                        if line.lstrip().startswith("perm=$(gh api"))
+            pr_permission_case = next(line for line in fork_arm.splitlines(keepends=True)
+                                      if line.lstrip().startswith('case "$perm"'))
+            allowed_summary = next(line for line in script.splitlines(keepends=True)
+                                   if line.startswith('echo "authz: allowed'))
+            for run in (
+                script.replace(fork_arm, "", 1),
+                script.replace(workflow_run_arm, "", 1),
+                script.replace(default_arm, "", 1),
+                script.replace(fail_line, "fail() { :; }\n", 1),
+                script.replace(fork_check, "", 1),
+                script.replace(pr_permission_lookup, "", 1),
+                script.replace(pr_permission_lookup,
+                               pr_permission_lookup.replace("|| echo none)", "|| echo write)", 1), 1),
+                script.replace(pr_permission_case,
+                               pr_permission_case.replace("admin|maintain|write", "admin|maintain|write|read", 1), 1),
+                script.replace(pr_permission_case,
+                               pr_permission_case.replace("admin|maintain|write", "admin|write", 1), 1),
+                script.replace("push|workflow_dispatch|", "push|pull_request_target|workflow_dispatch|", 1),
+                script.replace("exit 1", "exit 0"),
+                script.replace('"$HEAD_REPO" = "$REPO"', '"$HEAD_REPO" != "$REPO"'),
+                'if [ "$GITHUB_ACTOR" = "dependabot[bot]" ]; then exit 0; fi\n' + script,
+                script.replace(allowed_summary, "", 1),
+            ):
+                mutant = copy.deepcopy(job)
+                mutant["steps"][0]["run"] = run
+                mutants.append(mutant)
+            for index, mutant in enumerate(mutants):
+                with self.subTest(workflow=name, mutation=index):
+                    self.assertNotEqual(mutant, job)
+                    with self.assertRaises(AssertionError):
+                        self.assert_authz(mutant)
+            workflow = _workflow(name)
+            self.assert_job_inventory(name, workflow)
+            mutant = copy.deepcopy(workflow)
+            mutant["jobs"].pop("authz")
+            with self.assertRaises(AssertionError):
+                self.assert_job_inventory(name, mutant)
+            mutant = copy.deepcopy(workflow)
+            authz = mutant["jobs"].pop("authz")
+            mutant["jobs"]["authz"] = authz
+            self.assertNotEqual(list(mutant["jobs"]), list(workflow["jobs"]))
+            with self.assertRaises(AssertionError):
+                self.assert_job_inventory(name, mutant)
+
+    def authz_shell(self, script, values, *, permission="write", lookup_fails=False):
+        # Stub only gh inside this child shell for pull_request and workflow_run.
+        # Record the actual lookup and capture the workflow summary without network.
+        stub = r"""gh() {
+  printf '%s\n' "$*" >> "$AUTHZ_LOOKUP_LOG"
+  [ "$LOOKUP_FAILS" = false ] || return 9
+  printf '%s\n' "$LOOKUP_PERMISSION"
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = Path(tmp) / "summary"
+            lookups = Path(tmp) / "lookups"
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "EVENT": "pull_request", "REPO": "pineforge-4pass/pineforge-release",
+                "HEAD_REPO": "pineforge-4pass/pineforge-release", "HEAD_IS_FORK": "false",
+                "ASSOCIATION": "MEMBER", "PR_AUTHOR": "member",
+                "WR_HEAD_REPO": "", "WR_ACTOR": "",
+                "GH_TOKEN": "fixture-token",
+                "ALLOWED_BOTS": "dependabot[bot] pineforge-app[bot]",
+                "GITHUB_STEP_SUMMARY": str(summary), "AUTHZ_LOOKUP_LOG": str(lookups),
+                "LOOKUP_PERMISSION": permission, "LOOKUP_FAILS": str(lookup_fails).lower(),
+            }
+            env.update(values)
+            done = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", "-c", stub + script],
+                env=env, capture_output=True, text=True,
+            )
+            return (done, summary.read_text() if summary.exists() else "",
+                    lookups.read_text() if lookups.exists() else "")
+
+    def assert_authz_decision(self, script, values, accepted, *, permission="write",
+                              lookup_fails=False, expect_lookup=False):
+        done, summary, lookups = self.authz_shell(
+            script, values, permission=permission, lookup_fails=lookup_fails)
+        self.assertEqual(done.returncode, 0 if accepted else 1, (done.stdout, done.stderr, summary))
+        self.assertEqual(done.stderr, "")
+        event = values.get("EVENT", "pull_request")
+        author = values.get("PR_AUTHOR", "member")
+        if accepted:
+            suffix = f" by {author}" if author else ""
+            self.assertEqual(summary, f"authz: allowed ({event}{suffix})\n")
+            self.assertEqual(done.stdout, "")
+        else:
+            self.assertTrue(done.stdout.startswith("::error title=authz::"), done.stdout)
+            self.assertTrue(summary.startswith("authz: REFUSED: "), summary)
+            self.assertNotIn("authz: allowed", summary)
+            if expect_lookup and event == "pull_request":
+                association = values.get("ASSOCIATION", "MEMBER") or "NONE"
+                reported_permission = "none" if lookup_fails else permission
+                reason = (f"author {author or 'unknown'} ({association}) has permission "
+                          f"'{reported_permission}', not write, and is not an allowlisted bot")
+                self.assertEqual(done.stdout, f"::error title=authz::{reason}\n")
+                self.assertEqual(summary, f"authz: REFUSED: {reason}\n")
+        expected_lookup = ""
+        if expect_lookup:
+            actor = values["WR_ACTOR"] if event == "workflow_run" else author
+            expected_lookup = (
+                "api repos/pineforge-4pass/pineforge-release/collaborators/"
+                + actor + "/permission --jq .permission\n"
+            )
+        self.assertEqual(lookups, expected_lookup)
+
+    def test_actual_authz_shell_pins_author_identity_events_and_workflow_run_permissions(self):
+        repository = "pineforge-4pass/pineforge-release"
+        cases = [(association, {"ASSOCIATION": association}, True, {})
+                 for association in ("OWNER", "MEMBER", "COLLABORATOR")]
+        cases += [(bot, {"PR_AUTHOR": bot, "ASSOCIATION": "NONE"}, True, {})
+                  for bot in ("dependabot[bot]", "pineforge-app[bot]")]
+        cases += [(association, {"PR_AUTHOR": "outsider", "ASSOCIATION": association}, False,
+                   {"permission": "read", "expect_lookup": True})
+                  for association in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "")]
+        cases.append(("other bot", {"PR_AUTHOR": "another[bot]", "ASSOCIATION": "NONE"}, False,
+                      {"permission": "read", "expect_lookup": True}))
+        contributor = {"PR_AUTHOR": "private-member", "ASSOCIATION": "CONTRIBUTOR"}
+        for permission in ("admin", "maintain", "write", "read", "triage", "none", "", "unknown"):
+            cases.append(("CONTRIBUTOR permission " + permission, contributor,
+                          permission in {"admin", "maintain", "write"},
+                          {"permission": permission, "expect_lookup": True}))
+        cases.append(("CONTRIBUTOR lookup error", contributor, False,
+                      {"permission": "write", "lookup_fails": True, "expect_lookup": True}))
+        cases += [("other association with write", {
+            "PR_AUTHOR": "writer", "ASSOCIATION": association,
+        }, True, {"permission": "write", "expect_lookup": True})
+                  for association in ("NONE", "FIRST_TIME_CONTRIBUTOR", "")]
+        cases.append(("other bot with write", {"PR_AUTHOR": "another[bot]", "ASSOCIATION": "NONE"}, True,
+                      {"permission": "write", "expect_lookup": True}))
+        for head, fork in (("outside/fork", "false"), (repository, "true")):
+            cases.append(("CONTRIBUTOR head refused before lookup",
+                          {**contributor, "HEAD_REPO": head, "HEAD_IS_FORK": fork}, False, {}))
+        for author in ("member", "dependabot[bot]", "pineforge-app[bot]"):
+            for head, fork in (("outside/fork", "true"), ("member/fork", "true"),
+                               (repository, "true"), ("", "false")):
+                cases.append(("fork or missing head", {
+                    "HEAD_REPO": head, "HEAD_IS_FORK": fork, "PR_AUTHOR": author,
+                }, False, {}))
+        cases.append(("missing fork flag", {"HEAD_IS_FORK": ""}, False, {}))
+        cases += [(event, {"EVENT": event, "PR_AUTHOR": ""}, True, {})
+                  for event in ("push", "workflow_dispatch", "schedule", "merge_group",
+                                "release", "workflow_call", "repository_dispatch")]
+        cases += [(event, {"EVENT": event, "PR_AUTHOR": ""}, False, {})
+                  for event in ("unknown", "pull_request_target", "")]
+        for actor in ("member", "dependabot[bot]"):
+            cases.append(("target with author", {
+                "EVENT": "pull_request_target", "PR_AUTHOR": actor,
+            }, False, {}))
+        workflow_run = {"EVENT": "workflow_run", "PR_AUTHOR": "",
+                        "WR_HEAD_REPO": repository, "WR_ACTOR": "member"}
+        for permission in ("admin", "maintain", "write", "read", "triage", "none", "", "unknown"):
+            cases.append(("workflow_run permission " + permission, workflow_run,
+                          permission in {"admin", "maintain", "write"},
+                          {"permission": permission, "expect_lookup": True}))
+        cases.append(("failed permission lookup", workflow_run, False,
+                      {"permission": "write", "lookup_fails": True, "expect_lookup": True}))
+        cases.append(("non-member actor", {**workflow_run, "WR_ACTOR": "outsider"}, False,
+                      {"permission": "read", "expect_lookup": True}))
+        for actor in ("dependabot[bot]", "pineforge-app[bot]"):
+            cases.append(("workflow_run bot policy", {**workflow_run, "WR_ACTOR": actor},
+                          actor == "pineforge-app[bot]",
+                          {"permission": "none", "lookup_fails": True}))
+        for head in ("outside/fork", ""):
+            for actor in ("member", "dependabot[bot]", "pineforge-app[bot]"):
+                cases.append(("workflow_run foreign or missing head",
+                              {**workflow_run, "WR_HEAD_REPO": head, "WR_ACTOR": actor}, False, {}))
+        for name in self.ROUTED_JOBS:
+            job = _workflow(name)["jobs"]["authz"]
+            self.assert_authz(job)
+            step = job["steps"][0]
+            for label, values, accepted, options in cases:
+                values = {**values, "ALLOWED_BOTS": step["env"]["ALLOWED_BOTS"]}
+                with self.subTest(workflow=name, case=label, values=values):
+                    self.assert_authz_decision(step["run"], values, accepted, **options)
+
+    def test_actual_authz_decisions_refuse_fail_function_made_a_noop(self):
+        cases = (
+            ({"HEAD_REPO": "outside/fork"}, {}),
+            ({"HEAD_IS_FORK": "true"}, {}),
+            ({"ASSOCIATION": "NONE", "PR_AUTHOR": "outsider"},
+             {"permission": "read", "expect_lookup": True}),
+            ({"ASSOCIATION": "CONTRIBUTOR", "PR_AUTHOR": "private-member"},
+             {"permission": "write", "lookup_fails": True, "expect_lookup": True}),
+            ({"EVENT": "workflow_run", "PR_AUTHOR": "",
+              "WR_HEAD_REPO": "outside/fork", "WR_ACTOR": "member"}, {}),
+            ({"EVENT": "pull_request_target", "PR_AUTHOR": ""}, {}),
+        )
+        for name in self.ROUTED_JOBS:
+            step = _workflow(name)["jobs"]["authz"]["steps"][0]
+            script = step["run"]
+            fail_line = next(line for line in script.splitlines(keepends=True)
+                             if line.startswith("fail()"))
+            mutant = script.replace(fail_line, "fail() { :; }\n", 1)
+            self.assertNotEqual(mutant, script)
+            for values, options in cases:
+                values = {**values, "ALLOWED_BOTS": step["env"]["ALLOWED_BOTS"]}
+                with self.subTest(workflow=name, values=values):
+                    self.assert_authz_decision(script, values, False, **options)
+                    with self.assertRaises(AssertionError):
+                        self.assert_authz_decision(mutant, values, False, **options)
+
+    def test_actual_pr_permission_cases_detect_lookup_and_permission_mutations(self):
+        values = {"ASSOCIATION": "CONTRIBUTOR", "PR_AUTHOR": "private-member"}
+        for name in self.ROUTED_JOBS:
+            script = _workflow(name)["jobs"]["authz"]["steps"][0]["run"]
+            pr_arm = re.search(r"(?ms)^  pull_request\)\n.*?(?=^  \*\) fail)", script)[0]
+            lookup = next(line for line in pr_arm.splitlines(keepends=True)
+                          if line.lstrip().startswith("perm=$(gh api"))
+            permission_case = next(line for line in pr_arm.splitlines(keepends=True)
+                                   if line.lstrip().startswith('case "$perm"'))
+            mutations = (
+                ("delete PR lookup", lookup, "", True, {"permission": "write"}),
+                ("allow read", permission_case,
+                 permission_case.replace("admin|maintain|write", "admin|maintain|write|read", 1),
+                 False, {"permission": "read"}),
+                ("refuse maintain", permission_case,
+                 permission_case.replace("admin|maintain|write", "admin|write", 1),
+                 True, {"permission": "maintain"}),
+                ("lookup error passes", lookup,
+                 lookup.replace("|| echo none)", "|| echo write)", 1),
+                 False, {"permission": "write", "lookup_fails": True}),
+            )
+            for label, original, replacement, accepted, options in mutations:
+                self.assertEqual(script.count(original), 1)
+                mutant = script.replace(original, replacement, 1)
+                with self.subTest(workflow=name, mutation=label):
+                    self.assertNotEqual(mutant, script)
+                    self.assert_authz_decision(script, values, accepted, expect_lookup=True, **options)
+                    with self.assertRaises(AssertionError):
+                        self.assert_authz_decision(mutant, values, accepted, expect_lookup=True, **options)
+
+    def assert_exception_runner(self, workflow, identity, job):
+        expected = self.EXEMPT_RUNNERS[workflow][identity]
+        actual = job.get("runs-on")
+        self.assertNotEqual(actual, self.RUNNER, "release jobs must not join the shared pool")
+        self.assertEqual(actual, expected)
+        if (workflow, identity) in self.LEGACY_LABEL_JOBS:
+            self.assertEqual((job.get("env") or {}).get("PF_CI_LABELS"),
+                             '["self-hosted","pf-ci","pf-ci-x64"]')
+
+    def test_credential_and_release_routes_pin_ubuntu_latest_and_refuse_the_pool_array(self):
+        # This repository has no macOS jobs; its complete workflow/job inventory
+        # below also refuses adding an unreviewed macOS/pool matrix.
+        self.assertEqual({path.name for path in WORKFLOWS.glob("*.yml")},
+                         set(self.ROUTED_JOBS) | set(self.EXEMPT_RUNNERS))
+        for name, expected in self.EXEMPT_RUNNERS.items():
+            jobs = _workflow(name)["jobs"]
+            self.assertEqual(set(jobs), set(expected))
+            for identity, job in jobs.items():
+                with self.subTest(workflow=name, job=identity):
+                    self.assert_exception_runner(name, identity, job)
+                    mutant = copy.deepcopy(job)
+                    mutant["runs-on"] = self.RUNNER.copy()
+                    with self.assertRaises(AssertionError):
+                        self.assert_exception_runner(name, identity, mutant)
+                    if (name, identity) in self.LEGACY_LABEL_JOBS:
+                        mutant = copy.deepcopy(job)
+                        mutant["env"].pop("PF_CI_LABELS")
+                        with self.assertRaises(AssertionError):
+                            self.assert_exception_runner(name, identity, mutant)
 
     def test_docs_only_gates_keep_existing_checks_and_main_coverage(self):
         workflow = _workflow("python-test.yml")
@@ -1409,12 +3526,17 @@ class PrTierWorkflowTest(unittest.TestCase):
         self.assertEqual(changes["steps"][0]["if"], "github.event_name == 'pull_request'")
         for identity in self.ROUTED_JOBS["python-test.yml"] - {"release-ready"}:
             job = workflow["jobs"][identity]
-            self.assertEqual(job["needs"], "changes")
-            self.assertEqual(job["if"], "needs.changes.outputs.docs-only == 'false'")
+            self.assertEqual(job["needs"], ["authz", "changes"])
+            self.assert_job_condition(identity, job)
+        self.assertEqual(changes["needs"], "authz")
+        self.assert_job_condition("changes", changes)
         aggregate = workflow["jobs"]["release-ready"]
         self.assertEqual(aggregate["name"], "release/ready")
-        self.assertEqual(aggregate["if"], "${{ always() }}")
-        self.assertEqual(set(aggregate["needs"]), self.ROUTED_JOBS["python-test.yml"] - {"release-ready"} | {"changes"})
+        self.assert_job_condition("release-ready", aggregate)
+        self.assertEqual(set(aggregate["needs"]),
+                         self.ROUTED_JOBS["python-test.yml"] - {"release-ready"} | {"authz", "changes"})
+        self.assert_authz_refusal_first(aggregate)
+        self.assertEqual(aggregate["steps"][1]["env"]["AUTHZ_OK"], "${{ needs.authz.result == 'success' }}")
         facts = _workflow("facts-validate.yml")
         self.assertEqual(set(facts["on"]), {"pull_request", "push"})
         self.assertEqual(facts["on"]["push"]["branches"], ["main"])
@@ -1424,7 +3546,8 @@ class PrTierWorkflowTest(unittest.TestCase):
             "tests/test_release_workflows.py", ".github/workflows/**",
         ])
         validate = facts["jobs"]["validate"]
-        self.assertNotIn("if", validate, "the validate check must finish even on docs-only PRs")
+        self.assert_job_condition("validate", validate)
+        self.assertEqual(validate["needs"], "authz")
         self.assertEqual(validate["steps"][0]["with"]["fetch-depth"],
                          "${{ github.event_name == 'pull_request' && '0' || '1' }}")
         for step in validate["steps"][2:]:

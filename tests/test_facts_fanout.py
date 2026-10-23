@@ -380,7 +380,7 @@ class FanoutWorkflow(unittest.TestCase):
         self.assertIn("branches: [main]", text)
         self.assertIn("'facts/facts.json'", text)
         self.assertIn("default: true", text)
-        self.assertIn("cron: '7,22,37,52 * * * *'", text)
+        self.assertIn("cron: '7 3 * * *'", text)
         self.assertIn("group: facts-web-dispatch", text)
         self.assertIn("cancel-in-progress: false", text)
         self.assertNotIn("facts-web-dispatch", descriptions_text)

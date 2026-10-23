@@ -5,7 +5,7 @@ on:
     types: [pineforge-release-status]
   workflow_dispatch:
   schedule:
-    - cron: '1,16,31,46 * * * *'
+    - cron: '1,31 * * * *'
 
 permissions:
   contents: read
@@ -16,13 +16,8 @@ concurrency:
 
 jobs:
   plan:
-    runs-on: >-
-      ${{ github.event_name != 'pull_request_target' &&
-          github.actor != 'dependabot[bot]' && github.triggering_actor != 'dependabot[bot]' &&
-          contains(fromJSON('["push","pull_request","workflow_dispatch","schedule","release"]'), github.event_name) &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
-          fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
@@ -35,6 +30,7 @@ jobs:
           ref: main
           persist-credentials: false
       - id: plan
+        # signal omits DELIVERY_ONLY roles (compute): no policy, token or polling.
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
@@ -48,6 +44,7 @@ jobs:
   verify:
     needs: plan
     if: needs.plan.outputs.consumers != '[]'
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
     environment: release-automation
     permissions:

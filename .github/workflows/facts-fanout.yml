@@ -13,7 +13,7 @@ on:
         default: true
         required: true
   schedule:
-    - cron: '7,22,37,52 * * * *'
+    - cron: '7 3 * * *'
 
 permissions:
   contents: read
@@ -27,8 +27,8 @@ jobs:
   web:
     if: github.ref == 'refs/heads/main'
     environment: release-automation
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     env:
       FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
       # toJSON returns a nonempty string even for false; manual false is preserved.
@@ -95,8 +95,8 @@ jobs:
   license:
     if: github.ref == 'refs/heads/main'
     environment: release-automation
+    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     env:
       FACTS_CONSUMER_ROLE: license
       FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}

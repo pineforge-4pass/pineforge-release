@@ -875,11 +875,11 @@ class PinnedLicenceDigestsTest(unittest.TestCase):
     """
 
     PINNED = {
-        "pineforge-hpo/LICENSE": "032d774b3a42b323a621f0380d4dbad2cb377f88c7e3c255f3e845e961750a40",
-        "pineforge-hpo/NOTICE": "906b446211797822dcecba20fbc9df8734595ce7fdc6ef655b6b995c86ac32e0",
+        "pineforge-hpo/LICENSE": "1aa95beed7fc0b368872fcd1bcf6a09a0f67ef3014b5e48ae21404cb647a1136",
+        "pineforge-hpo/NOTICE": "7436681c495f6c699f8c71c8dd7e5343c2340912492b21674e343376be648d30",
         "pineforge-hpo/THIRD_PARTY_LICENSES/sobol_joe_kuo.txt":
             "9d10226b50eeb34be0ab06bfa3392c7bd1f04bf602f9af4343295d1fd003d0e3",
-        "pineforge-codegen/LICENSE": "8ce6f5370bc4832baa5a0771504ea34ed406459a82cf6eb55acd1dfcb473b6fc",
+        "pineforge-codegen/LICENSE": "5f43346a79228e0ee266ea08efc6e2106d64afa9255fc360cc329903268f720e",
     }
 
     def test_manifest_lists_exactly_the_pinned_digests_for_these_files(self):
@@ -914,15 +914,16 @@ class DispatcherModuleTest(unittest.TestCase):
 
 
 class ReadmePairRuleTest(unittest.TestCase):
-    # SHA-256 of README.md lines 196-225 (the pair rule) as published on the hub's main when this change was made.
+    # SHA-256 of README.md lines 215-244 (the pair rule, unchanged text; it was lines 196-225 before the
+    # release-flow section grew by 19 lines) as published on the hub's main when this change was made.
     # A checkout in CI has no origin/main, so the rule is pinned by digest; a deliberate change of the rule changes
     # this value in the same commit.
     PAIR_RULE_SHA256 = "35b72f7f5c7466cfc212a71eaf05df98f45e92411fd34a67bfff761556c61601"
 
-    def test_lines_196_to_225_are_byte_identical_to_the_published_rule(self):
+    def test_lines_215_to_244_are_byte_identical_to_the_published_rule(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
-        self.assertGreaterEqual(len(lines), 225)
-        self.assertEqual(hashlib.sha256(b"".join(lines[195:225])).hexdigest(), self.PAIR_RULE_SHA256)
+        self.assertGreaterEqual(len(lines), 244)
+        self.assertEqual(hashlib.sha256(b"".join(lines[214:244])).hexdigest(), self.PAIR_RULE_SHA256)
 
 
 if __name__ == "__main__":
