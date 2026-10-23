@@ -330,8 +330,7 @@ class RedeliverTest(unittest.TestCase):
                                     "RELEASE_COMPUTE_FIRST_PAIR": "not-semver"}):
             self.invoke(consumer="application")
         expected_body = contract.canonical({
-            "event_type": "release-pair",
-            "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE)),
+            "event_type": "pineforge-release", "client_payload": self.event,
         })
         self.assertEqual(self.requests, [expected_body])
         self.assertEqual(self.accepted, [expected_body])
@@ -339,15 +338,42 @@ class RedeliverTest(unittest.TestCase):
         self.assertEqual(self.puts, [(TAG, "delivery-redelivered-application-1.json", audit_raw)])
         self.assertEqual(self.output.read_bytes(), audit_raw)
 
-    def test_pair_redelivery_matches_automatic_dispatch_for_both_targets(self):
-        """Mutation: keep redeliver's former pineforge-release event/payload."""
+    def test_application_redelivery_preserves_release_ready_v1_without_an_opt_in(self):
+        """Mutation: map application to release-pair in manual stable replay."""
+        ready_raw = (ROOT / "tests/fixtures/release-ready.json").read_bytes()
+        before = copy.deepcopy(self.store.assets)
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "application"}):
+            self.assertEqual(self.cli(consumer="application"), 0)
         expected_body = contract.canonical({
-            "event_type": "release-pair",
-            "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE)),
-        })
+            "event_type": "pineforge-release", "client_payload": contract.decode(ready_raw)})
+        self.assertEqual(self.requests, [expected_body])
+        self.assertEqual(self.accepted, [expected_body])
+        sent = contract.decode(self.requests[0])["client_payload"]
+        self.assertEqual(contract.canonical(sent), ready_raw)
+        self.assertEqual(sent["schema"], "pineforge/release-ready/v1")
+        self.assertEqual(set(sent), {"schema", "event_id", "release_version", "prerelease", "hub_commit",
+                                    "versions", "image", "facts", "manifest", "run_id"})
+        self.assertNotIn(f"https://github.com/{contract.HUB}/releases/download/{TAG}/{contract.CANDIDATE}",
+                         self.public.reads)
+        audit_raw = contract.canonical(self.audit(1, consumer="application"))
+        name = "delivery-redelivered-application-1.json"
+        self.assertEqual(self.puts, [(TAG, name, audit_raw)])
+        self.assertEqual(self.store.assets, {**before, (TAG, name): audit_raw})
+        self.assertEqual(self.output.read_bytes(), audit_raw)
+
+    def test_redelivery_matches_each_targets_automatic_dispatch_contract(self):
+        """Mutation: switch either target to the other target's event/payload."""
+        expected_bodies = {
+            "application": contract.canonical({
+                "event_type": "pineforge-release", "client_payload": self.event}),
+            "compute": contract.canonical({
+                "event_type": "release-pair",
+                "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE))}),
+        }
         for consumer in ("application", "compute"):
             with self.subTest(consumer=consumer), patch.dict(os.environ, {
                     "RELEASE_READY_CONSUMERS": consumer, "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0"}):
+                expected_body = expected_bodies[consumer]
                 self.assertEqual(self.cli("dispatch", consumer=consumer,
                                           output=self.output.with_name("automatic.json")), 0)
                 self.assertEqual(self.cli(consumer=consumer), 0)
@@ -459,12 +485,20 @@ class RedeliverTest(unittest.TestCase):
         changed["hub_commit"] = "9" * 40
         candidate_url = f"https://github.com/{contract.HUB}/releases/download/{TAG}/{contract.CANDIDATE}"
         download = self.public.download
-        for consumer in ("application", "compute"):
-            with self.subTest(consumer=consumer), patch.dict(os.environ, {
-                    "RELEASE_READY_CONSUMERS": consumer, "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0"}), \
-                    patch.object(self.public, "download", side_effect=lambda url, origins:
-                                 contract.canonical(changed) if url == candidate_url else download(url, origins)):
-                self.assert_refused(consumer=consumer, message="manifest does not bind this candidate")
+        with patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "application,compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0"}), \
+                patch.object(self.public, "download", side_effect=lambda url, origins:
+                             contract.canonical(changed) if url == candidate_url else download(url, origins)):
+            self.assert_refused(consumer="compute", message="manifest does not bind this candidate")
+            self.public.reads.clear()
+            self.invoke(consumer="application")
+        expected_body = contract.canonical({"event_type": "pineforge-release", "client_payload": self.event})
+        self.assertEqual(self.requests, [expected_body])
+        self.assertEqual(self.accepted, [expected_body])
+        self.assertNotIn(candidate_url, self.public.reads)
+        audit_raw = contract.canonical(self.audit(1, consumer="application"))
+        self.assertEqual(self.puts, [(TAG, "delivery-redelivered-application-1.json", audit_raw)])
+        self.assertEqual(self.output.read_bytes(), audit_raw)
 
     def test_refuses_superseded_release(self):
         """Mutation: replace the newer-release require condition with True."""
