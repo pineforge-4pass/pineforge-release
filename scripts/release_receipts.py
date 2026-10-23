@@ -468,9 +468,9 @@ def collect(client, hub_client, store, role, run_id=0):
         if transition(previous, public):
             stem = prefix + role + "-" + (facts_target["commit"] + "-" + facts_target["sha256"] + "-" if facts_only else "")
             name = f"{stem}{public['attempt']}-{public['sequence']}.json"
-            raw = canonical(public)
+            receipt_raw = canonical(public)
             if run_id:
-                store.put(row, name, raw)
+                store.put(row, name, receipt_raw)
             if public["state"] == "failed":
                 incident = "facts-" + facts_target["sha256"] if facts_only else row["tag_name"]
                 title = "Facts consumer failed" if facts_only else f"Release {event['release_version']}: consumer failed"
@@ -478,7 +478,7 @@ def collect(client, hub_client, store, role, run_id=0):
                              f"Consumer role: {role}; failed stage evidence retained in the consumer's private report.\n\n" + run_link())
             if not run_id:
                 # Keep the sweep's only receipt write last, after every other fallible step.
-                store.put(row, name, raw)
+                store.put(row, name, receipt_raw)
 
     skipped = []
     for run in sorted(runs, key=lambda row: row["id"]):
@@ -488,15 +488,19 @@ def collect(client, hub_client, store, role, run_id=0):
         else:
             try:
                 collect_run(run)
-            except (Invalid, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
+            except (Invalid, Pending, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
                 # The text can carry consumer-controlled bytes: no markup, mention, marker or line break reaches an issue.
-                reason = "".join("?" if char in "<>@`[]\r\n" else char for char in str(error))[:200]
+                safe_characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _.,;()'=-"
+                reason = "".join(char if char in safe_characters else "?" for char in str(error))[:200]
                 skipped.append((run["id"], reason))
                 print(f"::warning::receipt artifact skipped: role={role} run={run['id']}: {reason}", file=sys.stderr)
     if skipped:
+        skipped_lines = [f"run={candidate_id}: {reason}" for candidate_id, reason in sorted(skipped)[:50]]
+        if len(skipped) > 50:
+            skipped_lines.append(f"and {len(skipped) - 50} more skipped")
         report_issue(hub_client, "receipt-skipped-" + role,
                      f"Release chain: receipt artifacts skipped ({role})",
-                     "\n".join(f"run={candidate_id}: {reason}" for candidate_id, reason in sorted(skipped)))
+                     "\n".join(skipped_lines))
 
 
 def signal_targets(signal, enabled):

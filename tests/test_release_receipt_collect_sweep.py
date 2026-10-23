@@ -193,18 +193,29 @@ class ReceiptCollectSweepTests(unittest.TestCase):
         self.assert_bad_first_continues(f, "month must be in 1..12")
 
     def test_skipped_reason_carries_no_marker_mention_markup_or_line_break_and_is_capped(self):
-        f = SweepFixture((90,))
-        hostile = "<!-- pineforge-release-chain:x -->\n@owner [a](b) `c` " + "x" * 300
-        with patch.object(receipts, "validate_receipt", side_effect=contract.Invalid(hostile)):
-            self.assertIsNone(self.collect(f))
-        body = self.report.call_args.args[3]
-        prefix = "run=90: "
-        self.assertTrue(body.startswith(prefix))
-        reason = body[len(prefix):]
-        self.assertEqual(len(reason), 200)
-        for char in "<>@`[]\r\n":
-            self.assertNotIn(char, reason)
-        self.assertNotIn("\n", self.output.getvalue().strip())
+        safe_suffix = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _.,;()'=- "
+        for hostile, expected in (
+            ("<!-- pineforge-release-chain:x -->", "??-- pineforge-release-chain?x --?"),
+            ("\r\n@owner [a](b) `c`", "???owner ?a?(b) ?c?"),
+            ("https://example.com", "https???example.com"),
+            ("#123", "?123"),
+            ("owner/repo#1", "owner?repo?1"),
+            ("&#64;owner", "??64;owner"),
+            ("~~~", "???"),
+            ("*x*", "?x?"),
+            ("|", "?"),
+            ("é\t\\", "???"),
+        ):
+            with self.subTest(hostile=hostile):
+                f = SweepFixture()
+                self.report.reset_mock()
+                self.output.seek(0)
+                self.output.truncate()
+                error = contract.Invalid(hostile + safe_suffix + "x" * 300)
+                with patch.object(receipts, "validate_receipt", side_effect=error):
+                    self.assertIsNone(self.collect(f))
+                self.assertEqual(f.written_names(), [])
+                self.assert_skipped(90, (expected + safe_suffix + "x" * 300)[:200], f)
 
     def test_sweep_skips_a_type_error_in_receipt(self):
         f = SweepFixture((90, 91, 92))
@@ -238,15 +249,23 @@ class ReceiptCollectSweepTests(unittest.TestCase):
         self.assertEqual(self.output.getvalue(), "")
         self.report.assert_not_called()
 
-    def test_pending_during_a_sweep_stays_fatal(self):
+    def test_pending_during_a_sweep_is_reported_and_skipped(self):
         f = SweepFixture((90, 91, 92))
-        error = contract.Pending("artifact unavailable")
-        with patch.object(f, "request", side_effect=error), self.assertRaises(contract.Pending) as caught:
-            self.collect(f)
-        self.assertIs(caught.exception, error)
-        self.assertEqual(f.written_names(), [])
-        self.assertEqual(self.output.getvalue(), "")
-        self.report.assert_not_called()
+        request = f.request
+
+        def request_with_unavailable_artifact(url, **kwargs):
+            if url == f.archive_url(90):
+                raise contract.Pending("artifact unavailable")
+            return request(url, **kwargs)
+
+        with patch.object(f, "request", side_effect=request_with_unavailable_artifact):
+            self.assert_bad_first_continues(f, "artifact unavailable")
+
+    def test_sweep_skips_a_receipt_naming_an_unknown_release(self):
+        f = SweepFixture((90, 91, 92))
+        f.documents[90]["release_version"] = "99.99.99"
+        f.seal(90)
+        self.assert_bad_first_continues(f, "hub release unavailable")
 
     def test_already_stored_newer_receipt_skips_validation_without_api_calls(self):
         for attempt, sequence in ((91, 1), (90, 8)):
@@ -318,6 +337,31 @@ class ReceiptCollectSweepTests(unittest.TestCase):
             for run_id in (90, 91, 92)
         )
         self.assertEqual(self.output.getvalue(), expected * 2)
+        self.assertEqual(f.written_names(), [])
+
+    def test_skipped_issue_lists_at_most_50_runs_and_replays_identically(self):
+        f = SweepFixture(tuple(reversed(range(90, 150))))
+        for run_id in f.documents:
+            f.documents[run_id] = copy.deepcopy(f.old_shape)
+            f.seal(run_id)
+        self.collect(f)
+        f.artifacts.reverse()
+        self.collect(f)
+        self.assertEqual(self.report.call_count, 2)
+        first, second = self.report.call_args_list
+        expected_body = "\n".join([
+            *(f"run={run_id}: {INVENTORY_ERROR}" for run_id in range(90, 140)),
+            "and 10 more skipped",
+        ])
+        self.assertEqual(first.args[1:], (
+            "receipt-skipped-hosted", "Release chain: receipt artifacts skipped (hosted)", expected_body,
+        ))
+        self.assertEqual(first.args[3].encode("utf-8"), second.args[3].encode("utf-8"))
+        expected_warnings = "".join(
+            f"::warning::receipt artifact skipped: role=hosted run={run_id}: {INVENTORY_ERROR}\n"
+            for run_id in range(90, 150)
+        )
+        self.assertEqual(self.output.getvalue(), expected_warnings * 2)
         self.assertEqual(f.written_names(), [])
 
     def test_clean_sweep_makes_no_skip_report(self):

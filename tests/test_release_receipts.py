@@ -289,8 +289,11 @@ class ReceiptCollectionTests(unittest.TestCase):
             self.collect()
         self.assertIn("::warning::receipt artifact skipped: role=license run=1007: ambiguous consumer receipt artifact",
                       output.getvalue())
-        self.assertEqual(self.store.assets, {})
-        self.assertFalse(any(route.endswith("/zip") for route in self.client.routes))
+        self.assertEqual(self.store.assets, {STEM + "1-2.json": EXPECTED_STORED[STEM + "1-2.json"]})
+        self.assertNotIn(f"https://api.github.com/repos/{REPO}/actions/artifacts/2007/zip", self.client.routes)
+        self.assertNotIn(f"https://api.github.com/repos/{REPO}/actions/artifacts/8000/zip", self.client.routes)
+        self.assertEqual(self.client.routes.count(
+            f"https://api.github.com/repos/{REPO}/actions/artifacts/2049/zip"), 1)
 
     def test_schedule_preserves_digest_inventory_and_role_checks(self):
         for mutation, message in (("digest", "receipt archive digest differs"),
@@ -309,7 +312,12 @@ class ReceiptCollectionTests(unittest.TestCase):
                 with redirect_stderr(output), patch.object(receipts, "report_issue"):
                     self.collect()
                 self.assertIn(f"::warning::receipt artifact skipped: role=license run=1007: {message}", output.getvalue())
-                self.assertEqual(self.store.assets, {})
+                self.assertEqual(self.store.assets, {STEM + "1-2.json": EXPECTED_STORED[STEM + "1-2.json"]})
+                self.assertEqual(self.client.routes.count(
+                    f"https://api.github.com/repos/{REPO}/actions/artifacts/2007/zip"), 1)
+                self.assertEqual(self.client.routes.count(
+                    f"https://api.github.com/repos/{REPO}/actions/artifacts/2049/zip"), 1)
+                self.store = MemoryStore()
                 with self.assertRaisesRegex(contract.Invalid, message):
                     self.collect(1007)
                 self.assertEqual(self.store.assets, {})
