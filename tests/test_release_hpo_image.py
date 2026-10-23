@@ -877,6 +877,10 @@ class ReadmePairRuleTest(unittest.TestCase):
     # this value in the same commit.
     PAIR_RULE_SHA256 = "35b72f7f5c7466cfc212a71eaf05df98f45e92411fd34a67bfff761556c61601"
 
+    def test_runner_documentation_keeps_the_430_line_published_layout(self):
+        lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
+        self.assertEqual(len(lines), 430)
+
     def test_lines_215_to_244_are_byte_identical_to_the_published_rule(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
         self.assertGreaterEqual(len(lines), 244)

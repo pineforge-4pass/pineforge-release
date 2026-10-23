@@ -3619,21 +3619,35 @@ class PrTierWorkflowTest(unittest.TestCase):
 
     def assert_authz_runner_documentation(self, chain, readme, workflows):
         introduction, supervisor = chain.split("## Supervisor configuration\n", 1)
-        canonical_runner = re.search(r"`name: authz`,\s*`runs-on: ([^`]+)`", supervisor)
-        self.assertIsNotNone(canonical_runner, "document the canonical authz runner")
-        for name, workflow in workflows.items():
-            self.assertEqual(canonical_runner[1], workflow["jobs"]["authz"]["runs-on"], name)
+        canonical_descriptions = re.findall(
+            r"Their first job is (.*?)Its eight payload fields", " ".join(supervisor.split()))
+        self.assertTrue(canonical_descriptions, "document the canonical authz job")
+        for description in canonical_descriptions:
+            self.assertNotIn("exception", description,
+                             "canonical authz uses the standard runner without an exception")
+        canonical_runners = re.findall(r"`name: authz`,\s*`runs-on: ([^`]+)`", supervisor)
+        self.assertTrue(canonical_runners, "document the canonical authz runner")
+        for runner in canonical_runners:
+            for name, workflow in workflows.items():
+                self.assertEqual(runner, workflow["jobs"]["authz"]["runs-on"], name)
         for label, text in (("release runner policy", introduction),
                             ("supervisor policy", supervisor), ("README", readme)):
             normalized = " ".join(text.split())
-            runners = re.search(
+            authz_runners = re.findall(
+                r"`authz`(?: jobs)? uses? `runs-on: ([^`]+)`", normalized)
+            for runner in authz_runners:
+                for name, workflow in workflows.items():
+                    self.assertEqual(runner, workflow["jobs"]["authz"]["runs-on"],
+                                     f"{label}: {name}: authz runner statement")
+            runner_pairs = re.findall(
                 r"`authz`(?: jobs)? uses? `runs-on: ([^`]+)`; "
                 r"the other (?:PR )?jobs use `runs-on: ([^`]+)`", normalized)
-            self.assertIsNotNone(runners, f"{label}: distinguish authz from the other hosted jobs")
-            for name, workflow in workflows.items():
-                for identity, job in workflow["jobs"].items():
-                    self.assertEqual(runners[1 if identity == "authz" else 2], job["runs-on"],
-                                     f"{label}: {name}:{identity}")
+            self.assertTrue(runner_pairs, f"{label}: distinguish authz from the other hosted jobs")
+            for runners in runner_pairs:
+                for name, workflow in workflows.items():
+                    for identity, job in workflow["jobs"].items():
+                        self.assertEqual(runners[0 if identity == "authz" else 1], job["runs-on"],
+                                         f"{label}: {name}:{identity}")
 
     def test_authz_runner_documentation_matches_workflows_and_refuses_stale_runners(self):
         documents = {"chain": (REPO / "docs/release-chain.md").read_text(),
@@ -3656,20 +3670,72 @@ class PrTierWorkflowTest(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     self.assert_authz_runner_documentation(mutant["chain"], mutant["readme"], workflows)
 
+    def test_authz_runner_documentation_refuses_the_reported_exception_clause(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        readme = (REPO / "README.md").read_text()
+        workflows = {name: _workflow(name) for name in self.ROUTED_JOBS}
+        # On #107 this substitution leaves the reported stale sentence intact;
+        # after the fix it restores precisely that sentence.
+        stale, count = re.subn(
+            r"(`ci-labels\.md`)(?: with the owner-approved runner exception)?"
+            r"(?=, `name: authz`,)",
+            r"\1 with the owner-approved runner exception", chain)
+        self.assertEqual(count, 1)
+        with self.assertRaisesRegex(AssertionError, "canonical authz.*exception"):
+            self.assert_authz_runner_documentation(stale, readme, workflows)
+
+    def test_authz_runner_documentation_refuses_additional_contradictory_statements(self):
+        documents = {"chain": (REPO / "docs/release-chain.md").read_text(),
+                     "readme": (REPO / "README.md").read_text()}
+        workflows = {name: _workflow(name) for name in self.ROUTED_JOBS}
+        for document in documents:
+            mutant = dict(documents)
+            mutant[document] += "\n`authz` uses `runs-on: ubuntu-latest`.\n"
+            with self.subTest(document=document):
+                with self.assertRaisesRegex(AssertionError, "authz runner statement"):
+                    self.assert_authz_runner_documentation(mutant["chain"], mutant["readme"], workflows)
+
     def assert_workflow_run_documentation(self, chain):
         supervisor = chain.split("## Supervisor configuration\n", 1)[1]
         policy = supervisor.split("For `workflow_run`,", 1)[1].split("The allowed ordinary events", 1)[0]
         policy = " ".join(policy.split())
         for statement in (
-            "The only bots accepted are `pineforge-app[bot]` or `pineforge-ci-dispatcher[bot]`",
             "non-empty `WR_HEAD_REPO` and `WR_ACTOR`",
             "`WR_HEAD_REPO` must equal `REPO`",
             "`ALLOWED_BOTS` applies only to `pull_request`",
-            "`dependabot[bot]` and every other `*[bot]` login are refused without a permission lookup",
-            "non-bot actors require `admin`, `maintain` or `write` permission",
             "a failed permission lookup refuses the run",
         ):
             self.assertIn(statement, policy)
+        documented_bots = re.findall(r"The only bots accepted are ([^.]+)\.", policy)
+        documented_permissions = re.findall(
+            r"non-bot actors require ([^.]+?) permission read from GitHub;", policy)
+        documented_globs = re.findall(
+            r"`dependabot\[bot\]` and every other `([^`]+)` login are refused without a permission lookup",
+            policy)
+        self.assertTrue(documented_bots, "document the workflow_run bot allowlist")
+        self.assertTrue(documented_permissions, "document the workflow_run permission rule")
+        self.assertTrue(documented_globs, "document the workflow_run bot refusal pattern")
+        for name in self.ROUTED_JOBS:
+            script = _workflow(name)["jobs"]["authz"]["steps"][0]["run"]
+            arm = re.search(r"(?ms)^  workflow_run\)\n.*?(?=^  pull_request\)\n)", script)
+            self.assertIsNotNone(arm, f"{name}: document the actual workflow_run arm")
+            bot_rules = re.findall(
+                r'(?m)^[ \t]+((?:"[^"\n]+"\|)*"[^"\n]+")\) ;;$', arm[0])
+            permission_rules = re.findall(r'case "\$perm" in ([a-z|]+)\) ;;', arm[0])
+            bot_globs = re.findall(
+                r'(?m)^[ \t]+(\*"[^"\n]+")\) fail "[^"\n]+" ;;$', arm[0])
+            self.assertEqual(len(bot_rules), 1, f"{name}: workflow_run bot allowlist")
+            self.assertEqual(len(permission_rules), 1, f"{name}: workflow_run permission rule")
+            self.assertEqual(len(bot_globs), 1, f"{name}: workflow_run bot refusal pattern")
+            for statement in documented_bots:
+                self.assertEqual(re.findall(r"`([^`]+)`", statement),
+                                 re.findall(r'"([^"]+)"', bot_rules[0]),
+                                 f"{name}: workflow_run bot allowlist")
+            for statement in documented_permissions:
+                self.assertEqual(re.findall(r"`([^`]+)`", statement), permission_rules[0].split("|"),
+                                 f"{name}: workflow_run permission rule")
+            for pattern in documented_globs:
+                self.assertEqual(pattern, bot_globs[0], f"{name}: workflow_run bot refusal pattern")
 
     def test_workflow_run_documentation_names_fixed_policy_and_refuses_omissions(self):
         chain = (REPO / "docs/release-chain.md").read_text()
@@ -3691,6 +3757,101 @@ class PrTierWorkflowTest(unittest.TestCase):
                 self.assertNotEqual(mutant, chain)
                 with self.assertRaises(AssertionError):
                     self.assert_workflow_run_documentation(mutant)
+
+    def test_workflow_run_documentation_detects_the_reported_third_bot_drift(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        workflows = {name: _workflow(name) for name in self.ROUTED_JOBS}
+        unchanged = copy.deepcopy(workflows)
+        original = '"pineforge-app[bot]"|"pineforge-ci-dispatcher[bot]"'
+        replacement = original + '|"pineforge-release[bot]"'
+        self.assertEqual(self.AUTHZ_TEXT.count(original), 1)
+        pin = self.AUTHZ_TEXT.replace(original, replacement, 1)
+        for workflow in workflows.values():
+            step = workflow["jobs"]["authz"]["steps"][0]
+            self.assertEqual(step["run"].count(original), 1)
+            step["run"] = step["run"].replace(original, replacement, 1)
+        # Only the file-reader boundary supplies mutated, real parsed workflow
+        # data. The documentation checker and canonical-job check both run.
+        with patch(f"{__name__}._workflow", side_effect=workflows.__getitem__), \
+                patch.object(self, "AUTHZ_TEXT", pin):
+            for workflow in workflows.values():
+                self.assert_authz(workflow["jobs"]["authz"])
+            with self.assertRaisesRegex(AssertionError, "workflow_run bot allowlist"):
+                self.assert_workflow_run_documentation(chain)
+            documented = "`pineforge-app[bot]` or `pineforge-ci-dispatcher[bot]`"
+            self.assertEqual(chain.count(documented), 1)
+            synchronized = chain.replace(
+                documented,
+                "`pineforge-app[bot]`, `pineforge-ci-dispatcher[bot]` or `pineforge-release[bot]`",
+                1)
+            self.assert_workflow_run_documentation(synchronized)
+        for name in self.ROUTED_JOBS:
+            mutant = copy.deepcopy(unchanged)
+            step = mutant[name]["jobs"]["authz"]["steps"][0]
+            step["run"] = step["run"].replace(original, replacement, 1)
+            with self.subTest(workflow=name), \
+                    patch(f"{__name__}._workflow", side_effect=mutant.__getitem__):
+                with self.assertRaisesRegex(AssertionError, "workflow_run bot allowlist"):
+                    self.assert_workflow_run_documentation(chain)
+
+    def test_workflow_run_documentation_detects_permission_rule_drift_in_either_workflow(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        workflows = {name: _workflow(name) for name in self.ROUTED_JOBS}
+        original = 'case "$perm" in admin|maintain|write)'
+        self.assertEqual(self.AUTHZ_TEXT.count(original), 2)
+        for workflow in workflows.values():
+            self.assertEqual(workflow["jobs"]["authz"]["steps"][0]["run"].count(original), 2)
+        documented = "require `admin`, `maintain` or `write` permission"
+        self.assertEqual(chain.count(documented), 1)
+        for replacement, permissions in (
+            ("admin|maintain|write|read", "`admin`, `maintain`, `write` or `read`"),
+            ("admin|write", "`admin` or `write`"),
+        ):
+            for name in self.ROUTED_JOBS:
+                mutant = copy.deepcopy(workflows)
+                step = mutant[name]["jobs"]["authz"]["steps"][0]
+                step["run"] = step["run"].replace(original, f'case "$perm" in {replacement})', 1)
+                self.assertNotEqual(mutant, workflows)
+                with self.subTest(workflow=name, permissions=replacement), \
+                        patch(f"{__name__}._workflow", side_effect=mutant.__getitem__):
+                    with self.assertRaisesRegex(AssertionError, "workflow_run permission rule"):
+                        self.assert_workflow_run_documentation(chain)
+            mutant = copy.deepcopy(workflows)
+            for workflow in mutant.values():
+                step = workflow["jobs"]["authz"]["steps"][0]
+                step["run"] = step["run"].replace(original, f'case "$perm" in {replacement})', 1)
+            self.assertNotEqual(mutant, workflows)
+            pin = self.AUTHZ_TEXT.replace(original, f'case "$perm" in {replacement})', 1)
+            with self.subTest(workflow="both", permissions=replacement), \
+                    patch(f"{__name__}._workflow", side_effect=mutant.__getitem__), \
+                    patch.object(self, "AUTHZ_TEXT", pin):
+                for workflow in mutant.values():
+                    self.assert_authz(workflow["jobs"]["authz"])
+                with self.assertRaisesRegex(AssertionError, "workflow_run permission rule"):
+                    self.assert_workflow_run_documentation(chain)
+                synchronized = chain.replace(documented, f"require {permissions} permission", 1)
+                self.assert_workflow_run_documentation(synchronized)
+
+    def test_workflow_run_documentation_refuses_additional_contradictory_statements(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        boundary = "The allowed ordinary events"
+        self.assertEqual(chain.count(boundary), 1)
+        for statement, reason in (
+            ("The only bots accepted are `dependabot[bot]`.", "workflow_run bot allowlist"),
+            ("Other, non-bot actors require `read` permission read from GitHub;",
+             "workflow_run permission rule"),
+        ):
+            mutant = chain.replace(boundary, statement + "\n" + boundary, 1)
+            with self.subTest(statement=statement):
+                with self.assertRaisesRegex(AssertionError, reason):
+                    self.assert_workflow_run_documentation(mutant)
+
+    def test_workflow_run_documentation_refuses_the_reported_unquoted_bot_glob(self):
+        chain = (REPO / "docs/release-chain.md").read_text()
+        stale, count = re.subn(r'`\*(?:"\[bot\]"|\[bot\])`', "`*[bot]`", chain)
+        self.assertEqual(count, 1)
+        with self.assertRaisesRegex(AssertionError, "workflow_run bot refusal pattern"):
+            self.assert_workflow_run_documentation(stale)
 
     def assert_exception_runner(self, workflow, identity, job):
         expected = self.EXEMPT_RUNNERS[workflow][identity]

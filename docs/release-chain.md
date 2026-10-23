@@ -923,7 +923,7 @@ runners: `authz` uses `runs-on: ubuntu-24.04`; the other PR jobs use
 a standing R6/rule-B exception for pineforge-release, without a `PF_CI_LABELS`
 environment variable. Both workflows run on every pull request without path or
 branch filters. Their first job is the canonical `authz` from
-`ci-labels.md` with the owner-approved runner exception, `name: authz`,
+`ci-labels.md`, `name: authz`,
 `runs-on: ubuntu-24.04`, `permissions: {}`, no
 condition, checkout or secrets, and the canonical no-timeout comment.
 Its eight payload fields are `EVENT`, `REPO`, `HEAD_REPO`, `HEAD_IS_FORK`,
@@ -943,7 +943,7 @@ For `workflow_run`, authz requires non-empty `WR_HEAD_REPO` and `WR_ACTOR`;
 `WR_HEAD_REPO` must equal `REPO`. The only bots accepted are
 `pineforge-app[bot]` or `pineforge-ci-dispatcher[bot]`.
 `ALLOWED_BOTS` applies only to `pull_request`; `dependabot[bot]` and every other
-`*[bot]` login are refused without a permission lookup. Other, non-bot actors
+`*"[bot]"` login are refused without a permission lookup. Other, non-bot actors
 require `admin`, `maintain` or `write` permission read from GitHub; a failed
 permission lookup refuses the run.
 The allowed ordinary events are `push`, `workflow_dispatch`, `schedule`,
