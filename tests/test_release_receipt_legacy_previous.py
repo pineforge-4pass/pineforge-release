@@ -2,6 +2,7 @@
 """Offline legacy predecessor identity regressions for the hub receipt validator."""
 from __future__ import annotations
 
+import base64
 import copy
 import unittest
 
@@ -18,12 +19,12 @@ LEGACY_PREVIOUS = {
     "npm_version": "0.9.40",
     "npm_integrity": "sha512-o1hmSb6FwjkF8lIwLhENJV+YPbYqSwG1KPvHyViPj5Yan3aHoNRCpM5uINaYbjZKjGS95VDClmASOUSD6ZktVw==",
     "git_head": "b988217f2aa21b6b772fb723adbc89bd4130c3f5",
-    # Synthetic OCI digest: the real 0.9.40 image digest is unavailable.
-    "image_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    # Real v0.9.40 multi-architecture OCI index, not an architecture child.
+    "image_digest": "sha256:129aa9cb5db4400523d1fc12a11671cfb820f934d893e4ee8945cd25c5bc202d",
 }
 LEGACY_PREVIOUS_BYTES = (
     b'{"git_head":"b988217f2aa21b6b772fb723adbc89bd4130c3f5",'
-    b'"image_digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777",'
+    b'"image_digest":"sha256:129aa9cb5db4400523d1fc12a11671cfb820f934d893e4ee8945cd25c5bc202d",'
     b'"legacy":true,'
     b'"npm_integrity":"sha512-o1hmSb6FwjkF8lIwLhENJV+YPbYqSwG1KPvHyViPj5Yan3aHoNRCpM5uINaYbjZKjGS95VDClmASOUSD6ZktVw==",'
     b'"npm_version":"0.9.40"}\n'
@@ -61,6 +62,62 @@ class LegacyPreviousReceiptTests(unittest.TestCase):
         self.assertEqual(contract.canonical(public["previous"]), LEGACY_PREVIOUS_BYTES)
         round_tripped = contract.decode(contract.canonical(public))
         self.assertEqual(round_tripped["previous"], LEGACY_PREVIOUS)
+        integrity = public["previous"]["npm_integrity"]
+        self.assertEqual(len(integrity), len("sha512-") + 86 + 2)
+        self.assertRegex(integrity, r"\Asha512-[A-Za-z0-9+/]{86}==\Z")
+        decoded = base64.b64decode(integrity[7:], validate=True)
+        self.assertEqual(len(decoded), 64)
+        self.assertEqual(base64.b64encode(decoded).decode("ascii"), integrity[7:])
+
+    def test_legacy_previous_refuses_reported_alternate_identity(self):
+        """Mutation: remove the complete legacy previous value comparison."""
+        fixture = offline_fixture()
+        fixture.receipt["previous"] = {
+            "legacy": True,
+            "npm_version": "99.0.0",
+            "npm_integrity": "sha512-" + "A" * 86 + "==",
+            "git_head": "0" * 40,
+            "image_digest": "sha256:" + "0" * 64,
+        }
+        with self.subTest(call="identity"), self.assertRaisesRegex(
+                contract.Invalid, r"\Alegacy previous identity differs\Z"):
+            receipts.identity(fixture.receipt["previous"], consumer="offline", slot="previous")
+        with self.subTest(call="validate_receipt"), self.assertRaisesRegex(
+                contract.Invalid, r"\Alegacy previous identity differs\Z"):
+            fixture.verify()
+
+    def test_legacy_previous_refuses_each_changed_pinned_value(self):
+        """Mutation: omit the changed field from the legacy previous value comparison."""
+        for field, value in (
+                ("npm_version", "99.0.0"),
+                ("npm_integrity", "sha512-" + "A" * 86 + "=="),
+                ("git_head", "0" * 40),
+                ("image_digest", "sha256:" + "0" * 64),
+                # The former synthetic fixture must never be accepted as the pin.
+                ("image_digest", "sha256:" + "7" * 64)):
+            fixture = offline_fixture()
+            fixture.receipt["previous"][field] = value
+            with self.subTest(field=field, value=value, call="identity"), self.assertRaisesRegex(
+                    contract.Invalid, r"\Alegacy previous identity differs\Z"):
+                receipts.identity(fixture.receipt["previous"], consumer="offline", slot="previous")
+            with self.subTest(field=field, value=value, call="validate_receipt"), self.assertRaisesRegex(
+                    contract.Invalid, r"\Alegacy previous identity differs\Z"):
+                fixture.verify()
+
+    def test_legacy_previous_pin_is_checked_before_identity_stage(self):
+        """Mutation: remove or "legacy" in receipt[name] from the early identity guard."""
+        for state in ("pending", "pr_open", "testing", "ready", "merged", "deploying",
+                      "failed", "superseded", "skipped_by_policy"):
+            with self.subTest(state=state):
+                fixture = offline_fixture()
+                fixture.receipt["state"] = state
+                if state == "skipped_by_policy":
+                    fixture.event["prerelease"] = True
+                fixture.receipt["previous"]["image_digest"] = "sha256:" + "7" * 64
+                with self.assertRaisesRegex(contract.Invalid, r"\Alegacy previous identity differs\Z"):
+                    fixture.verify()
+                self.assertEqual(fixture.queries, [])
+                self.assertEqual(fixture.downloads, [])
 
     def test_legacy_previous_refuses_each_extra_key(self):
         for extra in ("source", "event_id", "facts_commit", "unknown"):
