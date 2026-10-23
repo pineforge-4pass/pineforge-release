@@ -24,9 +24,8 @@ concurrency:
 jobs:
   authz:
     name: authz
-    # Hosted label (needs no toolchain or Docker).
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
-    runs-on: ubuntu-latest
+    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
+    runs-on: ubuntu-24.04
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
     steps:
@@ -53,17 +52,17 @@ jobs:
               # events; none of them runs pull-request code.
               ;;
             workflow_run)
-              # The pwn-request path: it runs in THIS repository with secrets even when the triggering run
-              # came from a fork. Refuse ALWAYS unless the triggering run's head is this repository, and
-              # apply the same identity rule to its triggering actor as to a pull-request author.
-              [ "$WR_HEAD_REPO" = "$REPO" ] || fail "workflow_run triggered from another repository (${WR_HEAD_REPO:-unknown})"
-              case " $ALLOWED_BOTS " in
-                *" $WR_ACTOR "*) ;;
+              # LB-437: bind identity to the triggering run and its re-runner.
+              # These two App bots are fixed canon policy; ALLOWED_BOTS is PR-only.
+              [ -n "${WR_HEAD_REPO:-}" ] || fail "workflow_run head repository is missing"
+              [ -n "${WR_ACTOR:-}" ] || fail "workflow_run triggering actor is missing"
+              [ "$WR_HEAD_REPO" = "$REPO" ] || fail "workflow_run head repository does not match this repository"
+              case "$WR_ACTOR" in
+                "pineforge-app[bot]"|"pineforge-ci-dispatcher[bot]") ;;
+                *"[bot]") fail "workflow_run bot is not on the canon allowlist" ;;
                 *)
-                  # No author_association exists on workflow_run: ask GitHub for the actor's permission on
-                  # this repository; anything but admin/maintain/write (or a failed call) refuses.
-                  perm=$(gh api "repos/$REPO/collaborators/$WR_ACTOR/permission" --jq .permission 2>/dev/null || echo none)
-                  case "$perm" in admin|maintain|write) ;; *) fail "workflow_run triggering actor ${WR_ACTOR:-unknown} has permission '$perm', not write" ;; esac ;;
+                  perm=$(gh api "repos/$REPO/collaborators/$WR_ACTOR/permission" --jq .permission 2>/dev/null) || fail "workflow_run permission lookup failed"
+                  case "$perm" in admin|maintain|write) ;; *) fail "workflow_run triggering actor does not have write permission" ;; esac ;;
               esac ;;
             pull_request)
               [ "$HEAD_REPO" = "$REPO" ] || fail "pull request from another repository (${HEAD_REPO:-unknown})"
