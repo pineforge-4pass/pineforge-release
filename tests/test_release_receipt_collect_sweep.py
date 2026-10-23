@@ -356,6 +356,26 @@ class ReceiptCollectSweepTests(unittest.TestCase):
         f.replace_archive(packed.getvalue())
         self.assert_bad_first_continues(f, "invalid JSON")
 
+    def test_sweep_reports_a_null_receipt_document(self):
+        f = SweepFixture((90, 91))
+        f.documents[90] = None
+        f.seal(90)
+        self.collect(f)
+        self.assertEqual(f.written_names(), ["consumer-hosted-90-8.json"])
+        self.assertNotIn((f.row["tag_name"], "consumer-hosted-90-7.json"), f.store.assets)
+        self.assert_validated(f)
+        self.assert_skipped(90, "receipt document must be an object", f)
+
+    def test_callback_rejects_a_null_document_as_invalid_evidence(self):
+        f = SweepFixture((90, 91))
+        f.documents[90] = None
+        f.seal(90)
+        with self.assertRaisesRegex(contract.Invalid, "^receipt document must be an object$"):
+            self.collect(f, run_id=90)
+        self.assertEqual(f.written_names(), [])
+        self.assertEqual(self.output.getvalue(), "")
+        self.report.assert_not_called()
+
     def test_sweep_skips_a_malformed_artifact_missing_release_version(self):
         f = SweepFixture((90, 91, 92))
         del f.documents[90]["release_version"]
@@ -393,11 +413,11 @@ class ReceiptCollectSweepTests(unittest.TestCase):
                 self.assertEqual(f.written_names(), [])
                 self.assert_skipped(90, (expected + safe_suffix + "x" * 300)[:200], f)
 
-    def test_sweep_skips_a_type_error_in_receipt(self):
+    def test_sweep_skips_a_non_object_receipt(self):
         f = SweepFixture((90, 91, 92))
         f.documents[90] = []
         f.seal(90)
-        self.assert_bad_first_continues(f, "list indices must be integers or slices, not str")
+        self.assert_bad_first_continues(f, "receipt document must be an object")
 
     def test_sweep_guards_malformed_attempt_and_sequence_before_comparison(self):
         for key in ("attempt", "sequence"):
@@ -457,28 +477,120 @@ class ReceiptCollectSweepTests(unittest.TestCase):
                 self.assertEqual(self.output.getvalue(), "")
                 self.report.assert_not_called()
 
-    def test_pending_during_a_sweep_is_reported_and_skipped(self):
+    def test_unavailable_earlier_receipt_cannot_bypass_terminal_or_regression_checks(self):
+        for source in ("pending", "http404"):
+            for earlier, later, reason in (
+                ("failed", "verified", "terminal consumer state requires a new attempt"),
+                ("deploying", "ready", "consumer state regressed"),
+            ):
+                with self.subTest(source=source, earlier=earlier, later=later):
+                    f = SweepFixture((90, 91))
+                    f.require_delivery()
+                    f.documents[90].update(state=earlier, e2e=None)
+                    if later != "verified":
+                        f.documents[91].update(state=later, e2e=None)
+                    f.seal(90)
+                    f.seal(91)
+                    request = f.request
+                    unavailable = contract.Pending("published artifact unavailable")
+                    real_client = binding.artifacts.Client(token="dummy")
+                    opener = Mock()
+                    opener.open.side_effect = urllib.error.HTTPError(
+                        f.archive_url(90), 404, "fixture", {}, None)
+                    self.report.reset_mock()
+                    self.output.seek(0)
+                    self.output.truncate()
+
+                    def request_with_unavailable_artifact(url, **kwargs):
+                        if url == f.archive_url(90):
+                            if source == "http404":
+                                return real_client.request(url, **kwargs)
+                            raise unavailable
+                        return request(url, **kwargs)
+
+                    with patch("urllib.request.build_opener", return_value=opener), \
+                            patch.object(f, "request", side_effect=request_with_unavailable_artifact) as requests, \
+                            self.assertRaisesRegex(
+                                contract.Pending, "^published artifact unavailable$") as caught:
+                        self.collect(f)
+                    requests.assert_called_once_with(f.archive_url(90), github=True)
+                    if source == "pending":
+                        self.assertIs(caught.exception, unavailable)
+                        opener.open.assert_not_called()
+                    else:
+                        opener.open.assert_called_once()
+                        self.assertEqual(opener.open.call_args.args[0].full_url, f.archive_url(90))
+                        self.assertEqual(opener.open.call_args.kwargs, {"timeout": 120})
+                    self.assertEqual(f.written_names(), [])
+                    self.assertEqual(f.files, [])
+                    self.assertEqual(self.output.getvalue(), "")
+                    self.report.assert_not_called()
+                    status = binding.pipeline.aggregate(f.store, f.row, f.event, enabled=("hosted",))
+                    self.assertEqual(status["consumers"], {"hosted": "pending"})
+                    self.assertFalse(status["complete"])
+
+                    # Recovery must apply (90, 7) before judging (90, 8).
+                    self.collect(f)
+                    self.assertEqual(f.written_names(), ["consumer-hosted-90-7.json"])
+                    stored = contract.decode(
+                        f.store.assets[(f.row["tag_name"], "consumer-hosted-90-7.json")])
+                    self.assertEqual((stored["state"], stored["reporting_run_id"]), (earlier, 90))
+                    self.assertNotIn((f.row["tag_name"], "consumer-hosted-90-8.json"), f.store.assets)
+                    self.assertEqual(self.report.call_count, 2 if earlier == "failed" else 1)
+                    if earlier == "failed":
+                        self.assertEqual(self.report.call_args_list[0].args[:3], (
+                            f, "v1.6.0", "Release 1.6.0: consumer failed",
+                        ))
+                    self.assertEqual(self.report.call_args_list[-1].args, (
+                        f, "receipt-skipped-hosted", "Release chain: receipt artifacts skipped (hosted)",
+                        f"run=91: {reason}",
+                    ))
+                    self.assertEqual(self.output.getvalue(), (
+                        f"::warning::receipt artifact skipped: role=hosted run=91: {reason}\n"
+                    ))
+                    status = binding.pipeline.aggregate(f.store, f.row, f.event, enabled=("hosted",))
+                    self.assertEqual(status["consumers"], {"hosted": earlier})
+                    self.assertFalse(status["complete"])
+
+    def test_pending_during_a_sweep_stays_fatal(self):
         f = SweepFixture((90, 91, 92))
         request = f.request
+        error = contract.Pending("artifact unavailable")
 
         def request_with_unavailable_artifact(url, **kwargs):
             if url == f.archive_url(90):
-                raise contract.Pending("artifact unavailable")
+                raise error
             return request(url, **kwargs)
 
-        with patch.object(f, "request", side_effect=request_with_unavailable_artifact):
-            self.assert_bad_first_continues(f, "artifact unavailable")
+        with patch.object(f, "request", side_effect=request_with_unavailable_artifact) as requests, \
+                self.assertRaises(contract.Pending) as caught:
+            self.collect(f)
+        self.assertIs(caught.exception, error)
+        requests.assert_called_once_with(f.archive_url(90), github=True)
+        self.assertEqual(f.written_names(), [])
+        self.assertEqual(f.files, [])
+        self.assertEqual(self.output.getvalue(), "")
+        self.report.assert_not_called()
 
-    def test_sweep_skips_a_receipt_naming_an_unknown_release(self):
+    def test_sweep_stops_on_a_receipt_naming_an_unavailable_release(self):
         f = SweepFixture((90, 91, 92))
         f.documents[90]["release_version"] = "99.99.99"
         f.seal(90)
-        self.assert_bad_first_continues(f, "hub release unavailable")
+        with self.assertRaisesRegex(contract.Pending, "^hub release unavailable$"):
+            self.collect(f)
+        self.assertIn(f.archive_url(90), f.routes)
+        for run_id in (91, 92):
+            self.assertNotIn(f.archive_url(run_id), f.routes)
+        self.assertEqual(f.written_names(), [])
+        self.assertEqual(f.files, [])
+        self.assertEqual(self.output.getvalue(), "")
+        self.report.assert_not_called()
 
-    def test_already_stored_newer_receipt_skips_validation_without_api_calls(self):
+    def test_already_stored_older_receipt_skips_validation_without_api_calls(self):
         for attempt, sequence in ((91, 1), (90, 8)):
             with self.subTest(attempt=attempt, sequence=sequence):
                 f = SweepFixture()
+                f.retain()
                 f.retain(attempt=attempt, sequence=sequence)
                 assets = dict(f.store.assets)
                 self.collect(f)
@@ -488,6 +600,59 @@ class ReceiptCollectSweepTests(unittest.TestCase):
                 self.assertEqual(f.store.assets, assets)
                 self.assertEqual(self.output.getvalue(), "")
                 self.report.assert_not_called()
+
+    def test_unretained_older_invalid_receipt_is_validated_and_reported(self):
+        for attempt, sequence in ((91, 1), (90, 8)):
+            with self.subTest(attempt=attempt, sequence=sequence):
+                f = SweepFixture()
+                f.retain(attempt=attempt, sequence=sequence)
+                assets = dict(f.store.assets)
+                f.documents[90] = f.old_shape
+                f.seal(90)
+                self.report.reset_mock()
+                self.output.seek(0)
+                self.output.truncate()
+                self.collect(f)
+                self.assertEqual(f.routes, [*f.discovery_routes(), f"repos/{REPO}/pulls/9"])
+                self.assertEqual(f.written_names(), [])
+                self.assertEqual(f.store.assets, assets)
+                self.assert_skipped(90, INVENTORY_ERROR, f)
+
+    def test_unretained_older_valid_receipt_is_reported_without_rewriting_state(self):
+        for state in ("verified", "failed"):
+            with self.subTest(state=state):
+                f = SweepFixture()
+                f.retain(sequence=8)
+                assets = dict(f.store.assets)
+                if state == "failed":
+                    f.documents[90].update(state=state, e2e=None)
+                    f.seal(90)
+                self.report.reset_mock()
+                self.output.seek(0)
+                self.output.truncate()
+                self.collect(f)
+                if state == "verified":
+                    self.assert_validated(f)
+                self.assertEqual(f.written_names(), [])
+                self.assertEqual(f.store.assets, assets)
+                self.assert_skipped(90, "older receipt has no matching retained evidence", f)
+
+    def test_older_stored_identity_replayed_from_another_run_is_reported(self):
+        f = SweepFixture((90, 91, 92))
+        f.documents[91] = copy.deepcopy(f.documents[90])
+        f.seal(91)
+        f.retain()
+        self.collect(f, run_id=92)
+        f.store.operations.clear()
+        f.routes.clear()
+        f.files.clear()
+        assets = dict(f.store.assets)
+        self.collect(f)
+        self.assert_validated(f)
+        self.assertEqual(f.routes.count(f"repos/{REPO}/pulls/9"), 1)
+        self.assertEqual(f.written_names(), [])
+        self.assertEqual(f.store.assets, assets)
+        self.assert_skipped(91, IDENTITY_ERROR, f)
 
     def test_same_key_same_evidence_is_skipped_without_validation(self):
         f = SweepFixture()

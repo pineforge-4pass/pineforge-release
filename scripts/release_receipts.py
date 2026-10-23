@@ -423,7 +423,9 @@ def fetch_artifact(client, repo, run, policy, artifacts=None):
         with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
             require(zipped.namelist() == ["release-receipt.json"], "unexpected receipt archive inventory")
             require(zipped.getinfo("release-receipt.json").file_size <= 2 * 1024 * 1024, "receipt exceeds size limit")
-            return decode(zipped.read("release-receipt.json"))
+            receipt = decode(zipped.read("release-receipt.json"))
+            require(type(receipt) is dict, "receipt document must be an object")
+            return receipt
     except (RuntimeError, zlib.error) as error:
         # zipfile uses RuntimeError for encryption and unsupported compression.
         raise Invalid("receipt archive cannot be decoded") from error
@@ -513,10 +515,18 @@ def collect(client, hub_client, store, role, run_id=0):
                 if previous is not None:
                     old = (previous["attempt"], previous["sequence"])
                     new = (receipt["attempt"], receipt["sequence"])
-                    # Only omit work that cannot advance the stored receipt.
-                    if old > new or (old == new
-                                     and previous.get("reporting_run_id") == run["id"]
-                                     and previous.get("evidence_sha256") == sha256(canonical(receipt))):
+                    retained = previous
+                    if old > new:
+                        name = f"consumer-{role}-{receipt['attempt']}-{receipt['sequence']}.json"
+                        retained_raw = store.read(row, name)
+                        retained = decode(retained_raw) if retained_raw is not None else None
+                    # A newer maximum is not proof that this artifact was validated.
+                    if (old >= new and retained is not None
+                            and retained.get("consumer") == role
+                            and retained.get("event_id") == event["event_id"]
+                            and (retained.get("attempt"), retained.get("sequence")) == new
+                            and retained.get("reporting_run_id") == run["id"]
+                            and retained.get("evidence_sha256") == sha256(canonical(receipt))):
                         return
         public = validate_receipt(client, repo, receipt, event, policy, run)
         if facts_only:
@@ -543,6 +553,10 @@ def collect(client, hub_client, store, role, run_id=0):
                         previous = obj
         elif run_id:
             previous = receipts(store, row, event["event_id"]).get(role)
+        elif previous is not None and new < old:
+            if retained is not None:
+                transition(retained, public)
+            raise Invalid("older receipt has no matching retained evidence")
         if transition(previous, public):
             stem = prefix + role + "-" + (facts_target["commit"] + "-" + facts_target["sha256"] + "-" if facts_only else "")
             name = f"{stem}{public['attempt']}-{public['sequence']}.json"
@@ -566,11 +580,11 @@ def collect(client, hub_client, store, role, run_id=0):
         else:
             try:
                 collect_run(run)
-            except RequestError:
-                # Preserve Invalid compatibility for callers without swallowing
-                # HTTP/auth/transport failures as malformed consumer evidence.
+            except (RequestError, Pending):
+                # Missing prerequisites and request failures must not let a
+                # later receipt advance against incomplete state history.
                 raise
-            except (Invalid, Pending, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
+            except (Invalid, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
                 # The text can carry consumer-controlled bytes: no markup, mention, marker or line break reaches an issue.
                 safe_characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _.,;()'=-"
                 reason = "".join(char if char in safe_characters else "?" for char in str(error))[:200]
