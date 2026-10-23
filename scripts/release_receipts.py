@@ -167,6 +167,30 @@ def check_coordinator(client, repo, evidence, policy, pr, ci):
     return run
 
 
+def check_postmerge(client, repo, evidence, policy, pr, actual, timestamp):
+    """Hosted E2E on merged main; private evidence content stays consumer-side."""
+    require(policy["e2e"]["expected"] == ["authz", "build", "verified"] and policy["e2e"]["approved_skips"] == [],
+            "postmerge inventory differs")
+    run = check_run(client, repo, evidence, policy["e2e"], pr["merge"])
+    require(run["id"] == evidence["run_id"] and run["run_attempt"] == evidence["run_attempt"],
+            "postmerge run identity differs")
+    metadata = client.api(f"repos/{repo}")
+    require(metadata["full_name"].lower() == repo.lower()
+            and run["repository"]["full_name"].lower() == repo.lower()
+            and run["head_repository"]["full_name"].lower() == repo.lower(),
+            "postmerge repository differs")
+    require(run["event"] == "workflow_dispatch" and run["head_branch"] == metadata["default_branch"] == "main" == pr["base"],
+            "untrusted postmerge source")
+    require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
+    require(run["checked_finished_at"] >= actual["merged_at"], "postmerge E2E completed before merge")
+    require(timestamp >= run["checked_finished_at"], "receipt predates postmerge verification")
+    artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
+    name = f"postmerge-evidence-{run['id']}-{run['run_attempt']}"
+    found = [a for a in artifacts if a["name"] == name and not a["expired"]]
+    require(len(found) == 1, "missing/ambiguous postmerge evidence")
+    return run
+
+
 def identity(obj, *, facts_only=False, consumer=None, slot=None):
     if type(obj) is dict and "provenance" in obj:
         require(not facts_only and consumer == "data" and slot == "previous",
@@ -227,6 +251,12 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     public["evidence_sha256"] = sha256(canonical(receipt))
     public["reporting_run_id"] = reporting_run["id"]
     state = receipt["state"]
+    postmerge = policy["e2e"]["workflow"] == "release-postmerge.yml"
+    if postmerge:
+        require(receipt["consumer"] == "hosted" and policy["ci"]["workflow"] == "release-pr.yml"
+                and policy["deploy"]["workflow"] == "release.yml", "unexpected postmerge consumer")
+        require((state == "verified") == (receipt["e2e"] is not None),
+                "postmerge E2E is required exactly in verified state")
     if state in ("pending", "failed", "superseded", "skipped_by_policy"):
         require(state != "skipped_by_policy" or (not facts_only and event["prerelease"]), "consumer cannot skip by policy")
         return public
@@ -244,25 +274,38 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     public["pr"] = pr
     if state in ("ready", "merged", "deploying", "verified"):
         ci_run = check_run(client, repo, receipt["ci"], policy["ci"], pr["head"])
-        if policy["e2e"]["workflow"] == "release-coordinator.yml":
+        if postmerge:
+            if state == "verified":
+                e2e_run = check_postmerge(client, repo, receipt["e2e"], policy, pr, actual, receipt["timestamp"])
+        elif policy["e2e"]["workflow"] == "release-coordinator.yml":
             require(receipt["consumer"] == "hosted" and policy["ci"]["workflow"] == "release-pr.yml", "unexpected coordinator consumer")
             e2e_run = check_coordinator(client, repo, receipt["e2e"], policy["e2e"], pr, receipt["ci"])
         else:
             e2e_run = check_run(client, repo, receipt["e2e"], policy["e2e"], pr["head"])
         identity(receipt["preview"], facts_only=facts_only, consumer=receipt["consumer"], slot="preview")
-        require(receipt["preview"]["source"] == pr["head"]
-                and (facts_only or receipt["preview"]["image_digest"] == event["image"]["digest"]),
-                "preview did not exercise the candidate source/image")
+        if postmerge:
+            require(receipt["preview"]["source"] == pr["merge"]
+                    and (facts_only or receipt["preview"]["image_digest"] == event["image"]["digest"]),
+                    "preview did not exercise the candidate source/image")
+        else:
+            require(receipt["preview"]["source"] == pr["head"]
+                    and (facts_only or receipt["preview"]["image_digest"] == event["image"]["digest"]),
+                    "preview did not exercise the candidate source/image")
         for name in ("ci", "e2e"):
+            if postmerge and state != "verified" and name == "e2e":
+                continue
             public[name] = {"run_id": receipt[name]["run_id"], "run_attempt": receipt[name]["run_attempt"],
                             "inventory_sha256": sha256(canonical(receipt[name]["results"]))}
         public["preview"] = receipt["preview"]
     if state in ("merged", "deploying", "verified"):
         match(COMMIT, pr["merge"])
         require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
-        # Required E2E must precede the merge; a production smoke cannot stand
-        # in for the consumer's candidate E2E gate.
-        require(ci_run["checked_finished_at"] <= actual["merged_at"] and e2e_run["checked_finished_at"] <= actual["merged_at"], "CI/E2E completed after merge")
+        if postmerge:
+            require(ci_run["checked_finished_at"] <= actual["merged_at"], "CI completed after merge")
+        else:
+            # Required E2E must precede the merge; a production smoke cannot stand
+            # in for the consumer's candidate E2E gate.
+            require(ci_run["checked_finished_at"] <= actual["merged_at"] and e2e_run["checked_finished_at"] <= actual["merged_at"], "CI/E2E completed after merge")
         merged_commit = client.api(f"repos/{repo}/commits/{pr['merge']}")
         require(merged_commit["parents"] and merged_commit["parents"][0]["sha"] == pr["base_sha"],
                 "merge inputs differ from the tested base; require updated merge/squash candidate")

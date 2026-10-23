@@ -299,14 +299,15 @@ A check-evidence object has exactly these fields, for each of `ci`, `e2e`,
 |---|---|
 | `run_id` | Integer, GitHub Actions run in the configured consumer repository. |
 | `run_attempt` | Integer, the particular GitHub attempt whose jobs are checked. |
-| `sha` | Commit; `pr.head` for CI/E2E, `pr.merge` for deploy and post-merge. Hosted `release-coordinator.yml` E2E alone uses `pr.base_sha`, subject to the binding checks below. |
+| `sha` | Commit; `pr.head` for CI/E2E, `pr.merge` for deploy and application post-merge. Hosted `release-postmerge.yml` E2E uses `pr.merge`; legacy hosted `release-coordinator.yml` E2E uses `pr.base_sha`, subject to the binding checks below. |
 | `expected` | Array of unique job-name strings, exactly the corresponding policy list, in the same order. |
 | `approved_skips` | Array of job-name strings, exactly the corresponding policy list, in the same order. |
 | `results` | Object with exactly one key per expected job; values `success`, or `skipped` only for owner-approved skips. Must equal actual GitHub jobs. |
 
 The referenced run must have completed successfully. Every expected job must
 exist exactly once and finish successfully or have its explicit approved skip;
-at least one must succeed. CI/E2E must finish before the PR's actual merge time.
+at least one must succeed. CI/E2E must finish before the PR's actual merge time,
+except hosted post-merge E2E as described below.
 The merge commit's first parent must be `base_sha`, proving the tested base
 landed. An unmerged PR must still have the tested base. Rebase/merge-queue source
 graphs need an approved adapter before enablement.
@@ -324,12 +325,25 @@ evidence is deferred. The neutral verified receipt adds `post_merge` containing
 only `run_id`, `run_attempt`, and `inventory_sha256`, the SHA-256 of the canonical
 results object, in the same form as `deploy`.
 
+**Hosted post-merge E2E.** Hosted now uses CI `release-pr.yml`, E2E
+`release-postmerge.yml` and deploy `release.yml`. E2E requires exactly
+`["authz", "build", "verified"]` with no approved skips. Its run and
+`preview.source` bind to `pr.merge`; the run must use `workflow_dispatch` on
+`main`, also the repository default branch and PR base. Its jobs must finish
+at or after the PR's actual `merged_at` and at or before the receipt timestamp;
+CI still finishes before merge. The run must retain exactly one non-expired
+`postmerge-evidence-<run_id>-<run_attempt>` artifact; the hub checks its name and
+existence, while its contents remain the hosted repository's private contract.
+E2E must be non-null exactly in `verified`. The old coordinator shape below is
+still accepted under its old policy for events whose receipts predate 2026-10-21.
+
 **Hosted coordinator binding.** Only consumer `hosted`, with CI workflow
 `release-pr.yml` and E2E workflow `release-coordinator.yml`, can use the base-code
 adapter in [`check_coordinator`](../scripts/release_receipts.py). Its E2E
 inventory is exactly `["candidate", "release/ready"]` in that order, with no
 approved skips. CI still runs at `pr.head`; deploy still runs at `pr.merge`.
-All other E2E workflows retain the exact PR-head check in `check_run`.
+Other E2E workflows, apart from hosted post-merge above, retain the exact
+PR-head check in `check_run`.
 
 The coordinator run must be completed successfully at the recorded E2E run ID
 and attempt, with `head_sha == pr.base_sha`. Its event must be `workflow_run`;
@@ -360,7 +374,8 @@ root `binding.json`. That JSON has exactly `schema`, `pr`, `head`, `base`,
 Binding PR/run/artifact IDs and attempts must be positive JSON integers;
 booleans, numeric strings and floats are refused.
 
-Only `candidate` and `release/ready` are the required hosted E2E jobs.
+For the legacy coordinator policy, only `candidate` and `release/ready` are
+the required hosted E2E jobs.
 `pending`, `policy` and `merge` are orchestration jobs, not additions to that
 inventory. Hosted CI requires `validate`, `checks`, `container`, `candidate`;
 hosted deploy requires `deploy`. Neither inventory permits skips. The public
@@ -370,7 +385,7 @@ An ordinary served-identity object has exactly these five fields:
 
 | Field | Type and allowed value |
 |---|---|
-| `source` | Commit; `pr.head` for preview, `pr.merge` for deployed, previous deployed source for previous. |
+| `source` | Commit; `pr.head` for preview (hosted post-merge uses `pr.merge`), `pr.merge` for deployed, previous deployed source for previous. |
 | `image_digest` | Digest string; preview and deployed equal the product manifest's index digest. Facts-only may use `null` when no product image is consumed. |
 | `facts_commit` | Commit, actually consumed canonical hub facts source. |
 | `facts_sha256` | SHA-256 of the exact facts bytes consumed. |
@@ -451,10 +466,10 @@ reported state even if earlier snapshots were never collected.
 | `pending` | Target accepted by coordinator; evidence fields may all be null. |
 | `pr_open` | Current same-repository PR with tested base/head recorded. |
 | `testing` | Same PR evidence; tests are in progress, not yet sufficient for ready. |
-| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. |
-| `merged` | Ready evidence plus actual merge commit, tested first parent and CI/E2E completion before merge. |
+| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. Hosted post-merge E2E is deferred to verified. |
+| `merged` | Ready evidence plus actual merge commit, tested first parent and CI/E2E completion before merge (CI only for hosted post-merge). |
 | `deploying` | Same evidence as merged; serving has not yet been verified. |
-| `verified` | All prior gates + successful complete deploy inventory + deployed and previous identities; report source is the merge commit. Application also requires its post-merge gate when configured. |
+| `verified` | All prior gates + successful complete deploy inventory + deployed and previous identities; report source is the merge commit. Hosted post-merge requires its E2E here. Application also requires its post-merge gate when configured. |
 | `failed` | Terminal failure in this attempt; evidence may be null, details stay in the consumer report. |
 | `superseded` | Terminal obsolete target in this attempt; evidence may be null. |
 | `skipped_by_policy` | Terminal policy skip, accepted only for product prereleases, never stable or facts-only. |
@@ -723,8 +738,8 @@ examples against its own validator, including the documented JSON.
 Both complete examples and the synthetic builder use the ordinary five-key
 form; the data bootstrap above is a separate, literal documented example.
 Use `--consumer hosted` for a synthetic hosted receipt with CI at the PR head
-and coordinator E2E at the tested base. Its example policy is the exact hosted
-entry below; a real coordinator must also publish its verified binding artifact.
+and post-merge E2E and preview at the merge commit. Its example policy is the
+exact hosted entry below; the E2E run must retain its post-merge evidence artifact.
 Use `--consumer application` for a synthetic application receipt with base `dev`
 and `post_merge` evidence at the merge commit. Its policy matches the application
 example below; replace all `example-*` values with APP's real workflows and
@@ -844,8 +859,9 @@ use `ubuntu-latest` per owner decision 10-21, including publication workflows.
 | Receivers and callback credentials | Each enabled consumer | Receiver on default branch; own CI + E2E aggregate required; scoped hub Contents-write callback token; artifact upload/read access. |
 
 Policy example: the `offline` entry remains a synthetic structure, not a
-production inventory. The `hosted` entry is the exact policy from the reviewed
-hosted credential-isolation contract. Merge that hosted entry into the existing
+production inventory. The `hosted` entry is the exact policy from hosted
+`receipt.mjs` at `0a1c82c8`, following the 2026-10-21 post-merge change.
+Merge that hosted entry into the existing
 `RELEASE_RECEIPT_POLICY` only after installing this hub adapter, preserving every
 other consumer entry. The supervisor applies the live policy; this change does
 not alter GitHub settings.
@@ -871,17 +887,17 @@ names. Do not use the example E2E/deploy inventories as production gates.
     "base": "main",
     "ci": {
       "workflow": "release-pr.yml",
-      "expected": ["validate", "checks", "container", "candidate"],
+      "expected": ["authz", "validate", "checks", "container"],
       "approved_skips": []
     },
     "e2e": {
-      "workflow": "release-coordinator.yml",
-      "expected": ["candidate", "release/ready"],
+      "workflow": "release-postmerge.yml",
+      "expected": ["authz", "build", "verified"],
       "approved_skips": []
     },
     "deploy": {
       "workflow": "release.yml",
-      "expected": ["deploy"],
+      "expected": ["decide", "deploy"],
       "approved_skips": []
     }
   },

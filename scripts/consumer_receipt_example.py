@@ -20,9 +20,9 @@ def example_policy(consumer="offline"):
     if consumer == "hosted":
         return {
             "workflow": "release-report.yml", "artifact": "release-receipt-hosted", "base": "main",
-            "ci": {"workflow": "release-pr.yml", "expected": ["validate", "checks", "container", "candidate"], "approved_skips": []},
-            "e2e": {"workflow": "release-coordinator.yml", "expected": ["candidate", "release/ready"], "approved_skips": []},
-            "deploy": {"workflow": "release.yml", "expected": ["deploy"], "approved_skips": []},
+            "ci": {"workflow": "release-pr.yml", "expected": ["authz", "validate", "checks", "container"], "approved_skips": []},
+            "e2e": {"workflow": "release-postmerge.yml", "expected": ["authz", "build", "verified"], "approved_skips": []},
+            "deploy": {"workflow": "release.yml", "expected": ["decide", "deploy"], "approved_skips": []},
         }
     if consumer == "application":
         # Only the base, artifact, CI job names and post-merge gate are known.
@@ -66,12 +66,13 @@ def build_receipt(event=None, *, consumer="offline", facts=None):
         expected = policy[name]["expected"]
         sha = merge if name in ("deploy", "post_merge") else head
         if consumer == "hosted" and name == "e2e":
-            sha = receipt["pr"]["base_sha"]
+            sha = merge
         receipt[name] = {"run_id": run_id, "run_attempt": 1, "sha": sha,
                          "expected": expected, "approved_skips": [], "results": {item: "success" for item in expected}}
     identity = {"source": head, "image_digest": image_digest, "facts_commit": facts_commit,
                 "facts_sha256": facts_sha, "deployment_id_sha256": "d" * 64}
-    receipt.update(preview=identity, deployed={**identity, "source": merge}, previous={**identity, "source": "4" * 40})
+    preview = {**identity, "source": merge} if consumer == "hosted" else identity
+    receipt.update(preview=preview, deployed={**identity, "source": merge}, previous={**identity, "source": "4" * 40})
     return receipt
 
 
