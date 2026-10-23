@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import release_artifacts as artifacts  # noqa: E402
 import release_contract as contract  # noqa: E402
 import release_pipeline as pipeline  # noqa: E402
-from test_release_binding import MemoryStore, fixture_manifest  # noqa: E402
+from test_release_binding import MemoryStore, expected_pair_payload, fixture_manifest  # noqa: E402
 
 TAG = "v1.6.0"
 CONSUMER = "hosted"
@@ -57,15 +57,16 @@ class PublicHub:
 
     def download(self, url, origins):
         if origins != {"github.com"}:
-            raise AssertionError("unexpected manifest download origins")
+            raise AssertionError("unexpected release asset download origins")
         for tag, row in self.store.rows.items():
-            if url == f"https://github.com/{contract.HUB}/releases/download/{tag}/{contract.ASSET}":
-                self.reads.append(url)
-                raw = self.store.read(row, contract.ASSET)
-                if raw is None:
-                    raise contract.Pending("public manifest unavailable")
-                return raw
-        raise AssertionError("unmodeled public manifest URL " + url)
+            for name in (contract.ASSET, contract.CANDIDATE):
+                if url == f"https://github.com/{contract.HUB}/releases/download/{tag}/{name}":
+                    self.reads.append(url)
+                    raw = self.store.read(row, name)
+                    if raw is None:
+                        raise contract.Pending("public release asset unavailable")
+                    return raw
+        raise AssertionError("unmodeled public release asset URL " + url)
 
 
 class RedeliverTest(unittest.TestCase):
@@ -186,8 +187,8 @@ class RedeliverTest(unittest.TestCase):
     def invoke(self, *, tag=TAG, consumer=CONSUMER):
         return pipeline.redeliver(self.target_client, self.store, tag, consumer, self.output)
 
-    def cli(self, command="redeliver", *, output=None):
-        argv = ["release_pipeline.py", command, "--tag", TAG, "--consumer", CONSUMER,
+    def cli(self, command="redeliver", *, output=None, tag=TAG, consumer=CONSUMER):
+        argv = ["release_pipeline.py", command, "--tag", tag, "--consumer", consumer,
                 "--output", str(output or self.output)]
         with patch.object(sys, "argv", argv):
             return pipeline.main()
@@ -322,14 +323,96 @@ class RedeliverTest(unittest.TestCase):
     def test_stable_application_is_delivered_once(self):
         """Mutation: drop event['prerelease'] from the policy require."""
         self.assertIs(self.event["prerelease"], False)
-        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "application"}):
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "application",
+                                    "RELEASE_COMPUTE_FIRST_PAIR": "not-semver"}):
             self.invoke(consumer="application")
-        expected_body = contract.canonical({"event_type": "pineforge-release", "client_payload": self.event})
+        expected_body = contract.canonical({
+            "event_type": "release-pair",
+            "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE)),
+        })
         self.assertEqual(self.requests, [expected_body])
         self.assertEqual(self.accepted, [expected_body])
         audit_raw = contract.canonical(self.audit(1, consumer="application"))
         self.assertEqual(self.puts, [(TAG, "delivery-redelivered-application-1.json", audit_raw)])
         self.assertEqual(self.output.read_bytes(), audit_raw)
+
+    def test_pair_redelivery_matches_automatic_dispatch_for_both_targets(self):
+        """Mutation: keep redeliver's former pineforge-release event/payload."""
+        expected_body = contract.canonical({
+            "event_type": "release-pair",
+            "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE)),
+        })
+        for consumer in ("application", "compute"):
+            with self.subTest(consumer=consumer), patch.dict(os.environ, {
+                    "RELEASE_READY_CONSUMERS": consumer, "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0"}):
+                self.assertEqual(self.cli("dispatch", consumer=consumer,
+                                          output=self.output.with_name("automatic.json")), 0)
+                self.assertEqual(self.cli(consumer=consumer), 0)
+                self.assertEqual(self.requests[-2:], [expected_body, expected_body])
+                audit_raw = contract.canonical(self.audit(1, consumer=consumer))
+                self.assertEqual(self.puts[-1], (TAG, f"delivery-redelivered-{consumer}-1.json", audit_raw))
+                self.assertEqual(self.output.read_bytes(), audit_raw)
+
+    def test_compute_redelivery_keeps_an_eligible_older_prerelease_pair(self):
+        """Mutation: apply the newer-release refusal to delivery-only compute."""
+        self.use_prerelease_manifest()
+        newer = fixture_manifest("1.6.1")
+        row = MemoryStore(newer).rows["v1.6.1"]
+        row.update(id=2, draft=False, prerelease=False)
+        self.store.rows[row["tag_name"]] = row
+        self.seed(row, contract.ASSET, contract.canonical(newer))
+        self.seed(self.row, "delivery-compute.json", contract.canonical({
+            "schema": "pineforge/release-delivery/v1", "event_id": self.event["event_id"],
+            "consumer": "compute", "attempt": 1, "state": "dispatch_accepted",
+            "run_id": 800, "timestamp": CLOCK}))
+        before = copy.deepcopy(self.store.assets)
+        tag = self.row["tag_name"]
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "compute",
+                                    "RELEASE_COMPUTE_FIRST_PAIR": self.event["release_version"]}):
+            self.invoke(tag=tag, consumer="compute")
+        expected_body = contract.canonical({
+            "event_type": "release-pair",
+            "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE)),
+        })
+        self.assertEqual(self.requests, [expected_body])
+        self.assertEqual(self.accepted, [expected_body])
+        name = "delivery-redelivered-compute-1.json"
+        audit_raw = contract.canonical(self.audit(1, consumer="compute"))
+        self.assertEqual(self.puts, [(tag, name, audit_raw)])
+        self.assertEqual(self.store.assets, {**before, (tag, name): audit_raw})
+        self.assertEqual(self.output.read_bytes(), audit_raw)
+
+    def test_compute_redelivery_requires_the_existing_first_pair_floor(self):
+        """Mutation: omit the compute floor check from manual repairs."""
+        for floor in ("", "1.6.1"):
+            with self.subTest(floor=floor), patch.dict(os.environ, {
+                    "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": floor}):
+                self.assert_refused(consumer="compute",
+                                    message="redelivery consumer is not enabled for this pair")
+
+    def test_malformed_compute_floor_fails_without_a_send_or_audit(self):
+        """Mutation: treat a malformed compute floor as enabled."""
+        before = copy.deepcopy(self.store.assets)
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "compute",
+                                    "RELEASE_COMPUTE_FIRST_PAIR": "not-semver"}):
+            self.assertNotEqual(self.cli(consumer="compute"), 0)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertEqual(self.store.assets, before)
+        self.assertFalse(self.output.exists())
+
+    def test_pair_redelivery_refuses_a_candidate_that_differs_from_the_manifest(self):
+        """Mutation: send the pair without checking the candidate binding."""
+        changed = contract.decode(self.store.read(self.row, contract.CANDIDATE))
+        changed["hub_commit"] = "9" * 40
+        candidate_url = f"https://github.com/{contract.HUB}/releases/download/{TAG}/{contract.CANDIDATE}"
+        download = self.public.download
+        for consumer in ("application", "compute"):
+            with self.subTest(consumer=consumer), patch.dict(os.environ, {
+                    "RELEASE_READY_CONSUMERS": consumer, "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0"}), \
+                    patch.object(self.public, "download", side_effect=lambda url, origins:
+                                 contract.canonical(changed) if url == candidate_url else download(url, origins)):
+                self.assert_refused(consumer=consumer, message="manifest does not bind this candidate")
 
     def test_refuses_superseded_release(self):
         """Mutation: replace the newer-release require condition with True."""

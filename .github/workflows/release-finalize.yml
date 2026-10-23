@@ -37,6 +37,7 @@ jobs:
       issues: write
     outputs:
       deliveries: ${{ steps.ready.outputs.deliveries }}
+      compute_configuration_error: ${{ steps.ready.outputs.compute_configuration_error }}
     steps:
       - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
         shell: bash
@@ -64,6 +65,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
           FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
           FACTS_LICENSE_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}
           RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
@@ -99,7 +101,7 @@ jobs:
         include: ${{ fromJSON(needs.finalize.outputs.deliveries) }}
     env:
       # Private targets never enter matrix outputs, log messages or public receipts.
-      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || '' }}
+      TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || matrix.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}
     steps:
       - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
         shell: bash
@@ -157,3 +159,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
         run: python3 scripts/release_pipeline.py alert --stage dispatch
+
+  report-compute-configuration-error:
+    needs: [finalize, notify-consumers]
+    if: ${{ always() && needs.finalize.outputs.compute_configuration_error != '' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Report rejected compute configuration
+        run: |
+          echo '::error::RELEASE_COMPUTE_FIRST_PAIR value was not accepted; compute is off for this run'
+          exit 1

@@ -13,10 +13,11 @@ import argparse
 import sys
 from pathlib import Path
 
-from release_contract import ROLES, canonical, payload, require
+from release_contract import RECEIPT_ROLES, canonical, payload, require
 
 
 def example_policy(consumer="offline"):
+    require(consumer in RECEIPT_ROLES, "unexpected consumer")
     if consumer == "hosted":
         return {
             "workflow": "release-report.yml", "artifact": "release-receipt-hosted", "base": "main",
@@ -46,7 +47,7 @@ def example_policy(consumer="offline"):
 
 def build_receipt(event=None, *, consumer="offline", facts=None):
     """A complete verified snapshot; facts-only has no product identity fields."""
-    require(consumer in ROLES, "unexpected consumer")
+    require(consumer in RECEIPT_ROLES, "unexpected consumer")
     require((facts is not None and consumer in ("web", "license")) or event is not None, "receipt target missing")
     head, merge = "1" * 40, "2" * 40
     policy = example_policy(consumer)
@@ -79,7 +80,7 @@ def build_receipt(event=None, *, consumer="offline", facts=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=Path(__file__).resolve().parents[1] / "tests/fixtures/release-manifest.json")
-    parser.add_argument("--consumer", choices=ROLES)
+    parser.add_argument("--consumer", choices=RECEIPT_ROLES)
     parser.add_argument("--facts-only", action="store_true")
     parser.add_argument("--facts-commit", default="e" * 40)
     parser.add_argument("--facts-sha256", default="f" * 64)

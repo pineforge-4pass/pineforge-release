@@ -30,6 +30,7 @@ jobs:
           ref: main
           persist-credentials: false
       - id: plan
+        # signal omits DELIVERY_ONLY roles (compute): no policy, token or polling.
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}

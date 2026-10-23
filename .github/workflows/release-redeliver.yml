@@ -18,6 +18,7 @@ on:
           - web
           - data
           - license
+          - compute
 
 permissions:
   contents: read
@@ -36,7 +37,7 @@ jobs:
       contents: write  # append one neutral redelivery audit asset in this hub
       issues: write
     env:
-      TARGET_REPOSITORY: ${{ inputs.consumer == 'offline' && 'pineforge-backtest-mcp' || inputs.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || inputs.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || inputs.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || inputs.consumer == 'data' && 'pineforge-data' || inputs.consumer == 'license' && 'pineforge-license' || '' }}
+      TARGET_REPOSITORY: ${{ inputs.consumer == 'offline' && 'pineforge-backtest-mcp' || inputs.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || inputs.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || inputs.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || inputs.consumer == 'data' && 'pineforge-data' || inputs.consumer == 'license' && 'pineforge-license' || inputs.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}
     steps:
       - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
         shell: bash
@@ -71,6 +72,7 @@ jobs:
           TAG: ${{ inputs.tag }}
           CONSUMER: ${{ inputs.consumer }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
         run: |
           python3 scripts/release_pipeline.py redeliver --tag "$TAG" --consumer "$CONSUMER" \
             --output "$RUNNER_TEMP/redelivery.json"

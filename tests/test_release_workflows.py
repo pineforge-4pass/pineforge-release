@@ -218,6 +218,8 @@ class PublishTest(unittest.TestCase):
     def test_prerelease_flag_is_in_every_dispatch_payload(self):
         finalizer = _workflow("release-finalize.yml")
         steps = finalizer["jobs"]["notify-consumers"]["steps"]
+        # Application/compute use release-pair, whose flag is inside build.
+        # Both payload contracts and channel policies are checked in binding tests.
         send = next(step for step in steps if step.get("name", "").startswith("Dispatch pineforge-release"))
         self.assertIn("scripts/release_pipeline.py dispatch", send["run"])
         self.assertNotIn("client_payload[", send["run"])
@@ -1706,13 +1708,88 @@ class NotifyConsumersTest(unittest.TestCase):
         self.assertNotIn("client_payload[", send["run"])
 
     def test_all_consumer_roles_have_explicit_registry_and_policy(self):
+        import release_contract as contract
         import release_pipeline as pipeline
-        expected = {"offline", "hosted", "application", "web", "data", "license"}
+        expected = {"offline", "hosted", "application", "web", "data", "license", "compute"}
+        self.assertEqual(set(contract.ROLES), expected)
+        self.assertEqual(contract.DELIVERY_ONLY, ("compute",))
+        self.assertEqual(set(contract.RECEIPT_ROLES), expected - {"compute"})
         self.assertEqual(set(pipeline.configured_roles(",".join(sorted(expected)))), expected)
         self.assertEqual(pipeline.configured_roles(""), [])
         for bad in ("unknown", "offline,offline", "offline, hosted", "offline\nhosted"):
             with self.subTest(bad=bad), self.assertRaises(pipeline.Invalid):
                 pipeline.configured_roles(bad)
+
+    def test_compute_target_reuses_the_exact_single_target_app_mint(self):
+        text = (WORKFLOWS / "release-finalize.yml").read_text()
+        job = _workflow("release-finalize.yml")["jobs"]["notify-consumers"]
+        target = job["env"]["TARGET_REPOSITORY"]
+        self.assertEqual(target.count("secrets.RELEASE_COMPUTE_REPOSITORY"), 1)
+        self.assertEqual(text.count("secrets.RELEASE_COMPUTE_REPOSITORY"), 1)
+        self.assertIn("matrix.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY", target)
+        mints = [step for step in job["steps"] if "create-github-app-token@" in step.get("uses", "")]
+        self.assertEqual(len(mints), 1)
+        self.assertEqual(mints[0]["uses"],
+                         "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510")
+        self.assertEqual(mints[0]["with"], {
+            "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
+            "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
+            "owner": "${{ github.repository_owner }}",
+            "repositories": "${{ env.TARGET_REPOSITORY }}",
+            "permission-contents": "write", "github-api-url": "https://api.github.com",
+        })
+        self.assertEqual(set(re.findall(r"secrets\.([A-Z_]+)", text)), {
+            "PINEFORGE_APP_ID", "PINEFORGE_APP_PRIVATE_KEY", "RELEASE_HOSTED_MCP_REPOSITORY",
+            "RELEASE_APPLICATION_REPOSITORY", "FACTS_WEB_REPOSITORY", "RELEASE_COMPUTE_REPOSITORY",
+        })
+
+    def test_compute_first_pair_is_explicit_and_receipt_workflow_stays_receipt_only(self):
+        finalize = _workflow("release-finalize.yml")["jobs"]["finalize"]
+        step = next(s for s in finalize["steps"] if s.get("id") == "ready")
+        self.assertEqual(step["env"]["RELEASE_COMPUTE_FIRST_PAIR"], "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}")
+        self.assertEqual(step["env"]["RELEASE_READY_CONSUMERS"], "${{ vars.RELEASE_READY_CONSUMERS }}")
+        text = (WORKFLOWS / "release-receipts.yml").read_text()
+        self.assertNotIn("RELEASE_COMPUTE_REPOSITORY", text)
+        self.assertNotIn("matrix.consumer == 'compute'", text)
+        planner = _workflow("release-receipts.yml")["jobs"]["plan"]
+        self.assertTrue(any("release_receipts.py signal" in s.get("run", "") for s in planner["steps"]))
+
+    def test_compute_configuration_error_is_reported_after_consumer_delivery(self):
+        jobs = _workflow("release-finalize.yml")["jobs"]
+        finalize = jobs["finalize"]
+        self.assertEqual(finalize["outputs"]["compute_configuration_error"],
+                         "${{ steps.ready.outputs.compute_configuration_error }}")
+        self.assertEqual(finalize["outputs"]["deliveries"], "${{ steps.ready.outputs.deliveries }}")
+        ready = next(step for step in finalize["steps"] if step.get("id") == "ready")
+        self.assertEqual(ready["run"].splitlines(), [
+            "set -euo pipefail",
+            'python3 scripts/release_pipeline.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"',
+            'echo "deliveries=$(cat "$RUNNER_TEMP/deliveries.json")" >> "$GITHUB_OUTPUT"',
+        ])
+        notify = jobs["notify-consumers"]
+        self.assertEqual(notify["needs"], "finalize")
+        self.assertEqual(notify["if"], "needs.finalize.outputs.deliveries != '[]'")
+        self.assertNotIn("compute_configuration_error", notify["if"])
+        self.assertEqual(notify["strategy"]["matrix"]["include"],
+                         "${{ fromJSON(needs.finalize.outputs.deliveries) }}")
+
+        reporter = jobs["report-compute-configuration-error"]
+        self.assertEqual(reporter["needs"], ["finalize", "notify-consumers"])
+        self.assertEqual(reporter["if"],
+                         "${{ always() && needs.finalize.outputs.compute_configuration_error != '' }}")
+        self.assertEqual(reporter["permissions"], {})
+        self.assertEqual(set(reporter), {"needs", "if", "runs-on", "permissions", "steps"})
+        self.assertEqual(len(reporter["steps"]), 1)
+        step = reporter["steps"][0]
+        self.assertEqual(set(step), {"name", "run"})
+        self.assertEqual(step["run"].splitlines(), [
+            "echo '::error::RELEASE_COMPUTE_FIRST_PAIR value was not accepted; compute is off for this run'",
+            "exit 1",
+        ])
+        # Exact job/step shapes exclude checkout, environments, credentials and token mints.
+        text = json.dumps(reporter)
+        for forbidden in ("checkout", "secrets.", "github.token", "create-github-app-token"):
+            self.assertNotIn(forbidden, text)
 
 
 class RedeliverWorkflowTest(unittest.TestCase):
@@ -1728,7 +1805,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
         self.assertEqual(inputs["consumer"], {
             "description": "One configured release consumer to repair",
             "type": "choice", "required": "true",
-            "options": ["offline", "hosted", "application", "web", "data", "license"],
+            "options": ["offline", "hosted", "application", "web", "data", "license", "compute"],
         })
         self.assertEqual(wf["permissions"], {"contents": "read"})
         self.assertEqual(set(wf["jobs"]), {"redeliver"})
@@ -1755,7 +1832,8 @@ class RedeliverWorkflowTest(unittest.TestCase):
             "inputs.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || "
             "inputs.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || "
             "inputs.consumer == 'data' && 'pineforge-data' || "
-            "inputs.consumer == 'license' && 'pineforge-license' || '' }}"
+            "inputs.consumer == 'license' && 'pineforge-license' || "
+            "inputs.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}"
         )
         self.assertEqual(job["env"], {"TARGET_REPOSITORY": target})
         self.assertEqual(target, sibling["env"]["TARGET_REPOSITORY"].replace("matrix.consumer", "inputs.consumer"))
@@ -1783,6 +1861,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
             "GH_TOKEN": "${{ steps.app.outputs.token }}", "HUB_TOKEN": "${{ github.token }}",
             "TAG": "${{ inputs.tag }}", "CONSUMER": "${{ inputs.consumer }}",
             "RELEASE_READY_CONSUMERS": "${{ vars.RELEASE_READY_CONSUMERS }}",
+            "RELEASE_COMPUTE_FIRST_PAIR": "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}",
         })
         self.assertEqual(sends[0]["run"],
                          'python3 scripts/release_pipeline.py redeliver --tag "$TAG" --consumer "$CONSUMER" \\\n'
@@ -2158,7 +2237,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         "facts-fanout.yml": {"web", "license"},
         "handle-upstream.yml": {"bump"},
         "publish.yml": {"tag-guard", "prepare", "publish", "failure-report"},
-        "release-finalize.yml": {"finalize", "notify-consumers"},
+        "release-finalize.yml": {"finalize", "notify-consumers", "report-compute-configuration-error"},
         "release-redeliver.yml": {"redeliver"},
         "release-receipts.yml": {"plan", "verify"},
         "release-reconcile.yml": {"producers"},
@@ -2177,6 +2256,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         ("publish.yml", "failure-report"),
         ("release-finalize.yml", "finalize"),
         ("release-finalize.yml", "notify-consumers"),
+        ("release-finalize.yml", "report-compute-configuration-error"),
         ("release-redeliver.yml", "redeliver"),
         ("release-receipts.yml", "plan"),
         ("release-receipts.yml", "verify"),
@@ -2440,7 +2520,8 @@ class PrTierWorkflowTest(unittest.TestCase):
         "publish.yml": {"tag-guard": "ubuntu-latest", "prepare": "ubuntu-latest",
                         "publish": "ubuntu-latest", "notify-consumers": None,
                         "failure-report": "ubuntu-latest"},
-        "release-finalize.yml": {"finalize": "ubuntu-latest", "notify-consumers": "ubuntu-latest"},
+        "release-finalize.yml": {"finalize": "ubuntu-latest", "notify-consumers": "ubuntu-latest",
+                                 "report-compute-configuration-error": "ubuntu-latest"},
         "release-redeliver.yml": {"redeliver": "ubuntu-latest"},
         "release-receipts.yml": {"plan": "ubuntu-latest", "verify": "ubuntu-latest"},
         "release-reconcile.yml": {"producers": "ubuntu-latest"},

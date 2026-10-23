@@ -33,6 +33,7 @@ import release_pair as pair  # noqa: E402
 import release_pipeline as pipeline  # noqa: E402
 import release_receipts as receipts  # noqa: E402
 import release_rollback as rollback  # noqa: E402
+import release_sources as sources  # noqa: E402
 import consumer_receipt_example as receipt_example  # noqa: E402
 
 
@@ -96,8 +97,32 @@ def candidate(manifest):
             "verification": {arch: {"backtest_sha256": "8" * 64, "trades": 3,
                                    **({"hpo_trials": 9, "hpo_sha256": "9" * 64} if pins["hpo"] else {})}
                              for arch in ("amd64", "arm64")},
-            "sources": {"release_tag": "source-set-02", "list_asset": "SOURCES.list",
+            "sources": {"release_tag": "v1.4.0", "list_asset": "set-02.SOURCES.list",
                         "list_sha256": "a" * 64, "amd64_sha256": "b" * 64, "arm64_sha256": "c" * 64}}
+
+
+def expected_pair_payload(manifest_raw, candidate_raw):
+    """Independent P04/P05 mapping; no production payload/hash helpers."""
+    manifest, built = json.loads(manifest_raw), json.loads(candidate_raw)
+    base = ("https://github.com/pineforge-4pass/pineforge-release/releases/download/v"
+            + manifest["release_version"] + "/")
+    return {
+        "pair_id": manifest["release_version"],
+        "engine_tag": manifest["versions"]["engine"]["tag"],
+        "codegen_tag": "v" + manifest["versions"]["codegen"]["version"],
+        "hpo_tag": manifest["versions"]["hpo"]["tag"] if manifest["versions"]["hpo"] else None,
+        "receipt_url": base + "release-manifest.json",
+        "receipt_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "source_sets": [built["sources"]],
+        "build": {
+            "prerelease": manifest["prerelease"], "hub_commit": manifest["hub_commit"],
+            "run_id": manifest["run_id"],
+            "image": {key: manifest["image"][key]
+                      for key in ("repository", "digest", "amd64_digest", "arm64_digest")},
+            "candidate_url": base + "release-candidate.json",
+            "candidate_sha256": hashlib.sha256(candidate_raw).hexdigest(),
+        },
+    }
 
 
 class MemoryStore:
@@ -198,6 +223,8 @@ class FinalizeClient:
     def api(self, route, **kwargs):
         if route == f"repos/{contract.HUB}/git/ref/heads/main":
             return {"object": {"sha": "e" * 40}}
+        if route == f"repos/{contract.HUB}/commits?path=facts/facts.json&sha=main&per_page=1":
+            return [{"sha": "e" * 40, "commit": {"committer": {"date": "2026-10-16T00:00:00Z"}}}]
         raise AssertionError("unmodeled API request " + route)
 
     def file(self, repo, commit, path):
@@ -286,6 +313,143 @@ class ManifestTests(unittest.TestCase):
             contract.decode(b'{"run_id":1,"run_id":2}')
 
 
+class PairPayloadTests(unittest.TestCase):
+    def test_event_types_cover_all_roles_and_preserve_legacy_events(self):
+        legacy = {"offline", "hosted", "web", "data", "license"}
+        self.assertEqual(set(contract.ROLES), legacy | {"application", "compute"})
+        self.assertEqual(set(contract.EVENT_TYPES), set(contract.ROLES))
+        self.assertEqual(contract.EVENT_TYPES,
+                         {**dict.fromkeys(legacy, "pineforge-release"),
+                          "application": "release-pair", "compute": "release-pair"})
+        self.assertEqual(contract.DELIVERY_ONLY, ("compute",))
+        self.assertEqual(set(contract.RECEIPT_ROLES), set(contract.ROLES) - {"compute"})
+
+    def test_payload_matches_fixture_bytes_and_independent_p04_mapping(self):
+        raw = (ROOT / "tests/fixtures/release-manifest.json").read_bytes()
+        ready = json.loads((ROOT / "tests/fixtures/release-ready.json").read_bytes())
+        candidate_raw = contract.canonical(candidate(json.loads(raw)))
+        expected = expected_pair_payload(raw, candidate_raw)
+        actual = contract.pair_payload(raw, candidate_raw)
+        self.assertEqual(set(actual), {"pair_id", "engine_tag", "codegen_tag", "hpo_tag",
+                                      "receipt_url", "receipt_sha256", "source_sets", "build"})
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual["receipt_sha256"], ready["manifest"]["sha256"])
+        self.assertEqual(actual["pair_id"], ready["release_version"])
+        self.assertEqual(actual["build"]["image"], ready["image"])
+        self.assertNotIn("npm_version", json.loads(candidate_raw)["versions"]["codegen"])
+        self.assertEqual(set(actual["build"]), {"prerelease", "hub_commit", "run_id", "image",
+                                              "candidate_url", "candidate_sha256"})
+
+    def test_pair_payload_preserves_cutoff_and_prerelease_tag_spellings(self):
+        for release in ("1.5.9", "1.6.0-beta.1", "1.6.0-rc.1", "1.6.0"):
+            with self.subTest(release=release):
+                manifest = fixture_manifest(release)
+                raw, candidate_raw = contract.canonical(manifest), contract.canonical(candidate(manifest))
+                actual = contract.pair_payload(raw, candidate_raw)
+                self.assertEqual(actual, expected_pair_payload(raw, candidate_raw))
+                self.assertEqual(actual["build"]["prerelease"], manifest["prerelease"])
+                self.assertEqual(actual["hpo_tag"],
+                                 manifest["versions"]["hpo"]["tag"] if manifest["versions"]["hpo"] else None)
+
+    def test_pair_payload_hashes_untouched_candidate_bytes(self):
+        raw = (ROOT / "tests/fixtures/release-manifest.json").read_bytes()
+        built = candidate(json.loads(raw))
+        candidate_raw = (json.dumps(built, indent=2) + "\n").encode()
+        actual = contract.pair_payload(raw, candidate_raw)
+        self.assertEqual(actual, expected_pair_payload(raw, candidate_raw))
+        self.assertNotEqual(actual["build"]["candidate_sha256"],
+                            hashlib.sha256(contract.canonical(built)).hexdigest())
+        self.assertEqual(actual["receipt_sha256"], hashlib.sha256(raw).hexdigest())
+
+    def test_pair_payload_uses_the_producer_source_tag_rule(self):
+        manifest = fixture_manifest()
+        raw = contract.canonical(manifest)
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "SOURCE-SETS.tsv"
+            for tag in ("v1.4.0-preview.1", "v1.4.0-nightly-2026.10", "v01.04.00", "v1.4.0-preview/1"):
+                built = candidate(manifest)
+                built["sources"]["release_tag"] = tag
+                registry.write_text(
+                    sources.REGISTRY_HEADER + "\n"
+                    + f"{'a' * 64}\t{tag}\t84\t{'b' * 64}\tset-02.SOURCES.list\n",
+                    encoding="utf-8")
+                with self.subTest(tag=tag):
+                    if tag == "v1.4.0-preview/1":
+                        with self.assertRaisesRegex(sources.SourcesError, "release tag must be a v-prefixed version"):
+                            sources.registry_set(registry, "a" * 64)
+                        with self.assertRaisesRegex(contract.Invalid, "^malformed identity$"):
+                            contract.pair_payload(raw, contract.canonical(built))
+                    else:
+                        produced = sources.registry_set(registry, "a" * 64)
+                        self.assertEqual(produced.release_tag, tag)
+                        candidate_raw = contract.canonical(built)
+                        actual = contract.pair_payload(raw, candidate_raw)
+                        self.assertEqual(actual, expected_pair_payload(raw, candidate_raw))
+                        self.assertEqual(actual["source_sets"][0]["release_tag"], produced.release_tag)
+
+    def test_pair_payload_refuses_image_hub_commit_and_producer_mismatches(self):
+        manifest = fixture_manifest()
+        raw = contract.canonical(manifest)
+        changes = (
+            (("image", "digest"), "sha256:" + "f" * 64, "manifest does not bind this candidate"),
+            (("hub_commit",), "f" * 40, "manifest does not bind this candidate"),
+            *((("versions", role, "commit"), "f" * 40,
+               "manifest producer identity differs from candidate") for role in ("engine", "codegen", "hpo")),
+        )
+        for path, value, message in changes:
+            built = copy.deepcopy(candidate(manifest))
+            target = built
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path), self.assertRaisesRegex(contract.Invalid, "^" + message + "$"):
+                contract.pair_payload(raw, contract.canonical(built))
+
+    def test_pair_payload_refuses_a_different_release_or_build_run(self):
+        manifest = fixture_manifest()
+        for built in (candidate(fixture_manifest("1.6.1")), {**candidate(manifest), "run_id": manifest["run_id"] + 1}):
+            with self.subTest(release=built["release_version"], run=built["run_id"]), \
+                    self.assertRaisesRegex(contract.Invalid, "^manifest does not bind this candidate$"):
+                contract.pair_payload(contract.canonical(manifest), contract.canonical(built))
+
+    def test_pair_payload_refuses_private_identifiers_and_extra_fields(self):
+        changes = (
+            ("manifest", ("image", "repository"), "ghcr.io/private-project/private-image", "unexpected image repository"),
+            ("manifest", ("hub_commit",), "projects/private-project", "malformed identity"),
+            ("candidate", ("sources", "release_tag"), "private-workload", "malformed identity"),
+            ("candidate", ("sources", "list_asset"), "gs://private-project/SOURCES.list", "malformed identity"),
+            ("candidate", ("sources", "project"), "private-project", "unexpected object fields"),
+        )
+        for source, path, value, message in changes:
+            manifest = fixture_manifest()
+            built = copy.deepcopy(candidate(manifest))
+            target = manifest if source == "manifest" else built
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(source=source, path=path), self.assertRaisesRegex(contract.Invalid, "^" + message + "$"):
+                contract.pair_payload(contract.canonical(manifest), contract.canonical(built))
+
+    def test_pair_payload_keeps_candidate_smoke_and_source_digest_gates(self):
+        manifest = fixture_manifest()
+        for path, value in ((("verification", "arm64", "trades"), 0),
+                            (("verification", "amd64", "hpo_trials"), 8),
+                            (("sources", "amd64_sha256"), "private-project")):
+            built = copy.deepcopy(candidate(manifest))
+            target = built
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(contract.Invalid):
+                contract.pair_payload(contract.canonical(manifest), contract.canonical(built))
+
+    def test_pair_payload_refuses_noncanonical_manifest_bytes(self):
+        manifest = fixture_manifest()
+        raw = (json.dumps(manifest, indent=2) + "\n").encode()
+        with self.assertRaisesRegex(contract.Invalid, "^noncanonical manifest bytes$"):
+            contract.pair_payload(raw, contract.canonical(candidate(manifest)))
+
+
 class FinalizerTests(unittest.TestCase):
     def setUp(self):
         self.m = fixture_manifest()
@@ -301,6 +465,21 @@ class FinalizerTests(unittest.TestCase):
 
     def finish(self):
         return pipeline.finalize(self.client, self.store, self.registry, self.row)
+
+    def plan(self, release="1.6.0", *, enabled="compute", first="1.6.0"):
+        manifest = fixture_manifest(release)
+        client, store, registry = FinalizeClient(manifest), MemoryStore(manifest), MemoryRegistry()
+        row = store.get("v" + release)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "age_minutes", return_value=0), patch.object(pipeline, "report_issue"):
+            output = Path(tmp) / "deliveries.json"
+            pipeline.finalize_all(client, store, registry, row["tag_name"], output)
+            deliveries = json.loads(output.read_bytes())
+        status = json.loads(store.read(row, "release-status-100-1.json"))
+        return deliveries, status, store
 
     def test_draft_is_invisible_by_tag_but_found_by_real_store_and_candidate_probe(self):
         with self.assertRaises(contract.Pending):
@@ -375,13 +554,17 @@ class FinalizerTests(unittest.TestCase):
         old = self.finish()
         self.assertEqual(self.registry.tags["latest"], newer["image"]["digest"])
         status = pipeline.aggregate(self.store, self.row, old, enabled=contract.ROLES, newest=pair.parse("1.6.1"))
-        self.assertEqual(set(status["consumers"].values()), {"superseded"})
+        self.assertEqual(status["consumers"],
+                         {**dict.fromkeys(contract.RECEIPT_ROLES, "superseded"), "compute": "pending"})
+        self.assertFalse(status["complete"])
 
     def test_dispatch_and_missing_receipt_never_mean_verified(self):
         event = self.finish()
         self.store.put(self.row, "delivery-offline-42-1.json", contract.canonical({"state": "dispatch_accepted"}))
         status = pipeline.aggregate(self.store, self.row, event, enabled=contract.ROLES)
         self.assertEqual(set(status["consumers"].values()), {"pending"})
+        self.assertEqual(set(status["consumers"]), set(contract.ROLES))
+        self.assertEqual(status["consumers"]["compute"], "pending")
         self.assertFalse(status["complete"])
 
     def test_prerelease_never_moves_latest_and_has_explicit_policy_inventory(self):
@@ -393,6 +576,7 @@ class FinalizerTests(unittest.TestCase):
         status = pipeline.aggregate(self.store, self.store.get("v1.6.0-rc.1"), event, enabled=contract.ROLES)
         self.assertEqual(status["consumers"]["application"], "skipped_by_policy")
         self.assertEqual(status["consumers"]["offline"], "pending")
+        self.assertEqual(status["consumers"]["compute"], "pending")
         facts = contract.canonical(self.client.facts)
         self.assertEqual(contract.retain_facts(event, facts, facts), event["facts"]["sha256"])
         with self.assertRaises(contract.Invalid):
@@ -405,6 +589,267 @@ class FinalizerTests(unittest.TestCase):
         self.assertTrue(empty["complete"])
         status = pipeline.aggregate(self.store, self.row, event, enabled=("offline",))
         self.assertEqual(status["consumers"], {"offline": "pending"})
+
+    def test_compute_delivery_completes_a_release_with_only_compute_pending(self):
+        event = self.finish()
+        for role in contract.RECEIPT_ROLES:
+            self.store.put(self.row, f"consumer-{role}-1-1.json", contract.canonical({
+                "event_id": event["event_id"], "consumer": role, "attempt": 1, "sequence": 1, "state": "verified"}))
+        pending = pipeline.aggregate(self.store, self.row, event, enabled=contract.ROLES)
+        self.assertEqual(pending["consumers"],
+                         {**dict.fromkeys(contract.RECEIPT_ROLES, "verified"), "compute": "pending"})
+        self.assertFalse(pending["complete"])
+        self.store.put(self.row, "delivery-compute.json", contract.canonical({
+            "event_id": event["event_id"], "consumer": "compute", "state": "dispatch_accepted"}))
+        delivered = pipeline.aggregate(self.store, self.row, event, enabled=contract.ROLES)
+        self.assertEqual(delivered["consumers"],
+                         {**dict.fromkeys(contract.RECEIPT_ROLES, "verified"), "compute": "delivered"})
+        self.assertTrue(delivered["complete"])
+
+    def test_compute_is_never_superseded_before_or_after_delivery(self):
+        event = self.finish()
+        for accepted in (False, True):
+            if accepted:
+                self.store.put(self.row, "delivery-compute.json", contract.canonical({
+                    "event_id": event["event_id"], "consumer": "compute", "state": "dispatch_accepted"}))
+            with self.subTest(accepted=accepted):
+                status = pipeline.aggregate(self.store, self.row, event, enabled=contract.ROLES,
+                                            newest=pair.parse("1.6.1"))
+                self.assertEqual(status["consumers"],
+                                 {**dict.fromkeys(contract.RECEIPT_ROLES, "superseded"),
+                                  "compute": "delivered" if accepted else "pending"})
+                self.assertEqual(status["complete"], accepted)
+
+    def test_compute_prerelease_delivery_completes_while_application_keeps_policy_skip(self):
+        manifest = fixture_manifest("1.6.0-rc.1")
+        store = MemoryStore(manifest)
+        row = store.get("v1.6.0-rc.1")
+        event = contract.payload(contract.canonical(manifest))
+        pending = pipeline.aggregate(store, row, event, enabled=("compute", "application"))
+        self.assertEqual(pending["consumers"], {"compute": "pending", "application": "skipped_by_policy"})
+        self.assertFalse(pending["complete"])
+        store.put(row, "delivery-compute.json", contract.canonical({
+            "event_id": event["event_id"], "consumer": "compute", "state": "dispatch_accepted"}))
+        delivered = pipeline.aggregate(store, row, event, enabled=("compute", "application"))
+        self.assertEqual(delivered["consumers"], {"compute": "delivered", "application": "skipped_by_policy"})
+        self.assertTrue(delivered["complete"])
+
+    def test_compute_delivery_closes_finalizer_incident_without_a_consumer_receipt(self):
+        event = self.finish()
+        self.store.put(self.row, "delivery-compute.json", contract.canonical({
+            "event_id": event["event_id"], "consumer": "compute", "state": "dispatch_accepted"}))
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "age_minutes", return_value=0), patch.object(pipeline, "report_issue") as report:
+            output = Path(tmp) / "deliveries.json"
+            pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0", output)
+            self.assertEqual(json.loads(output.read_bytes()), [])
+            status = json.loads(self.store.read(self.row, "release-status-100-1.json"))
+            self.assertEqual(status["consumers"], {"compute": "delivered"})
+            self.assertTrue(status["complete"])
+            self.assertEqual(status["stale"], [])
+            self.assertTrue(report.call_args.kwargs["complete"])
+            self.assertIn("Delivery-only roles complete at delivered (transport acceptance).",
+                          report.call_args.args[3])
+        self.assertFalse(any(a["name"].startswith("delivery-attempt-") for a in self.row["assets"]))
+
+    def test_compute_off_incident_body_is_byte_identical_to_base_literal(self):
+        legacy = "offline,hosted,application,web,data,license"
+        for enabled, first in ((legacy, "1.6.0"), (legacy + ",compute", ""),
+                               (legacy + ",compute", "1.6.1")):
+            store = MemoryStore(self.m)
+            row = store.get("v1.6.0")
+            store.put(row, contract.ASSET, (ROOT / "tests/fixtures/release-manifest.json").read_bytes())
+            with self.subTest(enabled=enabled, first=first), tempfile.TemporaryDirectory() as tmp, \
+                    patch.dict(os.environ, {
+                        "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                        "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                        "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                    patch.object(pipeline, "age_minutes", return_value=0), \
+                    patch.object(pipeline, "report_issue") as report:
+                pipeline.finalize_all(self.client, store, MemoryRegistry(), "v1.6.0",
+                                      Path(tmp) / "deliveries.json")
+                incidents = [call for call in report.call_args_list if call.args[1] == "v1.6.0"]
+                self.assertEqual(len(incidents), 1)
+                self.assertEqual(incidents[0].args[3].encode("utf-8"), (
+                    b"Event: `sha256:12a79d3776c447b1caf9513c96db3407b1d3cd2d71a510081e6763e994c2288e`\n\n"
+                    b"- offline: pending\n- hosted: pending\n- application: pending\n"
+                    b"- web: pending\n- data: pending\n- license: pending\n\n"
+                    b"Dispatch acceptance is transport only. "
+                    b"Verified means checked consumer receipt and served-state evidence."))
+
+    def test_compute_plan_is_off_when_first_pair_is_empty(self):
+        deliveries, status, store = self.plan(first="")
+        self.assertEqual(deliveries, [])
+        self.assertEqual(status["consumers"], {})
+        self.assertTrue(status["complete"])
+        self.assertFalse(any(name.startswith("delivery-attempt-") for _, name in store.assets))
+
+    def test_compute_plan_requires_ready_consumer_membership(self):
+        deliveries, status, store = self.plan(enabled="")
+        self.assertEqual(deliveries, [])
+        self.assertEqual(status["consumers"], {})
+        self.assertTrue(status["complete"])
+        self.assertFalse(any(name.startswith("delivery-attempt-") for _, name in store.assets))
+
+    def test_compute_plan_excludes_pairs_below_the_semver_floor(self):
+        for release, first in (("1.6.0-rc.2", "1.6.0-rc.10"),
+                               ("1.6.0-rc.10", "1.6.0"), ("1.9.9", "1.10.0")):
+            with self.subTest(release=release, first=first):
+                deliveries, status, store = self.plan(release, first=first)
+                self.assertEqual(deliveries, [])
+                self.assertEqual(status["consumers"], {})
+                self.assertTrue(status["complete"])
+                self.assertFalse(any(name.startswith("delivery-attempt-compute-") for _, name in store.assets))
+
+    def test_compute_plan_reserves_one_delivery_at_or_above_the_semver_floor(self):
+        for release, first in (("1.6.0", "1.6.0"), ("1.6.0-rc.10", "1.6.0-rc.2"),
+                               ("1.6.0", "1.6.0-rc.10"), ("1.10.0", "1.9.9")):
+            with self.subTest(release=release, first=first):
+                deliveries, status, store = self.plan(release, first=first)
+                self.assertEqual(deliveries, [{"consumer": "compute", "tag": "v" + release, "attempt": 1}])
+                self.assertEqual(status["consumers"], {"compute": "pending"})
+                self.assertFalse(status["complete"])
+                attempts = [name for _, name in store.assets if name.startswith("delivery-attempt-compute-")]
+                self.assertEqual(attempts, ["delivery-attempt-compute-1.json"])
+
+    def test_application_plan_keeps_its_stable_and_prerelease_policy_with_compute_off(self):
+        for release, expected in (("1.6.0", "pending"), ("1.6.0-rc.1", "skipped_by_policy")):
+            with self.subTest(release=release):
+                deliveries, status, store = self.plan(release, enabled="application,compute", first="")
+                self.assertEqual(deliveries, [{"consumer": "application", "tag": "v" + release, "attempt": 1}]
+                                 if expected == "pending" else [])
+                self.assertEqual(status["consumers"], {"application": expected})
+                self.assertFalse(any("compute" in name for _, name in store.assets))
+
+    def test_compute_plan_includes_an_older_pair_despite_a_newer_ready_release(self):
+        manifests = [fixture_manifest(v) for v in ("1.6.0", "1.6.1")]
+        client, store, registry = FinalizeClient(*manifests), MemoryStore(*manifests), MemoryRegistry()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "age_minutes", return_value=0), patch.object(pipeline, "report_issue"):
+            output = Path(tmp) / "deliveries.json"
+            pipeline.finalize_all(client, store, registry, "", output)
+            self.assertEqual(json.loads(output.read_bytes()),
+                             [{"consumer": "compute", "tag": "v1.6.1", "attempt": 1},
+                              {"consumer": "compute", "tag": "v1.6.0", "attempt": 1}])
+
+    def test_compute_plan_refuses_a_noncanonical_first_pair(self):
+        legacy = "offline,hosted,application,web,data,license"
+        manifests = [fixture_manifest(v) for v in ("1.6.0", "1.6.1", "1.6.2-rc.1")]
+
+        def run(first, enabled, *, github_output_enabled=True):
+            client, store, registry = FinalizeClient(*manifests), MemoryStore(*manifests), MemoryRegistry()
+            store_type = pipeline.Store
+            stderr, stdout = io.StringIO(), io.StringIO()
+            with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                    "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                    "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_OUTPUT": str(Path(tmp) / "github-output") if github_output_enabled else "",
+                    "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                    patch.object(pipeline, "Client", return_value=client), \
+                    patch.object(pipeline, "Store", side_effect=lambda bound_client:
+                                 store if bound_client is client else store_type(bound_client)), \
+                    patch.object(pipeline, "Registry", return_value=registry), \
+                    patch.object(pipeline, "age_minutes", return_value=0), \
+                    patch.object(pipeline, "now", return_value="2026-10-16T00:00:00Z"), \
+                    patch.object(pipeline, "version", wraps=pipeline.version) as parse_version, \
+                    patch.object(pipeline, "report_issue") as report, \
+                    patch.object(sys, "stderr", stderr), patch.object(sys, "stdout", stdout):
+                output = Path(tmp) / "deliveries.json"
+                github_output = Path(tmp) / "github-output"
+                github_output.write_text("existing_output=kept\n", encoding="utf-8")
+                with patch.object(sys, "argv", ["release_pipeline.py", "finalize", "--output", str(output)]):
+                    result = pipeline.main()
+                deliveries = output.read_bytes()
+                configuration_output = github_output.read_text(encoding="utf-8")
+                reports = [(call.args[1:], call.kwargs) for call in report.call_args_list]
+                validations = sum(call.args == (first,) for call in parse_version.call_args_list)
+            return (result, stderr.getvalue(), deliveries, store.assets, reports, registry.operations,
+                    validations, configuration_output, stdout.getvalue())
+
+        baseline = run("", legacy)
+        self.assertEqual(baseline[:2], (0, ""))
+        self.assertEqual(baseline[7:], ("existing_output=kept\n", ""))
+        self.assertEqual(json.loads(baseline[2]), [
+            {"consumer": "offline", "tag": "v1.6.2-rc.1", "attempt": 1},
+            {"consumer": "hosted", "tag": "v1.6.2-rc.1", "attempt": 1},
+            *({"consumer": role, "tag": "v1.6.1", "attempt": 1} for role in legacy.split(",")),
+        ])
+        configuration_line = ("compute_configuration_error=RELEASE_COMPUTE_FIRST_PAIR value was not accepted; "
+                              "compute is off for this run\n")
+        for first in ("v1.6.0", "1.6", "v1.7.0"):
+            with self.subTest(first=first):
+                actual = run(first, legacy + ",compute")
+                self.assertEqual(actual[2:6], baseline[2:6])
+                self.assertEqual(actual[:2], (0, ""))
+                self.assertEqual(actual[6], 1)
+                self.assertEqual(actual[7:], ("existing_output=kept\n" + configuration_line, ""))
+                unselected = run(first, legacy)
+                self.assertEqual(unselected[:6], baseline[:6])
+                self.assertEqual(unselected[6], 0)
+                self.assertEqual(unselected[7:], baseline[7:])
+
+        standalone = run("v1.7.0", legacy + ",compute", github_output_enabled=False)
+        self.assertEqual(standalone[:6], baseline[:6])
+        self.assertEqual(standalone[6:], (1, "existing_output=kept\n", configuration_line))
+
+    def test_compute_configuration_output_precedes_row_and_facts_failures(self):
+        configuration_line = ("compute_configuration_error=RELEASE_COMPUTE_FIRST_PAIR value was not accepted; "
+                              "compute is off for this run\n")
+
+        def check_configuration_output(*args, **kwargs):
+            self.assertEqual(github_output.read_text(encoding="utf-8"), configuration_line)
+
+        class MissingFactsClockClient(FinalizeClient):
+            def api(self, route, **kwargs):
+                if route == f"repos/{contract.HUB}/commits?path=facts/facts.json&sha=main&per_page=1":
+                    check_configuration_output()
+                    return []
+                return super().api(route, **kwargs)
+
+        for failure in ("row", "facts"):
+            with self.subTest(failure=failure):
+                manifest = fixture_manifest()
+                if failure == "row":
+                    manifest["image"]["digest"] = "malformed"
+                client = MissingFactsClockClient(manifest) if failure == "facts" else FinalizeClient(manifest)
+                store, registry = MemoryStore(manifest), MemoryRegistry()
+                store_type = pipeline.Store
+                stderr, stdout = io.StringIO(), io.StringIO()
+                with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                        "RELEASE_READY_CONSUMERS": "offline,web,compute", "RELEASE_COMPUTE_FIRST_PAIR": "v1.7.0",
+                        "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                        "GITHUB_OUTPUT": str(Path(tmp) / "github-output"),
+                        "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                        patch.object(pipeline, "Client", return_value=client), \
+                        patch.object(pipeline, "Store", side_effect=lambda bound_client:
+                                     store if bound_client is client else store_type(bound_client)), \
+                        patch.object(pipeline, "Registry", return_value=registry), \
+                        patch.object(pipeline, "age_minutes", return_value=0), \
+                        patch.object(pipeline, "report_issue", side_effect=check_configuration_output) as report, \
+                        patch.object(sys, "stderr", stderr), patch.object(sys, "stdout", stdout):
+                    output = Path(tmp) / "deliveries.json"
+                    github_output = Path(tmp) / "github-output"
+                    github_output.write_text("", encoding="utf-8")
+                    with patch.object(sys, "argv", ["release_pipeline.py", "finalize", "--output", str(output)]):
+                        self.assertEqual(pipeline.main(), 1)
+                    check_configuration_output()
+                    self.assertEqual(stderr.getvalue().splitlines(), [
+                        "::error::release chain operation failed; inspect the neutral incident and workflow run"])
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(json.loads(output.read_bytes()), [] if failure == "row" else [
+                        {"consumer": "offline", "tag": "v1.6.0", "attempt": 1},
+                        {"consumer": "web", "tag": "v1.6.0", "attempt": 1},
+                    ])
+                    if failure == "row":
+                        self.assertTrue(any(call.args[2] == "Release v1.6.0: readiness failed"
+                                            for call in report.call_args_list))
+                    self.assertFalse(any("compute" in name for _, name in store.assets))
 
     def test_finalize_all_never_redispatches_after_delivery_acceptance(self):
         event = self.finish()
@@ -470,6 +915,113 @@ class FinalizerTests(unittest.TestCase):
         self.assertEqual(self.registry.tags["1.6.0"], event["image"]["digest"])
         self.assertEqual(contract.payload(self.store.read(self.row, contract.ASSET)), event)
         self.assertIsNone(self.finish())
+
+
+class DispatchTests(unittest.TestCase):
+    """Use the existing MemoryStore/CLI harness with separate target/public clients."""
+    def ready_store(self, *manifests):
+        store = MemoryStore(*manifests)
+        for manifest in manifests:
+            row = store.get("v" + manifest["release_version"])
+            row.update(draft=False, prerelease=manifest["prerelease"])
+            store.put(row, contract.ASSET, contract.canonical(manifest))
+        return store
+
+    def send(self, store, consumer, tag="v1.6.0"):
+        sender = unittest.mock.Mock(spec=["api"])
+
+        def download(url, origins):
+            prefix = "https://github.com/pineforge-4pass/pineforge-release/releases/download/"
+            self.assertEqual(origins, {"github.com"})
+            self.assertTrue(url.startswith(prefix))
+            release_tag, asset = url.removeprefix(prefix).split("/")
+            self.assertIn(asset, ("release-manifest.json", "release-candidate.json"))
+            raw = store.assets.get((release_tag, asset))
+            if raw is None:
+                raise contract.Pending("published asset unavailable")
+            return raw
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "TARGET_REPOSITORY": "fixture", "GITHUB_RUN_ID": "100"}), \
+                patch.object(pipeline, "Client", side_effect=[sender, store]) as clients, \
+                patch.object(store, "download", side_effect=download, create=True) as fetch, \
+                patch.object(store, "pages", wraps=store.pages) as scan:
+            output = Path(tmp) / "delivery.json"
+            with patch.object(sys, "argv", ["release_pipeline.py", "dispatch", "--tag", tag,
+                                           "--consumer", consumer, "--output", str(output)]):
+                result = pipeline.main()
+            written = output.read_bytes() if output.exists() else None
+            self.assertEqual(clients.call_args_list, [unittest.mock.call(), unittest.mock.call(token="")])
+        return result, sender, written, fetch.call_args_list, scan.call_args_list
+
+    def test_pair_dispatch_posts_release_pair_with_exact_eight_key_payload(self):
+        for consumer, release in (("compute", "1.6.0"), ("application", "1.6.0"), ("compute", "1.6.0-rc.1")):
+            with self.subTest(consumer=consumer, release=release):
+                manifest = fixture_manifest(release)
+                store = self.ready_store(manifest)
+                tag = "v" + release
+                raw, candidate_raw = store.assets[(tag, contract.ASSET)], store.assets[(tag, pipeline.CANDIDATE)]
+                result, sender, written, fetches, _ = self.send(store, consumer, tag)
+                self.assertEqual(result, 0)
+                sender.api.assert_called_once_with("repos/pineforge-4pass/fixture/dispatches", method="POST",
+                    data={"event_type": "release-pair", "client_payload": expected_pair_payload(raw, candidate_raw)})
+                self.assertEqual(len(sender.api.call_args.kwargs["data"]["client_payload"]), 8)
+                self.assertEqual({call.args[0].rsplit("/", 1)[-1] for call in fetches},
+                                 {"release-manifest.json", "release-candidate.json"})
+                self.assertEqual(json.loads(written)["consumer"], consumer)
+                self.assertNotIn(b"fixture", written)
+
+    def test_legacy_dispatch_keeps_full_manifest_payload_bytes_for_every_other_role(self):
+        ready_raw = (ROOT / "tests/fixtures/release-ready.json").read_bytes()
+        for consumer in ("hosted", "offline", "web", "data", "license"):
+            with self.subTest(consumer=consumer):
+                store = self.ready_store(fixture_manifest())
+                result, sender, written, fetches, _ = self.send(store, consumer)
+                self.assertEqual(result, 0)
+                sent = sender.api.call_args.kwargs["data"]
+                sender.api.assert_called_once_with("repos/pineforge-4pass/fixture/dispatches", method="POST",
+                    data={"event_type": "pineforge-release", "client_payload": json.loads(ready_raw)})
+                self.assertEqual(contract.canonical(sent["client_payload"]), ready_raw)
+                self.assertEqual(len(fetches), 1)
+                self.assertTrue(fetches[0].args[0].endswith("/release-manifest.json"))
+                self.assertEqual(json.loads(written)["state"], "dispatch_accepted")
+
+    def test_compute_dispatch_accepts_older_pairs_while_receipt_roles_refuse(self):
+        for consumer in ("compute", *contract.RECEIPT_ROLES):
+            with self.subTest(consumer=consumer):
+                store = self.ready_store(fixture_manifest(), fixture_manifest("1.6.1"))
+                result, sender, written, _, scans = self.send(store, consumer)
+                if consumer == "compute":
+                    self.assertEqual(result, 0)
+                    sender.api.assert_called_once()
+                    self.assertEqual(json.loads(written)["consumer"], "compute")
+                    self.assertEqual(scans, [])
+                else:
+                    self.assertEqual(result, 1)
+                    sender.api.assert_not_called()
+                    self.assertIsNone(written)
+                    self.assertTrue(scans)
+
+    def test_pair_dispatch_refuses_candidate_mismatch_before_posting(self):
+        for consumer in ("compute", "application"):
+            with self.subTest(consumer=consumer):
+                store = self.ready_store(fixture_manifest())
+                built = json.loads(store.assets[("v1.6.0", pipeline.CANDIDATE)])
+                built["hub_commit"] = "f" * 40
+                store.assets[("v1.6.0", pipeline.CANDIDATE)] = contract.canonical(built)
+                result, sender, written, _, _ = self.send(store, consumer)
+                self.assertEqual(result, 1)
+                sender.api.assert_not_called()
+                self.assertIsNone(written)
+
+    def test_compute_dispatch_still_refuses_rejected_pairs(self):
+        store = self.ready_store(fixture_manifest())
+        store.put(store.get("v1.6.0"), "release-rejected.json", contract.canonical({"state": "rejected"}))
+        result, sender, written, fetches, _ = self.send(store, "compute")
+        self.assertEqual(result, 1)
+        sender.api.assert_not_called()
+        self.assertIsNone(written)
+        self.assertEqual(fetches, [])
 
 
 def archive(files):
@@ -841,6 +1393,77 @@ class ReceiptTests(unittest.TestCase):
         self.assertNotIn(b"fixture", raw)
         self.assertNotIn(b"e2e/one", raw)
         self.assertEqual(public["deployed"]["image_digest"], self.event["image"]["digest"])
+
+    def test_compute_consumer_receipts_are_refused_before_evidence_checks(self):
+        self.receipt["consumer"] = "compute"
+        for state in receipts.STATES:
+            self.receipt["state"] = state
+            with self.subTest(state=state), patch.object(receipts, "check_run") as check:
+                with self.assertRaisesRegex(contract.Invalid, "^invalid consumer receipt schema$"):
+                    self.verify()
+                check.assert_not_called()
+
+    def test_receipt_selection_keeps_all_six_policies_without_a_compute_policy(self):
+        expected = ("offline", "hosted", "application", "web", "data", "license")
+        policies = {role: self.policy for role in expected}
+        with patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": ",".join(contract.ROLES),
+                "RELEASE_RECEIPT_POLICY": json.dumps(policies),
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}):
+            self.assertEqual(pipeline.receipt_roles(), list(expected))
+            for role in expected:
+                with self.subTest(role=role):
+                    self.assertEqual(receipts.profile(role), self.policy)
+            with self.assertRaisesRegex(contract.Invalid, "^unexpected receipt role$"):
+                receipts.profile("compute")
+
+    def test_compute_collection_refuses_before_configuration_policy_or_network(self):
+        client = unittest.mock.Mock(spec=["api", "request"])
+        with patch.dict(os.environ, {"TARGET_REPOSITORY": "", "RELEASE_RECEIPT_POLICY": "{}"}), \
+                patch.object(receipts, "profile") as profile:
+            with self.assertRaisesRegex(contract.Invalid, "^unexpected receipt role$"):
+                receipts.collect(client, client, MemoryStore(), "compute")
+            profile.assert_not_called()
+        client.api.assert_not_called()
+        client.request.assert_not_called()
+
+    def test_compute_signal_is_refused_even_if_the_caller_enables_all_roles(self):
+        signal = {"schema": "pineforge/consumer-signal/v1", "consumer": "compute",
+                  "release_version": "1.6.0", "run_id": 90}
+        with self.assertRaisesRegex(contract.Invalid, "^invalid consumer signal$"):
+            receipts.signal_targets(signal, contract.ROLES)
+
+    def test_scheduled_receipt_plan_omits_compute_without_loading_any_policy(self):
+        store = MemoryStore()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": ",".join(contract.ROLES), "RELEASE_RECEIPT_POLICY": "{}",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false",
+                "GITHUB_EVENT_NAME": "schedule", "GITHUB_EVENT_PATH": str(Path(tmp) / "event.json")}), \
+                patch.object(receipts, "Store", return_value=store), patch.object(receipts, "Client"), \
+                patch.object(receipts, "profile") as profile:
+            Path(os.environ["GITHUB_EVENT_PATH"]).write_bytes(b"{}")
+            output = Path(tmp) / "consumers.json"
+            with patch.object(sys, "argv", ["release_receipts.py", "signal", "--output", str(output)]):
+                self.assertEqual(receipts.main(), 0)
+            self.assertEqual(json.loads(output.read_bytes()),
+                             [{"consumer": role, "run_id": "0"} for role in contract.RECEIPT_ROLES])
+            self.assertNotIn(b"compute", output.read_bytes())
+            profile.assert_not_called()
+
+    def test_example_builder_refuses_the_delivery_only_role(self):
+        with self.assertRaisesRegex(contract.Invalid, "^unexpected consumer$"):
+            receipt_example.build_receipt(self.event, consumer="compute")
+        with self.assertRaisesRegex(contract.Invalid, "^unexpected consumer$"):
+            receipt_example.example_policy("compute")
+
+    def test_stored_compute_consumer_receipt_cannot_claim_verified(self):
+        store = MemoryStore(self.manifest)
+        row = store.get("v1.6.0")
+        store.put(row, "consumer-compute-1-1.json", contract.canonical({
+            "event_id": self.event["event_id"], "consumer": "compute",
+            "attempt": 1, "sequence": 1, "state": "verified"}))
+        with self.assertRaisesRegex(contract.Invalid, "^consumer receipt identity differs$"):
+            pipeline.aggregate(store, row, self.event, enabled=("compute",))
 
     def test_exact_data_bootstrap_previous_is_verified(self):
         previous = self.data_bootstrap_previous()
