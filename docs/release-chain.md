@@ -411,7 +411,7 @@ fields defined here.
 | `pr` | PR object below, or `null` before PR evidence exists. |
 | `ci`, `e2e`, `deploy` | Each a check-evidence object below, or `null` before that evidence exists. |
 | `post_merge` | Application only: required exactly when the policy contains `post_merge`, otherwise forbidden. Same check-evidence object below; may be `null` before `verified`. |
-| `preview`, `deployed`, `previous` | Each a served-identity object below, or `null` before that evidence exists. `previous` records the rollback identity; only `data.previous` has the temporary pre-manifest bootstrap form below. |
+| `preview`, `deployed`, `previous` | Each a served-identity object below, or `null` before that evidence exists. `previous` records the rollback identity; only `data.previous` has the temporary pre-manifest bootstrap form below and only `offline.previous` may carry the legacy predecessor form. |
 
 The PR object has exactly these fields:
 
@@ -531,7 +531,7 @@ An ordinary served-identity object has exactly these five fields:
 | `deployment_id_sha256` | SHA-256 of the consumer's raw deployment/distribution identity; no raw private deployment ID or URL. |
 
 The ordinary form never has a `provenance` key, including for a real previous
-release. The sole alternative is the temporary data `previous` form below.
+release. The only alternatives are the temporary data `previous` form and the offline legacy `previous` form below.
 
 For product receipts, the hub fetches facts from its fixed repository, verifies
 bytes and schema, checks equal/newer Git ancestry, and requires an unchanged
@@ -595,6 +595,15 @@ collector re-validates every retained receipt artifact that the hub has not
 already stored, so dropping the form earlier makes each such artifact fail
 validation; in a sweep it is reported and skipped (see the collector skip rules
 below), and a callback naming that run still fails closed.
+
+**Legacy offline `previous`.** Only a product receipt with `consumer: offline` may
+record a predecessor that has no `release-lock.json`, and only in `previous`; the
+object is refused in `preview`, `deployed`, every other consumer and every
+facts-only receipt. It has exactly five keys: `legacy` (the boolean `true`),
+`npm_version` (bare canonical semver, no leading `v`), `npm_integrity` (`sha512-`
+plus 86 base64 characters and `==`), `git_head` (a 40-hex commit) and `image_digest`
+(`sha256:` plus 64 hex, never `null`). The hub checks shape only; it does not pin
+the values to a particular release.
 
 **State machine.** Ordered progress is
 `pending → pr_open → testing → ready → merged → deploying → verified`.
