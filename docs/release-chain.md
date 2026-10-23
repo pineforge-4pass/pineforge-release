@@ -1131,7 +1131,8 @@ differs from owner policy"); in a sweep (the scheduled sweep and a manual `--run
 sweep) it is reported with a `::warning::` line and one incident issue per role
 (`Release chain: receipt artifacts skipped (hosted)`) and skipped, and the sweep
 continues with the remaining artifacts. One that the hub already stored with the
-same or a greater `(attempt, sequence)` is not validated at all. A collection
+same `(attempt, sequence)`, canonical-evidence digest and reporting run ID is
+not validated again, including when a newer receipt is also stored. A collection
 triggered by a callback names one run id, checks only that run and still fails
 closed, so a new post-merge receipt verifies through its callback either way.
 Removing the retained coordinator-shape artifacts from the hosted repository before
@@ -1141,15 +1142,22 @@ release as `consumer-hosted-<run>-<sequence>.json`.
 **Collector skip rules.** In a sweep, a bad or old-shape artifact is reported
 with a `::warning::` line and one stable incident issue per role, then skipped.
 This includes encrypted ZIP entries, unsupported compression and corrupt
-compressed data. An artifact is not re-validated when the hub already stored a
-receipt for that role and release with a greater `(attempt, sequence)`, or the
-same key, canonical-evidence digest **and reporting run ID**. Equal evidence
+compressed data, JSON `null` and other non-object receipt documents. The sweep
+omits validation of a product artifact only when the hub retains its own
+`(attempt, sequence)`, canonical-evidence digest **and reporting run ID** for
+the same role and release. A greater stored key alone does not establish that
+an earlier artifact was validated. An unmatched older artifact is validated
+and reported; even otherwise-valid older evidence is reported as having no
+matching retained evidence, without rewriting the newer receipt. Equal evidence
 from a different reporting run is validated and refused as receipt identity
-reuse. Facts-only artifacts are still validated. A callback names one run and
-still fails closed. Non-404 HTTP errors (including authentication, rate limits
-and server failures) and transport errors from the real client stay fatal;
-`OSError` also stays fatal. `Pending` (unknown release, unavailable artifact)
-is reported and skipped in a sweep. The incident issue lists at most 50 runs
+reuse, including when a newer receipt is also stored. Facts-only artifacts are
+still validated. A callback names one run and still fails closed. Non-404 HTTP
+errors (including authentication, rate limits and server failures), transport
+errors from the real client and `OSError` stay fatal. `Pending` (including a
+404, unknown release or unavailable artifact) also aborts the sweep before any
+later receipt can advance against the missing earlier state. On retry the
+earlier receipt is processed first, so terminal-state and state-regression
+checks still apply to the later receipt. The incident issue lists at most 50 runs
 and a count of any additional skipped runs, reasons are reduced to a fixed safe
 character set, and the issue is not closed automatically when the artifacts
 expire.
