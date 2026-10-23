@@ -1717,7 +1717,7 @@ class NotifyConsumersTest(unittest.TestCase):
 
 class RedeliverWorkflowTest(unittest.TestCase):
     def test_manual_inputs_protected_single_job_and_serialized_permissions(self):
-        """Mutation: add on.schedule to release-redeliver.yml."""
+        """Mutation: delete the redeliver job's main-ref if."""
         wf = _workflow("release-redeliver.yml")
         self.assertEqual(set(wf["on"]), {"workflow_dispatch"})
         inputs = wf["on"]["workflow_dispatch"]["inputs"]
@@ -1733,6 +1733,8 @@ class RedeliverWorkflowTest(unittest.TestCase):
         self.assertEqual(wf["permissions"], {"contents": "read"})
         self.assertEqual(set(wf["jobs"]), {"redeliver"})
         job = wf["jobs"]["redeliver"]
+        self.assertEqual(job.get("if"), "github.ref == 'refs/heads/main'")
+        self.assertNotIn("needs", job)
         self.assertEqual(job["runs-on"], "ubuntu-latest")
         self.assertEqual(job["environment"], "release-automation")
         self.assertEqual(job["permissions"], {"contents": "write", "issues": "write"})

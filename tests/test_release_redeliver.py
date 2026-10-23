@@ -169,6 +169,20 @@ class RedeliverTest(unittest.TestCase):
             "event_id": self.event["event_id"], "consumer": CONSUMER,
             "state": "failed", "attempts": 3, "timestamp": CLOCK}))
 
+    def use_prerelease_manifest(self):
+        # Derive the variant with the same helper as the superseded-release test.
+        self.manifest = fixture_manifest("1.6.0-rc.1")
+        self.raw = contract.canonical(self.manifest)
+        self.event = contract.payload(self.raw)
+        self.assertIs(self.event["prerelease"], True)
+        fixture = MemoryStore(self.manifest)
+        # Retain the store object and its patched put so writes remain observable.
+        self.store.rows, self.store.assets = fixture.rows, fixture.assets
+        self.row = self.store.rows["v1.6.0-rc.1"]
+        self.row.update(draft=False, prerelease=True)
+        self.seed(self.row, contract.ASSET, self.raw)
+        self.store.operations.clear()
+
     def invoke(self, *, tag=TAG, consumer=CONSUMER):
         return pipeline.redeliver(self.target_client, self.store, tag, consumer, self.output)
 
@@ -178,10 +192,12 @@ class RedeliverTest(unittest.TestCase):
         with patch.object(sys, "argv", argv):
             return pipeline.main()
 
-    def assert_refused(self, *, tag=TAG, consumer=CONSUMER):
+    def assert_refused(self, *, tag=TAG, consumer=CONSUMER, message=None):
         before = copy.deepcopy(self.store.assets)
-        with self.assertRaises(contract.Invalid):
+        with self.assertRaises(contract.Invalid) as refused:
             self.invoke(tag=tag, consumer=consumer)
+        if message is not None:
+            self.assertEqual(str(refused.exception), message)
         self.assertEqual(self.store.assets, before)
         self.assertEqual(self.requests, [])
         self.assertEqual(self.puts, [])
@@ -274,15 +290,57 @@ class RedeliverTest(unittest.TestCase):
         self.seed(self.row, "release-rejected.json", contract.canonical({"reason": "withdrawn"}))
         self.assert_refused()
 
+    def test_refuses_prerelease_consumers_skipped_by_policy(self):
+        """Mutation: replace the prerelease-policy require condition with True."""
+        self.use_prerelease_manifest()
+        for consumer in ("application", "web", "data", "license"):
+            with self.subTest(consumer=consumer), \
+                    patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": consumer}):
+                self.assert_refused(
+                    tag=self.row["tag_name"], consumer=consumer,
+                    message="redelivery consumer is skipped by policy for a prerelease")
+
+    def test_prerelease_offline_and_hosted_are_delivered_once(self):
+        """Mutation: drop consumer membership from the prerelease-policy require."""
+        self.use_prerelease_manifest()
+        expected_body = contract.canonical({"event_type": "pineforge-release", "client_payload": self.event})
+        for consumer in ("offline", "hosted"):
+            with self.subTest(consumer=consumer), \
+                    patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": consumer}):
+                before = copy.deepcopy(self.store.assets)
+                sent_before = len(self.accepted)
+                tag = self.row["tag_name"]
+                self.invoke(tag=tag, consumer=consumer)
+                self.assertEqual(self.requests[sent_before:], [expected_body])
+                self.assertEqual(self.accepted[sent_before:], [expected_body])
+                name = f"delivery-redelivered-{consumer}-1.json"
+                audit_raw = contract.canonical(self.audit(1, consumer=consumer))
+                self.assertEqual(self.puts[sent_before:], [(tag, name, audit_raw)])
+                self.assertEqual(self.store.assets, {**before, (tag, name): audit_raw})
+                self.assertEqual(self.output.read_bytes(), audit_raw)
+
+    def test_stable_application_is_delivered_once(self):
+        """Mutation: drop event['prerelease'] from the policy require."""
+        self.assertIs(self.event["prerelease"], False)
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "application"}):
+            self.invoke(consumer="application")
+        expected_body = contract.canonical({"event_type": "pineforge-release", "client_payload": self.event})
+        self.assertEqual(self.requests, [expected_body])
+        self.assertEqual(self.accepted, [expected_body])
+        audit_raw = contract.canonical(self.audit(1, consumer="application"))
+        self.assertEqual(self.puts, [(TAG, "delivery-redelivered-application-1.json", audit_raw)])
+        self.assertEqual(self.output.read_bytes(), audit_raw)
+
     def test_refuses_superseded_release(self):
-        """Mutation: remove the newer-release comparison."""
+        """Mutation: replace the newer-release require condition with True."""
         newer = fixture_manifest("1.6.1")
         other = MemoryStore(newer)
         row = other.rows["v1.6.1"]
         row.update(id=2, draft=False, prerelease=False)
         self.store.rows[row["tag_name"]] = row
         self.seed(row, contract.ASSET, contract.canonical(newer))
-        self.assert_refused()
+        self.assertFalse(any(asset["name"].startswith("consumer-") for asset in self.row["assets"]))
+        self.assert_refused(message="release superseded before redelivery")
 
     def test_newer_draft_rejected_or_prerelease_does_not_supersede_stable(self):
         """Mutation: drop the dispatch rule's stable/prerelease filter."""
