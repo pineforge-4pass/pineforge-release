@@ -601,9 +601,9 @@ record a predecessor that has no `release-lock.json`, and only in `previous`; th
 object is refused in `preview`, `deployed`, every other consumer and every
 facts-only receipt. It has exactly five keys: `legacy` (the boolean `true`),
 `npm_version` (bare canonical semver, no leading `v`), `npm_integrity` (`sha512-`
-plus 86 base64 characters and `==`), `git_head` (a 40-hex commit) and `image_digest`
-(`sha256:` plus 64 hex, never `null`). The hub checks shape only; it does not pin
-the values to a particular release.
+plus the canonical base64 encoding of 64 bytes: 86 base64 characters and `==`),
+`git_head` (a commit) and `image_digest` (a digest, never `null`). The hub checks
+shape only; it does not pin the values to a particular release.
 
 **State machine.** Ordered progress is
 `pending → pr_open → testing → ready → merged → deploying → verified`.

@@ -205,7 +205,8 @@ def identity(obj, *, facts_only=False, consumer=None, slot=None):
         except ValueError as error:
             raise Invalid("malformed identity") from error
         match(r"sha512-[A-Za-z0-9+/]{86}==", obj["npm_integrity"])
-        require(len(base64.b64decode(obj["npm_integrity"][7:], validate=True)) == 64,
+        integrity = base64.b64decode(obj["npm_integrity"][7:], validate=True)
+        require(base64.b64encode(integrity).decode("ascii") == obj["npm_integrity"][7:],
                 "invalid npm integrity")
         match(COMMIT, obj["git_head"])
         match("sha256:" + SHA, obj["image_digest"])
