@@ -5229,7 +5229,8 @@ def _main(argv, binary_inputs) -> int:
                     help="Caller run identifier copied into the report sink header (default empty).")
     ap.add_argument("--spill-dir", type=Path, default=None, metavar="DIR",
                     help="Writable directory for engine scratch and unlinked report temporaries; "
-                         "defaults to the system temporary directory.")
+                         "defaults to the system temporary directory, then /var/tmp "
+                         "if disk backing is required.")
     # Selected-window mode (selected-window/v1; see the section above main). All of these are
     # absent from an ordinary command line, which then behaves exactly as before.
     ap.add_argument("--report-policy", default=None,
@@ -5894,6 +5895,64 @@ class _FdReportSink:
             self._owner.close()
 
 
+_MEMORY_FILESYSTEM_TYPES = {0x01021994: "tmpfs", 0x858458f6: "ramfs"}
+
+
+def _filesystem_type(fd, libc=None):
+    """Linux f_type, using the same stdlib probe for directories and artifacts."""
+    if not sys.platform.startswith("linux"):
+        return None
+    libc = libc if libc is not None else ctypes.CDLL(None, use_errno=True)
+    # f_type is the first long in Linux struct statfs. Reserve more than the
+    # complete structure without depending on its tail ABI.
+    filesystem = ctypes.create_string_buffer(256)
+    if libc.fstatfs(fd, ctypes.byref(filesystem)) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+    return ctypes.c_long.from_buffer(filesystem).value
+
+
+def _disk_report_directory(directory=None):
+    """Pass explicit backing to the engine; select disk backing only by default."""
+    if directory is not None:
+        return os.path.abspath(os.fspath(directory))
+    failures = []
+    candidates = []
+    try:
+        candidates.append(("default temporary directory", tempfile.gettempdir()))
+    except OSError as error:
+        failures.append(f"TMPDIR default temporary directory is unavailable: {error}")
+    candidates.append(("/var/tmp", "/var/tmp"))
+    checked = set()
+    for label, candidate in candidates:
+        candidate = os.path.abspath(candidate)
+        if candidate in checked:
+            continue
+        checked.add(candidate)
+        try:
+            fd = os.open(candidate, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                         | getattr(os, "O_CLOEXEC", 0))
+            try:
+                if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise OSError("not a directory")
+                kind = _filesystem_type(fd)
+                if kind in _MEMORY_FILESYSTEM_TYPES:
+                    failures.append(f"the {label} is {_MEMORY_FILESYSTEM_TYPES[kind]}, "
+                                    "which the engine refuses")
+                    continue
+                if not os.access(candidate, os.W_OK | os.X_OK):
+                    raise OSError("directory is not writable/searchable")
+            finally:
+                os.close(fd)
+        except OSError as error:
+            failures.append(f"{label} filesystem probe or directory access failed: {error}")
+            continue
+        return candidate
+    raise _request_invalid(
+        "; ".join(failures)
+        + "; set TMPDIR or --spill-dir to a disk-backed directory", "arguments")
+
+
 class _ReportSink:
     """A caller-owned path or an owner-only (0600) temporary sink file.
 
@@ -5910,7 +5969,7 @@ class _ReportSink:
     fd_mode = False
 
     def __init__(self, lib, state, *, directory=None, run_id="", path=None):
-        self.directory = os.fspath(directory) if directory is not None else tempfile.gettempdir()
+        self.directory = _disk_report_directory(directory)
         self.header, self.counts, self.sha256 = {}, {}, ""
         self.named, self.run_id = path is not None, run_id
         self.keep, self.closed = False, False
@@ -6045,11 +6104,11 @@ class _JSONUTF8:
 class _BoundedJSONFile:
     """Append, synchronize, then read a transactional ASCII artifact.
 
-    Deployment: a real disk filesystem supporting Linux O_DIRECT or Darwin
-    F_NOCACHE. RAM filesystems are not external storage. One aligned 64 KiB
-    anonymous window is the entire I/O working set; direct reads/writes bypass
-    the data page cache. Every write window is synchronized before reuse.
-    There is deliberately no buffered-I/O fallback or advisory eviction claim.
+    Disk files use Linux O_DIRECT or Darwin F_NOCACHE. Legacy libraries with
+    no engine sink can also use tmpfs/ramfs for the unjailed JSON artifact.
+    Engine sink and scratch directories are selected by _disk_report_directory.
+    One aligned 64 KiB anonymous window is the I/O working set. Every write
+    window is synchronized before reuse. Jailed and fd routes use StringIO.
     """
     window = 64 * 1024
 
@@ -6064,17 +6123,12 @@ class _BoundedJSONFile:
         self.libc = ctypes.CDLL(None, use_errno=True)
         fd = file.fileno()
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError("report artifacts require a disk-backed regular file")
+            raise OSError("report artifacts require a regular file")
         if sys.platform.startswith("linux"):
-            # f_type is the first long in Linux struct statfs. Reserve more
-            # than the complete structure without depending on its tail ABI.
-            filesystem = ctypes.create_string_buffer(256)
-            if self.libc.fstatfs(fd, ctypes.byref(filesystem)) != 0:
-                self._io_error()
-            kind = ctypes.c_long.from_buffer(filesystem).value
-            if kind in (0x01021994, 0x858458f6):  # tmpfs, ramfs (also memfd)
-                raise OSError("report artifacts require disk backing, not tmpfs or ramfs")
-            fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_DIRECT)
+            kind = _filesystem_type(fd, self.libc)
+            memory_backed = kind in _MEMORY_FILESYSTEM_TYPES
+            if not memory_backed:
+                fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_DIRECT)
         elif sys.platform == "darwin":
             fcntl.fcntl(fd, 48, 1)  # F_NOCACHE: synchronous uncached file I/O
         else:
@@ -6190,7 +6244,7 @@ class _UncachedSinkFile(_BoundedJSONFile):
     """Binary readback after the fixed sink reader has validated its header."""
     def __init__(self, file):
         position = file.tell()
-        super().__init__(file)
+        super().__init__(file)  # path sinks are unjailed only
         self.binary = self.reading = True
         self.position, self.size = position, os.fstat(file.fileno()).st_size
 
@@ -6261,7 +6315,7 @@ def _json_temporary(resources, directory):
         raise RunFailure("report sink open failed", "report_sink_failed",
                          {"reason": "scratch_io"}) from error
     try:
-        file = _BoundedJSONFile(file)
+        file = _BoundedJSONFile(file)  # unjailed report artifacts
         resources.callback(_close_json_temporary, file)
     except OSError as error:
         file.close()
