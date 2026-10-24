@@ -1167,3 +1167,57 @@ Python compilation and `git diff --check` (plus YAML parsing if a workflow
 changes).
 No test suite, Docker runtime/build, live dispatch, publication, token mint,
 credential read or deployment is needed on the Mac to implement this lane.
+
+## Running the image: scratch space (engine 1.7.0)
+
+For engine 1.7.0 runs, the image writes scratch files when a run closes a trade.
+Scratch is under `TMPDIR`, which defaults to `/tmp`;
+`docker/entrypoint.sh` creates `$TMPDIR/pf-work.*`.
+
+Memory-backed scratch is refused with the run failure codes
+`report_sink_failed` / `scratch_io`. This includes Docker
+`--read-only --tmpfs /tmp`, Kubernetes `emptyDir: {medium: Memory}`, and any
+ramfs/tmpfs mount.
+
+Mount a disk-backed volume at `/tmp`, or set `TMPDIR` to a directory on a
+disk-backed volume, for example `-e TMPDIR=/scratch -v <host-dir>:/scratch`.
+The root filesystem can stay read-only while the scratch volume is writable.
+
+With a read-only root filesystem, HPO subcommands also need a writable,
+disk-backed artifact cache: mount a volume at
+`/home/pineforge/.cache/pineforge/hpo`, or pass `--cache-dir` pointing into
+writable disk-backed storage.
+
+Docker examples (replace `<host-dir>` and `<cache-dir>` with disk directories
+writable by UID 10001 and `<image>` with your image reference; use an HPO image
+for the second command and add your usual input mounts and arguments):
+
+```sh
+docker run --read-only -v <host-dir>:/tmp <image> ...
+docker run --read-only -v <host-dir>:/tmp \
+  -v <cache-dir>:/home/pineforge/.cache/pineforge/hpo \
+  -v "$PWD/tests/fixtures/release-smoke:/in:ro" \
+  <image> hpo run /in/study.json --engine-root /opt/pineforge
+```
+
+For Kubernetes, use a disk-backed `emptyDir` without `medium: Memory`, or a
+PersistentVolume:
+
+```yaml
+spec:
+  containers:
+    - name: runner
+      image: <image>
+      securityContext:
+        readOnlyRootFilesystem: true
+      volumeMounts:
+        - name: scratch
+          mountPath: /tmp
+        - name: hpo-cache
+          mountPath: /home/pineforge/.cache/pineforge/hpo
+  volumes:
+    - name: scratch
+      emptyDir: {}
+    - name: hpo-cache
+      emptyDir: {}
+```
