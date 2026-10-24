@@ -1183,11 +1183,21 @@ Mount a disk-backed volume at `/tmp`, or set `TMPDIR` to a directory on a
 disk-backed volume, for example `-e TMPDIR=/scratch -v <host-dir>:/scratch`.
 The root filesystem can stay read-only while the scratch volume is writable.
 
-Docker example (replace `<host-dir>` with a writable directory on disk and
-`<image>` with your image reference; add your usual input mounts and arguments):
+With a read-only root filesystem, HPO subcommands also need a writable,
+disk-backed artifact cache: mount a volume at
+`/home/pineforge/.cache/pineforge/hpo`, or pass `--cache-dir` pointing into
+writable disk-backed storage.
+
+Docker examples (replace `<host-dir>` and `<cache-dir>` with disk directories
+writable by UID 10001 and `<image>` with your image reference; use an HPO image
+for the second command and add your usual input mounts and arguments):
 
 ```sh
 docker run --read-only -v <host-dir>:/tmp <image> ...
+docker run --read-only -v <host-dir>:/tmp \
+  -v <cache-dir>:/home/pineforge/.cache/pineforge/hpo \
+  -v "$PWD/tests/fixtures/release-smoke:/in:ro" \
+  <image> hpo run /in/study.json --engine-root /opt/pineforge
 ```
 
 For Kubernetes, use a disk-backed `emptyDir` without `medium: Memory`, or a
@@ -1203,7 +1213,11 @@ spec:
       volumeMounts:
         - name: scratch
           mountPath: /tmp
+        - name: hpo-cache
+          mountPath: /home/pineforge/.cache/pineforge/hpo
   volumes:
     - name: scratch
+      emptyDir: {}
+    - name: hpo-cache
       emptyDir: {}
 ```
