@@ -317,6 +317,12 @@ def require_consumer_unverified(store, row, event, consumer):
         for name in ("attempt", "sequence", "reporting_run_id"):
             positive(obj[name])
         match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
+        try:
+            # The publisher (release_receipts.validate_receipt) parses it the same way; the
+            # pattern alone accepts an impossible date such as 2026-99-99T99:99:99Z.
+            dt.datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00"))
+        except ValueError as error:
+            raise Invalid("malformed consumer receipt timestamp") from error
         match(SHA, obj["evidence_sha256"])
         identity = (obj["attempt"], obj["sequence"])
         require(identity not in seen, "duplicate consumer receipt identity")

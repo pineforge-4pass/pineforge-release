@@ -670,7 +670,7 @@ class RedeliverTest(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), audit_raw)
 
     def test_refuses_a_malformed_receipt_of_the_consumer(self):
-        """Mutation: drop the receipt shape validation from the public eligibility check."""
+        """Mutation: drop the receipt shape validation, or pattern-match its timestamp without parsing it."""
         def drop(name):
             return lambda body: body.pop(name)
 
@@ -678,6 +678,7 @@ class RedeliverTest(unittest.TestCase):
             return lambda body: body.update(values)
 
         malformed, positive = "malformed consumer receipt", "expected positive integer"
+        unparsable = "malformed consumer receipt timestamp"
         cases = [(f"missing {name}", drop(name), malformed)
                  for name in RECEIPT_FIELDS if name not in ("event_id", "consumer")]
         cases += [
@@ -689,6 +690,9 @@ class RedeliverTest(unittest.TestCase):
             ("zero sequence", change(sequence=0), positive),
             ("zero reporting run", change(reporting_run_id=0), positive),
             ("bad timestamp", change(timestamp="yesterday"), "malformed identity"),
+            # Both match the pattern; only parsing, as the publisher does, refuses them.
+            ("impossible date and time", change(timestamp="2026-99-99T99:99:99Z"), unparsable),
+            ("impossible day of month", change(timestamp="2026-02-30T00:00:00Z"), unparsable),
             ("bad evidence digest", change(evidence_sha256="xyz"), "malformed identity"),
         ]
         for label, edit, message in cases:
