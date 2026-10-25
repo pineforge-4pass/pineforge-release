@@ -369,8 +369,9 @@ an unknown state, another schema, event or release version, a non-positive attem
 sequence or run, or a bad timestamp or evidence digest) and two receipts with the
 same attempt and sequence, whatever their names and contents. Missing receipts,
 exhausted automatic delivery, an accepted but unverified delivery and another role's
-verified receipt do not block a repair. It reconstructs the role's identical payload
-from the original manifest, also reading the original candidate for compute, and
+verified receipt do not block a repair. It reconstructs the identical pair payload
+from the original manifest and candidate for compute, or the identical
+release-ready/v1 payload from the original manifest for receipt roles, and
 appends `delivery-redelivered-<consumer>-<n>.json` only after dispatch
 acceptance, recording the event, independent contiguous redelivery number, run,
 the actual dispatch response status, timestamp and `GITHUB_ACTOR` login.

@@ -487,8 +487,11 @@ def redelivery_source(tag, consumer):
             "redelivery consumer is skipped by policy for a prerelease")
     if consumer in DELIVERY_ONLY:
         first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
-        require(first and version(event["release_version"]) >= version(first),
-                "redelivery consumer is not enabled for this pair")
+        try:
+            enabled = first and version(event["release_version"]) >= version(first)
+        except ValueError:
+            raise Invalid("RELEASE_COMPUTE_FIRST_PAIR value was not accepted") from None
+        require(enabled, "redelivery consumer is not enabled for this pair")
     else:
         # Keep dispatch's channel-aware newer-release rule, including its exclusions.
         newer = [pair.parse(r["tag_name"]) for r in public.pages(f"repos/{HUB}/releases")
