@@ -355,6 +355,17 @@ class PairPayloadTests(unittest.TestCase):
         self.assertEqual(set(actual["build"]), {"prerelease", "hub_commit", "run_id", "image",
                                               "candidate_url", "candidate_sha256"})
 
+    def test_v1_6_3_pair_dispatch_body_matches_pinned_jq_bytes(self):
+        """Mutation: drop pair_payload's codegen tag prefix or change canonical wire bytes."""
+        fixture = ROOT / "tests/fixtures/release-pair-v1.6.3"
+        manifest_raw = (fixture / "release-manifest.json").read_bytes()
+        candidate_raw = (fixture / "release-candidate.json").read_bytes()
+        body = contract.canonical({
+            "event_type": "release-pair",
+            "client_payload": contract.pair_payload(manifest_raw, candidate_raw),
+        })
+        self.assertEqual(body, (fixture / "dispatch-body-pair-v1.6.3.json").read_bytes())
+
     def test_noncanonical_npm_integrity_is_rejected_before_dispatch(self):
         manifest = fixture_manifest()
         manifest["versions"]["codegen"]["npm_integrity"] = (
@@ -1289,6 +1300,9 @@ class DispatchTests(unittest.TestCase):
         """Mutation: map application to release-pair before its receiver is ready."""
         ready_raw = (ROOT / "tests/fixtures/release-ready.json").read_bytes()
         store = self.ready_store(fixture_manifest())
+        del store.assets[("v1.6.0", contract.CANDIDATE)]
+        row = store.rows["v1.6.0"]
+        row["assets"] = [asset for asset in row["assets"] if asset["name"] != contract.CANDIDATE]
         with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "application"}, clear=True):
             result, sender, written, fetches, _ = self.send(store, "application")
         self.assertEqual(result, 0)
@@ -1351,6 +1365,23 @@ class DispatchTests(unittest.TestCase):
                     sender.api.assert_not_called()
                     self.assertIsNone(written)
                     self.assertTrue(scans)
+
+    def test_compute_dispatch_without_a_candidate_stays_pending(self):
+        """Mutation: bypass the release-pair branch and post the manifest event."""
+        store = self.ready_store(fixture_manifest())
+        row = store.rows["v1.6.0"]
+        del store.assets[("v1.6.0", contract.CANDIDATE)]
+        row["assets"] = [asset for asset in row["assets"] if asset["name"] != contract.CANDIDATE]
+        before = copy.deepcopy(store.assets)
+        store.operations.clear()
+        result, sender, written, fetches, _ = self.send(store, "compute")
+        self.assertEqual(result, 3)
+        sender.api.assert_not_called()
+        self.assertIsNone(written)
+        self.assertEqual(store.assets, before)
+        self.assertEqual(store.operations, [])
+        self.assertEqual([call.args[0].rsplit("/", 1)[-1] for call in fetches],
+                         [contract.ASSET, contract.CANDIDATE])
 
     def test_pair_dispatch_refuses_candidate_mismatch_before_posting(self):
         store = self.ready_store(fixture_manifest())

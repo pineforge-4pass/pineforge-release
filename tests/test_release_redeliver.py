@@ -574,6 +574,9 @@ class RedeliverTest(unittest.TestCase):
     def test_application_redelivery_preserves_release_ready_v1_without_an_opt_in(self):
         """Mutation: map application to release-pair in manual stable replay."""
         ready_raw = (ROOT / "tests/fixtures/release-ready.json").read_bytes()
+        del self.store.assets[(TAG, contract.CANDIDATE)]
+        self.row["assets"] = [asset for asset in self.row["assets"]
+                              if asset["name"] != contract.CANDIDATE]
         before = copy.deepcopy(self.store.assets)
         with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "application"}):
             self.assertEqual(self.cli(consumer="application"), 0)
@@ -714,11 +717,29 @@ class RedeliverTest(unittest.TestCase):
             self.assertFalse(any(name.startswith("consumer-") for _, name in self.store.assets))
 
     def test_malformed_compute_floor_fails_without_a_send_or_audit(self):
-        """Mutation: treat a malformed compute floor as enabled."""
+        """Mutation: let the bare compute-floor parse error escape without naming its variable."""
         before = copy.deepcopy(self.store.assets)
         with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "compute",
                                     "RELEASE_COMPUTE_FIRST_PAIR": "not-semver"}):
-            self.assertNotEqual(self.cli(consumer="compute"), 0)
+            self.assert_refused(consumer="compute",
+                                message="RELEASE_COMPUTE_FIRST_PAIR value was not accepted")
+            self.assertEqual(self.cli(consumer="compute"), 1)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertEqual(self.store.assets, before)
+        self.assertFalse(self.output.exists())
+
+    def test_compute_redelivery_without_a_candidate_stays_pending(self):
+        """Mutation: bypass the release-pair branch and send the manifest event."""
+        del self.store.assets[(TAG, contract.CANDIDATE)]
+        self.row["assets"] = [asset for asset in self.row["assets"]
+                              if asset["name"] != contract.CANDIDATE]
+        before = copy.deepcopy(self.store.assets)
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "compute",
+                                    "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0"}):
+            self.assertEqual(self.cli(consumer="compute"), 3)
+        self.assertIn(f"https://github.com/{contract.HUB}/releases/download/{TAG}/{contract.CANDIDATE}",
+                      self.public.reads)
         self.assertEqual(self.requests, [])
         self.assertEqual(self.puts, [])
         self.assertEqual(self.store.assets, before)
