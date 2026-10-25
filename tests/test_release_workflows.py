@@ -2485,7 +2485,8 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
     def test_release_jobs_pin_ubuntu_latest_and_never_accept_pr_events(self):
         self.assert_release_runners(self.release_workflows())
 
-    def test_all_fourteen_release_jobs_pin_ubuntu_latest_under_the_standing_owner_rule(self):
+    def test_all_sixteen_release_jobs_pin_ubuntu_latest_under_the_standing_owner_rule(self):
+        self.assertEqual(len(self.HOSTED_JOBS), 16)
         self.assert_hosted_runners(self.release_workflows())
 
     def test_hosted_runner_pin_refuses_the_release_array_on_each_release_job(self):
