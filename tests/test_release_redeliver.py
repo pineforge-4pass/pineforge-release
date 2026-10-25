@@ -2,7 +2,7 @@
 """Manual redelivery regressions; execute in CI, never on the operator's Mac.
 
 The existing store fake keys every asset by release and exact name. Only HTTP
-transport is replaced: Client.api/request still serialize the real wire bytes.
+transport is replaced: production code still serializes the real wire bytes.
 Each test names a one-line production mutation that must make it fail.
 """
 from __future__ import annotations
@@ -25,7 +25,8 @@ import release_artifacts as artifacts  # noqa: E402
 import release_contract as contract  # noqa: E402
 import release_pipeline as pipeline  # noqa: E402
 import release_receipts as adapter  # noqa: E402
-from test_release_binding import MemoryStore, expected_pair_payload, fixture_manifest  # noqa: E402
+from test_release_binding import (FinalizeClient, MemoryRegistry, MemoryStore,  # noqa: E402
+                                  expected_pair_payload, fixture_manifest)
 
 TAG = "v1.6.0"
 CONSUMER = "hosted"
@@ -84,6 +85,9 @@ class RedeliverTest(unittest.TestCase):
         self.store = MemoryStore(self.manifest)
         self.row = self.store.rows[TAG]
         self.row.update(draft=False, prerelease=False)
+        self.store.workflow_runs[900] = {
+            "id": 900, "path": ".github/workflows/release-redeliver.yml",
+            "head_branch": "main", "status": "completed", "conclusion": "success"}
         self.seed = self.store.put
         self.seed(self.row, contract.ASSET, self.raw)
         self.store.operations.clear()
@@ -93,6 +97,7 @@ class RedeliverTest(unittest.TestCase):
         self.real_store = pipeline.Store
         self.tokens, self.requests, self.accepted, self.puts, self.effects = [], [], [], [], []
         self.fail_send = self.fail_put = False
+        self.dispatch_status = 204
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.output = Path(tmp.name) / "redelivery.json"
@@ -134,7 +139,9 @@ class RedeliverTest(unittest.TestCase):
             raise urllib.error.URLError("dispatch transport unavailable")
         self.accepted.append(request.data)
         self.effects.append("send")
-        return io.BytesIO(b"")
+        response = io.BytesIO(b"")
+        response.status = self.dispatch_status
+        return response
 
     def put(self, row, name, raw):
         self.puts.append((row["tag_name"], name, raw))
@@ -144,9 +151,9 @@ class RedeliverTest(unittest.TestCase):
         self.seed(row, name, raw)
 
     def audit(self, attempt, *, consumer=CONSUMER):
-        return {"schema": "pineforge/release-redelivery/v1", "event_id": self.event["event_id"],
+        return {"schema": "pineforge/release-redelivery/v2", "event_id": self.event["event_id"],
                 "consumer": consumer, "attempt": attempt, "state": "dispatch_accepted",
-                "run_id": 900, "timestamp": CLOCK, "actor": "release-operator"}
+                "run_id": 900, "dispatch_status": 204, "timestamp": CLOCK, "actor": "release-operator"}
 
     def seed_audit(self, number, *, consumer=CONSUMER, changes=None, name=None):
         obj = {**self.audit(number, consumer=consumer), **(changes or {})}
@@ -191,13 +198,13 @@ class RedeliverTest(unittest.TestCase):
         self.assert_refused(message=message)
         self.assertEqual(self.tokens, [""])
 
-    def seed_planner(self):
+    def seed_planner(self, *, consumer=CONSUMER):
         for number in (1, 2, 3):
-            self.seed(self.row, f"delivery-attempt-{CONSUMER}-{number}.json", contract.canonical({
-                "event_id": self.event["event_id"], "consumer": CONSUMER, "attempt": number,
+            self.seed(self.row, f"delivery-attempt-{consumer}-{number}.json", contract.canonical({
+                "event_id": self.event["event_id"], "consumer": consumer, "attempt": number,
                 "run_id": 800 + number, "timestamp": CLOCK}))
-        self.seed(self.row, f"delivery-failed-{CONSUMER}.json", contract.canonical({
-            "event_id": self.event["event_id"], "consumer": CONSUMER,
+        self.seed(self.row, f"delivery-failed-{consumer}.json", contract.canonical({
+            "event_id": self.event["event_id"], "consumer": consumer,
             "state": "failed", "attempts": 3, "timestamp": CLOCK}))
 
     def use_prerelease_manifest(self):
@@ -237,9 +244,10 @@ class RedeliverTest(unittest.TestCase):
     def workflow_before_target_mint(self, *, tag=TAG, consumer=CONSUMER, configured=CONSUMER):
         """Run the workflow's Python checks, stopping on failure or the token action.
 
-        Checkout, the apt guard and repository-name setup are covered by the
-        workflow wiring tests; this fixture supplies a valid target repository.
-        No App action or shell command is executed by this walk.
+        Checkout, the apt guard, the inline authorization script (executed by
+        RedeliverWorkflowTest.authorization_flow) and repository-name setup are
+        covered by the workflow wiring tests; this fixture supplies a valid
+        target repository. No App action or shell command is executed by this walk.
         """
         from test_release_workflows import _workflow
         bindings = {
@@ -361,6 +369,76 @@ class RedeliverTest(unittest.TestCase):
         self.seed_receipt("verified")
         self.assertIsNone(self.store.read(self.row, f"delivery-{CONSUMER}.json"))
         self.assert_workflow_refuses_before_mint()
+
+    def test_audit_records_environment_run_id_and_actual_dispatch_status(self):
+        """Mutation: omit the HTTP response status or substitute a constant run id."""
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "9123"}):
+            self.invoke()
+        audit = contract.decode(self.output.read_bytes())
+        self.assertEqual(audit["schema"], "pineforge/release-redelivery/v2")
+        self.assertEqual(audit["run_id"], 9123)
+        self.assertEqual(audit["dispatch_status"], self.dispatch_status)
+        self.assertEqual(audit["dispatch_status"], 204)
+        self.assertEqual(self.puts, [(TAG, f"delivery-redelivered-{CONSUMER}-1.json",
+                                     self.output.read_bytes())])
+        self.assertEqual(self.effects, ["send", "put"])
+
+    def test_non_204_dispatch_response_never_writes_an_acceptance_audit(self):
+        """Mutation: record 204 after any successful client.api call."""
+        before = copy.deepcopy(self.store.assets)
+        for status in (200, 201, 202):
+            with self.subTest(status=status):
+                self.dispatch_status = status
+                with self.assertRaisesRegex(contract.Invalid, "^redelivery dispatch status differs$"):
+                    self.invoke()
+                self.assertEqual(self.puts, [])
+                self.assertEqual(self.store.assets, before)
+                self.assertFalse(self.output.exists())
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.effects, ["send", "send", "send"])
+
+    def test_unconfirmed_history_refuses_before_another_dispatch(self):
+        """Mutation: omit confirm_redelivery_run from redeliver's history check."""
+        success = self.store.workflow_runs[900]
+        cases = (
+            ({**success, "path": ".github/workflows/release-finalize.yml"}, "redelivery workflow run differs"),
+            ({**success, "head_branch": "repair"}, "redelivery workflow run differs"),
+            ({**success, "conclusion": "failure"}, "redelivery workflow run differs"),
+            ({**success, "status": "in_progress", "conclusion": None}, "redelivery workflow run differs"),
+            (None, "redelivery workflow run unavailable"),
+            (contract.Invalid("artifact request failed (HTTP 500)"), "artifact request failed (HTTP 500)"),
+        )
+        for schema in ("pineforge/release-redelivery/v1", "pineforge/release-redelivery/v2"):
+            obj = {**self.audit(1), "schema": schema}
+            if schema.endswith("/v1"):
+                obj = {key: value for key, value in obj.items() if key != "dispatch_status"}
+            for run, message in cases:
+                with self.subTest(schema=schema, run=run):
+                    before = copy.deepcopy(self.store.assets)
+                    assets = copy.deepcopy(self.row["assets"])
+                    self.store.workflow_runs = {} if run is None else {900: run}
+                    self.store.run_reads.clear()
+                    try:
+                        self.seed(self.row, f"delivery-redelivered-{CONSUMER}-1.json", contract.canonical(obj))
+                        self.assert_refused(message=message)
+                        self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+                    finally:
+                        self.store.assets = before
+                        self.row["assets"] = assets
+
+    def test_confirmed_v1_history_can_append_v2_without_rewriting_history(self):
+        """Mutation: reject all legacy history instead of confirming its workflow run."""
+        legacy = {**self.audit(1), "schema": "pineforge/release-redelivery/v1"}
+        legacy = {key: value for key, value in legacy.items() if key != "dispatch_status"}
+        self.seed(self.row, f"delivery-redelivered-{CONSUMER}-1.json", contract.canonical(legacy))
+        before = copy.deepcopy(self.store.assets)
+        self.invoke()
+        audit = contract.canonical(self.audit(2))
+        name = f"delivery-redelivered-{CONSUMER}-2.json"
+        self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+        self.assertEqual(self.puts, [(TAG, name, audit)])
+        self.assertEqual(self.store.assets, {**before, (TAG, name): audit})
+        self.assertEqual(self.effects, ["send", "put"])
 
     def test_identical_wire_payload_and_exactly_one_append_after_acceptance(self):
         """Mutation: replace client_payload=event with {**event, 'run_id': run_id}."""
@@ -485,8 +563,7 @@ class RedeliverTest(unittest.TestCase):
                                     "RELEASE_COMPUTE_FIRST_PAIR": "not-semver"}):
             self.invoke(consumer="application")
         expected_body = contract.canonical({
-            "event_type": "release-pair",
-            "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE)),
+            "event_type": "pineforge-release", "client_payload": self.event,
         })
         self.assertEqual(self.requests, [expected_body])
         self.assertEqual(self.accepted, [expected_body])
@@ -494,15 +571,42 @@ class RedeliverTest(unittest.TestCase):
         self.assertEqual(self.puts, [(TAG, "delivery-redelivered-application-1.json", audit_raw)])
         self.assertEqual(self.output.read_bytes(), audit_raw)
 
-    def test_pair_redelivery_matches_automatic_dispatch_for_both_targets(self):
-        """Mutation: keep redeliver's former pineforge-release event/payload."""
+    def test_application_redelivery_preserves_release_ready_v1_without_an_opt_in(self):
+        """Mutation: map application to release-pair in manual stable replay."""
+        ready_raw = (ROOT / "tests/fixtures/release-ready.json").read_bytes()
+        before = copy.deepcopy(self.store.assets)
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "application"}):
+            self.assertEqual(self.cli(consumer="application"), 0)
         expected_body = contract.canonical({
-            "event_type": "release-pair",
-            "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE)),
-        })
+            "event_type": "pineforge-release", "client_payload": contract.decode(ready_raw)})
+        self.assertEqual(self.requests, [expected_body])
+        self.assertEqual(self.accepted, [expected_body])
+        sent = contract.decode(self.requests[0])["client_payload"]
+        self.assertEqual(contract.canonical(sent), ready_raw)
+        self.assertEqual(sent["schema"], "pineforge/release-ready/v1")
+        self.assertEqual(set(sent), {"schema", "event_id", "release_version", "prerelease", "hub_commit",
+                                    "versions", "image", "facts", "manifest", "run_id"})
+        self.assertNotIn(f"https://github.com/{contract.HUB}/releases/download/{TAG}/{contract.CANDIDATE}",
+                         self.public.reads)
+        audit_raw = contract.canonical(self.audit(1, consumer="application"))
+        name = "delivery-redelivered-application-1.json"
+        self.assertEqual(self.puts, [(TAG, name, audit_raw)])
+        self.assertEqual(self.store.assets, {**before, (TAG, name): audit_raw})
+        self.assertEqual(self.output.read_bytes(), audit_raw)
+
+    def test_redelivery_matches_each_targets_automatic_dispatch_contract(self):
+        """Mutation: switch either target to the other target's event/payload."""
+        expected_bodies = {
+            "application": contract.canonical({
+                "event_type": "pineforge-release", "client_payload": self.event}),
+            "compute": contract.canonical({
+                "event_type": "release-pair",
+                "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE))}),
+        }
         for consumer in ("application", "compute"):
             with self.subTest(consumer=consumer), patch.dict(os.environ, {
                     "RELEASE_READY_CONSUMERS": consumer, "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0"}):
+                expected_body = expected_bodies[consumer]
                 self.assertEqual(self.cli("dispatch", consumer=consumer,
                                           output=self.output.with_name("automatic.json")), 0)
                 self.assertEqual(self.cli(consumer=consumer), 0)
@@ -548,6 +652,67 @@ class RedeliverTest(unittest.TestCase):
                 self.assert_refused(consumer="compute",
                                     message="redelivery consumer is not enabled for this pair")
 
+    def test_accepted_compute_repair_completes_finalization_and_preserves_exhaustion(self):
+        """Mutation: aggregate reads only delivery-compute.json after repair."""
+        self.seed_planner(consumer="compute")
+        client, registry = FinalizeClient(self.manifest), MemoryRegistry()
+        deliveries = self.output.with_name("deliveries.json")
+        with patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "GITHUB_RUN_ID": "899", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "age_minutes", return_value=1000), \
+                patch.object(pipeline, "report_issue") as report:
+            pipeline.finalize_all(client, self.store, registry, TAG, deliveries)
+            failed = contract.decode(self.store.read(self.row, "release-status-899-1.json"))
+            self.assertEqual(failed["consumers"], {"compute": "failed"})
+            self.assertFalse(failed["complete"])
+            self.assertEqual(contract.decode(deliveries.read_bytes()), [])
+            self.assertFalse(report.call_args.kwargs["complete"])
+            before = copy.deepcopy(self.store.assets)
+            self.puts.clear()
+            os.environ["GITHUB_RUN_ID"] = "900"
+            self.store.workflow_runs[900].update(status="in_progress", conclusion=None)
+            self.assertEqual(self.cli(consumer="compute"), 0)
+            expected_body = contract.canonical({
+                "event_type": "release-pair",
+                "client_payload": expected_pair_payload(self.raw, self.store.read(self.row, contract.CANDIDATE)),
+            })
+            self.assertEqual(self.requests, [expected_body])
+            self.assertEqual(self.accepted, [expected_body])
+            audit_raw = contract.canonical(self.audit(1, consumer="compute"))
+            name = "delivery-redelivered-compute-1.json"
+            self.assertEqual(self.puts, [(TAG, name, audit_raw)])
+            self.assertEqual(self.output.read_bytes(), audit_raw)
+            self.assertEqual(self.store.assets, {**before, (TAG, name): audit_raw})
+            self.assertIsNone(self.store.read(self.row, "delivery-compute.json"))
+            os.environ["GITHUB_RUN_ID"] = "901"
+            report.reset_mock()
+            with self.assertRaisesRegex(contract.Invalid,
+                                        "^release finalization failed; inspect release incidents$"):
+                pipeline.finalize_all(client, self.store, registry, TAG, deliveries)
+            self.assertEqual(self.store.assets, {**before, (TAG, name): audit_raw})
+            self.assertEqual(contract.decode(deliveries.read_bytes()), [])
+            self.assertFalse(report.call_args.kwargs.get("complete", False))
+            self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+            self.store.workflow_runs[900].update(status="completed", conclusion="success")
+            self.store.run_reads.clear()
+            report.reset_mock()
+            pipeline.finalize_all(client, self.store, registry, TAG, deliveries)
+            latest = max((asset for asset in self.row["assets"] if asset["name"].startswith("release-status-")),
+                         key=lambda asset: asset["id"])
+            status = contract.decode(self.store.read(self.row, latest["name"]))
+            self.assertEqual(status["consumers"], {"compute": "delivered"})
+            self.assertTrue(status["complete"])
+            self.assertEqual(latest["name"], "release-status-901-1.json")
+            self.assertEqual(status["stale"], [])
+            self.assertEqual(contract.decode(deliveries.read_bytes()), [])
+            self.assertTrue(report.call_args.kwargs["complete"])
+            self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+            for key, raw in before.items():
+                self.assertEqual(self.store.assets[key], raw)
+            self.assertFalse(any(name.startswith("consumer-") for _, name in self.store.assets))
+
     def test_malformed_compute_floor_fails_without_a_send_or_audit(self):
         """Mutation: treat a malformed compute floor as enabled."""
         before = copy.deepcopy(self.store.assets)
@@ -565,12 +730,20 @@ class RedeliverTest(unittest.TestCase):
         changed["hub_commit"] = "9" * 40
         candidate_url = f"https://github.com/{contract.HUB}/releases/download/{TAG}/{contract.CANDIDATE}"
         download = self.public.download
-        for consumer in ("application", "compute"):
-            with self.subTest(consumer=consumer), patch.dict(os.environ, {
-                    "RELEASE_READY_CONSUMERS": consumer, "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0"}), \
-                    patch.object(self.public, "download", side_effect=lambda url, origins:
-                                 contract.canonical(changed) if url == candidate_url else download(url, origins)):
-                self.assert_refused(consumer=consumer, message="manifest does not bind this candidate")
+        with patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "application,compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0"}), \
+                patch.object(self.public, "download", side_effect=lambda url, origins:
+                             contract.canonical(changed) if url == candidate_url else download(url, origins)):
+            self.assert_refused(consumer="compute", message="manifest does not bind this candidate")
+            self.public.reads.clear()
+            self.invoke(consumer="application")
+        expected_body = contract.canonical({"event_type": "pineforge-release", "client_payload": self.event})
+        self.assertEqual(self.requests, [expected_body])
+        self.assertEqual(self.accepted, [expected_body])
+        self.assertNotIn(candidate_url, self.public.reads)
+        audit_raw = contract.canonical(self.audit(1, consumer="application"))
+        self.assertEqual(self.puts, [(TAG, "delivery-redelivered-application-1.json", audit_raw)])
+        self.assertEqual(self.output.read_bytes(), audit_raw)
 
     def test_refuses_superseded_release(self):
         """Mutation: replace the newer-release require condition with True."""

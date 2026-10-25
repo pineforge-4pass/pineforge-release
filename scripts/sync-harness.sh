@@ -15,6 +15,8 @@ set -euo pipefail
 FILES=(
   bind_compiled_inventory.py
   entrypoint.sh
+  pf_bars.py
+  pf_sink.py
   request_feed_inventory.py
   run_execution_observer.py
   run_json.py

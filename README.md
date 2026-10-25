@@ -333,10 +333,24 @@ to 1.0.0 carry `Apache-2.0`.
 
 ## Harness / engine ABI
 
-`docker/run_json.py` is the engine's harness, vendored from the pinned
-`pineforge-engine` tag (`scripts/sync-harness.sh <engine-version>`; `handle-upstream.yml`
-fetches the same file for the engine version it releases).
-The Dockerfile refuses to build when the harness `EXPECTED_PF_ABI` differs from
+`scripts/sync-harness.sh <engine-version>` vendors exactly ten engine runtime
+harness files into `docker/` from the pinned `pineforge-engine` tag, in sorted order:
+
+- `bind_compiled_inventory.py`
+- `entrypoint.sh`
+- `pf_bars.py`
+- `pf_sink.py`
+- `request_feed_inventory.py`
+- `run_execution_observer.py`
+- `run_json.py`
+- `run_phase_transport.py`
+- `selected_window_plan.py`
+- `selected_window_report.py`
+
+`handle-upstream.yml` syncs those files and regenerates `docker/HARNESS-SHA256SUMS`
+for the engine version it releases. The Dockerfile requires the same ten names
+and checks their installed bytes against the sums. It also refuses to build
+when `docker/run_json.py`'s `EXPECTED_PF_ABI` differs from
 `PF_ABI_VERSION` in the bundled engine headers.
 
 ## HPO command and bundled licences
@@ -360,7 +374,7 @@ The artifact cache is writable by the image's existing user; use `--cache-dir`
 with a writable mount to retain compiled artifacts between containers.
 
 With no first argument `hpo`, the dispatcher passes every argument unchanged
-to the engine's existing `/opt/pineforge/bin/entrypoint.sh`. The eight engine
+to the engine's existing `/opt/pineforge/bin/entrypoint.sh`. The ten engine
 harness files and their byte and ABI checks remain in place.
 
 For `--target hpo`, `HPO_VERSION` is a required build argument with no default,

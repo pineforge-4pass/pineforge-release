@@ -29,7 +29,7 @@ RECEIPT_ROLES = tuple(role for role in ROLES if role not in DELIVERY_ONLY)
 EVENT_TYPES = {
     "offline": "pineforge-release",
     "hosted": "pineforge-release",
-    "application": "release-pair",
+    "application": "pineforge-release",
     "web": "pineforge-release",
     "data": "pineforge-release",
     "license": "pineforge-release",
@@ -114,7 +114,9 @@ def validate(manifest):
     require(c["pypi_version"] == cv.pep440 and c["npm_version"] == str(cv), "codegen delivery versions differ")
     match(SHA, c["sdist_sha256"])
     match(r"sha512-[A-Za-z0-9+/]{86}==", c["npm_integrity"])
-    require(len(base64.b64decode(c["npm_integrity"][7:], validate=True)) == 64, "invalid npm integrity")
+    integrity = base64.b64decode(c["npm_integrity"][7:], validate=True)
+    require(base64.b64encode(integrity).decode("ascii") == c["npm_integrity"][7:],
+            "invalid npm integrity")
     for item in (e, c):
         match(COMMIT, item["commit"])
     if pair.hpo_pairing(v):

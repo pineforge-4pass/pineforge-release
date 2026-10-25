@@ -205,7 +205,8 @@ def identity(obj, *, facts_only=False, consumer=None, slot=None):
         except ValueError as error:
             raise Invalid("malformed identity") from error
         match(r"sha512-[A-Za-z0-9+/]{86}==", obj["npm_integrity"])
-        require(len(base64.b64decode(obj["npm_integrity"][7:], validate=True)) == 64,
+        integrity = base64.b64decode(obj["npm_integrity"][7:], validate=True)
+        require(base64.b64encode(integrity).decode("ascii") == obj["npm_integrity"][7:],
                 "invalid npm integrity")
         match(COMMIT, obj["git_head"])
         match("sha256:" + SHA, obj["image_digest"])
@@ -275,6 +276,7 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
                 and policy["deploy"]["workflow"] == "release.yml", "unexpected postmerge consumer")
         require((state == "verified") == (receipt["e2e"] is not None),
                 "postmerge E2E is required exactly in verified state")
+        require(state != "ready", "postmerge policy does not accept ready state")
     if state in ("pending", "failed", "superseded", "skipped_by_policy"):
         require(state != "skipped_by_policy" or (not facts_only and event["prerelease"]), "consumer cannot skip by policy")
         return public

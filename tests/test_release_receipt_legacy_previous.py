@@ -52,15 +52,15 @@ def verify_facts(fixture):
 
 
 class LegacyPreviousReceiptTests(unittest.TestCase):
-    def test_verified_offline_legacy_previous_is_accepted_and_stored_unchanged(self):
+    def test_verified_offline_legacy_previous_is_accepted_and_serialized_unchanged(self):
         """Mutation: change identity()'s legacy consumer == "offline" to consumer == "data"."""
         fixture = offline_fixture()
 
         public = fixture.verify()
         self.assertEqual(public["previous"], LEGACY_PREVIOUS)
         self.assertEqual(contract.canonical(public["previous"]), LEGACY_PREVIOUS_BYTES)
-        stored = contract.decode(contract.canonical(public))
-        self.assertEqual(stored["previous"], LEGACY_PREVIOUS)
+        round_tripped = contract.decode(contract.canonical(public))
+        self.assertEqual(round_tripped["previous"], LEGACY_PREVIOUS)
 
     def test_legacy_previous_refuses_each_extra_key(self):
         for extra in ("source", "event_id", "facts_commit", "unknown"):
@@ -92,7 +92,11 @@ class LegacyPreviousReceiptTests(unittest.TestCase):
             fixture = offline_fixture()
             # Mutation: replace identity()'s legacy slot == "previous" with True.
             fixture.receipt[slot] = copy.deepcopy(LEGACY_PREVIOUS)
-            with self.subTest(slot=slot), self.assertRaisesRegex(
+            # Call identity() too, before source lookups can mask a missing scope check.
+            with self.subTest(slot=slot, call="identity"), self.assertRaisesRegex(
+                    contract.Invalid, "legacy identity is only valid for product offline.previous"):
+                receipts.identity(fixture.receipt[slot], consumer="offline", slot=slot)
+            with self.subTest(slot=slot, call="validate_receipt"), self.assertRaisesRegex(
                     contract.Invalid, "legacy identity is only valid for product offline.previous"):
                 fixture.verify()
 
@@ -103,6 +107,26 @@ class LegacyPreviousReceiptTests(unittest.TestCase):
             with self.subTest(consumer=consumer), self.assertRaisesRegex(
                     contract.Invalid, "legacy identity is only valid for product offline.previous"):
                 fixture.verify()
+
+    def test_legacy_scope_is_checked_before_identity_stage(self):
+        """Mutation: remove or "legacy" in receipt[name] from the early identity guard."""
+        for state in ("pending", "pr_open", "testing", "ready", "merged", "deploying",
+                      "failed", "superseded", "skipped_by_policy"):
+            for consumer, slot in (("offline", "preview"), ("offline", "deployed"),
+                                   ("hosted", "previous"), ("data", "previous"), ("web", "previous")):
+                with self.subTest(state=state, consumer=consumer, slot=slot):
+                    fixture = coordinator.ReceiptFixture(consumer)
+                    fixture.receipt["state"] = state
+                    # Permit policy skipping so it cannot mask the missing legacy guard.
+                    if state == "skipped_by_policy":
+                        fixture.event["prerelease"] = True
+                    fixture.receipt[slot] = copy.deepcopy(LEGACY_PREVIOUS)
+                    with self.assertRaisesRegex(
+                            contract.Invalid, "legacy identity is only valid for product offline.previous"):
+                        fixture.verify()
+                    # Even a later scope refusal must not stand in for the early guard.
+                    self.assertEqual(fixture.queries, [])
+                    self.assertEqual(fixture.downloads, [])
 
     def test_legacy_identity_refuses_facts_only_offline_previous(self):
         """Mutation: remove not facts_only and from identity()'s legacy scope condition."""
@@ -118,7 +142,7 @@ class LegacyPreviousReceiptTests(unittest.TestCase):
                 receipts.identity(LEGACY_PREVIOUS, **context)
 
     def test_legacy_identity_accepts_product_offline_previous(self):
-        """Mutation: replace identity()'s legacy return with return obj."""
+        """Positive control for a product offline.previous identity."""
         with self.subTest(consumer="offline", slot="previous"):
             self.assertIsNone(receipts.identity(LEGACY_PREVIOUS, consumer="offline", slot="previous"))
 
@@ -130,6 +154,17 @@ class LegacyPreviousReceiptTests(unittest.TestCase):
             with self.subTest(consumer=consumer), self.assertRaisesRegex(
                     contract.Invalid, "legacy identity is only valid for product offline.previous"):
                 verify_facts(fixture)
+
+    def test_legacy_previous_rejects_noncanonical_npm_integrity(self):
+        """Mutation: restore the decoded-length-only legacy npm integrity check."""
+        fixture = offline_fixture()
+        fixture.receipt["previous"]["npm_integrity"] = (
+            "sha512-o1hmSb6FwjkF8lIwLhENJV+YPbYqSwG1KPvHyViPj5Yan3aHoNRCpM5uINaYbjZKjGS95VDClmASOUSD6ZktVx=="
+        )
+        with self.subTest(call="identity"), self.assertRaisesRegex(contract.Invalid, "invalid npm integrity"):
+            receipts.identity(fixture.receipt["previous"], consumer="offline", slot="previous")
+        with self.subTest(call="validate_receipt"), self.assertRaisesRegex(contract.Invalid, "invalid npm integrity"):
+            fixture.verify()
 
     def test_legacy_previous_rejects_malformed_values(self):
         mutations = (
@@ -149,6 +184,7 @@ class LegacyPreviousReceiptTests(unittest.TestCase):
             # Mutation: remove identity()'s match("sha256:" + SHA, obj["image_digest"]).
             ("image_digest null", "image_digest", None),
             ("image_digest 63 hex", "image_digest", "sha256:" + "7" * 63),
+            ("image_digest uppercase", "image_digest", "sha256:" + "A" * 64),
             ("image_digest without prefix", "image_digest", "7" * 64),
         )
         for description, field, value in mutations:
