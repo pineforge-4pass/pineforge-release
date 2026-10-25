@@ -29,7 +29,7 @@ RECEIPT_ROLES = tuple(role for role in ROLES if role not in DELIVERY_ONLY)
 EVENT_TYPES = {
     "offline": "pineforge-release",
     "hosted": "pineforge-release",
-    "application": "release-pair",
+    "application": "pineforge-release",
     "web": "pineforge-release",
     "data": "pineforge-release",
     "license": "pineforge-release",

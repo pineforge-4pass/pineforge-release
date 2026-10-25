@@ -36,8 +36,6 @@ jobs:
     permissions:
       contents: write  # append one neutral redelivery audit asset in this hub
       issues: write
-    env:
-      TARGET_REPOSITORY: ${{ inputs.consumer == 'offline' && 'pineforge-backtest-mcp' || inputs.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || inputs.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || inputs.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || inputs.consumer == 'data' && 'pineforge-data' || inputs.consumer == 'license' && 'pineforge-license' || inputs.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}
     steps:
       - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
         shell: bash
@@ -49,12 +47,54 @@ jobs:
         with:
           ref: main
           persist-credentials: false
-      - name: Require one configured consumer repository
+      - name: Authorize consumer and pair before token mint
         shell: bash
+        env:
+          PYTHONPATH: scripts
+          TAG: ${{ inputs.tag }}
+          CONSUMER: ${{ inputs.consumer }}
+          RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
         run: |
+          set -euo pipefail
+          python3 -c '
+          import os
+          import sys
+          import release_pipeline as pipeline
+
+          try:
+              consumer = os.environ["CONSUMER"]
+              enabled = pipeline.configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+              pipeline.require(consumer in enabled, "redelivery consumer is not configured")
+              tag = os.environ["TAG"]
+              release = pipeline.version(tag.removeprefix("v"))
+              pipeline.require(tag == "v" + str(release), "redelivery tag must be canonical vX.Y.Z")
+              if consumer in pipeline.DELIVERY_ONLY:
+                  first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
+                  pipeline.require(first and release >= pipeline.version(first),
+                                   "redelivery consumer is not enabled for this pair")
+          except (ValueError, pipeline.pair.RuleError):
+              sys.exit("::error::redelivery consumer or pair is not authorized")
+          '
+      - name: Validate public redelivery eligibility
+        env:
+          TAG: ${{ inputs.tag }}
+          CONSUMER: ${{ inputs.consumer }}
+          RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
+        run: |
+          python3 scripts/release_pipeline.py redeliver-check --tag "$TAG" --consumer "$CONSUMER"
+      - name: Require one configured consumer repository
+        id: target
+        shell: bash
+        env:
+          TARGET_REPOSITORY: ${{ inputs.consumer == 'offline' && 'pineforge-backtest-mcp' || inputs.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || inputs.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || inputs.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || inputs.consumer == 'data' && 'pineforge-data' || inputs.consumer == 'license' && 'pineforge-license' || inputs.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}
+        run: |
+          set -euo pipefail
           if ! [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
             echo '::error::Missing or malformed consumer repository setup'; exit 1
           fi
+          printf 'repository=%s\n' "$TARGET_REPOSITORY" >> "$GITHUB_OUTPUT"
       - name: Mint App token (scoped to one target)
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -62,13 +102,14 @@ jobs:
           app-id: ${{ secrets.PINEFORGE_APP_ID }}
           private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: ${{ env.TARGET_REPOSITORY }}
+          repositories: ${{ steps.target.outputs.repository }}
           permission-contents: write
           github-api-url: https://api.github.com
       - name: Redeliver immutable release-ready payload and append audit
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           HUB_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: ${{ steps.target.outputs.repository }}
           TAG: ${{ inputs.tag }}
           CONSUMER: ${{ inputs.consumer }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}

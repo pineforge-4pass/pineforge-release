@@ -10,11 +10,13 @@ import argparse
 import datetime as dt
 import os
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
 import release_pair as pair
-from release_artifacts import Client, PRODUCERS, command, npm, producer
+from release_artifacts import Client, PRODUCERS, SafeRedirect, command, npm, producer
 from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYPES,
                               HUB, IMAGE, RECEIPT_ROLES, ROLES, SCHEMA, SHA, Invalid,
                               Pending, bind_facts, canonical, decode, keys, match,
@@ -23,6 +25,13 @@ from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYP
 
 FACTS_RECEIPTS_TAG = "facts-receipts"
 COMPLETE_STATES = ("verified", "skipped_by_policy", "superseded", "delivered")
+# The public consumer-<role>-<attempt>-<sequence>.json receipt that release_receipts publishes. That
+# module imports this one, so these are repeated here; tests compare them with its real output.
+RECEIPT_SCHEMA = "pineforge/consumer-receipt/v1"
+RECEIPT_STATES = ("pending", "pr_open", "testing", "ready", "merged", "deploying", "verified", "failed",
+                  "superseded", "skipped_by_policy")
+RECEIPT_FIELDS = ("schema", "consumer", "attempt", "sequence", "state", "timestamp",
+                  "event_id", "release_version", "evidence_sha256", "reporting_run_id")
 # Delay after each reserved attempt: two retries, then an acknowledgement grace
 # period before a terminal failure. Reservations survive failed/cancelled jobs.
 DELIVERY_BACKOFF_MINUTES = (15, 60, 15)
@@ -285,6 +294,105 @@ def receipts(store, row, event_id):
     return result
 
 
+def require_consumer_unverified(store, row, event, consumer):
+    """Redelivery eligibility from every receipt of one consumer, never from a selected one.
+
+    receipts() keeps a single receipt per role and, for an equal (attempt, sequence), the lower
+    asset id without comparing contents; it checks a receipt's identity but not its shape. A
+    receipt without a state, or a verified one hidden by a conflicting copy or by a later
+    attempt, must not authorize another delivery. Fail closed on any malformed or duplicated
+    receipt of this consumer and on any verified one. Other roles keep only the identity check.
+    """
+    seen, verified = set(), False
+    fresh = store.get(row["tag_name"])
+    for item in sorted(fresh["assets"], key=lambda a: a["id"]):
+        if not item["name"].startswith("consumer-"):
+            continue
+        obj = decode(store.read(fresh, item["name"]))
+        require(obj["event_id"] == event["event_id"] and obj["consumer"] in RECEIPT_ROLES,
+                "consumer receipt identity differs")
+        if obj["consumer"] != consumer:
+            continue
+        require(set(RECEIPT_FIELDS) <= set(obj) and obj["schema"] == RECEIPT_SCHEMA
+                and obj["release_version"] == event["release_version"]
+                and obj["state"] in RECEIPT_STATES, "malformed consumer receipt")
+        for name in ("attempt", "sequence", "reporting_run_id"):
+            positive(obj[name])
+        match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
+        try:
+            # The publisher (release_receipts.validate_receipt) parses it the same way; the
+            # pattern alone accepts an impossible date such as 2026-99-99T99:99:99Z.
+            dt.datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00"))
+        except ValueError as error:
+            raise Invalid("malformed consumer receipt timestamp") from error
+        match(SHA, obj["evidence_sha256"])
+        identity = (obj["attempt"], obj["sequence"])
+        require(identity not in seen, "duplicate consumer receipt identity")
+        seen.add(identity)
+        verified = verified or obj["state"] == "verified"
+    require(not verified, "consumer already verified")
+
+
+def confirm_redelivery_run(client, audit):
+    """A public asset is evidence only when the hub confirms its trusted run."""
+    try:
+        run = client.api(f"repos/{HUB}/actions/runs/{audit['run_id']}")
+    except Pending:
+        raise Invalid("redelivery workflow run unavailable") from None
+    require(type(run) is dict and type(run.get("id")) is int and run["id"] == audit["run_id"]
+            and run.get("path") == ".github/workflows/release-redeliver.yml"
+            and run.get("head_branch") == "main" and run.get("status") == "completed"
+            and run.get("conclusion") == "success", "redelivery workflow run differs")
+
+
+def delivery_accepted(store, row, event_id, role):
+    """Read acceptance evidence; manual repair preserves automatic failure history."""
+    name = f"delivery-{role}.json"
+    raw = store.read(row, name)
+    evidence = [] if raw is None else [(name, raw)]
+    prefix = f"delivery-redelivered-{role}-"
+    for asset in store.get(row["tag_name"])["assets"]:
+        if asset["name"].startswith(prefix):
+            evidence.append((asset["name"], store.read(row, asset["name"])))
+    attempts, audits = [], []
+    has_acceptance = raw is not None
+    for asset_name, accepted in evidence:
+        obj = decode(accepted)
+        require(type(obj) is dict and obj.get("event_id") == event_id
+                and obj.get("consumer") == role and obj.get("state") == "dispatch_accepted",
+                "accepted delivery identity differs")
+        if asset_name == name:
+            continue
+        # Match the append-only redelivery audit contract before using it to
+        # complete a delivery-only role. Never infer success from its filename.
+        fields = ("schema", "event_id", "consumer", "attempt", "state", "run_id", "timestamp", "actor")
+        if obj.get("schema") == "pineforge/release-redelivery/v2":
+            fields += ("dispatch_status",)
+        keys(obj, fields)
+        require(obj["schema"] in ("pineforge/release-redelivery/v1", "pineforge/release-redelivery/v2"),
+                "redelivery history identity differs")
+        positive(obj["attempt"])
+        positive(obj["run_id"])
+        if obj["schema"] == "pineforge/release-redelivery/v2":
+            require(type(obj["dispatch_status"]) is int and obj["dispatch_status"] == 204,
+                    "redelivery dispatch status differs")
+        require(asset_name == f"{prefix}{obj['attempt']}.json" and canonical(obj) == accepted,
+                "redelivery history asset differs")
+        match(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", obj["actor"])
+        match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
+        dt.datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00"))
+        attempts.append(obj["attempt"])
+        audits.append(obj)
+    require(sorted(attempts) == list(range(1, len(attempts) + 1)), "invalid redelivery attempt history")
+    for audit in audits:
+        confirm_redelivery_run(store.client, audit)
+        # Confirmed v1 audits remain readable history, but lack a recorded
+        # dispatch response and cannot establish compute completion.
+        if audit["schema"] == "pineforge/release-redelivery/v2":
+            has_acceptance = True
+    return has_acceptance
+
+
 def aggregate(store, row, event, *, enabled=(), newest=None):
     by_role = receipts(store, row, event["event_id"])
     states = {}
@@ -293,10 +401,8 @@ def aggregate(store, row, event, *, enabled=(), newest=None):
             continue
         obj = by_role.get(role)
         if role in DELIVERY_ONLY:
-            # P16: compute records every pair, including rc and older pairs.
-            # It bypasses aggregate supersession (release_pipeline.py:304-305)
-            # and the dispatch refusal (release_pipeline.py:563-567), before this change.
-            states[role] = "delivered" if store.read(row, f"delivery-{role}.json") is not None else "pending"
+            # Compute records every eligible pair, including rc and older pairs.
+            states[role] = "delivered" if delivery_accepted(store, row, event["event_id"], role) else "pending"
         elif newest is not None and version(event["release_version"]) < newest and (not obj or obj["state"] != "verified"):
             states[role] = "superseded"
         elif obj:
@@ -340,13 +446,35 @@ def plan_delivery(store, row, event, role):
     return {"consumer": role, "tag": row["tag_name"], "attempt": attempt}, False
 
 
-def redeliver(client, store, tag, consumer, output):
-    """Manually resend one public event; append one audit only after acceptance."""
+def redelivery_dispatch(client, target, data):
+    """Keep the actual dispatch HTTP status, which Client.api discards."""
+    headers = {"User-Agent": "pineforge-release-reconciler", "Accept": "application/vnd.github+json",
+               "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"}
+    if client.token:
+        headers["Authorization"] = "Bearer " + client.token
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/pineforge-4pass/{target}/dispatches",
+        data=canonical(data), headers=headers, method="POST")
+    try:
+        with urllib.request.build_opener(SafeRedirect()).open(request, timeout=120) as response:
+            status = response.status
+            require(type(status) is int and status == 204, "redelivery dispatch status differs")
+            return status
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            raise Pending("published artifact unavailable") from None
+        raise Invalid(f"artifact request failed (HTTP {error.code})") from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise Invalid("artifact transport failed") from None
+
+
+def redelivery_source(tag, consumer):
+    """Validate eligibility and read the payload without write credentials."""
     require(consumer in configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", "")),
             "redelivery consumer is not configured")
     require(tag == "v" + str(version(tag.removeprefix("v"))), "redelivery tag must be canonical vX.Y.Z")
-    # The dispatch client has a target-only App token. Release checks and exact
-    # manifest reads use a public client; the injected store appends audit.
+    # The workflow runs these public checks before minting its target-only App
+    # token. Redelivery repeats them before sending instead of trusting a cache.
     public = Client(token="")
     row = public.api(f"repos/{HUB}/releases/tags/{tag}")
     require(row["tag_name"] == tag and not row["draft"], "cannot redeliver a draft or different release")
@@ -379,31 +507,47 @@ def redeliver(client, store, tag, consumer, output):
         obj = decode(accepted)
         require(obj["event_id"] == event["event_id"] and obj["consumer"] == consumer
                 and obj["state"] == "dispatch_accepted", "accepted delivery identity differs")
-        by_role = receipts(public_store, row, event["event_id"])
-        require(by_role.get(consumer, {}).get("state") != "verified", "consumer already verified")
+    # With or without delivery-<consumer>.json: any verified receipt, a malformed one or two
+    # claiming the same identity refuses; a missing, failed or pending one still repairs.
+    require_consumer_unverified(public_store, row, event, consumer)
+    return public_store, row, event, client_payload
 
+
+def redeliver(client, store, tag, consumer, output):
+    """Manually resend one public event; append one audit only after acceptance."""
+    public_store, row, event, client_payload = redelivery_source(tag, consumer)
+    event_type = EVENT_TYPES[consumer]
     prefix = f"delivery-redelivered-{consumer}-"
     actor_pattern = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?"
-    attempts = []
+    attempts, audits = [], []
     for asset in public_store.get(tag)["assets"]:
         if not asset["name"].startswith(prefix):
             continue
         previous = public_store.read(row, asset["name"])
         obj = decode(previous)
-        keys(obj, ("schema", "event_id", "consumer", "attempt", "state", "run_id", "timestamp", "actor"))
-        require(obj["schema"] == "pineforge/release-redelivery/v1"
+        fields = ("schema", "event_id", "consumer", "attempt", "state", "run_id", "timestamp", "actor")
+        if type(obj) is dict and obj.get("schema") == "pineforge/release-redelivery/v2":
+            fields += ("dispatch_status",)
+        keys(obj, fields)
+        require(obj["schema"] in ("pineforge/release-redelivery/v1", "pineforge/release-redelivery/v2")
                 and obj["event_id"] == event["event_id"] and obj["consumer"] == consumer
                 and obj["state"] == "dispatch_accepted", "redelivery history identity differs")
         positive(obj["attempt"])
         positive(obj["run_id"])
+        if obj["schema"] == "pineforge/release-redelivery/v2":
+            require(type(obj["dispatch_status"]) is int and obj["dispatch_status"] == 204,
+                    "redelivery dispatch status differs")
         require(asset["name"] == f"{prefix}{obj['attempt']}.json" and canonical(obj) == previous,
                 "redelivery history asset differs")
         match(actor_pattern, obj["actor"])
         match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
         dt.datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00"))
         attempts.append(obj["attempt"])
+        audits.append(obj)
     attempts.sort()
     require(attempts == list(range(1, len(attempts) + 1)), "invalid redelivery attempt history")
+    for audit in audits:
+        confirm_redelivery_run(store.client, audit)
     attempt = len(attempts) + 1
     positive(attempt)
     run_id = int(os.environ["GITHUB_RUN_ID"])
@@ -411,11 +555,10 @@ def redeliver(client, store, tag, consumer, output):
     actor = match(actor_pattern, os.environ["GITHUB_ACTOR"])
     target = os.environ.get("TARGET_REPOSITORY", "")
     match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", target)
-    client.api(f"repos/pineforge-4pass/{target}/dispatches", method="POST",
-               data={"event_type": event_type, "client_payload": client_payload})
-    audit = canonical({"schema": "pineforge/release-redelivery/v1", "event_id": event["event_id"],
+    dispatch_status = redelivery_dispatch(client, target, {"event_type": event_type, "client_payload": client_payload})
+    audit = canonical({"schema": "pineforge/release-redelivery/v2", "event_id": event["event_id"],
                        "consumer": consumer, "attempt": attempt, "state": "dispatch_accepted",
-                       "run_id": run_id, "timestamp": now(), "actor": actor})
+                       "run_id": run_id, "dispatch_status": dispatch_status, "timestamp": now(), "actor": actor})
     # No reservation or planner/receipt updates. An unsuccessful append fails
     # this run; absent an audit asset, the next run sends the same event again.
     store.put(row, f"{prefix}{attempt}.json", audit)
@@ -461,12 +604,14 @@ def facts_freshness(client, store, roles):
 def finalize_all(client, store, registry, tag, output):
     enabled = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
     compute_first_pair = None
+    compute_configuration_error = False
     if "compute" in enabled:
         first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
         if first:
             try:
                 compute_first_pair = version(first)
             except ValueError:
+                compute_configuration_error = True
                 # Preserve the diagnostic even if later row/facts work fails.
                 # The workflow reports it after sending the other roles.
                 configuration_output = (
@@ -489,10 +634,17 @@ def finalize_all(client, store, registry, tag, output):
             if event is None:
                 continue
             newest = finalized_version(store)
+            planned_roles = delivery_roles(event["release_version"], enabled, compute_first_pair)
+            # A typo stops compute sends, but cannot remove its completion obligation.
+            status_roles = enabled if compute_configuration_error else planned_roles
             status = aggregate(store, row, event,
-                               enabled=delivery_roles(event["release_version"], enabled, compute_first_pair), newest=newest)
+                               enabled=status_roles, newest=newest)
             for role, state in status["consumers"].items():
                 if state == "pending":
+                    if role not in planned_roles:
+                        if store.read(row, f"delivery-failed-{role}.json") is not None:
+                            status["consumers"][role] = "failed"
+                        continue
                     delivery, failed = plan_delivery(store, row, event, role)
                     if delivery:
                         deliveries.append(delivery)
@@ -608,6 +760,9 @@ def main():
     p.add_argument("--consumer", choices=ROLES, required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--attempt", type=int, default=1)
+    p = sub.add_parser("redeliver-check")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--consumer", choices=ROLES, required=True)
     p = sub.add_parser("redeliver")
     p.add_argument("--tag", required=True)
     p.add_argument("--consumer", choices=ROLES, required=True)
@@ -615,9 +770,12 @@ def main():
     p = sub.add_parser("alert")
     p.add_argument("--stage", required=True, choices=("publish", "producer", "finalize", "dispatch", "receipt"))
     args = parser.parse_args()
-    client = Client()
-    store = Store(client)
     try:
+        if args.cmd == "redeliver-check":
+            redelivery_source(args.tag, args.consumer)
+            return 0
+        client = Client()
+        store = Store(client)
         if args.cmd == "producer":
             producer(client, args.component, args.version)
         elif args.cmd == "bindings":
