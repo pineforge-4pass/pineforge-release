@@ -128,6 +128,9 @@ def expected_pair_payload(manifest_raw, candidate_raw):
 class MemoryStore:
     def __init__(self, *manifests):
         self.rows, self.assets, self.operations = {}, {}, []
+        # Model the hub API independently of the production acceptance checker.
+        self.client = self
+        self.workflow_runs, self.run_reads = {}, []
         for obj in manifests:
             tag = "v" + obj["release_version"]
             self.rows[tag] = {"id": len(self.rows) + 1, "tag_name": tag, "draft": True,
@@ -144,6 +147,18 @@ class MemoryStore:
         return self.releases()
 
     def api(self, route, *, method="GET", data=None):
+        run_prefix = f"repos/{contract.HUB}/actions/runs/"
+        if route.startswith(run_prefix):
+            if method != "GET" or data is not None:
+                raise AssertionError("workflow confirmation must be read-only")
+            self.run_reads.append(route)
+            run = self.workflow_runs.get(int(route.removeprefix(run_prefix)))
+            if run is None:
+                # Client.request maps GitHub's HTTP 404 to Pending.
+                raise contract.Pending("published artifact unavailable")
+            if isinstance(run, Exception):
+                raise run
+            return copy.deepcopy(run)
         prefix = f"repos/{contract.HUB}/releases"
         if route == prefix and method == "POST":
             row = {**data, "id": len(self.rows) + 1, "assets": [], "created_at": "2026-10-16T00:00:00Z"}
@@ -315,12 +330,12 @@ class ManifestTests(unittest.TestCase):
 
 class PairPayloadTests(unittest.TestCase):
     def test_event_types_cover_all_roles_and_preserve_legacy_events(self):
-        legacy = {"offline", "hosted", "web", "data", "license"}
-        self.assertEqual(set(contract.ROLES), legacy | {"application", "compute"})
+        legacy = {"offline", "hosted", "application", "web", "data", "license"}
+        self.assertEqual(set(contract.ROLES), legacy | {"compute"})
         self.assertEqual(set(contract.EVENT_TYPES), set(contract.ROLES))
         self.assertEqual(contract.EVENT_TYPES,
                          {**dict.fromkeys(legacy, "pineforge-release"),
-                          "application": "release-pair", "compute": "release-pair"})
+                          "compute": "release-pair"})
         self.assertEqual(contract.DELIVERY_ONLY, ("compute",))
         self.assertEqual(set(contract.RECEIPT_ROLES), set(contract.ROLES) - {"compute"})
 
@@ -709,12 +724,146 @@ class FinalizerTests(unittest.TestCase):
         # Asset upload order does not change a valid, contiguous repair history.
         store = MemoryStore(self.m)
         row = store.get("v1.6.0")
+        store.workflow_runs[900] = {
+            "id": 900, "path": ".github/workflows/release-redeliver.yml",
+            "head_branch": "main", "status": "completed", "conclusion": "success"}
         for attempt in (2, 1):
             store.put(row, f"delivery-redelivered-compute-{attempt}.json",
-                      contract.canonical({**audit, "attempt": attempt}))
+                      contract.canonical({**audit, "schema": "pineforge/release-redelivery/v2",
+                                          "attempt": attempt, "dispatch_status": 204}))
         status = pipeline.aggregate(store, row, event, enabled=("compute",))
         self.assertEqual(status["consumers"], {"compute": "delivered"})
         self.assertTrue(status["complete"])
+        self.assertEqual(store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"] * 2)
+
+    def test_reader_forged_v1_compute_audit_cannot_complete_exhausted_delivery(self):
+        """Mutation: return bool(evidence) without confirming the audit's run."""
+        self.store.put(self.row, contract.ASSET, contract.canonical(self.m))
+        event = self.finish()
+        self.assertEqual(event["event_id"],
+                         "sha256:12a79d3776c447b1caf9513c96db3407b1d3cd2d71a510081e6763e994c2288e")
+        # Exact reader input: canonical bytes followed by LF, not a derived v2 fixture.
+        forged = (
+            b'{"actor":"release-operator","attempt":1,"consumer":"compute",'
+            b'"event_id":"sha256:12a79d3776c447b1caf9513c96db3407b1d3cd2d71a510081e6763e994c2288e",'
+            b'"run_id":1,"schema":"pineforge/release-redelivery/v1","state":"dispatch_accepted",'
+            b'"timestamp":"2026-10-23T00:00:00Z"}\n'
+        )
+        self.assertEqual(contract.canonical(contract.decode(forged)), forged)
+        self.store.put(self.row, "delivery-redelivered-compute-1.json", forged)
+        for attempt in (1, 2, 3):
+            self.store.put(self.row, f"delivery-attempt-compute-{attempt}.json", contract.canonical({
+                "event_id": event["event_id"], "consumer": "compute", "attempt": attempt,
+                "run_id": 800 + attempt, "timestamp": "2026-10-23T00:00:00Z"}))
+        self.store.put(self.row, "delivery-failed-compute.json", contract.canonical({
+            "event_id": event["event_id"], "consumer": "compute", "state": "failed",
+            "attempts": 3, "timestamp": "2026-10-23T00:00:00Z"}))
+        before = copy.deepcopy(self.store.assets)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "GITHUB_RUN_ID": "901", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
+                patch.object(pipeline, "report_issue") as report:
+            output = Path(tmp) / "deliveries.json"
+            with self.assertRaisesRegex(contract.Invalid,
+                                        "^release finalization failed; inspect release incidents$"):
+                pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0", output)
+            self.assertEqual(contract.decode(output.read_bytes()), [])
+            self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/1"])
+            self.assertEqual(self.store.assets, before)
+            self.assertEqual(report.call_args.args[2], "Release v1.6.0: readiness failed")
+            self.assertFalse(report.call_args.kwargs.get("complete", False))
+
+    def test_compute_manual_audits_require_each_workflow_run_binding(self):
+        """Mutations: omit the API lookup or any individual run comparison."""
+        event = contract.payload(contract.canonical(self.m))
+        legacy = {"schema": "pineforge/release-redelivery/v1", "event_id": event["event_id"],
+                  "consumer": "compute", "attempt": 1, "state": "dispatch_accepted",
+                  "run_id": 900, "timestamp": "2026-10-23T00:00:00Z", "actor": "release-operator"}
+        success = {"id": 900, "path": ".github/workflows/release-redeliver.yml",
+                   "head_branch": "main", "status": "completed", "conclusion": "success"}
+        cases = (
+            ("other workflow", {**success, "path": ".github/workflows/release-finalize.yml"},
+             "redelivery workflow run differs"),
+            ("other branch", {**success, "head_branch": "repair"}, "redelivery workflow run differs"),
+            ("failure", {**success, "conclusion": "failure"}, "redelivery workflow run differs"),
+            ("in progress", {**success, "status": "in_progress", "conclusion": None},
+             "redelivery workflow run differs"),
+            ("unfinished success", {**success, "status": "in_progress"}, "redelivery workflow run differs"),
+            ("other id", {**success, "id": 901}, "redelivery workflow run differs"),
+            ("boolean id", {**success, "id": True}, "redelivery workflow run differs"),
+            ("not an object", [], "redelivery workflow run differs"),
+            ("404", None, "redelivery workflow run unavailable"),
+            ("403", contract.Invalid("artifact request failed (HTTP 403)"),
+             r"artifact request failed \(HTTP 403\)"),
+            ("500", contract.Invalid("artifact request failed (HTTP 500)"),
+             r"artifact request failed \(HTTP 500\)"),
+            ("transport", contract.Invalid("artifact transport failed"), "artifact transport failed"),
+        )
+        # v1 gives each negative input a red-on-main case in the existing schema;
+        # v2 independently proves the same binding applies to new audit evidence.
+        for audit in (legacy, {**legacy, "schema": "pineforge/release-redelivery/v2", "dispatch_status": 204}):
+            for label, run, message in cases:
+                with self.subTest(schema=audit["schema"], case=label):
+                    store = MemoryStore(self.m)
+                    row = store.get("v1.6.0")
+                    if run is not None:
+                        store.workflow_runs[900] = run
+                    store.put(row, "delivery-redelivered-compute-1.json", contract.canonical(audit))
+                    before = copy.deepcopy(store.assets)
+                    with self.assertRaisesRegex(contract.Invalid, "^" + message + "$"):
+                        pipeline.aggregate(store, row, event, enabled=("compute",))
+                    self.assertEqual(store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+                    self.assertEqual(store.assets, before)
+
+    def test_confirmed_legacy_audit_is_history_only_until_a_v2_dispatch(self):
+        """Mutation: let a confirmed v1 audit without a dispatch status complete compute."""
+        event = contract.payload(contract.canonical(self.m))
+        audit = {"schema": "pineforge/release-redelivery/v1", "event_id": event["event_id"],
+                 "consumer": "compute", "attempt": 1, "state": "dispatch_accepted",
+                 "run_id": 900, "timestamp": "2026-10-23T00:00:00Z", "actor": "release-operator"}
+        self.store.workflow_runs[900] = {
+            "id": 900, "path": ".github/workflows/release-redeliver.yml",
+            "head_branch": "main", "status": "completed", "conclusion": "success"}
+        self.store.put(self.row, "delivery-redelivered-compute-1.json", contract.canonical(audit))
+        status = pipeline.aggregate(self.store, self.row, event, enabled=("compute",))
+        self.assertEqual(status["consumers"], {"compute": "pending"})
+        self.assertFalse(status["complete"])
+        self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+        self.store.workflow_runs[901] = {**self.store.workflow_runs[900], "id": 901}
+        self.store.put(self.row, "delivery-redelivered-compute-2.json", contract.canonical({
+            **audit, "schema": "pineforge/release-redelivery/v2", "attempt": 2,
+            "run_id": 901, "dispatch_status": 204}))
+        before = copy.deepcopy(self.store.assets)
+        self.store.run_reads.clear()
+        status = pipeline.aggregate(self.store, self.row, event, enabled=("compute",))
+        self.assertEqual(status["consumers"], {"compute": "delivered"})
+        self.assertTrue(status["complete"])
+        self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900",
+                                              f"repos/{contract.HUB}/actions/runs/901"])
+        self.assertEqual(self.store.assets, before)
+
+    def test_v2_compute_audit_requires_recorded_204_and_a_positive_run_id(self):
+        """Mutations: omit dispatch_status validation or accept an audit without run_id."""
+        event = contract.payload(contract.canonical(self.m))
+        audit = {"schema": "pineforge/release-redelivery/v2", "event_id": event["event_id"],
+                 "consumer": "compute", "attempt": 1, "state": "dispatch_accepted", "dispatch_status": 204,
+                 "run_id": 900, "timestamp": "2026-10-23T00:00:00Z", "actor": "release-operator"}
+        cases = [
+            ({key: value for key, value in audit.items() if key != "run_id"}, "unexpected object fields"),
+            ({key: value for key, value in audit.items() if key != "dispatch_status"}, "unexpected object fields"),
+            ({**audit, "run_id": True}, "expected positive integer"),
+            *[({**audit, "dispatch_status": status}, "redelivery dispatch status differs")
+              for status in (200, 201, 202, 400, True, "204", None)],
+        ]
+        for obj, message in cases:
+            with self.subTest(audit=obj):
+                store = MemoryStore(self.m)
+                row = store.get("v1.6.0")
+                store.put(row, "delivery-redelivered-compute-1.json", contract.canonical(obj))
+                with self.assertRaisesRegex(contract.Invalid, "^" + message + "$"):
+                    pipeline.aggregate(store, row, event, enabled=("compute",))
+                self.assertEqual(store.run_reads, [])
 
     def test_compute_is_never_superseded_before_or_after_delivery(self):
         event = self.finish()
@@ -848,6 +997,60 @@ class FinalizerTests(unittest.TestCase):
                              [{"consumer": "compute", "tag": "v1.6.1", "attempt": 1},
                               {"consumer": "compute", "tag": "v1.6.0", "attempt": 1}])
 
+    def test_malformed_compute_floor_preserves_failed_and_pending_incidents(self):
+        """Mutation: use the disabled delivery inventory for completion after a typo."""
+        for state in ("failed", "pending"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp, \
+                    patch.dict(os.environ, {
+                        "RELEASE_READY_CONSUMERS": "offline,compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                        "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                        "GITHUB_OUTPUT": str(Path(tmp) / "github-output"),
+                        "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false",
+                    }, clear=True), patch.object(pipeline, "age_minutes", return_value=1000), \
+                    patch.object(pipeline, "now", return_value="2026-10-16T00:00:00Z"), \
+                    patch.object(pipeline, "report_issue") as report:
+                client, store, registry = FinalizeClient(self.m), MemoryStore(self.m), MemoryRegistry()
+                row = store.get("v1.6.0")
+                event = pipeline.finalize(client, store, registry, row)
+                store.put(row, "consumer-offline-1-1.json", contract.canonical({
+                    "event_id": event["event_id"], "consumer": "offline", "state": "verified",
+                    "attempt": 1, "sequence": 1, "timestamp": "2026-10-16T00:00:00Z"}))
+                if state == "failed":
+                    for attempt in (1, 2, 3):
+                        store.put(row, f"delivery-attempt-compute-{attempt}.json", contract.canonical({
+                            "event_id": event["event_id"], "consumer": "compute", "attempt": attempt,
+                            "run_id": 90, "timestamp": "2026-10-16T00:00:00Z"}))
+                    store.put(row, "delivery-failed-compute.json", contract.canonical({
+                        "event_id": event["event_id"], "consumer": "compute", "state": "failed",
+                        "attempts": 3, "timestamp": "2026-10-16T00:00:00Z"}))
+                output = Path(tmp) / "deliveries.json"
+                pipeline.finalize_all(client, store, registry, "v1.6.0", output)
+                first = json.loads(store.read(row, "release-status-100-1.json"))
+                self.assertEqual(first["consumers"], {"offline": "verified", "compute": state})
+                self.assertFalse(first["complete"])
+                self.assertEqual(json.loads(output.read_bytes()), [] if state == "failed" else [
+                    {"consumer": "compute", "tag": "v1.6.0", "attempt": 1}])
+                self.assertFalse(report.call_args.kwargs["complete"])
+                before = copy.deepcopy(store.assets)
+
+                os.environ["RELEASE_COMPUTE_FIRST_PAIR"] = "v1.6.0"
+                os.environ["GITHUB_RUN_ID"] = "101"
+                report.reset_mock()
+                pipeline.finalize_all(client, store, registry, "v1.6.0", output)
+                self.assertEqual(json.loads(output.read_bytes()), [])
+                latest = max((asset for asset in row["assets"] if asset["name"].startswith("release-status-")),
+                             key=lambda asset: asset["id"])
+                status = json.loads(store.read(row, latest["name"]))
+                self.assertEqual(status["consumers"], {"offline": "verified", "compute": state})
+                self.assertFalse(status["complete"])
+                self.assertEqual(status, first)
+                self.assertEqual(latest["name"], "release-status-100-1.json")
+                self.assertEqual(store.assets, before)
+                report.assert_not_called()
+                self.assertEqual((Path(tmp) / "github-output").read_text(encoding="utf-8"), (
+                    "compute_configuration_error=RELEASE_COMPUTE_FIRST_PAIR value was not accepted; "
+                    "compute is off for this run\n"))
+
     def test_compute_plan_refuses_a_noncanonical_first_pair(self):
         legacy = "offline,hosted,application,web,data,license"
         manifests = [fixture_manifest(v) for v in ("1.6.0", "1.6.1", "1.6.2-rc.1")]
@@ -890,12 +1093,30 @@ class FinalizerTests(unittest.TestCase):
             {"consumer": "hosted", "tag": "v1.6.2-rc.1", "attempt": 1},
             *({"consumer": role, "tag": "v1.6.1", "attempt": 1} for role in legacy.split(",")),
         ])
+        expected_assets = dict(baseline[3])
+        for key, raw in baseline[3].items():
+            if key[1].startswith("release-status-"):
+                status = json.loads(raw)
+                status["consumers"]["compute"] = "pending"
+                status["complete"] = False
+                expected_assets[key] = contract.canonical(status)
+        expected_reports = []
+        for args, kwargs in baseline[4]:
+            if args[0].startswith("v"):
+                tag, _, body = args
+                body = body.replace("\n\nDispatch acceptance", "\n- compute: pending\n\nDispatch acceptance")
+                body += "\n\nDelivery-only roles complete at delivered (transport acceptance)."
+                expected_reports.append(((tag, f"Release {tag[1:]}: pending/failed", body),
+                                         {**kwargs, "complete": False}))
+            else:
+                expected_reports.append((args, kwargs))
+        expected = (baseline[2], expected_assets, expected_reports, baseline[5])
         configuration_line = ("compute_configuration_error=RELEASE_COMPUTE_FIRST_PAIR value was not accepted; "
                               "compute is off for this run\n")
         for first in ("v1.6.0", "1.6", "v1.7.0"):
             with self.subTest(first=first):
                 actual = run(first, legacy + ",compute")
-                self.assertEqual(actual[2:6], baseline[2:6])
+                self.assertEqual(actual[2:6], expected)
                 self.assertEqual(actual[:2], (0, ""))
                 self.assertEqual(actual[6], 1)
                 self.assertEqual(actual[7:], ("existing_output=kept\n" + configuration_line, ""))
@@ -905,7 +1126,7 @@ class FinalizerTests(unittest.TestCase):
                 self.assertEqual(unselected[7:], baseline[7:])
 
         standalone = run("v1.7.0", legacy + ",compute", github_output_enabled=False)
-        self.assertEqual(standalone[:6], baseline[:6])
+        self.assertEqual(standalone[:6], (0, "", *expected))
         self.assertEqual(standalone[6:], (1, "existing_output=kept\n", configuration_line))
 
     def test_compute_configuration_output_precedes_row_and_facts_failures(self):
@@ -1064,8 +1285,27 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(clients.call_args_list, [unittest.mock.call(), unittest.mock.call(token="")])
         return result, sender, written, fetch.call_args_list, scan.call_args_list
 
+    def test_application_dispatch_preserves_release_ready_v1_without_an_opt_in(self):
+        """Mutation: map application to release-pair before its receiver is ready."""
+        ready_raw = (ROOT / "tests/fixtures/release-ready.json").read_bytes()
+        store = self.ready_store(fixture_manifest())
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "application"}, clear=True):
+            result, sender, written, fetches, _ = self.send(store, "application")
+        self.assertEqual(result, 0)
+        sender.api.assert_called_once_with("repos/pineforge-4pass/fixture/dispatches", method="POST",
+            data={"event_type": "pineforge-release", "client_payload": json.loads(ready_raw)})
+        sent = sender.api.call_args.kwargs["data"]["client_payload"]
+        self.assertEqual(contract.canonical(sent), ready_raw)
+        self.assertEqual(sent["schema"], "pineforge/release-ready/v1")
+        self.assertEqual(set(sent), {"schema", "event_id", "release_version", "prerelease", "hub_commit",
+                                    "versions", "image", "facts", "manifest", "run_id"})
+        self.assertEqual(len(fetches), 1)
+        self.assertTrue(fetches[0].args[0].endswith("/release-manifest.json"))
+        self.assertEqual(json.loads(written)["consumer"], "application")
+        self.assertEqual(json.loads(written)["event_id"], json.loads(ready_raw)["event_id"])
+
     def test_pair_dispatch_posts_release_pair_with_exact_eight_key_payload(self):
-        for consumer, release in (("compute", "1.6.0"), ("application", "1.6.0"), ("compute", "1.6.0-rc.1")):
+        for consumer, release in (("compute", "1.6.0"), ("compute", "1.6.0-rc.1")):
             with self.subTest(consumer=consumer, release=release):
                 manifest = fixture_manifest(release)
                 store = self.ready_store(manifest)
@@ -1083,7 +1323,7 @@ class DispatchTests(unittest.TestCase):
 
     def test_legacy_dispatch_keeps_full_manifest_payload_bytes_for_every_other_role(self):
         ready_raw = (ROOT / "tests/fixtures/release-ready.json").read_bytes()
-        for consumer in ("hosted", "offline", "web", "data", "license"):
+        for consumer in ("hosted", "offline", "application", "web", "data", "license"):
             with self.subTest(consumer=consumer):
                 store = self.ready_store(fixture_manifest())
                 result, sender, written, fetches, _ = self.send(store, consumer)
@@ -1113,16 +1353,22 @@ class DispatchTests(unittest.TestCase):
                     self.assertTrue(scans)
 
     def test_pair_dispatch_refuses_candidate_mismatch_before_posting(self):
-        for consumer in ("compute", "application"):
-            with self.subTest(consumer=consumer):
-                store = self.ready_store(fixture_manifest())
-                built = json.loads(store.assets[("v1.6.0", pipeline.CANDIDATE)])
-                built["hub_commit"] = "f" * 40
-                store.assets[("v1.6.0", pipeline.CANDIDATE)] = contract.canonical(built)
-                result, sender, written, _, _ = self.send(store, consumer)
-                self.assertEqual(result, 1)
-                sender.api.assert_not_called()
-                self.assertIsNone(written)
+        store = self.ready_store(fixture_manifest())
+        built = json.loads(store.assets[("v1.6.0", pipeline.CANDIDATE)])
+        built["hub_commit"] = "f" * 40
+        store.assets[("v1.6.0", pipeline.CANDIDATE)] = contract.canonical(built)
+        result, sender, written, _, _ = self.send(store, "compute")
+        self.assertEqual(result, 1)
+        sender.api.assert_not_called()
+        self.assertIsNone(written)
+        result, sender, written, fetches, _ = self.send(store, "application")
+        self.assertEqual(result, 0)
+        sender.api.assert_called_once_with("repos/pineforge-4pass/fixture/dispatches", method="POST",
+            data={"event_type": "pineforge-release",
+                  "client_payload": json.loads((ROOT / "tests/fixtures/release-ready.json").read_bytes())})
+        self.assertEqual(len(fetches), 1)
+        self.assertTrue(fetches[0].args[0].endswith("/release-manifest.json"))
+        self.assertEqual(json.loads(written)["consumer"], "application")
 
     def test_compute_dispatch_still_refuses_rejected_pairs(self):
         store = self.ready_store(fixture_manifest())

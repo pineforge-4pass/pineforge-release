@@ -145,11 +145,11 @@ The previous alias digests are preserved before the first promotion.
 
 ## Exact ready event contract
 
-The `offline`, `hosted`, `web`, `data` and `license` event type remains
+The `offline`, `hosted`, `application`, `web`, `data` and `license` event type remains
 **`pineforge-release`**, with unchanged payload bytes. Its ten payload fields are
 exactly section 3.2 of the design: `schema`, `event_id`, `release_version`,
 `prerelease`, `hub_commit`, `versions`, `image`, `facts`, `manifest`, `run_id`.
-The `application` and `compute` roles use **`release-pair`**, described below.
+The `compute` role uses **`release-pair`**, described below.
 `EVENT_TYPES` in `scripts/release_contract.py` is the single role-to-event table.
 
 Fixtures for consumer implementations:
@@ -179,10 +179,10 @@ referenced artifacts. No arbitrary repository/asset/path is accepted from the
 sender. A newer verified canonical facts snapshot may be retained if its target
 release entry agrees exactly. Record the actually consumed commit and digest.
 
-### Pair event for application and compute
+### Pair event for compute
 
 `pair_payload(manifest_raw, candidate_raw)` in `scripts/release_contract.py`
-builds the same `release-pair` payload for both targets. It validates the
+builds the `release-pair` payload for compute. It validates the
 immutable manifest and the candidate's existing smoke/source gates, then
 requires equal release version, image, hub commit, build run and producer pins.
 The manifest's codegen npm fields are the finalizer's additions; all original
@@ -212,13 +212,14 @@ The payload has exactly these eight top-level keys:
 | `candidate_url` | Fixed hub's `releases/download/v<pair_id>/release-candidate.json` HTTPS URL. |
 | `candidate_sha256` | Lowercase SHA-256 of the untouched published candidate bytes. |
 
-The application remains a normal receipt role. Its event type changes to
-`release-pair` so it receives the shared pair/build inputs; this does not change
-its CI/E2E/deploy receipt requirements. Derive
-`event_id = "sha256:" + receipt_sha256`; facts and image identity come from the
-manifest fetched at `receipt_url`, after checking its untouched bytes against
-`receipt_sha256`. It remains `skipped_by_policy` for prereleases because its
-receiver refuses those dispatches.
+The application remains a normal receipt role, using `pineforge-release` with
+the exact ten-key `pineforge/release-ready/v1` payload above and its existing
+CI/E2E/deploy receipt requirements. Its default-branch receiver accepts only
+that contract; application pair support remains deferred until APP PR #723
+lands. Application delivery is opt-in through `RELEASE_READY_CONSUMERS`; the
+agreed 1.7.0 application delivery uses a manual stable replay of release-ready/v1.
+It remains `skipped_by_policy` for prereleases because its receiver refuses
+those dispatches.
 
 Builders remain deployers: the application builds its Cloud Run image and
 hosted builds its container. The compute receiver only validates each pair and
@@ -251,8 +252,10 @@ JSON strings; blank `hpo_tag` decodes to null. Repeating the same
 bounded delivery history and report a neutral incident to
 `RELEASE_REPORT_OWNER`. No older-pair backfill is needed for the initial rollout.
 
-The hub's `release-redeliver.yml` uses the same `release-pair` mapping for
-application and compute, fetching the original manifest and candidate bytes.
+The hub's `release-redeliver.yml` uses the same role-to-event mapping as automatic
+dispatch: application receives the ten-key release-ready/v1 payload from the
+original manifest, and compute receives `release-pair` from the original
+manifest and candidate bytes.
 Compute repair also requires its role selection and a valid, nonempty
 `RELEASE_COMPUTE_FIRST_PAIR` no greater than the pair's version. A newer release
 does not supersede an eligible compute repair; application keeps its existing
@@ -283,7 +286,7 @@ Prerelease application/web/data/license roles, if configured, are explicitly
 |---|---|---|---|
 | `offline` | `pineforge-release` | Verified consumer receipt | Consumer dev/next gates |
 | `hosted` | `pineforge-release` | Verified consumer receipt | Consumer dev/next gates |
-| `application` | `release-pair` | Verified consumer receipt | `skipped_by_policy` |
+| `application` | `pineforge-release` | Verified consumer receipt | `skipped_by_policy` |
 | `web` | `pineforge-release` | Verified consumer receipt | `skipped_by_policy` |
 | `data` | `pineforge-release` | Verified consumer receipt | `skipped_by_policy` |
 | `license` | `pineforge-release` if explicitly selected; normally facts-only | Verified consumer receipt | `skipped_by_policy` for product releases |
@@ -296,6 +299,11 @@ the role is listed. Below-floor pairs are omitted from compute's deliveries,
 aggregate and staleness inventory. Leave the variable empty until the compute
 receiver is merged, then the supervisor sets the agreed current application/
 hosted pair. There is no automatic backfill below that floor.
+An unreadable nonempty floor suppresses compute deliveries but retains compute
+in the completion and staleness inventory for every processed release. Existing
+validated acceptance remains `delivered`; an exhausted delivery remains
+`failed`, and a missing acceptance remains `pending`. Failed or pending compute
+cannot close a release incident or produce a status with `complete: true`.
 
 `DELIVERY_ONLY = ("compute",)` explicitly separates delivery roles from the six
 `RECEIPT_ROLES`. Compute is `delivered` only after decoding acceptance evidence
@@ -303,7 +311,18 @@ from `delivery-compute.json` or the manual `delivery-redelivered-compute-N.json`
 audit history and validating the matching `event_id`, compute consumer and
 `dispatch_accepted` state. Malformed or mismatching evidence is refused.
 Manual audits must also satisfy their schema, canonical bytes, actor, clock and
-contiguous attempt numbering. Valid acceptance counts as complete and can close
+contiguous attempt numbering. Completion from a manual audit requires a
+`pineforge/release-redelivery/v2` audit with integer `dispatch_status: 204` and
+positive integer `run_id`. Using the hub client, the finalizer confirms that run
+through `repos/pineforge-4pass/pineforge-release/actions/runs/<run_id>`: its id
+must match, workflow path must be `.github/workflows/release-redeliver.yml`,
+head branch must be `main`, status must be `completed`, and conclusion must be
+`success`. Missing runs (404), API errors, and mismatching or unfinished runs
+are refused and cannot complete compute or close its incident. Confirmed v1
+audits remain readable for contiguous history only; without a recorded dispatch
+response they cannot complete compute. A subsequent confirmed v2 audit can
+complete that history. Audits without a run id are refused.
+Valid acceptance counts as complete and can close
 a release incident. It never becomes `superseded` or `skipped_by_policy`, and a
 newer ready release does not refuse an eligible compute send or retry. `delivered` proves
 transport acceptance; it makes no deployment or served-state claim.
@@ -334,13 +353,19 @@ uses the `release-automation` environment: today that environment permits main
 and release tags and has no required reviewers, so the dispatch right is the
 only approval unless the owner gives the repair a dedicated reviewed environment.
 The consumer must be in `RELEASE_READY_CONSUMERS`; this membership and canonical
-tag are checked before minting the target App token. Compute also requires a
+tag are checked before resolving target repository secrets or minting the
+target App token. The repository guard runs after authorization and passes the
+validated repository through a step output. Compute also requires a
 nonempty canonical `RELEASE_COMPUTE_FIRST_PAIR` no greater than the pair's version
 before minting. The send repeats those authorization checks against the immutable
-manifest. It resends the immutable manifest's identical
-payload and appends `delivery-redelivered-<consumer>-<n>.json` only after dispatch
+manifest. It reconstructs the role's identical payload from the original
+manifest, also reading the original candidate for compute, and appends
+`delivery-redelivered-<consumer>-<n>.json` only after dispatch
 acceptance, recording the event, independent contiguous redelivery number, run,
-timestamp and `GITHUB_ACTOR` login. It never touches `delivery-<consumer>.json`,
+the actual dispatch response status, timestamp and `GITHUB_ACTOR` login.
+The v2 audit takes its run id from `GITHUB_RUN_ID` and is written only for an
+HTTP 204 dispatch response. Before another repair, the hub also confirms the
+runs named by prior v1 or v2 audits. It never touches `delivery-<consumer>.json`,
 `delivery-failed-<consumer>.json`, `delivery-attempt-*`, receipts or other release
 assets. The finalizer validates accepted manual compute audits as delivery
 completion even after automatic retries are exhausted; the original failure and
@@ -348,8 +373,8 @@ attempt assets remain unchanged. Receipt roles still require consumer evidence.
 If dispatch succeeds but the audit write fails, the run fails; when no
 audit asset was written, the next run sends again with the same number, so a
 duplicate delivery is possible. The receipt contract is unchanged: redelivery
-keeps the same `event_id`, and the consumer's idempotence rules decide how to
-handle it.
+keeps the same `event_id` for receipt roles; compute keeps the same `pair_id`
+and `receipt_sha256`. The receiver's idempotence rules decide how to handle it.
 
 `release-receipts.yml` polls selected consumers every 30 minutes and accepts the
 callback below to repair dropped notifications. It mints a target-only read
@@ -412,7 +437,7 @@ fields defined here.
 | Field | Type and allowed value |
 |---|---|
 | `schema` | String, exactly `pineforge/consumer-receipt/v1`. |
-| `event_id` | Digest string, exactly the verified hub manifest's event ID. For application `release-pair`, `event_id = "sha256:" + receipt_sha256`; facts and image identity come from the manifest fetched at `receipt_url`, with its untouched bytes checked against `receipt_sha256`. |
+| `event_id` | Digest string, exactly the verified hub manifest's event ID from the release-ready/v1 payload. |
 | `consumer` | String: `offline`, `hosted`, `application`, `web`, `data`, or `license`; must match the hub's scoped target/policy. License implements the facts-only variant below. |
 | `release_version` | Bare canonical semver string `X.Y.Z` or `X.Y.Z-{alpha,beta,rc}.N`, exactly the hub event's version; no leading `v` or leading-zero integers. |
 | `attempt` | Integer identifying an automation attempt, increasing per consumer/target; use the coordinator's GitHub run ID, not `GITHUB_RUN_ATTEMPT` alone. |
@@ -1014,7 +1039,7 @@ use `ubuntu-latest` per owner decision 10-21, including publication workflows.
 | `RELEASE_COMPUTE_REPOSITORY` (new secret) | Hub `release-automation` environment secrets | Private short name of the compute target repository; the application target likewise lives in `RELEASE_APPLICATION_REPOSITORY`. Both reuse the existing one-target App mint. No values belong in source or public audit assets. |
 | `RELEASE_RECEIPT_POLICY` (new secret) | Hub repository Actions secret (read by the receipt verify job, which runs in the `release-automation` environment; do not also create it in the environment, it would shadow this one) | JSON map of each enabled receipt role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories, plus optional application-only `post_merge`. Compute needs no entry. Keep private workflow/job details out of public source. |
 | `RELEASE_READY_CONSUMERS` (new variable) | Hub repository | Explicit comma-separated upgraded product receiver roles. Empty sends nothing; disabled roles do not block aggregate completion or become overdue. Facts flags independently select web/license receipt polling and freshness. |
-| `RELEASE_COMPUTE_FIRST_PAIR` (new variable; empty/off) | Hub repository | Bare canonical semver lower bound for compute, including prereleases. Compute must also be in `RELEASE_READY_CONSUMERS`. When selected, validate the value once before processing releases. A malformed value disables compute for that run and sets the fixed `compute_configuration_error` output before any release work. Other roles are processed as with compute off; the configuration error alone leaves the script's exit status at 0. The workflow reports it after consumer notification as described below. Diagnostics name the variable and say its value was not accepted, without exposing the value. The configuration error creates or reopens no per-release incident. An unselected compute role ignores the value. Keep empty until the receiver merges; no older-pair backfill for the initial rollout. |
+| `RELEASE_COMPUTE_FIRST_PAIR` (new variable; empty/off) | Hub repository | Bare canonical semver lower bound for compute, including prereleases. Compute must also be in `RELEASE_READY_CONSUMERS`. When selected, validate the value once before processing releases. A malformed nonempty value suppresses compute deliveries and sets the fixed `compute_configuration_error` output before any release work, while retaining compute in each release's completion inventory with its existing delivered, failed or pending state. Failed or pending compute keeps the incident incomplete; the typo cannot authorize a complete status or incident closure. Other roles' delivery planning continues; the configuration error alone leaves the script's exit status at 0. The workflow reports it after consumer notification as described below. Diagnostics name the variable and say its value was not accepted, without exposing the value. An unselected compute role ignores the value. Keep empty until the receiver merges; no older-pair backfill for the initial rollout. |
 | `RELEASE_REPORT_OWNER` (new variable) | Hub repository | GitHub login to assign/mention on release and failure issues. |
 | `RELEASE_READY_MAX_AGE_MINUTES` (optional variable; 60) | Hub repository | Missing readiness prerequisite alert threshold. |
 | `RELEASE_CONSUMER_MAX_AGE_MINUTES` (optional variable; 180) | Hub repository | Non-app missing/stalled completion threshold. |

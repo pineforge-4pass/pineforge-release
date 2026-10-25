@@ -218,7 +218,7 @@ class PublishTest(unittest.TestCase):
     def test_prerelease_flag_is_in_every_dispatch_payload(self):
         finalizer = _workflow("release-finalize.yml")
         steps = finalizer["jobs"]["notify-consumers"]["steps"]
-        # Application/compute use release-pair, whose flag is inside build.
+        # Compute uses release-pair, whose flag is inside build.
         # Both payload contracts and channel policies are checked in binding tests.
         send = next(step for step in steps if step.get("name", "").startswith("Dispatch pineforge-release"))
         self.assertIn("scripts/release_pipeline.py dispatch", send["run"])
@@ -1793,11 +1793,40 @@ class NotifyConsumersTest(unittest.TestCase):
 
 
 class RedeliverWorkflowTest(unittest.TestCase):
+    def test_no_job_or_unauthorized_step_resolves_any_secret(self):
+        """Mutation: restore TARGET_REPOSITORY at job scope, or move its guard before authorization."""
+        def secret_paths(node, path):
+            if isinstance(node, dict):
+                return [found for key, value in node.items()
+                        for found in secret_paths(value, path + "." + str(key))]
+            if isinstance(node, list):
+                return [found for index, value in enumerate(node)
+                        for found in secret_paths(value, path + f"[{index}]")]
+            return [path] if isinstance(node, str) and "secrets." in node else []
+
+        workflow = _workflow("release-redeliver.yml")
+        for name, job in workflow["jobs"].items():
+            with self.subTest(job=name):
+                self.assertEqual(secret_paths(job.get("env", {}), "jobs." + name + ".env"), [],
+                                 "job environment resolves a secret before authorization")
+                steps = job["steps"]
+                authorization = next(index for index, step in enumerate(steps)
+                                     if step.get("name") == "Authorize consumer and pair before token mint")
+                for index, step in enumerate(steps[:authorization + 1]):
+                    self.assertEqual(secret_paths(step, f"jobs.{name}.steps[{index}]"), [],
+                                     "step resolves a secret before authorization succeeds")
+                guard = next(index for index, step in enumerate(steps)
+                             if step.get("name") == "Require one configured consumer repository")
+                self.assertGreater(guard, authorization)
+                for step in steps[authorization:guard + 1]:
+                    self.assertNotIn("if", step, "target secrets require successful authorization")
+                    self.assertNotIn("continue-on-error", step, "authorization failure must stop the job")
+
     def authorization_flow(self, steps, *, enabled="compute", first="1.6.0", tag="v1.6.0", consumer="compute"):
         """CI only: execute actual guards; count reached mint/dispatch boundaries."""
         follows = (".github/workflows/release-redeliver.yml", "scripts/release_pipeline.py",
                    "scripts/release_contract.py", "scripts/release_pair.py",
-                   "scripts/release_artifacts.py", "scripts/release_sources.py")
+                   "scripts/release_artifacts.py", "scripts/release_sources.py", os.devnull)
         forbidden = ("/.config/zsh/keys", "/.ssh", "/.aws", "/.codex", "/.config/pineforge")
         for name in follows:
             path = str(REPO / name)
@@ -1809,8 +1838,12 @@ class RedeliverWorkflowTest(unittest.TestCase):
             "${{ vars.RELEASE_READY_CONSUMERS }}": enabled,
             "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}": first,
         }
+        for step in steps:
+            target = step.get("env", {}).get("TARGET_REPOSITORY")
+            if target is not None:
+                context[target] = "configured-target"
         environment = {"PATH": os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1",
-                       "TARGET_REPOSITORY": "configured-target"}
+                       "TARGET_REPOSITORY": "configured-target", "GITHUB_OUTPUT": os.devnull}
         checkout = next(i for i, step in enumerate(steps)
                         if step.get("uses", "").startswith("actions/checkout@"))
         mints, dispatches, results = 0, 0, []
@@ -1850,6 +1883,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
         for enabled, first, tag in (
                 ("compute", "", "v1.6.0"),
                 ("offline", "1.6.0", "v1.6.0"),
+                ("offline", "", "v1.7.0"),
                 ("compute", "1.6.1", "v1.6.0"),
                 ("compute", "v1.6.0", "v1.6.0"),
                 ("compute", "1.6.0-rc.10", "v1.6.0-rc.2")):
@@ -1926,7 +1960,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
             "inputs.consumer == 'license' && 'pineforge-license' || "
             "inputs.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}"
         )
-        self.assertEqual(job["env"], {"TARGET_REPOSITORY": target})
+        self.assertNotIn("env", job)
         self.assertEqual(target, sibling["env"]["TARGET_REPOSITORY"].replace("matrix.consumer", "inputs.consumer"))
         steps = job["steps"]
         self.assertEqual(steps[0], ReleaseTriggerWorkflowTest.APT_GUARD_STEP)
@@ -1940,16 +1974,23 @@ class RedeliverWorkflowTest(unittest.TestCase):
             "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
             "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
             "owner": "${{ github.repository_owner }}",
-            "repositories": "${{ env.TARGET_REPOSITORY }}",
+            "repositories": "${{ steps.target.outputs.repository }}",
             "permission-contents": "write", "github-api-url": "https://api.github.com",
         })
         guard = next(step for step in steps if step.get("name") == "Require one configured consumer repository")
+        self.assertEqual(guard["id"], "target")
+        self.assertEqual(guard["env"], {"TARGET_REPOSITORY": target})
         self.assertIn('[[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]', guard["run"])
+        self.assertIn('printf \'repository=%s\\n\' "$TARGET_REPOSITORY" >> "$GITHUB_OUTPUT"', guard["run"])
+        authorization = next(step for step in steps
+                             if step.get("name") == "Authorize consumer and pair before token mint")
+        self.assertLess(steps.index(authorization), steps.index(guard))
         self.assertLess(steps.index(guard), steps.index(actions[mint]))
         sends = [step for step in steps if "release_pipeline.py redeliver " in step.get("run", "")]
         self.assertEqual(len(sends), 1)
         self.assertEqual(sends[0]["env"], {
             "GH_TOKEN": "${{ steps.app.outputs.token }}", "HUB_TOKEN": "${{ github.token }}",
+            "TARGET_REPOSITORY": "${{ steps.target.outputs.repository }}",
             "TAG": "${{ inputs.tag }}", "CONSUMER": "${{ inputs.consumer }}",
             "RELEASE_READY_CONSUMERS": "${{ vars.RELEASE_READY_CONSUMERS }}",
             "RELEASE_COMPUTE_FIRST_PAIR": "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}",
