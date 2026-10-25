@@ -876,7 +876,10 @@ class PinnedLicenceDigestsTest(unittest.TestCase):
 
     PINNED = {
         "pineforge-hpo/LICENSE": "1aa95beed7fc0b368872fcd1bcf6a09a0f67ef3014b5e48ae21404cb647a1136",
-        "pineforge-hpo/NOTICE": "7436681c495f6c699f8c71c8dd7e5343c2340912492b21674e343376be648d30",
+        # hpo 1.7.0 NOTICE: approved by L6 on 10-25 under the owner's HUB170-TAG = A;
+        # the only change vs 1.6.3 is the bundled reader's path
+        # (src/cli/json.hpp -> src/core/json.hpp).
+        "pineforge-hpo/NOTICE": "fb088c51cdd2b82f2ee6488730de8334310796f124046df9679dc1e96f744d1b",
         "pineforge-hpo/THIRD_PARTY_LICENSES/sobol_joe_kuo.txt":
             "9d10226b50eeb34be0ab06bfa3392c7bd1f04bf602f9af4343295d1fd003d0e3",
         "pineforge-codegen/LICENSE": "5f43346a79228e0ee266ea08efc6e2106d64afa9255fc360cc329903268f720e",
