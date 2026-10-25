@@ -1793,6 +1793,41 @@ class NotifyConsumersTest(unittest.TestCase):
 
 
 class RedeliverWorkflowTest(unittest.TestCase):
+    def test_public_eligibility_is_checked_before_target_token_mint(self):
+        """Mutation: move or remove the public eligibility step, or let it follow the repository guard."""
+        steps = _workflow("release-redeliver.yml")["jobs"]["redeliver"]["steps"]
+        checks = [step for step in steps
+                  if "release_pipeline.py redeliver-check " in step.get("run", "")]
+        self.assertEqual(len(checks), 1)
+        check = checks[0]
+        checkout = next(step for step in steps if "actions/checkout@" in step.get("uses", ""))
+        mint = next(step for step in steps if "create-github-app-token@" in step.get("uses", ""))
+        send = next(step for step in steps if "release_pipeline.py redeliver " in step.get("run", ""))
+        self.assertLess(steps.index(checkout), steps.index(check))
+        self.assertLess(steps.index(check), steps.index(mint))
+        self.assertLess(steps.index(mint), steps.index(send))
+        # Both pre-mint checks stay, in this order: authorization, this public eligibility check,
+        # then the repository guard (the first step that resolves a target secret), then the mint.
+        authorization = next(step for step in steps
+                             if step.get("name") == "Authorize consumer and pair before token mint")
+        guard = next(step for step in steps if step.get("name") == "Require one configured consumer repository")
+        self.assertLess(steps.index(checkout), steps.index(authorization))
+        self.assertLess(steps.index(authorization), steps.index(check))
+        self.assertLess(steps.index(check), steps.index(guard))
+        self.assertLess(steps.index(guard), steps.index(mint))
+        self.assertNotIn("secrets.", json.dumps(steps[:steps.index(check) + 1]),
+                         "a step resolves a secret before authorization and eligibility complete")
+        self.assertEqual(check["env"], {
+            "TAG": "${{ inputs.tag }}", "CONSUMER": "${{ inputs.consumer }}",
+            "RELEASE_READY_CONSUMERS": "${{ vars.RELEASE_READY_CONSUMERS }}",
+            "RELEASE_COMPUTE_FIRST_PAIR": "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}",
+        })
+        self.assertEqual(check["run"],
+                         'python3 scripts/release_pipeline.py redeliver-check --tag "$TAG" --consumer "$CONSUMER"\n')
+        for step in (check, mint, send):
+            self.assertNotIn("if", step)
+            self.assertNotIn("continue-on-error", step)
+
     def test_no_job_or_unauthorized_step_resolves_any_secret(self):
         """Mutation: restore TARGET_REPOSITORY at job scope, or move its guard before authorization."""
         def secret_paths(node, path):
@@ -1823,7 +1858,12 @@ class RedeliverWorkflowTest(unittest.TestCase):
                     self.assertNotIn("continue-on-error", step, "authorization failure must stop the job")
 
     def authorization_flow(self, steps, *, enabled="compute", first="1.6.0", tag="v1.6.0", consumer="compute"):
-        """CI only: execute actual guards; count reached mint/dispatch boundaries."""
+        """CI only: execute actual guards; count reached mint/dispatch boundaries.
+
+        The public eligibility step reads the live hub, so this walk counts it instead of running it:
+        test_release_redeliver.RedeliverTest.workflow_before_target_mint runs that same step against
+        its fake hub. A mint reached before that step fails here, so both pre-mint checks stay in line.
+        """
         follows = (".github/workflows/release-redeliver.yml", "scripts/release_pipeline.py",
                    "scripts/release_contract.py", "scripts/release_pair.py",
                    "scripts/release_artifacts.py", "scripts/release_sources.py", os.devnull)
@@ -1846,17 +1886,21 @@ class RedeliverWorkflowTest(unittest.TestCase):
                        "TARGET_REPOSITORY": "configured-target", "GITHUB_OUTPUT": os.devnull}
         checkout = next(i for i, step in enumerate(steps)
                         if step.get("uses", "").startswith("actions/checkout@"))
-        mints, dispatches, results = 0, 0, []
+        mints, dispatches, eligibility_checks, results = 0, 0, 0, []
         for step in steps[checkout + 1:]:
             self.assertNotIn("if", step, "authorization and token steps must use the default success guard")
             self.assertNotIn("continue-on-error", step, "a failed authorization must stop later steps")
             self.assertEqual(step.get("shell", "bash"), "bash")
             if step.get("uses", "").startswith("actions/create-github-app-token@"):
+                self.assertEqual(eligibility_checks, 1, "the public eligibility check must precede the token mint")
                 mints += 1
                 continue
             if "release_pipeline.py redeliver " in step.get("run", ""):
                 dispatches += 1
                 return mints, dispatches, results
+            if "release_pipeline.py redeliver-check " in step.get("run", ""):
+                eligibility_checks += 1
+                continue
             self.assertIn("run", step, "unexpected action before redelivery")
             script = step["run"]
             for part in forbidden:
@@ -2015,6 +2059,23 @@ class RedeliverWorkflowTest(unittest.TestCase):
                          "idempotence", "audit write fails", "next run sends again", "duplicate delivery"):
             with self.subTest(required=required):
                 self.assertIn(required, repair)
+
+    def test_docs_state_which_receipts_refuse_a_redelivery(self):
+        """Mutation: describe only the latest receipt, or drop the malformed and duplicate refusals."""
+        text = (REPO / "docs/release-chain.md").read_text()
+        start = text.index("Use `release-redeliver.yml` for an explicitly reviewed repair")
+        end = text.index("`release-receipts.yml` polls", start)
+        repair = " ".join(text[start:end].split())
+        for required in (
+                "every hub receipt of that consumer",
+                "any `verified` receipt, not only its latest, even when `delivery-<consumer>.json` is absent",
+                "refuses a malformed receipt of that consumer",
+                "two receipts with the same attempt and sequence, whatever their names and contents",
+                "Missing receipts, exhausted automatic delivery, an accepted but unverified delivery "
+                "and another role's verified receipt do not block a repair"):
+            with self.subTest(required=required):
+                self.assertIn(required, repair)
+        self.assertNotIn("latest receipts", repair)
 
 
 class HarnessSyncTest(unittest.TestCase):

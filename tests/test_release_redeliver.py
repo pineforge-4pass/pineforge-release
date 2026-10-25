@@ -10,10 +10,12 @@ from __future__ import annotations
 import copy
 import io
 import os
+import shlex
 import sys
 import tempfile
 import unittest
 import urllib.error
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +24,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import release_artifacts as artifacts  # noqa: E402
 import release_contract as contract  # noqa: E402
 import release_pipeline as pipeline  # noqa: E402
+import release_receipts as adapter  # noqa: E402
 from test_release_binding import (FinalizeClient, MemoryRegistry, MemoryStore,  # noqa: E402
                                   expected_pair_payload, fixture_manifest)
 
@@ -29,6 +32,10 @@ TAG = "v1.6.0"
 CONSUMER = "hosted"
 TARGET = "fixture-hosted"
 CLOCK = "2026-10-23T00:00:00Z"
+# The keys release_receipts.validate_receipt publishes for a product receipt in every state
+# (a test below compares this list with the adapter's real output).
+RECEIPT_FIELDS = ("schema", "consumer", "attempt", "sequence", "state", "timestamp",
+                  "event_id", "release_version", "evidence_sha256", "reporting_run_id")
 
 
 class PublicHub:
@@ -159,14 +166,37 @@ class RedeliverTest(unittest.TestCase):
             "consumer": CONSUMER, "attempt": 3, "state": "dispatch_accepted",
             "run_id": 800, "timestamp": CLOCK}))
 
+    def receipt_body(self, state, *, consumer=CONSUMER, attempt=1, sequence=1):
+        # A trusted hub summary, after the existing receipt adapter verified the
+        # consumer's evidence. Redelivery eligibility reads its shape, identity and state.
+        return {"schema": "pineforge/consumer-receipt/v1", "event_id": self.event["event_id"],
+                "release_version": "1.6.0", "consumer": consumer, "state": state,
+                "attempt": attempt, "sequence": sequence, "timestamp": CLOCK,
+                "evidence_sha256": "a" * 64, "reporting_run_id": 700}
+
     def seed_receipt(self, state, *, consumer=CONSUMER, attempt=1, sequence=1):
-        # These are trusted hub summaries, after the existing receipt adapter
-        # verified consumer evidence. Redelivery only selects their latest state.
-        self.seed(self.row, f"consumer-{consumer}-{attempt}-{sequence}.json", contract.canonical({
-            "schema": "pineforge/consumer-receipt/v1", "event_id": self.event["event_id"],
-            "release_version": "1.6.0", "consumer": consumer, "state": state,
-            "attempt": attempt, "sequence": sequence, "timestamp": CLOCK,
-            "evidence_sha256": "a" * 64, "reporting_run_id": 700}))
+        self.seed_receipt_asset(f"consumer-{consumer}-{attempt}-{sequence}.json", self.receipt_body(
+            state, consumer=consumer, attempt=attempt, sequence=sequence))
+
+    def seed_receipt_asset(self, name, body):
+        self.seed(self.row, name, contract.canonical(body))
+
+    @contextmanager
+    def restored_store(self):
+        """Undo a subtest's seeded assets and any effects so every case starts alike."""
+        assets, listed = copy.deepcopy(self.store.assets), copy.deepcopy(self.row["assets"])
+        try:
+            yield
+        finally:
+            self.store.assets = assets
+            self.row["assets"] = listed
+            for effects in (self.tokens, self.requests, self.accepted, self.puts, self.effects):
+                effects.clear()
+
+    def assert_public_refusal(self, message):
+        """Refused with this message after public reads only: no other credential, send or write."""
+        self.assert_refused(message=message)
+        self.assertEqual(self.tokens, [""])
 
     def seed_planner(self, *, consumer=CONSUMER):
         for number in (1, 2, 3):
@@ -210,6 +240,135 @@ class RedeliverTest(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(self.puts, [])
         self.assertFalse(self.output.exists())
+
+    def workflow_before_target_mint(self, *, tag=TAG, consumer=CONSUMER, configured=CONSUMER):
+        """Run the workflow's Python checks, stopping on failure or the token action.
+
+        Checkout, the apt guard, the inline authorization script (executed by
+        RedeliverWorkflowTest.authorization_flow) and repository-name setup are
+        covered by the workflow wiring tests; this fixture supplies a valid
+        target repository. No App action or shell command is executed by this walk.
+        """
+        from test_release_workflows import _workflow
+        bindings = {
+            "${{ inputs.tag }}": tag,
+            "${{ inputs.consumer }}": consumer,
+            "${{ vars.RELEASE_READY_CONSUMERS }}": configured,
+            "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}": os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", ""),
+        }
+        result, diagnostic = None, ""
+        for step in _workflow("release-redeliver.yml")["jobs"]["redeliver"]["steps"]:
+            if "create-github-app-token@" in step.get("uses", ""):
+                return "mint", result, diagnostic
+            if "release_pipeline.py" not in step.get("run", ""):
+                continue
+            words = shlex.split(step["run"])
+            self.assertEqual(words[:2], ["python3", "scripts/release_pipeline.py"])
+            env = {name: bindings[value] for name, value in step.get("env", {}).items()}
+            stderr = io.StringIO()
+            with patch.dict(os.environ, env, clear=True), redirect_stderr(stderr):
+                argv = [os.path.expandvars(word) for word in words[1:]]
+                with patch.object(sys, "argv", argv):
+                    result = pipeline.main()
+            diagnostic = stderr.getvalue()
+            if result != 0:
+                return "refused", result, diagnostic
+        self.fail("redelivery workflow never reached a target token mint")
+
+    def test_workflow_refuses_prerelease_application_before_target_token_mint(self):
+        """Mutation: move the public eligibility check after the App token mint."""
+        self.use_prerelease_manifest()
+        before = copy.deepcopy(self.store.assets)
+        outcome, result, stderr = self.workflow_before_target_mint(
+            tag="v1.6.0-rc.1", consumer="application", configured="application")
+        self.assertEqual((outcome, result), ("refused", 1))
+        self.assertIn("::error::", stderr)
+        self.assertEqual(self.tokens, [""])
+        # The same prerelease is eligible for hosted; the check must allow it
+        # through to the mint without sending or appending anything itself.
+        self.assertEqual(self.workflow_before_target_mint(
+            tag="v1.6.0-rc.1", consumer="hosted", configured="hosted"), ("mint", 0, ""))
+        self.assertEqual(self.tokens, ["", ""])
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertFalse(self.output.exists())
+
+    def test_workflow_refuses_unconfigured_consumer_before_target_token_mint(self):
+        """Mutation: omit the public check before minting, or only its configured-consumer require."""
+        before = copy.deepcopy(self.store.assets)
+        # The valid published tag: the membership require is the only possible refusal.
+        outcome, result, stderr = self.workflow_before_target_mint(
+            tag=TAG, consumer="license", configured="offline")
+        self.assertEqual((outcome, result), ("refused", 1))
+        self.assertIn("::error::", stderr)
+        self.assertEqual(self.tokens, [])
+        self.assertEqual(self.public.reads, [])
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertFalse(self.output.exists())
+
+    def test_workflow_refuses_noncanonical_tag_before_target_token_mint(self):
+        """Mutation: bypass the canonical-tag check in the shared eligibility check."""
+        before = copy.deepcopy(self.store.assets)
+        outcome, result, stderr = self.workflow_before_target_mint(
+            tag="not-a-semver-tag", consumer="license", configured="license")
+        self.assertEqual((outcome, result), ("refused", 1))
+        self.assertIn("::error::", stderr)
+        self.assertEqual(self.tokens, [])
+        self.assertEqual(self.public.reads, [])
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertFalse(self.output.exists())
+
+    def test_workflow_refuses_verified_consumer_before_target_token_mint(self):
+        """Mutation: omit receipt verification from the public eligibility check."""
+        self.seed_planner()
+        self.seed_audit(1)
+        self.seed_receipt("verified", attempt=2, sequence=1)
+        before = copy.deepcopy(self.store.assets)
+        outcome, result, stderr = self.workflow_before_target_mint()
+        self.assertEqual((outcome, result), ("refused", 1))
+        self.assertIn("::error::", stderr)
+        self.assertEqual(self.tokens, [""])
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertFalse(self.output.exists())
+
+    def assert_workflow_refuses_before_mint(self):
+        """Only the public client exists; nothing reaches the mint, a target or the hub store."""
+        before = copy.deepcopy(self.store.assets)
+        outcome, result, stderr = self.workflow_before_target_mint()
+        self.assertEqual((outcome, result), ("refused", 1))
+        self.assertIn("::error::", stderr)
+        self.assertEqual(self.tokens, [""])
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.puts, [])
+        self.assertFalse(self.output.exists())
+
+    def test_workflow_refuses_stateless_receipt_before_target_token_mint(self):
+        """Mutation: decide from receipts()'s selected receipt, whose missing state is not 'verified'."""
+        # Reader input: a valid verified receipt, then its copy at attempt 2 without a state.
+        # The rules are isolated below (malformed shape, any verified, duplicate identity).
+        self.seed_receipt("verified")
+        stateless = self.receipt_body("verified", attempt=2)
+        del stateless["state"]
+        self.seed_receipt_asset(f"consumer-{CONSUMER}-2-1.json", stateless)
+        self.assertIsNone(self.store.read(self.row, f"delivery-{CONSUMER}.json"))
+        self.assert_workflow_refuses_before_mint()
+
+    def test_workflow_refuses_conflicting_duplicate_receipt_before_target_token_mint(self):
+        """Mutation: decide from receipts()'s selected receipt, the lower asset id of equal identities."""
+        # Reader input: a failed copy uploaded first (lower asset id) hides the canonical
+        # verified receipt of the same event, consumer, attempt and sequence.
+        self.seed_receipt_asset(f"consumer-{CONSUMER}-copy.json", self.receipt_body("failed"))
+        self.seed_receipt("verified")
+        self.assertIsNone(self.store.read(self.row, f"delivery-{CONSUMER}.json"))
+        self.assert_workflow_refuses_before_mint()
 
     def test_audit_records_environment_run_id_and_actual_dispatch_status(self):
         """Mutation: omit the HTTP response status or substitute a constant run id."""
@@ -639,6 +798,14 @@ class RedeliverTest(unittest.TestCase):
         self.seed_receipt("failed", attempt=1, sequence=9)
         self.assert_refused()
 
+    def test_refuses_verified_consumer_without_delivery_acceptance(self):
+        """Mutation: put receipt verification back inside the acceptance branch."""
+        self.seed_planner()
+        self.seed_audit(1)
+        self.seed_receipt("verified", attempt=2, sequence=1)
+        self.assertIsNone(self.store.read(self.row, f"delivery-{CONSUMER}.json"))
+        self.assert_refused(message="consumer already verified")
+
     def test_accepted_but_unverified_consumer_can_be_repaired(self):
         """Mutation: refuse whenever delivery-<consumer>.json exists."""
         self.seed_acceptance()
@@ -650,6 +817,125 @@ class RedeliverTest(unittest.TestCase):
         self.assertEqual(self.store.assets, {**before, (TAG, name): contract.canonical(self.audit(1))})
         self.assertEqual([entry[1] for entry in self.puts], [name])
         self.assertEqual(len(self.accepted), 1)
+
+    def test_repairs_a_consumer_with_only_pending_or_failed_receipts_beside_verified_roles(self):
+        """Mutation: refuse when the consumer has any receipt, or when any other role is verified."""
+        self.seed_planner()
+        self.seed_audit(1)
+        for attempt in (1, 2):
+            self.seed_receipt("pending", attempt=attempt, sequence=1)
+            self.seed_receipt("failed", attempt=attempt, sequence=2)
+        for other in ("offline", "application"):
+            self.seed_receipt("verified", consumer=other, attempt=3)
+        self.assertIsNone(self.store.read(self.row, f"delivery-{CONSUMER}.json"))
+        before = copy.deepcopy(self.store.assets)
+        # The public check lets the workflow reach the mint, then the repair sends and appends.
+        self.assertEqual(self.workflow_before_target_mint(), ("mint", 0, ""))
+        self.assertEqual(self.tokens, [""])
+        self.assertEqual((self.requests, self.puts, self.store.assets), ([], [], before))
+        self.invoke()
+        name = f"delivery-redelivered-{CONSUMER}-2.json"
+        audit_raw = contract.canonical(self.audit(2))
+        self.assertEqual(self.puts, [(TAG, name, audit_raw)])
+        self.assertEqual(self.effects, ["send", "put"])
+        self.assertEqual(len(self.accepted), 1)
+        self.assertEqual(self.store.assets, {**before, (TAG, name): audit_raw})
+        self.assertEqual(self.output.read_bytes(), audit_raw)
+
+    def test_refuses_a_malformed_receipt_of_the_consumer(self):
+        """Mutation: drop the receipt shape validation, or pattern-match its timestamp without parsing it."""
+        def drop(name):
+            return lambda body: body.pop(name)
+
+        def change(**values):
+            return lambda body: body.update(values)
+
+        malformed, positive = "malformed consumer receipt", "expected positive integer"
+        unparsable = "malformed consumer receipt timestamp"
+        cases = [(f"missing {name}", drop(name), malformed)
+                 for name in RECEIPT_FIELDS if name not in ("event_id", "consumer")]
+        cases += [
+            ("unknown state", change(state="VERIFIED"), malformed),
+            ("another schema", change(schema="pineforge/facts-consumer-receipt/v1"), malformed),
+            ("another release version", change(release_version="1.6.1"), malformed),
+            ("zero attempt", change(attempt=0), positive),
+            ("boolean attempt", change(attempt=True), positive),
+            ("zero sequence", change(sequence=0), positive),
+            ("zero reporting run", change(reporting_run_id=0), positive),
+            ("bad timestamp", change(timestamp="yesterday"), "malformed identity"),
+            # Both match the pattern; only parsing, as the publisher does, refuses them.
+            ("impossible date and time", change(timestamp="2026-99-99T99:99:99Z"), unparsable),
+            ("impossible day of month", change(timestamp="2026-02-30T00:00:00Z"), unparsable),
+            ("bad evidence digest", change(evidence_sha256="xyz"), "malformed identity"),
+        ]
+        for label, edit, message in cases:
+            # One non-verified receipt: its shape is the only possible refusal.
+            with self.subTest(case=label), self.restored_store():
+                body = self.receipt_body("ready")
+                edit(body)
+                self.seed_receipt_asset(f"consumer-{CONSUMER}-1-1.json", body)
+                self.assert_public_refusal(message)
+
+    def test_refuses_a_verified_receipt_that_is_not_the_selected_one(self):
+        """Mutation: decide from the highest (attempt, sequence) receipt instead of every receipt."""
+        orders = {
+            "verified first": (("verified", 1, 1), ("failed", 2, 1)),
+            "verified last": (("failed", 2, 1), ("verified", 1, 1)),
+        }
+        for label, seeds in orders.items():
+            with self.subTest(order=label), self.restored_store():
+                for state, attempt, sequence in seeds:
+                    self.seed_receipt(state, attempt=attempt, sequence=sequence)
+                self.assert_public_refusal("consumer already verified")
+
+    def test_refuses_two_receipts_with_the_same_identity_whichever_asset_is_older(self):
+        """Mutation: drop the duplicate-identity require (the lower asset id is then selected)."""
+        copy_name, canonical_name = f"consumer-{CONSUMER}-copy.json", f"consumer-{CONSUMER}-1-1.json"
+        orders = {
+            "copy first": ((copy_name, "failed"), (canonical_name, "ready")),
+            "canonical first": ((canonical_name, "ready"), (copy_name, "failed")),
+        }
+        for label, seeds in orders.items():
+            # Neither receipt is verified: the duplicate identity is the only possible refusal.
+            with self.subTest(order=label), self.restored_store():
+                for name, state in seeds:
+                    self.seed_receipt_asset(name, self.receipt_body(state))
+                self.assert_public_refusal("duplicate consumer receipt identity")
+
+    def test_receipt_constants_match_the_receipt_adapter(self):
+        """Mutation: change a receipt state, the schema or a field in only one of the two modules."""
+        # release_receipts imports release_pipeline, so the pipeline repeats these values.
+        self.assertEqual(pipeline.RECEIPT_STATES, adapter.STATES)
+        self.assertEqual(pipeline.RECEIPT_SCHEMA, adapter.PRODUCT_SCHEMA)
+        self.assertEqual(set(pipeline.RECEIPT_FIELDS), set(RECEIPT_FIELDS))
+
+    def test_every_state_the_receipt_adapter_publishes_is_understood(self):
+        """Mutation: leave a state of release_receipts.STATES out of the known receipt states."""
+        for index, state in enumerate(adapter.STATES, start=1):
+            with self.subTest(state=state), self.restored_store():
+                self.seed_receipt(state, attempt=index)
+                if state == "verified":
+                    self.assert_public_refusal("consumer already verified")
+                else:
+                    pipeline.redelivery_source(TAG, CONSUMER)
+
+    def test_eligibility_accepts_receipts_exactly_as_the_adapter_publishes_them(self):
+        """Mutation: require a receipt field or value form that release_receipts never publishes."""
+        self.assertEqual(set(self.receipt_body("ready")), set(RECEIPT_FIELDS))
+        policy = {"workflow": "release.yml", "e2e": {"workflow": "e2e.yml"}}
+        reporting_run = {"id": 90, "path": ".github/workflows/release.yml", "event": "push"}
+        for attempt, state in enumerate(("pending", "failed", "superseded"), start=1):
+            private = {
+                "schema": adapter.PRODUCT_SCHEMA, "event_id": self.event["event_id"],
+                "release_version": self.event["release_version"], "consumer": CONSUMER,
+                "attempt": attempt, "sequence": 1, "state": state, "timestamp": "2020-01-01T00:00:00Z",
+                "pr": None, "ci": None, "e2e": None, "deploy": None,
+                "preview": None, "deployed": None, "previous": None}
+            public = adapter.validate_receipt(None, "pineforge-4pass/fixture", private, self.event,
+                                              policy, reporting_run)
+            self.assertEqual(set(public), set(RECEIPT_FIELDS))
+            self.seed_receipt_asset(f"consumer-{CONSUMER}-{attempt}-1.json", public)
+        pipeline.redelivery_source(TAG, CONSUMER)
 
     def test_refuses_noncanonical_public_manifest_bytes(self):
         """Mutation: build the event from decode(raw) instead of payload(raw)."""

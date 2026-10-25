@@ -76,6 +76,14 @@ jobs:
           except (ValueError, pipeline.pair.RuleError):
               sys.exit("::error::redelivery consumer or pair is not authorized")
           '
+      - name: Validate public redelivery eligibility
+        env:
+          TAG: ${{ inputs.tag }}
+          CONSUMER: ${{ inputs.consumer }}
+          RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
+        run: |
+          python3 scripts/release_pipeline.py redeliver-check --tag "$TAG" --consumer "$CONSUMER"
       - name: Require one configured consumer repository
         id: target
         shell: bash

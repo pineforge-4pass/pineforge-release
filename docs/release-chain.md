@@ -354,13 +354,24 @@ and release tags and has no required reviewers, so the dispatch right is the
 only approval unless the owner gives the repair a dedicated reviewed environment.
 The consumer must be in `RELEASE_READY_CONSUMERS`; this membership and canonical
 tag are checked before resolving target repository secrets or minting the
-target App token. The repository guard runs after authorization and passes the
-validated repository through a step output. Compute also requires a
-nonempty canonical `RELEASE_COMPUTE_FIRST_PAIR` no greater than the pair's version
-before minting. The send repeats those authorization checks against the immutable
-manifest. It reconstructs the role's identical payload from the original
-manifest, also reading the original candidate for compute, and appends
-`delivery-redelivered-<consumer>-<n>.json` only after dispatch
+target App token. Compute also requires a nonempty canonical
+`RELEASE_COMPUTE_FIRST_PAIR` no greater than the pair's version before minting.
+After that authorization, `redeliver-check` validates the canonical tag,
+configured consumer, public release eligibility and every hub receipt of that
+consumer using unauthenticated reads, still before any target repository secret
+is resolved or the target App token is minted. The repository guard runs only
+after both checks and passes the validated repository through a step output.
+The send repeats the authorization and eligibility checks against the immutable
+manifest before sending. It refuses a consumer with
+any `verified` receipt, not only its latest, even when `delivery-<consumer>.json`
+is absent. It also refuses a malformed receipt of that consumer (a missing field,
+an unknown state, another schema, event or release version, a non-positive attempt,
+sequence or run, or a bad timestamp or evidence digest) and two receipts with the
+same attempt and sequence, whatever their names and contents. Missing receipts,
+exhausted automatic delivery, an accepted but unverified delivery and another role's
+verified receipt do not block a repair. It reconstructs the role's identical payload
+from the original manifest, also reading the original candidate for compute, and
+appends `delivery-redelivered-<consumer>-<n>.json` only after dispatch
 acceptance, recording the event, independent contiguous redelivery number, run,
 the actual dispatch response status, timestamp and `GITHUB_ACTOR` login.
 The v2 audit takes its run id from `GITHUB_RUN_ID` and is written only for an

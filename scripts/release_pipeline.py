@@ -25,6 +25,13 @@ from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYP
 
 FACTS_RECEIPTS_TAG = "facts-receipts"
 COMPLETE_STATES = ("verified", "skipped_by_policy", "superseded", "delivered")
+# The public consumer-<role>-<attempt>-<sequence>.json receipt that release_receipts publishes. That
+# module imports this one, so these are repeated here; tests compare them with its real output.
+RECEIPT_SCHEMA = "pineforge/consumer-receipt/v1"
+RECEIPT_STATES = ("pending", "pr_open", "testing", "ready", "merged", "deploying", "verified", "failed",
+                  "superseded", "skipped_by_policy")
+RECEIPT_FIELDS = ("schema", "consumer", "attempt", "sequence", "state", "timestamp",
+                  "event_id", "release_version", "evidence_sha256", "reporting_run_id")
 # Delay after each reserved attempt: two retries, then an acknowledgement grace
 # period before a terminal failure. Reservations survive failed/cancelled jobs.
 DELIVERY_BACKOFF_MINUTES = (15, 60, 15)
@@ -287,6 +294,45 @@ def receipts(store, row, event_id):
     return result
 
 
+def require_consumer_unverified(store, row, event, consumer):
+    """Redelivery eligibility from every receipt of one consumer, never from a selected one.
+
+    receipts() keeps a single receipt per role and, for an equal (attempt, sequence), the lower
+    asset id without comparing contents; it checks a receipt's identity but not its shape. A
+    receipt without a state, or a verified one hidden by a conflicting copy or by a later
+    attempt, must not authorize another delivery. Fail closed on any malformed or duplicated
+    receipt of this consumer and on any verified one. Other roles keep only the identity check.
+    """
+    seen, verified = set(), False
+    fresh = store.get(row["tag_name"])
+    for item in sorted(fresh["assets"], key=lambda a: a["id"]):
+        if not item["name"].startswith("consumer-"):
+            continue
+        obj = decode(store.read(fresh, item["name"]))
+        require(obj["event_id"] == event["event_id"] and obj["consumer"] in RECEIPT_ROLES,
+                "consumer receipt identity differs")
+        if obj["consumer"] != consumer:
+            continue
+        require(set(RECEIPT_FIELDS) <= set(obj) and obj["schema"] == RECEIPT_SCHEMA
+                and obj["release_version"] == event["release_version"]
+                and obj["state"] in RECEIPT_STATES, "malformed consumer receipt")
+        for name in ("attempt", "sequence", "reporting_run_id"):
+            positive(obj[name])
+        match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
+        try:
+            # The publisher (release_receipts.validate_receipt) parses it the same way; the
+            # pattern alone accepts an impossible date such as 2026-99-99T99:99:99Z.
+            dt.datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00"))
+        except ValueError as error:
+            raise Invalid("malformed consumer receipt timestamp") from error
+        match(SHA, obj["evidence_sha256"])
+        identity = (obj["attempt"], obj["sequence"])
+        require(identity not in seen, "duplicate consumer receipt identity")
+        seen.add(identity)
+        verified = verified or obj["state"] == "verified"
+    require(not verified, "consumer already verified")
+
+
 def confirm_redelivery_run(client, audit):
     """A public asset is evidence only when the hub confirms its trusted run."""
     try:
@@ -422,13 +468,13 @@ def redelivery_dispatch(client, target, data):
         raise Invalid("artifact transport failed") from None
 
 
-def redeliver(client, store, tag, consumer, output):
-    """Manually resend one public event; append one audit only after acceptance."""
+def redelivery_source(tag, consumer):
+    """Validate eligibility and read the payload without write credentials."""
     require(consumer in configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", "")),
             "redelivery consumer is not configured")
     require(tag == "v" + str(version(tag.removeprefix("v"))), "redelivery tag must be canonical vX.Y.Z")
-    # The dispatch client has a target-only App token. Release checks and exact
-    # manifest reads use a public client; the injected store appends audit.
+    # The workflow runs these public checks before minting its target-only App
+    # token. Redelivery repeats them before sending instead of trusting a cache.
     public = Client(token="")
     row = public.api(f"repos/{HUB}/releases/tags/{tag}")
     require(row["tag_name"] == tag and not row["draft"], "cannot redeliver a draft or different release")
@@ -461,9 +507,16 @@ def redeliver(client, store, tag, consumer, output):
         obj = decode(accepted)
         require(obj["event_id"] == event["event_id"] and obj["consumer"] == consumer
                 and obj["state"] == "dispatch_accepted", "accepted delivery identity differs")
-        by_role = receipts(public_store, row, event["event_id"])
-        require(by_role.get(consumer, {}).get("state") != "verified", "consumer already verified")
+    # With or without delivery-<consumer>.json: any verified receipt, a malformed one or two
+    # claiming the same identity refuses; a missing, failed or pending one still repairs.
+    require_consumer_unverified(public_store, row, event, consumer)
+    return public_store, row, event, client_payload
 
+
+def redeliver(client, store, tag, consumer, output):
+    """Manually resend one public event; append one audit only after acceptance."""
+    public_store, row, event, client_payload = redelivery_source(tag, consumer)
+    event_type = EVENT_TYPES[consumer]
     prefix = f"delivery-redelivered-{consumer}-"
     actor_pattern = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?"
     attempts, audits = [], []
@@ -707,6 +760,9 @@ def main():
     p.add_argument("--consumer", choices=ROLES, required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--attempt", type=int, default=1)
+    p = sub.add_parser("redeliver-check")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--consumer", choices=ROLES, required=True)
     p = sub.add_parser("redeliver")
     p.add_argument("--tag", required=True)
     p.add_argument("--consumer", choices=ROLES, required=True)
@@ -714,9 +770,12 @@ def main():
     p = sub.add_parser("alert")
     p.add_argument("--stage", required=True, choices=("publish", "producer", "finalize", "dispatch", "receipt"))
     args = parser.parse_args()
-    client = Client()
-    store = Store(client)
     try:
+        if args.cmd == "redeliver-check":
+            redelivery_source(args.tag, args.consumer)
+            return 0
+        client = Client()
+        store = Store(client)
         if args.cmd == "producer":
             producer(client, args.component, args.version)
         elif args.cmd == "bindings":
