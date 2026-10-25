@@ -55,6 +55,35 @@ jobs:
           if ! [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
             echo '::error::Missing or malformed consumer repository setup'; exit 1
           fi
+      - name: Authorize consumer and pair before token mint
+        shell: bash
+        env:
+          PYTHONPATH: scripts
+          TAG: ${{ inputs.tag }}
+          CONSUMER: ${{ inputs.consumer }}
+          RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
+        run: |
+          set -euo pipefail
+          python3 -c '
+          import os
+          import sys
+          import release_pipeline as pipeline
+
+          try:
+              consumer = os.environ["CONSUMER"]
+              enabled = pipeline.configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+              pipeline.require(consumer in enabled, "redelivery consumer is not configured")
+              tag = os.environ["TAG"]
+              release = pipeline.version(tag.removeprefix("v"))
+              pipeline.require(tag == "v" + str(release), "redelivery tag must be canonical vX.Y.Z")
+              if consumer in pipeline.DELIVERY_ONLY:
+                  first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
+                  pipeline.require(first and release >= pipeline.version(first),
+                                   "redelivery consumer is not enabled for this pair")
+          except (ValueError, pipeline.pair.RuleError):
+              sys.exit("::error::redelivery consumer or pair is not authorized")
+          '
       - name: Mint App token (scoped to one target)
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0

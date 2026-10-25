@@ -634,6 +634,88 @@ class FinalizerTests(unittest.TestCase):
                          {**dict.fromkeys(contract.RECEIPT_ROLES, "verified"), "compute": "delivered"})
         self.assertTrue(delivered["complete"])
 
+    def test_compute_delivery_refuses_malformed_or_nonobject_acceptance(self):
+        """Mutation: restore aggregate's asset-presence-only delivery check."""
+        event = contract.payload(contract.canonical(self.m))
+        for raw, message in (
+                (b"", "invalid JSON"),
+                (b"{", "invalid JSON"),
+                (b"\xff", "invalid JSON"),
+                (b"null", "accepted delivery identity differs"),
+                (b"[]", "accepted delivery identity differs"),
+                (b'"dispatch_accepted"', "accepted delivery identity differs"),
+                (b"{}", "accepted delivery identity differs")):
+            with self.subTest(raw=raw):
+                store = MemoryStore(self.m)
+                row = store.get("v1.6.0")
+                store.put(row, "delivery-compute.json", raw)
+                before = copy.deepcopy(store.assets)
+                with self.assertRaisesRegex(contract.Invalid, "^" + message + "$"):
+                    pipeline.aggregate(store, row, event, enabled=("compute",))
+                self.assertEqual(store.assets, before)
+
+    def test_compute_delivery_refuses_wrong_event_consumer_or_verdict(self):
+        """Mutations: omit each of the three acceptance identity checks."""
+        event = contract.payload(contract.canonical(self.m))
+        accepted = {"event_id": event["event_id"], "consumer": "compute", "state": "dispatch_accepted"}
+        cases = (
+            # Exact reader input, followed by independent mutations of each field.
+            {"consumer": "offline", "state": "failed", "event_id": "sha256:" + "0" * 64},
+            {**accepted, "event_id": "sha256:" + "0" * 64},
+            {**accepted, "consumer": "offline"},
+            {**accepted, "state": "failed"},
+        )
+        for obj in cases:
+            with self.subTest(evidence=obj):
+                store = MemoryStore(self.m)
+                row = store.get("v1.6.0")
+                store.put(row, "delivery-compute.json", contract.canonical(obj))
+                with self.assertRaisesRegex(contract.Invalid, "^accepted delivery identity differs$"):
+                    pipeline.aggregate(store, row, event, enabled=("compute",))
+
+    def test_compute_manual_acceptance_requires_valid_matching_audit_history(self):
+        """Mutation: count redelivery asset names without validating their bytes."""
+        event = contract.payload(contract.canonical(self.m))
+        audit = {"schema": "pineforge/release-redelivery/v1", "event_id": event["event_id"],
+                 "consumer": "compute", "attempt": 1, "state": "dispatch_accepted",
+                 "run_id": 900, "timestamp": "2026-10-23T00:00:00Z", "actor": "release-operator"}
+        name = "delivery-redelivered-compute-1.json"
+        cases = (
+            (name, b"", "invalid JSON"),
+            (name, contract.canonical({**audit, "event_id": "sha256:" + "0" * 64}),
+             "accepted delivery identity differs"),
+            (name, contract.canonical({**audit, "consumer": "offline"}), "accepted delivery identity differs"),
+            (name, contract.canonical({**audit, "state": "failed"}), "accepted delivery identity differs"),
+            (name, contract.canonical({**audit, "schema": "pineforge/release-delivery/v1"}),
+             "redelivery history identity differs"),
+            (name, contract.canonical({**audit, "extra": "not-audit-evidence"}), "unexpected object fields"),
+            (name, contract.canonical({**audit, "attempt": 0}), "expected positive integer"),
+            (name, contract.canonical({**audit, "attempt": True}), "expected positive integer"),
+            (name, contract.canonical({**audit, "run_id": 0}), "expected positive integer"),
+            (name, contract.canonical({**audit, "actor": "not/a/login"}), "malformed identity"),
+            (name, contract.canonical({**audit, "timestamp": "not-a-timestamp"}), "malformed identity"),
+            (name, contract.canonical(audit) + b" ", "redelivery history asset differs"),
+            ("delivery-redelivered-compute-2.json", contract.canonical(audit), "redelivery history asset differs"),
+            ("delivery-redelivered-compute-2.json", contract.canonical({**audit, "attempt": 2}),
+             "invalid redelivery attempt history"),
+        )
+        for asset, raw, message in cases:
+            with self.subTest(asset=asset, raw=raw):
+                store = MemoryStore(self.m)
+                row = store.get("v1.6.0")
+                store.put(row, asset, raw)
+                with self.assertRaisesRegex(contract.Invalid, "^" + message + "$"):
+                    pipeline.aggregate(store, row, event, enabled=("compute",))
+        # Asset upload order does not change a valid, contiguous repair history.
+        store = MemoryStore(self.m)
+        row = store.get("v1.6.0")
+        for attempt in (2, 1):
+            store.put(row, f"delivery-redelivered-compute-{attempt}.json",
+                      contract.canonical({**audit, "attempt": attempt}))
+        status = pipeline.aggregate(store, row, event, enabled=("compute",))
+        self.assertEqual(status["consumers"], {"compute": "delivered"})
+        self.assertTrue(status["complete"])
+
     def test_compute_is_never_superseded_before_or_after_delivery(self):
         event = self.finish()
         for accepted in (False, True):

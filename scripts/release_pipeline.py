@@ -285,6 +285,39 @@ def receipts(store, row, event_id):
     return result
 
 
+def delivery_accepted(store, row, event_id, role):
+    """Read acceptance evidence; manual repair preserves automatic failure history."""
+    name = f"delivery-{role}.json"
+    raw = store.read(row, name)
+    evidence = [] if raw is None else [(name, raw)]
+    prefix = f"delivery-redelivered-{role}-"
+    for asset in store.get(row["tag_name"])["assets"]:
+        if asset["name"].startswith(prefix):
+            evidence.append((asset["name"], store.read(row, asset["name"])))
+    attempts = []
+    for asset_name, accepted in evidence:
+        obj = decode(accepted)
+        require(type(obj) is dict and obj.get("event_id") == event_id
+                and obj.get("consumer") == role and obj.get("state") == "dispatch_accepted",
+                "accepted delivery identity differs")
+        if asset_name == name:
+            continue
+        # Match the append-only redelivery audit contract before using it to
+        # complete a delivery-only role. Never infer success from its filename.
+        keys(obj, ("schema", "event_id", "consumer", "attempt", "state", "run_id", "timestamp", "actor"))
+        require(obj["schema"] == "pineforge/release-redelivery/v1", "redelivery history identity differs")
+        positive(obj["attempt"])
+        positive(obj["run_id"])
+        require(asset_name == f"{prefix}{obj['attempt']}.json" and canonical(obj) == accepted,
+                "redelivery history asset differs")
+        match(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", obj["actor"])
+        match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
+        dt.datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00"))
+        attempts.append(obj["attempt"])
+    require(sorted(attempts) == list(range(1, len(attempts) + 1)), "invalid redelivery attempt history")
+    return bool(evidence)
+
+
 def aggregate(store, row, event, *, enabled=(), newest=None):
     by_role = receipts(store, row, event["event_id"])
     states = {}
@@ -293,10 +326,8 @@ def aggregate(store, row, event, *, enabled=(), newest=None):
             continue
         obj = by_role.get(role)
         if role in DELIVERY_ONLY:
-            # P16: compute records every pair, including rc and older pairs.
-            # It bypasses aggregate supersession (release_pipeline.py:304-305)
-            # and the dispatch refusal (release_pipeline.py:563-567), before this change.
-            states[role] = "delivered" if store.read(row, f"delivery-{role}.json") is not None else "pending"
+            # Compute records every eligible pair, including rc and older pairs.
+            states[role] = "delivered" if delivery_accepted(store, row, event["event_id"], role) else "pending"
         elif newest is not None and version(event["release_version"]) < newest and (not obj or obj["state"] != "verified"):
             states[role] = "superseded"
         elif obj:

@@ -1793,6 +1793,97 @@ class NotifyConsumersTest(unittest.TestCase):
 
 
 class RedeliverWorkflowTest(unittest.TestCase):
+    def authorization_flow(self, steps, *, enabled="compute", first="1.6.0", tag="v1.6.0", consumer="compute"):
+        """CI only: execute actual guards; count reached mint/dispatch boundaries."""
+        follows = (".github/workflows/release-redeliver.yml", "scripts/release_pipeline.py",
+                   "scripts/release_contract.py", "scripts/release_pair.py",
+                   "scripts/release_artifacts.py", "scripts/release_sources.py")
+        forbidden = ("/.config/zsh/keys", "/.ssh", "/.aws", "/.codex", "/.config/pineforge")
+        for name in follows:
+            path = str(REPO / name)
+            if any(part in path for part in forbidden) or path.endswith(".env"):
+                self.fail("refused workflow control source path: " + path)
+        print("Workflow authorization control follows: " + ", ".join(str(REPO / name) for name in follows))
+        context = {
+            "${{ inputs.tag }}": tag, "${{ inputs.consumer }}": consumer,
+            "${{ vars.RELEASE_READY_CONSUMERS }}": enabled,
+            "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}": first,
+        }
+        environment = {"PATH": os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1",
+                       "TARGET_REPOSITORY": "configured-target"}
+        checkout = next(i for i, step in enumerate(steps)
+                        if step.get("uses", "").startswith("actions/checkout@"))
+        mints, dispatches, results = 0, 0, []
+        for step in steps[checkout + 1:]:
+            self.assertNotIn("if", step, "authorization and token steps must use the default success guard")
+            self.assertNotIn("continue-on-error", step, "a failed authorization must stop later steps")
+            self.assertEqual(step.get("shell", "bash"), "bash")
+            if step.get("uses", "").startswith("actions/create-github-app-token@"):
+                mints += 1
+                continue
+            if "release_pipeline.py redeliver " in step.get("run", ""):
+                dispatches += 1
+                return mints, dispatches, results
+            self.assertIn("run", step, "unexpected action before redelivery")
+            script = step["run"]
+            for part in forbidden:
+                self.assertNotIn(part, script, "refused protected path in workflow control command")
+            self.assertNotRegex(script, r"\S*\.env\b", "refused env file in workflow control command")
+            step_env = dict(environment)
+            for key, value in step.get("env", {}).items():
+                if value.startswith("${{"):
+                    self.assertIn(value, context, "unexpected workflow control context")
+                    value = context[value]
+                step_env[key] = value
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+                cwd=REPO, env=step_env, capture_output=True, text=True, timeout=30,
+            )
+            results.append(result)
+            if result.returncode:
+                return mints, dispatches, results
+        self.fail("redelivery boundary missing from workflow")
+
+    def test_compute_disabled_or_unselected_pairs_refuse_before_token_mint(self):
+        """Mutations: delete authorization, move it after mint, or omit either gate."""
+        steps = _workflow("release-redeliver.yml")["jobs"]["redeliver"]["steps"]
+        for enabled, first, tag in (
+                ("compute", "", "v1.6.0"),
+                ("offline", "1.6.0", "v1.6.0"),
+                ("compute", "1.6.1", "v1.6.0"),
+                ("compute", "v1.6.0", "v1.6.0"),
+                ("compute", "1.6.0-rc.10", "v1.6.0-rc.2")):
+            with self.subTest(enabled=enabled, first=first, tag=tag):
+                mints, dispatches, results = self.authorization_flow(steps, enabled=enabled, first=first, tag=tag)
+                self.assertEqual((mints, dispatches), (0, 0))
+                self.assertEqual(results[-1].returncode, 1)
+                self.assertEqual(results[-1].stderr,
+                                 "::error::redelivery consumer or pair is not authorized\n")
+        # Positive controls execute the same actual guard and catch an always-refuse implementation.
+        for consumer, enabled, first, tag in (
+                ("compute", "compute", "1.6.0", "v1.6.0"),
+                ("compute", "compute", "1.6.0-rc.2", "v1.6.0-rc.10"),
+                ("compute", "offline,compute", "1.6.0", "v1.6.1"),
+                ("offline", "offline", "", "v1.6.0"),
+                ("application", "application", "not-semver", "v1.6.0")):
+            with self.subTest(consumer=consumer, first=first, tag=tag):
+                mints, dispatches, results = self.authorization_flow(
+                    steps, consumer=consumer, enabled=enabled, first=first, tag=tag)
+                self.assertEqual((mints, dispatches), (1, 1))
+                self.assertTrue(results)
+                self.assertTrue(all(result.returncode == 0 for result in results))
+
+    def test_authorization_crash_stops_the_sequence_and_retains_its_exit(self):
+        """Deliberate crash row: no marker or successful wrapper can hide the work's exit."""
+        steps = copy.deepcopy(_workflow("release-redeliver.yml")["jobs"]["redeliver"]["steps"])
+        # The existing repository guard gives this control a real anchor on main too.
+        guard = next(step for step in steps if step.get("name") == "Require one configured consumer repository")
+        guard["run"] = 'set -euo pipefail\npython3 -c \'raise RuntimeError("deliberate authorization crash")\'\n'
+        mints, dispatches, results = self.authorization_flow(steps)
+        self.assertEqual((mints, dispatches), (0, 0))
+        self.assertEqual(results[-1].returncode, 1)
+        self.assertIn("RuntimeError: deliberate authorization crash", results[-1].stderr)
+
     def test_manual_inputs_protected_single_job_and_serialized_permissions(self):
         """Mutation: delete the redeliver job's main-ref if."""
         wf = _workflow("release-redeliver.yml")
