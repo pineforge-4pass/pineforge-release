@@ -1908,6 +1908,23 @@ class RedeliverWorkflowTest(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, repair)
 
+    def test_docs_state_which_receipts_refuse_a_redelivery(self):
+        """Mutation: describe only the latest receipt, or drop the malformed and duplicate refusals."""
+        text = (REPO / "docs/release-chain.md").read_text()
+        start = text.index("Use `release-redeliver.yml` for an explicitly reviewed repair")
+        end = text.index("`release-receipts.yml` polls", start)
+        repair = " ".join(text[start:end].split())
+        for required in (
+                "every hub receipt of that consumer",
+                "any `verified` receipt, not only its latest, even when `delivery-<consumer>.json` is absent",
+                "refuses a malformed receipt of that consumer",
+                "two receipts with the same attempt and sequence, whatever their names and contents",
+                "Missing receipts, exhausted automatic delivery, an accepted but unverified delivery "
+                "and another role's verified receipt do not block a repair"):
+            with self.subTest(required=required):
+                self.assertIn(required, repair)
+        self.assertNotIn("latest receipts", repair)
+
 
 class HarnessSyncTest(unittest.TestCase):
     """The release image carries exactly the engine's eight runtime harness files. One script holds

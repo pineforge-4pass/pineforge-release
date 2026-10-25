@@ -23,6 +23,13 @@ from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYP
 
 FACTS_RECEIPTS_TAG = "facts-receipts"
 COMPLETE_STATES = ("verified", "skipped_by_policy", "superseded", "delivered")
+# The public consumer-<role>-<attempt>-<sequence>.json receipt that release_receipts publishes. That
+# module imports this one, so these are repeated here; tests compare them with its real output.
+RECEIPT_SCHEMA = "pineforge/consumer-receipt/v1"
+RECEIPT_STATES = ("pending", "pr_open", "testing", "ready", "merged", "deploying", "verified", "failed",
+                  "superseded", "skipped_by_policy")
+RECEIPT_FIELDS = ("schema", "consumer", "attempt", "sequence", "state", "timestamp",
+                  "event_id", "release_version", "evidence_sha256", "reporting_run_id")
 # Delay after each reserved attempt: two retries, then an acknowledgement grace
 # period before a terminal failure. Reservations survive failed/cancelled jobs.
 DELIVERY_BACKOFF_MINUTES = (15, 60, 15)
@@ -285,6 +292,39 @@ def receipts(store, row, event_id):
     return result
 
 
+def require_consumer_unverified(store, row, event, consumer):
+    """Redelivery eligibility from every receipt of one consumer, never from a selected one.
+
+    receipts() keeps a single receipt per role and, for an equal (attempt, sequence), the lower
+    asset id without comparing contents; it checks a receipt's identity but not its shape. A
+    receipt without a state, or a verified one hidden by a conflicting copy or by a later
+    attempt, must not authorize another delivery. Fail closed on any malformed or duplicated
+    receipt of this consumer and on any verified one. Other roles keep only the identity check.
+    """
+    seen, verified = set(), False
+    fresh = store.get(row["tag_name"])
+    for item in sorted(fresh["assets"], key=lambda a: a["id"]):
+        if not item["name"].startswith("consumer-"):
+            continue
+        obj = decode(store.read(fresh, item["name"]))
+        require(obj["event_id"] == event["event_id"] and obj["consumer"] in RECEIPT_ROLES,
+                "consumer receipt identity differs")
+        if obj["consumer"] != consumer:
+            continue
+        require(set(RECEIPT_FIELDS) <= set(obj) and obj["schema"] == RECEIPT_SCHEMA
+                and obj["release_version"] == event["release_version"]
+                and obj["state"] in RECEIPT_STATES, "malformed consumer receipt")
+        for name in ("attempt", "sequence", "reporting_run_id"):
+            positive(obj[name])
+        match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
+        match(SHA, obj["evidence_sha256"])
+        identity = (obj["attempt"], obj["sequence"])
+        require(identity not in seen, "duplicate consumer receipt identity")
+        seen.add(identity)
+        verified = verified or obj["state"] == "verified"
+    require(not verified, "consumer already verified")
+
+
 def aggregate(store, row, event, *, enabled=(), newest=None):
     by_role = receipts(store, row, event["event_id"])
     states = {}
@@ -379,8 +419,9 @@ def redelivery_source(tag, consumer):
         obj = decode(accepted)
         require(obj["event_id"] == event["event_id"] and obj["consumer"] == consumer
                 and obj["state"] == "dispatch_accepted", "accepted delivery identity differs")
-    by_role = receipts(public_store, row, event["event_id"])
-    require(by_role.get(consumer, {}).get("state") != "verified", "consumer already verified")
+    # With or without delivery-<consumer>.json: any verified receipt, a malformed one or two
+    # claiming the same identity refuses; a missing, failed or pending one still repairs.
+    require_consumer_unverified(public_store, row, event, consumer)
     return public_store, row, event, client_payload
 
 

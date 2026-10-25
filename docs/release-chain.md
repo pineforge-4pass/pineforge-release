@@ -331,9 +331,15 @@ and release tags and has no required reviewers, so the dispatch right is the
 only approval unless the owner gives the repair a dedicated reviewed environment.
 The consumer must be in `RELEASE_READY_CONSUMERS`. Before minting the target App
 token, `redeliver-check` validates the canonical tag, configured consumer, public
-release eligibility and latest receipts using unauthenticated reads. Redelivery
-repeats those checks before sending. An already verified consumer is refused even
-when `delivery-<consumer>.json` is absent. It resends the immutable manifest's identical
+release eligibility and every hub receipt of that consumer using unauthenticated
+reads. Redelivery repeats those checks before sending. It refuses a consumer with
+any `verified` receipt, not only its latest, even when `delivery-<consumer>.json`
+is absent. It also refuses a malformed receipt of that consumer (a missing field,
+an unknown state, another schema, event or release version, a non-positive attempt,
+sequence or run, or a bad timestamp or evidence digest) and two receipts with the
+same attempt and sequence, whatever their names and contents. Missing receipts,
+exhausted automatic delivery, an accepted but unverified delivery and another role's
+verified receipt do not block a repair. It resends the immutable manifest's identical
 payload and appends `delivery-redelivered-<consumer>-<n>.json` only after dispatch
 acceptance, recording the event, independent contiguous redelivery number, run,
 timestamp and `GITHUB_ACTOR` login. It never touches `delivery-<consumer>.json`,
