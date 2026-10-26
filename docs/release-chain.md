@@ -89,6 +89,8 @@ an unchanged version with an image or verified candidate keeps its existing no-o
 Tags predating this workflow need a reviewed migration; the hub does not invent
 new manifests for historical images without candidate verification.
 
+Exception on record: on 2026-10-25 the `v1.7.0` tag was re-pointed from `73d2a1eed8393d46cae0fa8d1d785ac2919d5a10` to `ab95811bc18dc7a593ce27f864e340bd270fef79` (the licence-sums fix, #121) by the maintainer's decision after a full pre-proof; the published image's revision label is `ab95811bc18dc7a593ce27f864e340bd270fef79`.
+
 ## Candidate and readiness
 
 `publish.yml` validates the release tag before preparation can reuse
