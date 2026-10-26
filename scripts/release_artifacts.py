@@ -22,6 +22,8 @@ from release_contract import (COMMIT, Invalid, Pending, canonical, decode,
 PRODUCERS = {"engine": "pineforge-4pass/pineforge-engine",
              "codegen": "pineforge-4pass/pineforge-codegen-oss",
              "hpo": "pineforge-4pass/pineforge-hpo"}
+# Engine releases carry no macOS archive from 1.8.0.
+ENGINE_LINUX_ONLY_FROM = pair.parse("1.8.0")
 
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
@@ -223,7 +225,10 @@ def producer(client, component, version):
     native = None
     if component == "engine":
         pin["tag"] = "v" + str(v)
-        for triple in ("linux-x86_64", "linux-aarch64", "macos-universal"):
+        triples = ("linux-x86_64", "linux-aarch64")
+        if pair.Version(v.major, v.minor, v.patch) < ENGINE_LINUX_ONLY_FROM:
+            triples += ("macos-universal",)
+        for triple in triples:
             name = f"pineforge-v{v}-{triple}.tar.gz"
             raw = asset(client, obj, name, repo)
             checksum = asset(client, obj, name + ".sha256", repo).decode("ascii").split()

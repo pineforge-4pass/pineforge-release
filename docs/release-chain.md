@@ -110,7 +110,7 @@ draft and never create a second candidate for its version. The finalizer runs
 as a reusable job after publication, on facts-file changes, hourly,
 and on manual replay. It never rebuilds a stored verified candidate. It requires:
 
-- Engine's published Linux and macOS archives and matching checksums.
+- Engine's published Linux x86_64 and aarch64 archives and matching checksums from engine 1.8.0; earlier releases also carry a macOS archive.
 - The matching codegen PyPI sdist and its tagged Python source.
 - The matching npm Pyodide tarball, registry SHA-512 integrity, versioned browser
   archive digest, and source agreement across npm/PyPI/tagged source.

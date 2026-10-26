@@ -1433,7 +1433,10 @@ class ProducerFixture:
             obj = {"tag_name": tag, "draft": False, "prerelease": self.v.prerelease, "assets": []}
             self.api_data[f"repos/{repo}/releases/tags/{tag}"] = obj
             self.releases[role] = obj
-        for triple in ("linux-x86_64", "linux-aarch64", "macos-universal"):
+        triples = ("linux-x86_64", "linux-aarch64")
+        if pair.Version(self.v.major, self.v.minor, self.v.patch) < pair.parse("1.8.0"):
+            triples += ("macos-universal",)
+        for triple in triples:
             name = f"pineforge-v{self.v}-{triple}.tar.gz"
             data = b"engine-" + triple.encode()
             self.add_asset("engine", name, data)
@@ -1505,6 +1508,69 @@ class ProducerFixture:
 
 
 class ProducerTests(unittest.TestCase):
+    def test_engine_from_1_8_0_requires_only_linux_archives(self):
+        for v in ("1.8.0", "1.8.0-rc.1", "1.8.1", "2.0.0"):
+            with self.subTest(version=v):
+                client = ProducerFixture(v)
+                names = {f"pineforge-v{v}-{triple}.tar.gz"
+                         for triple in ("linux-x86_64", "linux-aarch64")}
+                self.assertEqual({a["name"] for a in client.releases["engine"]["assets"]},
+                                 names | {name + ".sha256" for name in names})
+                self.assertFalse(any("macos" in url for url in client.downloads))
+                pin, inventory = artifacts.producer(client, "engine", v)
+                self.assertEqual(pin, {"version": v, "commit": "a" * 40, "tag": "v" + v})
+                self.assertEqual(inventory, {})
+
+    def test_engine_from_1_8_0_refuses_missing_or_corrupt_linux_assets(self):
+        for triple in ("linux-x86_64", "linux-aarch64"):
+            for problem, kind, message in (
+                    ("archive", contract.Pending, "^required producer asset unavailable$"),
+                    ("checksum", contract.Pending, "^required producer asset unavailable$"),
+                    ("wrong-checksum", contract.Invalid, "^engine tarball checksum differs$")):
+                with self.subTest(triple=triple, problem=problem):
+                    client = ProducerFixture("1.8.0")
+                    name = f"pineforge-v{client.v}-{triple}.tar.gz"
+                    if problem == "wrong-checksum":
+                        checksum = next(a for a in client.releases["engine"]["assets"]
+                                        if a["name"] == name + ".sha256")
+                        raw = ("0" * 64 + "  " + name + "\n").encode()
+                        client.downloads[checksum["browser_download_url"]] = raw
+                        checksum["digest"] = "sha256:" + contract.sha256(raw)
+                    else:
+                        missing = name + (".sha256" if problem == "checksum" else "")
+                        item = next(a for a in client.releases["engine"]["assets"] if a["name"] == missing)
+                        client.releases["engine"]["assets"].remove(item)
+                        del client.downloads[item["browser_download_url"]]
+                    with self.assertRaisesRegex(kind, message):
+                        artifacts.producer(client, "engine", "1.8.0")
+
+    def test_engine_before_1_8_0_still_requires_macos_archive(self):
+        for v in ("1.6.0", "1.7.0", "1.7.0-rc.1"):
+            with self.subTest(version=v):
+                client = ProducerFixture(v)
+                pin, inventory = artifacts.producer(client, "engine", v)
+                self.assertEqual(pin, {"version": v, "commit": "a" * 40, "tag": "v" + v})
+                self.assertEqual(inventory, {})
+                name = f"pineforge-v{v}-macos-universal.tar.gz"
+                item = next(a for a in client.releases["engine"]["assets"] if a["name"] == name)
+                client.releases["engine"]["assets"].remove(item)
+                del client.downloads[item["browser_download_url"]]
+                with self.assertRaisesRegex(contract.Pending, "^required producer asset unavailable$"):
+                    artifacts.producer(client, "engine", v)
+
+    def test_engine_from_1_8_0_ignores_extra_macos_asset(self):
+        client = ProducerFixture("1.8.0")
+        name = "pineforge-v1.8.0-macos-universal.tar.gz"
+        # Extra assets are ignored and their bytes stay out of the inventory.
+        client.add_asset("engine", name, b"unused macOS archive")
+        url = client.releases["engine"]["assets"][-1]["browser_download_url"]
+        with patch.object(client, "download", wraps=client.download) as downloads:
+            pin, inventory = artifacts.producer(client, "engine", "1.8.0")
+        self.assertEqual(pin, {"version": "1.8.0", "commit": "a" * 40, "tag": "v1.8.0"})
+        self.assertEqual(inventory, {})
+        self.assertNotIn(url, [call.args[0] for call in downloads.call_args_list])
+        self.assertEqual(len(downloads.call_args_list), 4)
+
     def test_three_producers_and_both_codegen_delivery_paths_are_bound(self):
         client = ProducerFixture()
         bound = pipeline.bindings(client, "1.6.0", "1.6.0", "1.6.0", "1.6.0", "d" * 40)
