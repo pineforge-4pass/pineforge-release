@@ -46,6 +46,18 @@ DATA_BOOTSTRAP_PREVIOUS = {
     },
 }
 
+# TEMPORARY real offline 0.9.40 predecessor. Remove in the first hub release after
+# offline MCP ships its first non-legacy release through the new chain (0.9.43 or later).
+# See docs/release-chain.md.
+OFFLINE_LEGACY_PREVIOUS = {
+    "legacy": True,
+    "npm_version": "0.9.40",
+    "npm_integrity": "sha512-o1hmSb6FwjkF8lIwLhENJV+YPbYqSwG1KPvHyViPj5Yan3aHoNRCpM5uINaYbjZKjGS95VDClmASOUSD6ZktVw==",
+    "git_head": "b988217f2aa21b6b772fb723adbc89bd4130c3f5",
+    # Multi-architecture index of ghcr.io/pineforge-4pass/pineforge-backtest-mcp:v0.9.40.
+    "image_digest": "sha256:129aa9cb5db4400523d1fc12a11671cfb820f934d893e4ee8945cd25c5bc202d",
+}
+
 
 def object_pages(client, route, key):
     rows = []
@@ -200,7 +212,7 @@ def identity(obj, *, facts_only=False, consumer=None, slot=None):
     if type(obj) is dict and "legacy" in obj:
         require(not facts_only and consumer == "offline" and slot == "previous",
                 "legacy identity is only valid for product offline.previous")
-        keys(obj, ("legacy", "npm_version", "npm_integrity", "git_head", "image_digest"))
+        keys(obj, OFFLINE_LEGACY_PREVIOUS)
         require(obj["legacy"] is True, "legacy identity flag must be true")
         try:
             version(obj["npm_version"])
@@ -212,6 +224,8 @@ def identity(obj, *, facts_only=False, consumer=None, slot=None):
                 "invalid npm integrity")
         match(COMMIT, obj["git_head"])
         match("sha256:" + SHA, obj["image_digest"])
+        require(all(obj[name] == value for name, value in OFFLINE_LEGACY_PREVIOUS.items()),
+                "legacy previous identity differs")
         return
     if type(obj) is dict and "provenance" in obj:
         require(not facts_only and consumer == "data" and slot == "previous",
