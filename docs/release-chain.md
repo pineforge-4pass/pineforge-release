@@ -32,7 +32,8 @@ with Contents or Issues write access. The `publish.yml` reusable
 `notify-consumers` caller obtains its runners from `release-finalize.yml`.
 
 `pull_request` and `pull_request_target` workflows must never use this class.
-The PR jobs in `python-test.yml` and `facts-validate.yml` also use
+The PR jobs in `python-test.yml` and `facts-validate.yml` also use GitHub-hosted runners.
+Their `authz` jobs use `runs-on: ubuntu-24.04`; the other PR jobs use
 `runs-on: ubuntu-latest` per the owner decision.
 The hub runs these jobs on GitHub-hosted runners without waiting for
 the release pool. These hosted jobs do not require a release runner group allowlist.
@@ -1022,13 +1023,14 @@ their required branch checks, and no consumer may use an admin merge. Configure
 `release/ready` requires successful authz and change detection, then the complete
 suite inventory; only a verified documentation-only PR may skip suites.
 
-The hub's `python-test.yml` and `facts-validate.yml` PR checks use the literal
+The hub's `python-test.yml` and `facts-validate.yml` PR checks use GitHub-hosted
+runners: `authz` uses `runs-on: ubuntu-24.04`; the other PR jobs use
 `runs-on: ubuntu-latest` per owner decision 10-21 (msg 1562390657274748981),
 a standing R6/rule-B exception for pineforge-release, without a `PF_CI_LABELS`
 environment variable. Both workflows run on every pull request without path or
 branch filters. Their first job is the canonical `authz` from
-`ci-labels.md` with the owner-approved runner exception, `name: authz`,
-`runs-on: ubuntu-latest`, `permissions: {}`, no
+`ci-labels.md`, `name: authz`,
+`runs-on: ubuntu-24.04`, `permissions: {}`, no
 condition, checkout or secrets, and the canonical no-timeout comment.
 Its eight payload fields are `EVENT`, `REPO`, `HEAD_REPO`, `HEAD_IS_FORK`,
 `ASSOCIATION`, `PR_AUTHOR`, `WR_HEAD_REPO` and `WR_ACTOR`; the other two
@@ -1043,9 +1045,13 @@ or `write` read from GitHub.
 An author outside the bot allowlist reported as `CONTRIBUTOR`, including a
 member with private organization membership, passes only with `admin`,
 `maintain` or `write` permission read from GitHub; a failed lookup refuses the run.
-For `workflow_run`, authz requires this repository's head and either an
-allowlisted bot or triggering-actor permission `admin`, `maintain` or
-`write`; a failed permission lookup refuses the run.
+For `workflow_run`, authz requires non-empty `WR_HEAD_REPO` and `WR_ACTOR`;
+`WR_HEAD_REPO` must equal `REPO`. The only bots accepted are
+`pineforge-app[bot]` or `pineforge-ci-dispatcher[bot]`.
+`ALLOWED_BOTS` applies only to `pull_request`; `dependabot[bot]` and every other
+`*"[bot]"` login are refused without a permission lookup. Other, non-bot actors
+require `admin`, `maintain` or `write` permission read from GitHub; a failed
+permission lookup refuses the run.
 The allowed ordinary events are `push`, `workflow_dispatch`, `schedule`,
 `merge_group`, `release`, `workflow_call` and `repository_dispatch`;
 `pull_request_target` and unknown events fail red.
