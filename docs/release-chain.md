@@ -218,11 +218,11 @@ The payload has exactly these eight top-level keys:
 The application remains a normal receipt role, using `pineforge-release` with
 the exact ten-key `pineforge/release-ready/v1` payload above and its existing
 CI/E2E/deploy receipt requirements. Its default-branch receiver accepts only
-that contract; application pair support remains deferred until APP PR #723
-lands. Application delivery is opt-in through `RELEASE_READY_CONSUMERS`; the
-agreed 1.7.0 application delivery uses a manual stable replay of release-ready/v1.
-It remains `skipped_by_policy` for prereleases because its receiver refuses
-those dispatches.
+that contract. The agreed 1.7.0 application delivery was a manual stable
+replay of release-ready/v1. Before the 2026-10-16 workflow change, publication
+used a fixed offline/hosted/application notification matrix; the finalizer now
+uses the configured role list. Application remains `skipped_by_policy` for
+prereleases because its receiver refuses those dispatches.
 
 Builders remain deployers: the application builds its Cloud Run image and
 hosted builds its container. The compute receiver only validates each pair and
@@ -273,15 +273,52 @@ not create a product release.
 ## Consumer completion adapter
 
 Product dispatch is enabled only for roles in repository variable
-`RELEASE_READY_CONSUMERS` (comma-separated, no spaces). Enable `offline`,
-`hosted`, `application`, `web` or `data` only after the default-branch receiver
-creates PRs and gates merge/deployment on its full CI/E2E. Keep `license` out of
-product dispatch: its facts receiver is independently selected by
-`FACTS_LICENSE_DISPATCH_ENABLED=true`. Web facts polling is similarly selected
-by `FACTS_WEB_DISPATCH_ENABLED=true`. Each selected receipt role needs a receipt
-policy; `compute` is delivery-only and needs none.
-Disabled product roles are omitted from aggregate consumers, completion and
-staleness calculations; an empty product set completes with no deliveries.
+`RELEASE_READY_CONSUMERS` (comma-separated, no spaces), preserving its explicit
+selection meaning. The finalizer also parses `RELEASE_READY_EXCLUDE` with the
+same rules. Before any delivery attempt is reserved, every role in `ROLES`
+must occur in exactly one of those variables. A missing role or a role in both
+variables fails the finalizer and names both variables. An unset or empty
+exclusion variable means an empty exclusion list; for the initial rollout set
+it to `web,license,compute` while `RELEASE_READY_CONSUMERS` is
+`offline,hosted,application,data`.
+Excluded roles are omitted from aggregate consumers, completion and staleness
+calculations. Keep `license` out of product dispatch when its facts receiver is
+selected by `FACTS_LICENSE_DISPATCH_ENABLED=true`; web facts polling is
+similarly selected by `FACTS_WEB_DISPATCH_ENABLED=true`. Those flags retain
+their existing receipt behavior and do not replace role accounting. Each
+selected receipt role needs a receipt policy; `compute` is delivery-only and
+needs none.
+The notify matrix refuses an empty or malformed target before minting a token
+and names the matrix role without exposing the target value.
+After acceptance, notification requires a `repository_dispatch` run of the
+receiver created at or after dispatch. Receipt roles use the
+`pineforge-release` workflow marker; compute uses its `release-pair` marker.
+The check uses `event_id` in the display title or artifact name where
+available; otherwise it reports `event_id_match: unavailable` and uses that
+receiver workflow's creation time. It makes five polls with sleeps of 5, 15,
+30 and 60 seconds and has a fixed API-call budget. Missing startup or an
+already failed/cancelled receiver run fails notification with role, repository,
+tag and event identity. No blind redispatch follows a receiver failure. A
+queued or running receiver proves startup, while receipt checks remain
+responsible for full completion. A receipt that remains `pending` does not
+fail publication; the existing age alert continues to report it.
+
+The finalizer writes a delivery attempt before the notification matrix starts.
+If a later finalizer control fails, the matrix output is forced to `[]`, the
+notify job is skipped, and cleanup appends a release marker for reservations
+from that finalizer run. This keeps an unsent reservation from consuming the
+bounded retry history.
+
+`scripts/release_fanout_check.py check --tag vX.Y.Z` reads delivery assets and
+receiver run evidence without writes and prints stable JSON followed by a
+human table for every role. It returns nonzero for an enabled role with a
+missing delivery, missing receiver run or failed run, and for an unaccounted
+role; excluded roles are visible and do not require a delivery. Set
+`RELEASE_TARGET_<ROLE>_REPOSITORY` to the configured short repository names.
+The optional workflow uses the hub token for public release assets and a
+scoped Actions-read App token for receiver repositories. The
+`release-fanout-check` workflow accepts the same tag for manual inspection.
+
 Prerelease application/web/data/license roles, if configured, are explicitly
 `skipped_by_policy`; offline/hosted must enforce their dev/next policy.
 
@@ -340,11 +377,13 @@ It permits **three total attempts**: the first immediately, a second at least
 15 minutes after the first, and a third at least 60 minutes after the second.
 After a further 15-minute acknowledgement grace period without delivery
 acceptance, it appends `delivery-failed-<consumer>.json`, changes that role to
-failed, updates the release incident once, and stops. Failed/cancelled jobs also
-consume their reserved attempt. Each delivery job rechecks acceptance and retry
-exhaustion before sending, so a late queued job also stops. Later valid consumer
-evidence can still advance progress; scheduled runs do not clear the retry
-history. Investigate and use an explicit reviewed
+failed, updates the release incident once, and stops. If a later finalizer
+control fails before notification, the notify matrix is skipped and cleanup
+appends a release marker for that run's unsent reservations. An actual delivery
+job failure leaves its reservation in the retry history. Each delivery job
+rechecks acceptance and retry exhaustion before sending, so a late queued job
+also stops. Later valid consumer evidence can still advance progress; scheduled
+runs do not clear the retry history. Investigate and use an explicit reviewed
 recovery for an exhausted delivery.
 
 Use `release-redeliver.yml` for an explicitly reviewed repair of one published
@@ -1053,13 +1092,14 @@ use `ubuntu-latest` per owner decision 10-21, including publication workflows.
 | `RELEASE_HOSTED_MCP_REPOSITORY`, `RELEASE_APPLICATION_REPOSITORY`, `FACTS_WEB_REPOSITORY` (existing) | Hub `release-automation` environment secrets | Private short repository names for neutral hosted/application/web targets. Public offline/data/license names are fixed in workflows. |
 | `RELEASE_COMPUTE_REPOSITORY` (new secret) | Hub `release-automation` environment secrets | Private short name of the compute target repository; the application target likewise lives in `RELEASE_APPLICATION_REPOSITORY`. Both reuse the existing one-target App mint. No values belong in source or public audit assets. |
 | `RELEASE_RECEIPT_POLICY` (new secret) | Hub repository Actions secret (read by the receipt verify job, which runs in the `release-automation` environment; do not also create it in the environment, it would shadow this one) | JSON map of each enabled receipt role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories, plus optional application-only `post_merge`. Compute needs no entry. Keep private workflow/job details out of public source. |
-| `RELEASE_READY_CONSUMERS` (new variable) | Hub repository | Explicit comma-separated upgraded product receiver roles. Empty sends nothing; disabled roles do not block aggregate completion or become overdue. Facts flags independently select web/license receipt polling and freshness. |
+| `RELEASE_READY_CONSUMERS` | Hub repository | Explicit comma-separated dispatch roles. Empty keeps product delivery off. Every role must also be accounted for in `RELEASE_READY_EXCLUDE`; this variable's selection meaning is unchanged. |
+| `RELEASE_READY_EXCLUDE` (optional variable; empty) | Hub repository | Explicit comma-separated exclusions using the same duplicate and unknown-role checks. Every role must be in exactly one list; unset means empty. Set `web,license,compute` for the initial stable configuration. Exclusions appear in the fanout check's JSON and human output. |
 | `RELEASE_COMPUTE_FIRST_PAIR` (new variable; empty/off) | Hub repository | Bare canonical semver lower bound for compute, including prereleases. Compute must also be in `RELEASE_READY_CONSUMERS`. When selected, validate the value once before processing releases. A malformed nonempty value suppresses compute deliveries and sets the fixed `compute_configuration_error` output before any release work, while retaining compute in each release's completion inventory with its existing delivered, failed or pending state. Failed or pending compute keeps the incident incomplete; the typo cannot authorize a complete status or incident closure. Other roles' delivery planning continues; the configuration error alone leaves the script's exit status at 0. The workflow reports it after consumer notification as described below. Diagnostics name the variable and say its value was not accepted, without exposing the value. An unselected compute role ignores the value. Keep empty until the receiver merges; no older-pair backfill for the initial rollout. |
 | `RELEASE_REPORT_OWNER` (new variable) | Hub repository | GitHub login to assign/mention on release and failure issues. |
 | `RELEASE_READY_MAX_AGE_MINUTES` (optional variable; 60) | Hub repository | Missing readiness prerequisite alert threshold. |
 | `RELEASE_CONSUMER_MAX_AGE_MINUTES` (optional variable; 180) | Hub repository | Non-app missing/stalled completion threshold. |
 | `RELEASE_APPLICATION_MAX_AGE_MINUTES` (optional variable; 1440) | Hub repository | App stage freshness, separate from per-test time limits. |
-| `FACTS_LICENSE_DISPATCH_ENABLED` (new variable) | Hub repository | Set true after the license facts receiver and receipt policy are ready; also selects license receipt polling without product dispatch. Existing repository `FACTS_WEB_DISPATCH_ENABLED` independently selects web facts dispatch/polling. |
+| `FACTS_LICENSE_DISPATCH_ENABLED` | Hub repository | Set true after the license facts receiver and receipt policy are ready; selects license facts dispatch and receipt polling without changing product role selection. `FACTS_WEB_DISPATCH_ENABLED` similarly gates web facts delivery and polling. |
 | Actions permissions, Issues, GHCR visibility | Hub repository | Permit workflow contents/packages/issues writes; enable Issues and public pulls of the existing GHCR package. |
 | `release-automation` environment (existing) | Hub repository | Permit protected main and release `v*` tags and the intended automatic jobs. Required human reviewers would pause full automation. |
 | Release asset setting | Hub repository | These releases keep append-only audit/receipt assets after publication; GitHub's repository-wide immutable-release setting must permit these appends. The scripts enforce manifest/fixed-tag byte immutability and never overwrite/delete them. |
@@ -1067,9 +1107,11 @@ use `ubuntu-latest` per owner decision 10-21, including publication workflows.
 
 The `finalize` job exports `compute_configuration_error` from the `ready` step
 alongside its existing `deliveries` output. For a malformed compute floor alone,
-the script exits 0, so `set -euo pipefail` reaches the unchanged delivery-output
-export and `notify-consumers` sends the other roles' planned deliveries. That
-job's condition remains `needs.finalize.outputs.deliveries != '[]'`.
+the script exits 0, so `set -euo pipefail` reaches the delivery-output step and
+`notify-consumers` sends the other roles' planned deliveries. If any finalizer
+control fails, delivery-output emits `[]`, the notify condition also requires a
+successful finalizer result, and the reservation cleanup job releases unsent
+attempts.
 The final `report-compute-configuration-error` job has
 `needs: [finalize, notify-consumers]` and
 `if: ${{ always() && needs.finalize.outputs.compute_configuration_error != '' }}`.

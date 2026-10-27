@@ -33,7 +33,7 @@ RECEIPT_STATES = ("pending", "pr_open", "testing", "ready", "merged", "deploying
 RECEIPT_FIELDS = ("schema", "consumer", "attempt", "sequence", "state", "timestamp",
                   "event_id", "release_version", "evidence_sha256", "reporting_run_id")
 # Delay after each reserved attempt: two retries, then an acknowledgement grace
-# period before a terminal failure. Reservations survive failed/cancelled jobs.
+# period before a terminal failure. Unsent reservations are released by cleanup.
 DELIVERY_BACKOFF_MINUTES = (15, 60, 15)
 
 
@@ -256,6 +256,35 @@ def configured_roles(raw):
     return roles
 
 
+class ConfigurationError(Invalid):
+    pass
+
+
+def excluded_roles():
+    return configured_roles(os.environ.get("RELEASE_READY_EXCLUDE", ""))
+
+
+def validate_consumer_configuration():
+    enabled = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+    excluded = excluded_roles()
+    overlap = [role for role in ROLES if role in enabled and role in excluded]
+    if overlap:
+        raise ConfigurationError(
+            "release consumer role listed in both RELEASE_READY_CONSUMERS and "
+            "RELEASE_READY_EXCLUDE: " + ",".join(overlap))
+    missing = [role for role in ROLES if role not in enabled and role not in excluded]
+    if missing:
+        raise ConfigurationError(
+            "release consumer configuration is incomplete; missing role(s): "
+            + ",".join(missing)
+            + "; account for every role in RELEASE_READY_CONSUMERS or RELEASE_READY_EXCLUDE")
+    return enabled, excluded
+
+
+def release_roles():
+    return configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+
+
 def receipt_roles():
     roles = [role for role in configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
              if role not in DELIVERY_ONLY]
@@ -416,12 +445,38 @@ def aggregate(store, row, event, *, enabled=(), newest=None):
             "complete": all(value in COMPLETE_STATES for value in states.values())}
 
 
+def _reservation_release(row, store, name, event, role, attempt):
+    raw = store.read(row, name)
+    if raw is None:
+        return False
+    obj = decode(raw)
+    require(type(obj) is dict and obj.get("event_id") == event["event_id"]
+            and obj.get("consumer") == role and obj.get("attempt") == attempt
+            and obj.get("state") == "released", "delivery reservation release differs")
+    positive(obj.get("run_id"))
+    match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj.get("timestamp"))
+    return True
+
+
+def _attempt_release_name(role, attempt, run_id):
+    return f"delivery-attempt-released-{role}-{attempt}-{run_id}.json"
+
+
 def plan_delivery(store, row, event, role):
     """Reserve at most three deliveries; accepted transport never retries."""
     if store.read(row, f"delivery-{role}.json") is not None:
         return None, False
     failed_name = f"delivery-failed-{role}.json"
-    if store.read(row, failed_name) is not None:
+    failed = store.read(row, failed_name)
+    failed_released = False
+    if failed is not None:
+        failed_obj = decode(failed)
+        require(failed_obj["event_id"] == event["event_id"]
+                and failed_obj["consumer"] == role and failed_obj["state"] == "failed",
+                "delivery failure identity differs")
+        failed_released = _reservation_release(
+            row, store, f"delivery-failed-release-{role}.json", event, role, failed_obj["attempts"])
+    if failed is not None and not failed_released:
         return None, True
     attempts = []
     prefix = f"delivery-attempt-{role}-"
@@ -430,20 +485,64 @@ def plan_delivery(store, row, event, role):
             obj = decode(store.read(row, asset["name"]))
             require(obj["event_id"] == event["event_id"] and obj["consumer"] == role, "delivery attempt identity differs")
             positive(obj["attempt"])
-            attempts.append(obj)
+            positive(obj["run_id"])
+            if not _reservation_release(row, store,
+                                        _attempt_release_name(role, obj["attempt"], obj["run_id"]),
+                                        event, role, obj["attempt"]):
+                attempts.append(obj)
     attempts.sort(key=lambda obj: obj["attempt"])
     require([obj["attempt"] for obj in attempts] == list(range(1, len(attempts) + 1))
             and len(attempts) <= len(DELIVERY_BACKOFF_MINUTES), "invalid delivery attempt history")
     if attempts and age_minutes(attempts[-1]["timestamp"]) < DELIVERY_BACKOFF_MINUTES[len(attempts) - 1]:
         return None, False
     if len(attempts) == len(DELIVERY_BACKOFF_MINUTES):
-        store.put(row, failed_name, canonical({"event_id": event["event_id"], "consumer": role,
-                                             "state": "failed", "attempts": len(attempts), "timestamp": now()}))
+        if failed is None:
+            store.put(row, failed_name, canonical({"event_id": event["event_id"], "consumer": role,
+                                                 "state": "failed", "attempts": len(attempts),
+                                                 "run_id": int(os.environ["GITHUB_RUN_ID"]),
+                                                 "timestamp": now()}))
         return None, True
     attempt = len(attempts) + 1
-    store.put(row, f"{prefix}{attempt}.json", canonical({"event_id": event["event_id"], "consumer": role,
-              "attempt": attempt, "run_id": int(os.environ["GITHUB_RUN_ID"]), "timestamp": now()}))
+    run_id = int(os.environ["GITHUB_RUN_ID"])
+    reservation_name = f"{prefix}{attempt}.json"
+    if store.read(row, reservation_name) is not None:
+        reservation_name = f"{prefix}{attempt}-run-{run_id}.json"
+    store.put(row, reservation_name, canonical({"event_id": event["event_id"], "consumer": role,
+              "attempt": attempt, "run_id": run_id, "timestamp": now()}))
     return {"consumer": role, "tag": row["tag_name"], "attempt": attempt}, False
+
+
+def release_delivery_attempts(client, store, tag=""):
+    """Release reservations made by a finalizer that never reached its sender."""
+    positive(int(os.environ["GITHUB_RUN_ID"]))
+    rows = [store.get(tag)] if tag else store.releases()
+    current_run = int(os.environ["GITHUB_RUN_ID"])
+    for row in rows:
+        for role in ROLES:
+            failed_name = f"delivery-failed-{role}.json"
+            failed = store.read(row, failed_name)
+            if failed is not None:
+                failed_obj = decode(failed)
+                if failed_obj.get("run_id") == current_run:
+                    release_name = f"delivery-failed-release-{role}.json"
+                    if store.read(row, release_name) is None:
+                        store.put(row, release_name, canonical({
+                            "event_id": failed_obj["event_id"], "consumer": role,
+                            "attempt": failed_obj["attempts"], "state": "released",
+                            "run_id": current_run, "timestamp": now()}))
+            prefix = f"delivery-attempt-{role}-"
+            for asset in store.get(row["tag_name"])["assets"]:
+                if not asset["name"].startswith(prefix):
+                    continue
+                obj = decode(store.read(row, asset["name"]))
+                if obj.get("run_id") != current_run:
+                    continue
+                release_name = _attempt_release_name(role, obj["attempt"], current_run)
+                if store.read(row, release_name) is None:
+                    store.put(row, release_name, canonical({
+                        "event_id": obj["event_id"], "consumer": role,
+                        "attempt": obj["attempt"], "state": "released",
+                        "run_id": current_run, "timestamp": now()}))
 
 
 def redelivery_dispatch(client, target, data):
@@ -605,7 +704,7 @@ def facts_freshness(client, store, roles):
 
 
 def finalize_all(client, store, registry, tag, output):
-    enabled = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+    enabled, _ = validate_consumer_configuration()
     compute_first_pair = None
     compute_configuration_error = False
     if "compute" in enabled:
@@ -757,6 +856,8 @@ def main():
     p = sub.add_parser("finalize")
     p.add_argument("--tag", default="")
     p.add_argument("--output", required=True)
+    p = sub.add_parser("release-attempts")
+    p.add_argument("--tag", default="")
     sub.add_parser("reconcile")
     p = sub.add_parser("dispatch")
     p.add_argument("--tag", required=True)
@@ -800,6 +901,8 @@ def main():
             if args.tag:
                 version(args.tag.removeprefix("v"))
             finalize_all(client, store, Registry(), args.tag, args.output)
+        elif args.cmd == "release-attempts":
+            release_delivery_attempts(client, store, args.tag)
         elif args.cmd == "reconcile":
             reconcile(client, store)
         elif args.cmd == "redeliver":
@@ -841,16 +944,20 @@ def main():
                 client_payload = pair_payload(raw, candidate_raw)
             target = os.environ.get("TARGET_REPOSITORY", "")
             match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", target)
+            dispatch_time = now()
             client.api(f"repos/pineforge-4pass/{target}/dispatches", method="POST",
                        data={"event_type": event_type, "client_payload": client_payload})
             Path(args.output).write_bytes(canonical({"schema": "pineforge/release-delivery/v1", "event_id": event["event_id"],
                 "consumer": args.consumer, "state": "dispatch_accepted", "attempt": args.attempt,
-                "run_id": int(os.environ["GITHUB_RUN_ID"]), "timestamp": now()}))
+                "run_id": int(os.environ["GITHUB_RUN_ID"]), "timestamp": dispatch_time}))
         else:
             report_issue(client, args.stage + "-failure", "Release chain: " + args.stage + " failed", run_link())
     except Pending as error:
         print("::notice::" + str(error), file=sys.stderr)
         return 3
+    except ConfigurationError as error:
+        print("::error::" + str(error), file=sys.stderr)
+        return 1
     except (Invalid, ValueError, OSError, KeyError, TypeError, pair.RuleError):
         # No untrusted API bodies, private target names, paths or credentials.
         print("::error::release chain operation failed; inspect the neutral incident and workflow run", file=sys.stderr)

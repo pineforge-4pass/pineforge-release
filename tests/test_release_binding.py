@@ -520,12 +520,17 @@ class FinalizerTests(unittest.TestCase):
     def finish(self):
         return pipeline.finalize(self.client, self.store, self.registry, self.row)
 
+    def exclude(self, enabled):
+        selected = set(enabled.split(",")) if enabled else set()
+        return ",".join(role for role in contract.ROLES if role not in selected)
+
     def plan(self, release="1.6.0", *, enabled="compute", first="1.6.0"):
         manifest = fixture_manifest(release)
         client, store, registry = FinalizeClient(manifest), MemoryStore(manifest), MemoryRegistry()
         row = store.get("v" + release)
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                "RELEASE_READY_CONSUMERS": enabled, "RELEASE_READY_EXCLUDE": self.exclude(enabled),
+                "RELEASE_COMPUTE_FIRST_PAIR": first,
                 "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "age_minutes", return_value=0), patch.object(pipeline, "report_issue"):
@@ -771,7 +776,8 @@ class FinalizerTests(unittest.TestCase):
             "attempts": 3, "timestamp": "2026-10-23T00:00:00Z"}))
         before = copy.deepcopy(self.store.assets)
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_READY_EXCLUDE": self.exclude("compute"),
+                "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
                 "GITHUB_RUN_ID": "901", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "report_issue") as report:
@@ -909,7 +915,8 @@ class FinalizerTests(unittest.TestCase):
         self.store.put(self.row, "delivery-compute.json", contract.canonical({
             "event_id": event["event_id"], "consumer": "compute", "state": "dispatch_accepted"}))
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_READY_EXCLUDE": self.exclude("compute"),
+                "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
                 "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "age_minutes", return_value=0), patch.object(pipeline, "report_issue") as report:
@@ -934,7 +941,8 @@ class FinalizerTests(unittest.TestCase):
             store.put(row, contract.ASSET, (ROOT / "tests/fixtures/release-manifest.json").read_bytes())
             with self.subTest(enabled=enabled, first=first), tempfile.TemporaryDirectory() as tmp, \
                     patch.dict(os.environ, {
-                        "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                        "RELEASE_READY_CONSUMERS": enabled, "RELEASE_READY_EXCLUDE": self.exclude(enabled),
+                        "RELEASE_COMPUTE_FIRST_PAIR": first,
                         "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                         "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                     patch.object(pipeline, "age_minutes", return_value=0), \
@@ -963,6 +971,52 @@ class FinalizerTests(unittest.TestCase):
         self.assertEqual(status["consumers"], {})
         self.assertTrue(status["complete"])
         self.assertFalse(any(name.startswith("delivery-attempt-") for _, name in store.assets))
+
+    def test_finalize_requires_every_role_to_be_accounted_for_before_reserving(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "offline,hosted,application,data",
+                "RELEASE_READY_EXCLUDE": "",
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}, clear=True), \
+                patch.object(pipeline, "report_issue"):
+            with self.assertRaisesRegex(
+                    pipeline.ConfigurationError,
+                    r"missing role\(s\): web,license,compute; account for every role in "
+                    r"RELEASE_READY_CONSUMERS or RELEASE_READY_EXCLUDE"):
+                pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0",
+                                      Path(tmp) / "deliveries.json")
+        self.assertFalse(any(asset["name"].startswith("delivery-attempt-")
+                             for asset in self.row["assets"]))
+
+    def test_finalize_refuses_a_role_listed_in_both_configuration_variables(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "offline,hosted,application,data",
+                "RELEASE_READY_EXCLUDE": "data,web,license,compute",
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}, clear=True), \
+                patch.object(pipeline, "report_issue"):
+            with self.assertRaisesRegex(
+                    pipeline.ConfigurationError,
+                    r"listed in both RELEASE_READY_CONSUMERS and RELEASE_READY_EXCLUDE: data"):
+                pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0",
+                                      Path(tmp) / "deliveries.json")
+        self.assertFalse(any(asset["name"].startswith("delivery-attempt-")
+                             for asset in self.row["assets"]))
+
+    def test_all_accounted_roles_keep_the_explicit_dispatch_set(self):
+        enabled = "offline,hosted,application,data"
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": enabled,
+                "RELEASE_READY_EXCLUDE": self.exclude(enabled),
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}, clear=True), \
+                patch.object(pipeline, "age_minutes", return_value=0), \
+                patch.object(pipeline, "report_issue"):
+            output = Path(tmp) / "deliveries.json"
+            pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0", output)
+            self.assertEqual(contract.decode(output.read_bytes()), [
+                {"consumer": role, "tag": "v1.6.0", "attempt": 1}
+                for role in ("offline", "hosted", "application", "data")])
 
     def test_compute_plan_excludes_pairs_below_the_semver_floor(self):
         for release, first in (("1.6.0-rc.2", "1.6.0-rc.10"),
@@ -998,7 +1052,8 @@ class FinalizerTests(unittest.TestCase):
         manifests = [fixture_manifest(v) for v in ("1.6.0", "1.6.1")]
         client, store, registry = FinalizeClient(*manifests), MemoryStore(*manifests), MemoryRegistry()
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_READY_EXCLUDE": self.exclude("compute"),
+                "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
                 "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "age_minutes", return_value=0), patch.object(pipeline, "report_issue"):
@@ -1013,7 +1068,9 @@ class FinalizerTests(unittest.TestCase):
         for state in ("failed", "pending"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp, \
                     patch.dict(os.environ, {
-                        "RELEASE_READY_CONSUMERS": "offline,compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                        "RELEASE_READY_CONSUMERS": "offline,compute",
+                        "RELEASE_READY_EXCLUDE": self.exclude("offline,compute"),
+                        "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
                         "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                         "GITHUB_OUTPUT": str(Path(tmp) / "github-output"),
                         "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false",
@@ -1071,7 +1128,8 @@ class FinalizerTests(unittest.TestCase):
             store_type = pipeline.Store
             stderr, stdout = io.StringIO(), io.StringIO()
             with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                    "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                    "RELEASE_READY_CONSUMERS": enabled, "RELEASE_READY_EXCLUDE": self.exclude(enabled),
+                    "RELEASE_COMPUTE_FIRST_PAIR": first,
                     "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                     "GITHUB_OUTPUT": str(Path(tmp) / "github-output") if github_output_enabled else "",
                     "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
@@ -1164,7 +1222,9 @@ class FinalizerTests(unittest.TestCase):
                 store_type = pipeline.Store
                 stderr, stdout = io.StringIO(), io.StringIO()
                 with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                        "RELEASE_READY_CONSUMERS": "offline,web,compute", "RELEASE_COMPUTE_FIRST_PAIR": "v1.7.0",
+                        "RELEASE_READY_CONSUMERS": "offline,web,compute",
+                        "RELEASE_READY_EXCLUDE": self.exclude("offline,web,compute"),
+                        "RELEASE_COMPUTE_FIRST_PAIR": "v1.7.0",
                         "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                         "GITHUB_OUTPUT": str(Path(tmp) / "github-output"),
                         "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
@@ -1197,7 +1257,8 @@ class FinalizerTests(unittest.TestCase):
         event = self.finish()
         self.store.put(self.row, "delivery-offline.json", contract.canonical({"event_id": event["event_id"], "state": "dispatch_accepted"}))
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": "offline", "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "RELEASE_READY_CONSUMERS": "offline", "RELEASE_READY_EXCLUDE": self.exclude("offline"),
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "report_issue"):
             output = Path(tmp) / "deliveries.json"
@@ -1208,7 +1269,8 @@ class FinalizerTests(unittest.TestCase):
 
     def test_finalize_all_delivery_retries_back_off_then_fail_once_and_stop(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": "offline", "GITHUB_RUN_ATTEMPT": "1",
+                "RELEASE_READY_CONSUMERS": "offline", "RELEASE_READY_EXCLUDE": self.exclude("offline"),
+                "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "report_issue") as report:
             output = Path(tmp) / "deliveries.json"

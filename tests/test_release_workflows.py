@@ -1736,7 +1736,8 @@ class NotifyConsumersTest(unittest.TestCase):
             "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
             "owner": "${{ github.repository_owner }}",
             "repositories": "${{ env.TARGET_REPOSITORY }}",
-            "permission-contents": "write", "github-api-url": "https://api.github.com",
+            "permission-contents": "write", "permission-actions": "read",
+            "github-api-url": "https://api.github.com",
         })
         self.assertEqual(set(re.findall(r"secrets\.([A-Z_]+)", text)), {
             "PINEFORGE_APP_ID", "PINEFORGE_APP_PRIVATE_KEY", "RELEASE_HOSTED_MCP_REPOSITORY",
@@ -1759,19 +1760,37 @@ class NotifyConsumersTest(unittest.TestCase):
         finalize = jobs["finalize"]
         self.assertEqual(finalize["outputs"]["compute_configuration_error"],
                          "${{ steps.ready.outputs.compute_configuration_error }}")
-        self.assertEqual(finalize["outputs"]["deliveries"], "${{ steps.ready.outputs.deliveries }}")
+        self.assertEqual(finalize["outputs"]["deliveries"],
+                         "${{ steps.delivery-output.outputs.deliveries }}")
         ready = next(step for step in finalize["steps"] if step.get("id") == "ready")
         self.assertEqual(ready["run"].splitlines(), [
             "set -euo pipefail",
             'python3 scripts/release_pipeline.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"',
+        ])
+        output = next(step for step in finalize["steps"] if step.get("id") == "delivery-output")
+        self.assertEqual(output["if"], "${{ always() }}")
+        self.assertEqual(output["run"].splitlines(), [
+            "set -euo pipefail",
+            'if [[ "${{ steps.ready.outcome }}" == "success" && -f "$RUNNER_TEMP/deliveries.json" ]]; then',
             'echo "deliveries=$(cat "$RUNNER_TEMP/deliveries.json")" >> "$GITHUB_OUTPUT"',
+            "else",
+            "echo 'deliveries=[]' >> \"$GITHUB_OUTPUT\"",
+            "fi",
         ])
         notify = jobs["notify-consumers"]
         self.assertEqual(notify["needs"], "finalize")
-        self.assertEqual(notify["if"], "needs.finalize.outputs.deliveries != '[]'")
+        self.assertEqual(notify["if"],
+                         "${{ needs.finalize.result == 'success' && needs.finalize.outputs.deliveries != '[]' }}")
         self.assertNotIn("compute_configuration_error", notify["if"])
         self.assertEqual(notify["strategy"]["matrix"]["include"],
                          "${{ fromJSON(needs.finalize.outputs.deliveries) }}")
+
+        cleanup = jobs["release-attempt-cleanup"]
+        self.assertEqual(cleanup["needs"], "finalize")
+        self.assertEqual(cleanup["if"], "${{ always() && needs.finalize.result != 'success' }}")
+        self.assertEqual(cleanup["permissions"], {"contents": "write"})
+        self.assertTrue(any("release_pipeline.py release-attempts" in step.get("run", "")
+                            for step in cleanup["steps"]))
 
         reporter = jobs["report-compute-configuration-error"]
         self.assertEqual(reporter["needs"], ["finalize", "notify-consumers"])
@@ -2431,7 +2450,9 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         "facts-fanout.yml": {"web", "license"},
         "handle-upstream.yml": {"bump"},
         "publish.yml": {"tag-guard", "prepare", "publish", "failure-report"},
-        "release-finalize.yml": {"finalize", "notify-consumers", "report-compute-configuration-error"},
+        "release-finalize.yml": {"finalize", "release-attempt-cleanup", "notify-consumers",
+                                "report-compute-configuration-error"},
+        "release-fanout-check.yml": {"check"},
         "release-redeliver.yml": {"redeliver"},
         "release-receipts.yml": {"plan", "verify"},
         "release-reconcile.yml": {"producers"},
@@ -2449,8 +2470,10 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         ("publish.yml", "publish"),
         ("publish.yml", "failure-report"),
         ("release-finalize.yml", "finalize"),
+        ("release-finalize.yml", "release-attempt-cleanup"),
         ("release-finalize.yml", "notify-consumers"),
         ("release-finalize.yml", "report-compute-configuration-error"),
+        ("release-fanout-check.yml", "check"),
         ("release-redeliver.yml", "redeliver"),
         ("release-receipts.yml", "plan"),
         ("release-receipts.yml", "verify"),
@@ -2485,8 +2508,8 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
     def test_release_jobs_pin_ubuntu_latest_and_never_accept_pr_events(self):
         self.assert_release_runners(self.release_workflows())
 
-    def test_all_sixteen_release_jobs_pin_ubuntu_latest_under_the_standing_owner_rule(self):
-        self.assertEqual(len(self.HOSTED_JOBS), 16)
+    def test_all_eighteen_release_jobs_pin_ubuntu_latest_under_the_standing_owner_rule(self):
+        self.assertEqual(len(self.HOSTED_JOBS), 18)
         self.assert_hosted_runners(self.release_workflows())
 
     def test_hosted_runner_pin_refuses_the_release_array_on_each_release_job(self):
@@ -2713,8 +2736,10 @@ class PrTierWorkflowTest(unittest.TestCase):
         "publish.yml": {"tag-guard": "ubuntu-latest", "prepare": "ubuntu-latest",
                         "publish": "ubuntu-latest", "notify-consumers": None,
                         "failure-report": "ubuntu-latest"},
-        "release-finalize.yml": {"finalize": "ubuntu-latest", "notify-consumers": "ubuntu-latest",
+        "release-finalize.yml": {"finalize": "ubuntu-latest", "release-attempt-cleanup": "ubuntu-latest",
+                                 "notify-consumers": "ubuntu-latest",
                                  "report-compute-configuration-error": "ubuntu-latest"},
+        "release-fanout-check.yml": {"check": "ubuntu-latest"},
         "release-redeliver.yml": {"redeliver": "ubuntu-latest"},
         "release-receipts.yml": {"plan": "ubuntu-latest", "verify": "ubuntu-latest"},
         "release-reconcile.yml": {"producers": "ubuntu-latest"},
@@ -3940,6 +3965,47 @@ class PrTierWorkflowTest(unittest.TestCase):
                     with self.assertRaises(AssertionError):
                         self.assert_test_inputs_run(workflow, inputs)
         self.assertEqual(self.named_repo_files('# open("facts/README.md").read()\n'), set())
+
+
+class ReleaseFanoutRegressionTest(unittest.TestCase):
+    """Red-first controls for stable fanout and receiver-start enforcement."""
+
+    def test_release_ready_consumers_keeps_explicit_selection_meaning(self):
+        sys.path.insert(0, str(REPO / "scripts"))
+        import release_pipeline as pipeline
+
+        with patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "hosted",
+                "RELEASE_READY_EXCLUDE": "",
+                "FACTS_WEB_DISPATCH_ENABLED": "false",
+                "FACTS_LICENSE_DISPATCH_ENABLED": "false",
+        }, clear=True):
+            self.assertEqual(pipeline.release_roles(), ["hosted"])
+            self.assertEqual(pipeline.excluded_roles(), [])
+
+    def test_finalizer_requires_a_configured_target_for_each_enabled_role(self):
+        finalizer = _workflow("release-finalize.yml")
+        guard = next(step for step in finalizer["jobs"]["notify-consumers"]["steps"]
+                     if step.get("name") == "Require one configured consumer repository")
+        self.assertIn("ROLE", guard["env"])
+        self.assertIn("for role ${ROLE}", guard["run"])
+        error_line = next(line for line in guard["run"].splitlines() if "::error::" in line)
+        self.assertNotIn("TARGET_REPOSITORY", error_line)
+
+    def test_notify_waits_for_a_receiver_run_and_runs_after_finalizer_failure(self):
+        finalizer = _workflow("release-finalize.yml")
+        notify = finalizer["jobs"]["notify-consumers"]
+        self.assertIn("needs.finalize.result == 'success'", notify["if"])
+        self.assertNotIn("always()", notify["if"])
+        self.assertTrue(any("release_fanout_check.py wait" in step.get("run", "")
+                            for step in notify["steps"]))
+        mint = next(step for step in notify["steps"]
+                    if "create-github-app-token@" in step.get("uses", ""))
+        self.assertEqual(mint["with"]["permission-actions"], "read")
+        cleanup = finalizer["jobs"]["release-attempt-cleanup"]
+        self.assertIn("needs.finalize.result != 'success'", cleanup["if"])
+        self.assertTrue(any("release-attempts" in step.get("run", "")
+                            for step in cleanup["steps"]))
 
 
 if __name__ == "__main__":
