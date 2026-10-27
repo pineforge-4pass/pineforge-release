@@ -1413,7 +1413,7 @@ class GkePythonDiagnosticWorkflowTest(unittest.TestCase):
         self.assertEqual(fields, {
             "executable", "real_executable", "base_executable", "version", "prefix", "base_prefix",
             "path", "global_sites", "user_site", "user_site_enabled", "home_present", "isolated",
-            "sitecustomize", "usercustomize", "pip_origin", "vendored_import_error",
+            "sitecustomize", "usercustomize", "pip_origin", "vendored_import_error", "libpython_mapped",
         })
         self.assertIn('importlib.util.find_spec("pip")', probe)
         self.assertIn("from pip._vendor.packaging.requirements import Requirement", probe)

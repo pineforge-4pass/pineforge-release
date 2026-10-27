@@ -64,6 +64,9 @@ jobs:
           print("environment variable names only:", json.dumps(sorted(
               k for k in os.environ if k.startswith(("PIP", "PYTHON")) or
               k in {"HOME", "VIRTUAL_ENV"})), flush=True)
+          print("tool cache locations (directories, not credentials):", json.dumps({
+              name: os.environ.get(name) for name in ("RUNNER_TOOL_CACHE", "AGENT_TOOLSDIRECTORY")}), flush=True)
+          print("hosted tool cache present:", os.path.isdir("/opt/hostedtoolcache/Python"), flush=True)
           run("which -a python3", ["which", "-a", "python3"])
           run("python3 -m pip --version", ["python3", "-B", "-m", "pip", "--version"])
           try:
@@ -87,7 +90,13 @@ jobs:
               from pip._vendor.packaging.version import Version
           except ImportError as error:
               vendored = type(error).__name__
-          print(json.dumps({"executable": sys.executable, "real_executable": os.path.realpath(sys.executable),
+          mapped = []
+          try:
+              with open("/proc/self/maps", encoding="utf-8") as maps:
+                  mapped = sorted({line.split()[-1] for line in maps if "libpython" in line})
+          except OSError as error:
+              mapped = [type(error).__name__]
+          print(json.dumps({"libpython_mapped": mapped, "executable": sys.executable, "real_executable": os.path.realpath(sys.executable),
               "base_executable": getattr(sys, "_base_executable", None), "version": sys.version,
               "prefix": sys.prefix, "base_prefix": sys.base_prefix, "path": sys.path,
               "global_sites": site.getsitepackages(), "user_site": site.getusersitepackages(),
