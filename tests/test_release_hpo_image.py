@@ -923,9 +923,12 @@ class ReadmePairRuleTest(unittest.TestCase):
     # this value in the same commit.
     PAIR_RULE_SHA256 = "35b72f7f5c7466cfc212a71eaf05df98f45e92411fd34a67bfff761556c61601"
 
-    def test_runner_documentation_keeps_the_430_line_published_layout(self):
+    # The README was 430 lines when this pin was written; the harness documentation for engine 1.7.0 added 14
+    # lines (the pf_bars.py / pf_sink.py change) and the pair payload documentation added 2 more, so the published
+    # layout on main is 446 lines. The pair-rule digest above covers lines 215-244, which did not change.
+    def test_runner_documentation_keeps_the_446_line_published_layout(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
-        self.assertEqual(len(lines), 430)
+        self.assertEqual(len(lines), 446)
 
     def test_lines_215_to_244_are_byte_identical_to_the_published_rule(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
