@@ -1,0 +1,146 @@
+name: Diagnose GKE Python and pip
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  inspect:
+    runs-on: gke-2cpu-4gb-amd64
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Install runner tools
+        run: sudo apt-get update && sudo apt-get install -y ca-certificates curl git
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Inspect Python and pip visibility
+        shell: bash
+        run: |
+          set -eu
+          python3 -B - <<'PY'
+          import json, os, re, subprocess, sys
+
+          # Keep inherited paths and credentials out of captured command output.
+          hidden = {}
+          for name, value in os.environ.items():
+              if value and ("/" in value or "\\" in value or
+                            re.search("TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH|KEY", name, re.I)):
+                  hidden[value] = "<environment:" + name + ">"
+              if name == "PYTHONPATH":
+                  for index, entry in enumerate(value.split(os.pathsep)):
+                      if entry:
+                          hidden[entry] = "<environment:PYTHONPATH[" + str(index) + "]>"
+
+          def redact(text):
+              text = re.sub(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+", "<URL withheld>", text)
+              for value in sorted(hidden, key=len, reverse=True):
+                  text = text.replace(value, hidden[value])
+                  text = text.replace(json.dumps(value)[1:-1], hidden[value])
+              return text
+
+          failed = False
+
+          def run(label, command, environment=None):
+              global failed
+              print(label, flush=True)
+              try:
+                  result = subprocess.run(command, env=environment, capture_output=True,
+                                          text=True, timeout=30)
+              except (OSError, subprocess.TimeoutExpired) as error:
+                  print("probe error:", type(error).__name__, flush=True)
+                  failed = True
+                  return
+              print(redact(result.stdout), end="", flush=True)
+              print(redact(result.stderr), end="", flush=True)
+              print("exit status:", result.returncode, flush=True)
+              failed |= result.returncode != 0
+
+          print("environment variable names only:", json.dumps(sorted(
+              k for k in os.environ if k.startswith(("PIP", "PYTHON")) or
+              k in {"HOME", "VIRTUAL_ENV"})), flush=True)
+          run("which -a python3", ["which", "-a", "python3"])
+          run("python3 -m pip --version", ["python3", "-B", "-m", "pip", "--version"])
+          try:
+              from pip._internal.configuration import Configuration
+              location_keys = {"global.user", "install.user", "global.target", "install.target",
+                               "global.prefix", "install.prefix", ":env:.user",
+                               ":env:.target", ":env:.prefix"}
+              config = Configuration(isolated=False)
+              config.load()
+              print("pip location settings (values withheld):", json.dumps(sorted(
+                  k for k, _ in config.items() if k in location_keys)), flush=True)
+          except Exception as error:
+              print("pip configuration error:", type(error).__name__, flush=True)
+              failed = True
+
+          probe = """import importlib.util, json, os, site, sys
+          spec = importlib.util.find_spec("pip")
+          vendored = None
+          try:
+              from pip._vendor.packaging.requirements import Requirement
+              from pip._vendor.packaging.version import Version
+          except ImportError as error:
+              vendored = type(error).__name__
+          print(json.dumps({"executable": sys.executable, "real_executable": os.path.realpath(sys.executable),
+              "base_executable": getattr(sys, "_base_executable", None), "version": sys.version,
+              "prefix": sys.prefix, "base_prefix": sys.base_prefix, "path": sys.path,
+              "global_sites": site.getsitepackages(), "user_site": site.getusersitepackages(),
+              "user_site_enabled": site.ENABLE_USER_SITE, "home_present": "HOME" in os.environ,
+              "isolated": sys.flags.isolated,
+              "sitecustomize": getattr(sys.modules.get("sitecustomize"), "__file__", None),
+              "usercustomize": getattr(sys.modules.get("usercustomize"), "__file__", None),
+              "pip_origin": None if spec is None else spec.origin, "vendored_import_error": vendored}))
+          sys.exit(int(spec is None or vendored is not None))
+          """
+          for label, flags, environment in (
+              ("normal", [], None),
+              ("isolated", ["-I"], None),
+              ("stripped", [], {"PATH": os.defpath}),
+              ("isolated and stripped", ["-I"], {"PATH": os.defpath}),
+          ):
+              run(label, [sys.executable, *flags, "-B", "-c", probe], environment)
+          sys.exit(int(failed))
+          PY
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: source
+        if: ${{ !cancelled() }}
+        with:
+          persist-credentials: false
+
+      - name: Install workflow YAML parser
+        id: dependencies
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        run: python3 -m pip install 'PyYAML==6.0.3' -r facts/requirements-validation.txt
+
+      - name: Download published hpo wheels
+        id: wheels
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 --max-time 120 \
+            'https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v0.15.0/pineforge_hpo-0.15.0-py3-none-any.whl' \
+            -o pineforge_hpo-0.15.0-py3-none-any.whl
+          printf '%s\n' 'ee09f5fd72fd43c26027c294d0e871ab6f3d856fbc5d28c53910a3bbcfa968a6  pineforge_hpo-0.15.0-py3-none-any.whl' > hpo-accepted.sha256
+          sha256sum -c --strict hpo-accepted.sha256
+          curl -fsSL --retry 3 --max-time 120 \
+            'https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v0.13.2/pineforge_hpo-0.13.2-py3-none-any.whl' \
+            -o pineforge_hpo-0.13.2-py3-none-any.whl
+          printf '%s\n' '57fff4c49cba794a9657e7882376eee294366843cf0442306195b8390dd0d073  pineforge_hpo-0.13.2-py3-none-any.whl' > hpo-rejected.sha256
+          sha256sum -c --strict hpo-rejected.sha256
+          {
+            echo "PINEFORGE_HPO_ACCEPTED_WHEEL=$RUNNER_TEMP/pineforge_hpo-0.15.0-py3-none-any.whl"
+            echo "PINEFORGE_HPO_REJECTED_WHEEL=$RUNNER_TEMP/pineforge_hpo-0.13.2-py3-none-any.whl"
+          } >> "$GITHUB_ENV"
+
+      - name: Reproduce published transpile bounds
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && steps.wheels.outcome == 'success' }}
+        continue-on-error: true
+        run: python3 -m unittest discover -s tests -p 'test_release_hpo_image.py' -k 'HpoResolutionTest.test_published_transpile_bounds_against_codegen_1_5_0' -v
