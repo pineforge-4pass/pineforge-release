@@ -295,8 +295,9 @@ receiver created at or after dispatch. Receipt roles use the
 `pineforge-release` workflow marker; compute uses its `release-pair` marker.
 The check uses `event_id` in the display title or artifact name where
 available; otherwise it reports `event_id_match: unavailable` and uses that
-receiver workflow's creation time. It makes five polls with sleeps of 5, 15,
-30 and 60 seconds and has a fixed API-call budget. Missing startup or an
+receiver workflow's creation time. It makes eight polls with sleeps of up to
+240 seconds, about ten minutes in total, and a fixed API-call budget; a found
+run ends the wait at once. Missing startup or an
 already failed/cancelled receiver run fails notification with role, repository,
 tag and event identity. No blind redispatch follows a receiver failure. A
 queued or running receiver proves startup, while receipt checks remain

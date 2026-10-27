@@ -18,10 +18,10 @@ from release_contract import (ASSET, EVENT_TYPES, HUB, Invalid, Pending, ROLES, 
 import release_pipeline as pipeline
 
 
-# Five polls and 110 seconds of sleeps keep a notify matrix well below the CI
-# round bound while allowing GitHub Actions to enqueue a repository dispatch.
-RECEIVER_RUN_POLL_DELAYS_SECONDS = (0, 5, 15, 30, 60)
-RECEIVER_API_CALL_BUDGET = 16
+# Eight polls and 650 seconds of sleeps allow GitHub Actions to enqueue a
+# repository dispatch before a missing receiver run fails notification.
+RECEIVER_RUN_POLL_DELAYS_SECONDS = (0, 5, 15, 30, 60, 120, 180, 240)
+RECEIVER_API_CALL_BUDGET = 64
 RECEIVER_CHECK_API_CALL_BUDGET = 64
 RECEIVER_MAX_API_PAGES = 8
 RECEIVER_WORKFLOW_MARKERS = {
