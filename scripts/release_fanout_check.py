@@ -32,6 +32,11 @@ TARGET_ENVIRONMENT = {
     role: "RELEASE_TARGET_" + role.upper() + "_REPOSITORY"
     for role in ROLES
 }
+PUBLIC_RECEIVER_REPOSITORIES = {
+    "offline": "pineforge-backtest-mcp",
+    "data": "pineforge-data",
+    "license": "pineforge-license",
+}
 PROTECTED_PATH_MARKERS = (
     (".config", "zsh", "keys"),
     (".config", "pineforge"),
@@ -111,6 +116,10 @@ def object_pages(client, route, key, budget=None):
 def repository_name(repository):
     match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", repository)
     return "pineforge-4pass/" + repository
+
+
+def repository_display(role, repository):
+    return repository if PUBLIC_RECEIVER_REPOSITORIES.get(role) == repository else role
 
 
 def receiver_runs(client, role, repository, dispatched_at, budget):
@@ -202,8 +211,11 @@ def run_result(repository, found):
 
 
 def wait_for_receiver(client, role, repository, tag, event_id, dispatched_at, *,
-                      sleep=time.sleep, poll_delays=RECEIVER_RUN_POLL_DELAYS_SECONDS):
+                      sleep=time.sleep, poll_delays=RECEIVER_RUN_POLL_DELAYS_SECONDS,
+                      repo_display=None):
     repository_name(repository)
+    display = repository if repo_display is None else repo_display
+    repository_name(display)
     require(role in EVENT_TYPES, "unknown receiver role")
     match(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc)\.[0-9]+)?", tag)
     match("sha256:" + SHA, event_id)
@@ -215,19 +227,21 @@ def wait_for_receiver(client, role, repository, tag, event_id, dispatched_at, *,
         try:
             found = find_receiver_run(client, role, repository, event_id, dispatched_at, budget)
         except (Invalid, Pending) as error:
-            raise Invalid("receiver run check failed: role=" + role + " repo=" + repository
-                          + " tag=" + tag + " event_id=" + event_id + ": " + str(error)) from error
+            public_details = repo_display is None or PUBLIC_RECEIVER_REPOSITORIES.get(role) == repository
+            reason = str(error) if public_details else "receiver API unavailable"
+            raise Invalid("receiver run check failed: role=" + role + " repo=" + display
+                          + " tag=" + tag + " event_id=" + event_id + ": " + reason) from error
         if found is None:
             continue
         result = run_result(repository, found)
         if result["failed"]:
             raise Invalid(
-                "receiver run failed: role=" + role + " repo=" + repository
+                "receiver run failed: role=" + role + " repo=" + display
                 + " tag=" + tag + " event_id=" + event_id
                 + " run_id=" + str(result["id"])
                 + " conclusion=" + str(result["conclusion"]))
         return result
-    raise Invalid("receiver run missing: role=" + role + " repo=" + repository
+    raise Invalid("receiver run missing: role=" + role + " repo=" + display
                   + " tag=" + tag + " event_id=" + event_id)
 
 
@@ -289,6 +303,7 @@ def check_release(hub_client, receiver_client, tag, *, roles=None, excluded=None
     rows = []
     for role in ROLES:
         target = targets.get(role, os.environ.get(TARGET_ENVIRONMENT[role], ""))
+        public_target = PUBLIC_RECEIVER_REPOSITORIES.get(role) == target
         accounted = role in enabled or role in excluded_set
         if role not in enabled:
             rows.append({
@@ -296,6 +311,7 @@ def check_release(hub_client, receiver_client, tag, *, roles=None, excluded=None
                 "enabled": False,
                 "excluded": role in excluded_set,
                 "accounted": accounted,
+                "ok": role in excluded_set,
                 "repository": None,
                 "dispatched": False,
                 "receiver_run_found": False,
@@ -331,20 +347,23 @@ def check_release(hub_client, receiver_client, tag, *, roles=None, excluded=None
                     result = run_result(target, found)
                     if result["failed"]:
                         error = "receiver run concluded " + str(result["conclusion"])
+            except Pending:
+                error = "receiver run unavailable"
             except (Invalid, KeyError, TypeError, ValueError) as caught:
-                error = str(caught)
+                error = str(caught) if public_target else "receiver run check failed"
         rows.append({
             "role": role,
             "enabled": True,
             "excluded": False,
             "accounted": True,
-            "repository": target,
+            "ok": dispatched and result is not None and not error,
+            "repository": repository_display(role, target),
             "dispatched": dispatched,
             "receiver_run_found": result is not None,
             "run_id": None if result is None else result["id"],
             "status": None if result is None else result["status"],
             "conclusion": None if result is None else result["conclusion"],
-            "url": None if result is None else result["url"],
+            "url": result["url"] if result is not None and public_target else None,
             "event_id_match": None if result is None else result["event_id_match"],
             "error": error,
         })
@@ -354,10 +373,7 @@ def check_release(hub_client, receiver_client, tag, *, roles=None, excluded=None
         "event_id": event_id,
         "excluded": excluded,
         "roles": rows,
-        "ok": all(row["excluded"] or
-                  (row["enabled"] and row["dispatched"]
-                   and row["receiver_run_found"] and not row["error"])
-                  for row in rows),
+        "ok": all(row["ok"] for row in rows),
     }
 
 
@@ -369,7 +385,7 @@ def render_human(report):
     ]
     for row in report.get("roles", []):
         state = "enabled" if row.get("enabled") else "excluded" if row.get("excluded") else "unaccounted"
-        lines.append("{} | {} | {} | {} | {} | {} | {}".format(
+        lines.append("{} | {} | {} | {} | {} | {} | {} | {}".format(
             row.get("role", ""), state, row.get("repository") or "-",
             str(row.get("dispatched", False)).lower(),
             str(row.get("run_id") or "-"),
@@ -392,6 +408,7 @@ def main():
     wait.add_argument("--tag", required=True)
     wait.add_argument("--role", choices=pipeline.ROLES, required=True)
     wait.add_argument("--repository", required=True)
+    wait.add_argument("--repo-display")
     wait.add_argument("--delivery", required=True)
     args = parser.parse_args()
     try:
@@ -406,13 +423,18 @@ def main():
             return 0 if report["ok"] else 1
         delivery = read_delivery(args.delivery)
         require(delivery["consumer"] == args.role, "delivery role differs")
+        display = repository_display(args.role, args.repository)
+        require(args.repo_display is None or args.repo_display == display,
+                "receiver repository display differs")
         client = Client()
         result = wait_for_receiver(
             client, args.role, args.repository, args.tag,
-            delivery["event_id"], delivery["timestamp"])
+            delivery["event_id"], delivery["timestamp"], repo_display=args.repo_display or display)
+        if PUBLIC_RECEIVER_REPOSITORIES.get(args.role) != args.repository:
+            result["url"] = None
         print(canonical({
             "schema": "pineforge/release-fanout/v1", "role": args.role,
-            "repository": args.repository, "tag": args.tag,
+            "repository": display, "tag": args.tag,
             "event_id": delivery["event_id"], "receiver": result,
         }).decode("utf-8"), end="")
         return 0

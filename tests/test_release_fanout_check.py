@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import copy
+import io
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import release_contract as contract  # noqa: E402
@@ -72,21 +75,23 @@ class HubClient:
         return self.assets[asset_id]
 
 
-def release_with_delivery():
+def release_with_delivery(roles=("hosted",)):
     ready = contract.canonical({"event_id": EVENT_ID, "timestamp": DISPATCHED_AT})
-    hosted = contract.canonical({
-        "schema": "pineforge/release-delivery/v1", "event_id": EVENT_ID,
-        "consumer": "hosted", "state": "dispatch_accepted", "attempt": 1,
-        "run_id": 41, "timestamp": DISPATCHED_AT,
-    })
     release = {
         "tag_name": TAG, "draft": False,
-        "assets": [
-            {"id": 1, "name": "release-ready.json", "state": "uploaded"},
-            {"id": 2, "name": "delivery-hosted.json", "state": "uploaded"},
-        ],
+        "assets": [{"id": 1, "name": "release-ready.json", "state": "uploaded"}],
     }
-    return HubClient(release, {1: ready, 2: hosted})
+    assets = {1: ready}
+    for asset_id, role in enumerate(roles, start=2):
+        release["assets"].append({
+            "id": asset_id, "name": f"delivery-{role}.json", "state": "uploaded",
+        })
+        assets[asset_id] = contract.canonical({
+            "schema": "pineforge/release-delivery/v1", "event_id": EVENT_ID,
+            "consumer": role, "state": "dispatch_accepted", "attempt": 1,
+            "run_id": 41, "timestamp": DISPATCHED_AT,
+        })
+    return HubClient(release, assets)
 
 
 class ReleaseFanoutCheckTests(unittest.TestCase):
@@ -262,6 +267,139 @@ class ReleaseFanoutCheckTests(unittest.TestCase):
         self.assertFalse(application["receiver_run_found"])
         self.assertFalse(report["ok"])
         self.assertEqual(report["event_id"], EVENT_ID)
+
+    def test_receiver_404_is_a_failing_role_without_aborting_other_roles(self):
+        class MissingReceiverClient(ReceiverClient):
+            def api(self, route):
+                if route.startswith("repos/pineforge-4pass/fixture-hosted/"):
+                    self.routes.append(route)
+                    raise contract.Pending("published artifact unavailable")
+                return super().api(route)
+
+        enabled = ["offline", "hosted", "data"]
+        targets = {
+            "offline": "pineforge-backtest-mcp", "hosted": "fixture-hosted",
+            "data": "pineforge-data",
+        }
+        receiver = MissingReceiverClient([receiver_run(conclusion="success", event_id=EVENT_ID)])
+        report = fanout.check_release(
+            release_with_delivery(enabled), receiver, TAG, roles=enabled,
+            excluded=[role for role in contract.ROLES if role not in enabled], targets=targets)
+        self.assertEqual([row["role"] for row in report["roles"]], list(contract.ROLES))
+        rows = {row["role"]: row for row in report["roles"]}
+        self.assertFalse(report["ok"])
+        self.assertFalse(rows["hosted"]["ok"])
+        self.assertTrue(rows["hosted"]["dispatched"])
+        self.assertFalse(rows["hosted"]["receiver_run_found"])
+        self.assertEqual(rows["hosted"]["error"], "receiver run unavailable")
+        self.assertIn("receiver run unavailable", fanout.render_human(report))
+        for role in ("offline", "data"):
+            self.assertTrue(rows[role]["ok"])
+            self.assertTrue(rows[role]["receiver_run_found"])
+            self.assertEqual(rows[role]["run_id"], 7001)
+            self.assertIsNone(rows[role]["error"])
+        self.assertEqual(len(receiver.routes), 3)
+
+    def test_check_report_masks_secret_targets_and_retains_public_targets(self):
+        public = {
+            "offline": "pineforge-backtest-mcp", "data": "pineforge-data",
+            "license": "pineforge-license",
+        }
+        for role in contract.ROLES:
+            target = public.get(role, "fixture-private-" + role)
+            for conclusion in ("success", "failure"):
+                with self.subTest(role=role, conclusion=conclusion):
+                    run = receiver_run(
+                        conclusion=conclusion, event_id=EVENT_ID,
+                        workflow="release-pair" if role == "compute" else "pineforge-release")
+                    run["html_url"] = f"https://github.com/pineforge-4pass/{target}/actions/runs/7001"
+                    report = fanout.check_release(
+                        release_with_delivery([role]), ReceiverClient([run]), TAG, roles=[role],
+                        excluded=[other for other in contract.ROLES if other != role],
+                        targets={role: target})
+                    row = next(row for row in report["roles"] if row["role"] == role)
+                    self.assertEqual(report["ok"], conclusion == "success")
+                    self.assertTrue(row["receiver_run_found"])
+                    self.assertEqual(row["run_id"], 7001)
+                    rendered = contract.canonical(report).decode() + fanout.render_human(report)
+                    if role in public:
+                        self.assertEqual(row["repository"], target)
+                        self.assertEqual(row["url"], run["html_url"])
+                        self.assertIn(target, rendered)
+                    else:
+                        self.assertEqual(row["repository"], role)
+                        self.assertIsNone(row["url"])
+                        self.assertNotIn(target, rendered)
+
+    def test_check_report_masks_secret_targets_in_receiver_errors(self):
+        target = "fixture-private-application"
+
+        class UnavailableReceiverClient(ReceiverClient):
+            def api(self, route):
+                self.routes.append(route)
+                raise contract.Invalid("cannot read repository " + target)
+
+        receiver = UnavailableReceiverClient()
+        report = fanout.check_release(
+            release_with_delivery(["application"]), receiver, TAG, roles=["application"],
+            excluded=[role for role in contract.ROLES if role != "application"],
+            targets={"application": target})
+        row = next(row for row in report["roles"] if row["role"] == "application")
+        self.assertFalse(report["ok"])
+        self.assertFalse(row["receiver_run_found"])
+        self.assertEqual(row["error"], "receiver run check failed")
+        self.assertNotIn(target, contract.canonical(report).decode() + fanout.render_human(report))
+        self.assertEqual(len(receiver.routes), 1)
+        self.assertIn("/" + target + "/", receiver.routes[0])
+
+    def test_wait_cli_masks_secret_targets_in_failures_and_successes(self):
+        class UnavailableReceiverClient(ReceiverClient):
+            def api(self, route):
+                self.routes.append(route)
+                raise contract.Pending("published artifact unavailable")
+
+        for role in ("hosted", "application", "web", "compute"):
+            target = "fixture-private-" + role
+            for outcome in ("failure", "queued", "unavailable"):
+                with self.subTest(role=role, outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                    delivery = Path(tmp) / "delivery.json"
+                    delivery.write_bytes(contract.canonical({
+                        "consumer": role, "state": "dispatch_accepted",
+                        "event_id": EVENT_ID, "timestamp": DISPATCHED_AT,
+                    }))
+                    run = receiver_run(
+                        conclusion="failure" if outcome == "failure" else None,
+                        status="completed" if outcome == "failure" else "queued",
+                        event_id=EVENT_ID,
+                        workflow="release-pair" if role == "compute" else "pineforge-release")
+                    run["html_url"] = f"https://github.com/pineforge-4pass/{target}/actions/runs/7001"
+                    receiver = (UnavailableReceiverClient() if outcome == "unavailable"
+                                else ReceiverClient([run]))
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with patch.object(fanout, "Client", return_value=receiver), \
+                            patch.object(sys, "argv", [
+                                "release_fanout_check.py", "wait", "--tag", TAG, "--role", role,
+                                "--repository", target, "--delivery", str(delivery),
+                            ]), patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+                        result = fanout.main()
+                    self.assertEqual(result, 0 if outcome == "queued" else 1)
+                    self.assertIn(role, stdout.getvalue() + stderr.getvalue())
+                    self.assertNotIn(target, stdout.getvalue() + stderr.getvalue())
+                    self.assertIn("following file: " + str(delivery.resolve()), stderr.getvalue())
+                    self.assertEqual(len(receiver.routes), 1)
+                    self.assertIn("/" + target + "/", receiver.routes[0])
+                    # Exercise the same explicit display argument used by notification.
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with patch.object(fanout, "Client", return_value=receiver), \
+                            patch.object(sys, "argv", [
+                                "release_fanout_check.py", "wait", "--tag", TAG, "--role", role,
+                                "--repository", target, "--repo-display", role,
+                                "--delivery", str(delivery),
+                            ]), patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+                        self.assertEqual(fanout.main(), 0 if outcome == "queued" else 1)
+                    self.assertNotIn(target, stdout.getvalue() + stderr.getvalue())
+                    self.assertEqual(len(receiver.routes), 2)
+                    self.assertIn("/" + target + "/", receiver.routes[1])
 
 
 if __name__ == "__main__":

@@ -188,10 +188,11 @@ jobs:
           ROLE: ${{ matrix.consumer }}
           TAG: ${{ matrix.tag }}
           TARGET_REPOSITORY: ${{ env.TARGET_REPOSITORY }}
+          REPO_DISPLAY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || matrix.consumer }}
           DELIVERY_FILE: ${{ runner.temp }}/delivery.json
         run: |
           python3 scripts/release_fanout_check.py wait --tag "$TAG" --role "$ROLE" \
-            --repository "$TARGET_REPOSITORY" --delivery "$DELIVERY_FILE"
+            --repository "$TARGET_REPOSITORY" --repo-display "$REPO_DISPLAY" --delivery "$DELIVERY_FILE"
       - name: Preserve this delivery attempt
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

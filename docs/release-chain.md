@@ -288,6 +288,7 @@ similarly selected by `FACTS_WEB_DISPATCH_ENABLED=true`. Those flags retain
 their existing receipt behavior and do not replace role accounting. Each
 selected receipt role needs a receipt policy; `compute` is delivery-only and
 needs none.
+Example: keeping `web,license` in `RELEASE_READY_EXCLUDE` with `FACTS_WEB_DISPATCH_ENABLED=true` and `FACTS_LICENSE_DISPATCH_ENABLED=true` is the supported combination for facts-only receivers.
 The notify matrix refuses an empty or malformed target before minting a token
 and names the matrix role without exposing the target value.
 After acceptance, notification requires a `repository_dispatch` run of the
@@ -296,10 +297,14 @@ receiver created at or after dispatch. Receipt roles use the
 The check uses `event_id` in the display title or artifact name where
 available; otherwise it reports `event_id_match: unavailable` and uses that
 receiver workflow's creation time. It makes eight polls with sleeps of up to
-240 seconds, about ten minutes in total, and a fixed API-call budget; a found
-run ends the wait at once. Missing startup or an
-already failed/cancelled receiver run fails notification with role, repository,
-tag and event identity. No blind redispatch follows a receiver failure. A
+240 seconds, 650 seconds in total, and a fixed API-call budget; a found
+run ends the wait at once.
+A receiver that has not created its run within the ~650 s window fails the release run; a queued run counts as started.
+Any completed receiver run that did not succeed (failure, cancelled, skipped, neutral, timed out) fails the release run.
+Diagnostics identify the role, tag and event; repository names and run URLs
+are shown only for the fixed public offline, data and license targets.
+The notify step passes `--repo-display` with the role for secret targets.
+No blind redispatch follows a receiver failure. A
 queued or running receiver proves startup, while receipt checks remain
 responsible for full completion. A receipt that remains `pending` does not
 fail publication; the existing age alert continues to report it.
@@ -308,14 +313,22 @@ The finalizer writes a delivery attempt before the notification matrix starts.
 If a later finalizer control fails, the matrix output is forced to `[]`, the
 notify job is skipped, and cleanup appends a release marker for reservations
 from that finalizer run. This keeps an unsent reservation from consuming the
-bounded retry history.
+bounded retry history. A `delivery-<role>.json` acceptance prevents cleanup.
+Release markers are named
+`delivery-attempt-released-<role>-<attempt>-<run_id>-<run_attempt>.json`;
+the next plan reuses the released attempt number with a distinct append-only
+reservation asset. A rerun has its own reservation and release marker.
+Existing reservations and release markers without run-attempt metadata remain
+readable.
 
 `scripts/release_fanout_check.py check --tag vX.Y.Z` reads delivery assets and
 receiver run evidence without writes and prints stable JSON followed by a
 human table for every role. It returns nonzero for an enabled role with a
 missing delivery, missing receiver run or failed run, and for an unaccounted
-role; excluded roles are visible and do not require a delivery. Set
-`RELEASE_TARGET_<ROLE>_REPOSITORY` to the configured short repository names.
+role; excluded roles are visible and do not require a delivery.
+An unavailable receiver API (including a 404) produces a failing role row
+while the check continues reporting the other roles.
+Set `RELEASE_TARGET_<ROLE>_REPOSITORY` to the configured short repository names.
 The optional workflow uses the hub token for public release assets and a
 scoped Actions-read App token for receiver repositories. The
 `release-fanout-check` workflow accepts the same tag for manual inspection.

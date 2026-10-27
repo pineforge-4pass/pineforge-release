@@ -3974,7 +3974,7 @@ class PrTierWorkflowTest(unittest.TestCase):
 
 
 class ReleaseFanoutRegressionTest(unittest.TestCase):
-    """Red-first controls for stable fanout and receiver-start enforcement."""
+    """Configuration pins and receiver-start regression controls."""
 
     def test_consumer_environments_pass_the_configured_exclusion_list(self):
         """Mutation: remove an exclusion binding beside a consumer-list binding."""
@@ -4000,6 +4000,7 @@ class ReleaseFanoutRegressionTest(unittest.TestCase):
         self.assertIn("release-redeliver.yml", checked)
 
     def test_release_ready_consumers_keeps_explicit_selection_meaning(self):
+        """Selection pin; red on earlier main only because release_roles/excluded_roles were absent."""
         sys.path.insert(0, str(REPO / "scripts"))
         import release_pipeline as pipeline
 
@@ -4021,7 +4022,7 @@ class ReleaseFanoutRegressionTest(unittest.TestCase):
         error_line = next(line for line in guard["run"].splitlines() if "::error::" in line)
         self.assertNotIn("TARGET_REPOSITORY", error_line)
 
-    def test_notify_waits_for_a_receiver_run_and_runs_after_finalizer_failure(self):
+    def test_notify_waits_for_a_receiver_run_and_is_skipped_after_finalizer_failure(self):
         finalizer = _workflow("release-finalize.yml")
         notify = finalizer["jobs"]["notify-consumers"]
         self.assertIn("needs.finalize.result == 'success'", notify["if"])
@@ -4035,6 +4036,16 @@ class ReleaseFanoutRegressionTest(unittest.TestCase):
         self.assertIn("needs.finalize.result != 'success'", cleanup["if"])
         self.assertTrue(any("release-attempts" in step.get("run", "")
                             for step in cleanup["steps"]))
+
+    def test_notify_passes_public_repository_names_or_roles_for_receiver_logs(self):
+        notify = _workflow("release-finalize.yml")["jobs"]["notify-consumers"]
+        wait = next(step for step in notify["steps"] if step.get("name") == "Require receiver run")
+        self.assertEqual(wait["env"]["REPO_DISPLAY"],
+                         "${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || "
+                         "matrix.consumer == 'data' && 'pineforge-data' || "
+                         "matrix.consumer == 'license' && 'pineforge-license' || matrix.consumer }}")
+        self.assertIn('--repo-display "$REPO_DISPLAY"', wait["run"])
+        self.assertIn('--repository "$TARGET_REPOSITORY"', wait["run"])
 
 
 if __name__ == "__main__":

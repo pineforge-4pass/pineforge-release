@@ -445,7 +445,7 @@ def aggregate(store, row, event, *, enabled=(), newest=None):
             "complete": all(value in COMPLETE_STATES for value in states.values())}
 
 
-def _reservation_release(row, store, name, event, role, attempt):
+def _reservation_release(row, store, name, event, role, attempt, *, run_id=None, run_attempt=None):
     raw = store.read(row, name)
     if raw is None:
         return False
@@ -454,12 +454,39 @@ def _reservation_release(row, store, name, event, role, attempt):
             and obj.get("consumer") == role and obj.get("attempt") == attempt
             and obj.get("state") == "released", "delivery reservation release differs")
     positive(obj.get("run_id"))
+    require((run_id is None or obj["run_id"] == run_id)
+            and (run_attempt is None or obj.get("run_attempt") == run_attempt),
+            "delivery reservation release run differs")
     match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj.get("timestamp"))
     return True
 
 
-def _attempt_release_name(role, attempt, run_id):
-    return f"delivery-attempt-released-{role}-{attempt}-{run_id}.json"
+def _attempt_release_name(role, attempt, run_id, run_attempt=None):
+    suffix = "" if run_attempt is None else f"-{run_attempt}"
+    return f"delivery-attempt-released-{role}-{attempt}-{run_id}{suffix}.json"
+
+
+def _attempt_released(row, store, event, role, reservation):
+    attempt, run_id = reservation["attempt"], reservation["run_id"]
+    if "run_attempt" in reservation:
+        run_attempt = reservation["run_attempt"]
+        positive(run_attempt)
+        names = [(_attempt_release_name(role, attempt, run_id, run_attempt), run_attempt)]
+    else:
+        # Existing reservations can have either the original marker or a
+        # marker appended by cleanup after the run-attempt format was added.
+        legacy = _attempt_release_name(role, attempt, run_id)
+        prefix = legacy.removesuffix(".json") + "-"
+        names = [(legacy, None)]
+        for asset in store.get(row["tag_name"])["assets"]:
+            name = asset["name"]
+            if name.startswith(prefix) and name.endswith(".json"):
+                run_attempt = int(name[len(prefix):-len(".json")])
+                positive(run_attempt)
+                names.append((name, run_attempt))
+    return any(_reservation_release(row, store, name, event, role, attempt,
+                                    run_id=run_id, run_attempt=run_attempt)
+               for name, run_attempt in names)
 
 
 def plan_delivery(store, row, event, role):
@@ -486,9 +513,7 @@ def plan_delivery(store, row, event, role):
             require(obj["event_id"] == event["event_id"] and obj["consumer"] == role, "delivery attempt identity differs")
             positive(obj["attempt"])
             positive(obj["run_id"])
-            if not _reservation_release(row, store,
-                                        _attempt_release_name(role, obj["attempt"], obj["run_id"]),
-                                        event, role, obj["attempt"]):
+            if not _attempt_released(row, store, event, role, obj):
                 attempts.append(obj)
     attempts.sort(key=lambda obj: obj["attempt"])
     require([obj["attempt"] for obj in attempts] == list(range(1, len(attempts) + 1))
@@ -504,11 +529,13 @@ def plan_delivery(store, row, event, role):
         return None, True
     attempt = len(attempts) + 1
     run_id = int(os.environ["GITHUB_RUN_ID"])
+    run_attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
+    positive(run_attempt)
     reservation_name = f"{prefix}{attempt}.json"
     if store.read(row, reservation_name) is not None:
-        reservation_name = f"{prefix}{attempt}-run-{run_id}.json"
+        reservation_name = f"{prefix}{attempt}-run-{run_id}-{run_attempt}.json"
     store.put(row, reservation_name, canonical({"event_id": event["event_id"], "consumer": role,
-              "attempt": attempt, "run_id": run_id, "timestamp": now()}))
+              "attempt": attempt, "run_id": run_id, "run_attempt": run_attempt, "timestamp": now()}))
     return {"consumer": role, "tag": row["tag_name"], "attempt": attempt}, False
 
 
@@ -517,8 +544,12 @@ def release_delivery_attempts(client, store, tag=""):
     positive(int(os.environ["GITHUB_RUN_ID"]))
     rows = [store.get(tag)] if tag else store.releases()
     current_run = int(os.environ["GITHUB_RUN_ID"])
+    current_attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
+    positive(current_attempt)
     for row in rows:
         for role in ROLES:
+            if store.read(row, f"delivery-{role}.json") is not None:
+                continue
             failed_name = f"delivery-failed-{role}.json"
             failed = store.read(row, failed_name)
             if failed is not None:
@@ -535,14 +566,15 @@ def release_delivery_attempts(client, store, tag=""):
                 if not asset["name"].startswith(prefix):
                     continue
                 obj = decode(store.read(row, asset["name"]))
-                if obj.get("run_id") != current_run:
+                if (obj.get("run_id") != current_run
+                        or obj.get("run_attempt", current_attempt) != current_attempt):
                     continue
-                release_name = _attempt_release_name(role, obj["attempt"], current_run)
+                release_name = _attempt_release_name(role, obj["attempt"], current_run, current_attempt)
                 if store.read(row, release_name) is None:
                     store.put(row, release_name, canonical({
                         "event_id": obj["event_id"], "consumer": role,
                         "attempt": obj["attempt"], "state": "released",
-                        "run_id": current_run, "timestamp": now()}))
+                        "run_id": current_run, "run_attempt": current_attempt, "timestamp": now()}))
 
 
 def redelivery_dispatch(client, target, data):
