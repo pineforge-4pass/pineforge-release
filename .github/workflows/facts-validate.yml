@@ -86,9 +86,12 @@ jobs:
 
   validate:
     needs: authz
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
-    runs-on: ubuntu-latest
+    # PR and merge-group legs stay hosted until the member-only admission workflow is in place.
+    runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}
     steps:
+      - name: Install push runner tools
+        if: github.event_name == 'push'
+        run: sudo apt-get update && sudo apt-get install -y ca-certificates diffutils git python3
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
