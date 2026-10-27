@@ -32,7 +32,8 @@ with Contents or Issues write access. The `publish.yml` reusable
 `notify-consumers` caller obtains its runners from `release-finalize.yml`.
 
 `pull_request` and `pull_request_target` workflows must never use this class.
-The PR jobs in `python-test.yml` and `facts-validate.yml` also use
+The PR jobs in `python-test.yml` and `facts-validate.yml` also use GitHub-hosted runners.
+Their `authz` jobs use `runs-on: ubuntu-24.04`; the other PR jobs use
 `runs-on: ubuntu-latest` per the owner decision.
 The hub runs these jobs on GitHub-hosted runners without waiting for
 the release pool. These hosted jobs do not require a release runner group allowlist.
@@ -527,6 +528,10 @@ The PR object has exactly these fields:
 | `head` | Commit, the actual PR head. |
 | `merge` | `null` before merge, then the actual merge/squash commit. |
 
+In `pr_open`, `testing`, and supported `ready` receipts, `merge` may stay `null`.
+Any non-null value must be a valid commit SHA and equal GitHub's actual merge
+commit for a merged PR; an unmerged PR cannot claim a merge.
+
 A check-evidence object has exactly these fields, for each of `ci`, `e2e`,
 `deploy`, and the conditional application `post_merge`:
 
@@ -561,23 +566,53 @@ only `run_id`, `run_attempt`, and `inventory_sha256`, the SHA-256 of the canonic
 results object, in the same form as `deploy`.
 
 **Hosted post-merge E2E.** Hosted now uses CI `release-pr.yml`, E2E
-`release-postmerge.yml` and deploy `release.yml`. E2E requires exactly
+`release-postmerge.yml` and deploy `release.yml`. Hosted `verified` means
+deployed AND the post-deploy smoke passed. This smoke is NOT a pre-deploy gate.
+The consumer owns smoke-after-deploy sequencing; the hub checks successful
+deploy and E2E evidence with the time bounds below, without comparing their
+completion times. E2E requires exactly
 `["authz", "build", "verified"]` with no approved skips. Its run and
 `preview.source` bind to `pr.merge`; the run must use `workflow_dispatch` on
 `main`, also the repository default branch and PR base. Its jobs must finish
 at or after the PR's actual `merged_at` and at or before the receipt timestamp;
-CI still finishes before merge. The run must retain exactly one non-expired
+CI still finishes before merge.
+
+The hub reads `.github/workflows/release-postmerge.yml` through GitHub's
+contents API at both `pr.base_sha` and `pr.merge`. Both must identify files with
+valid blob SHAs, and those blob SHAs must be equal. A changed gate is REFUSED
+with "postmerge workflow differs from tested base", even if its jobs and evidence
+artifact succeed. A PR that edits this gate must land first on its own; release
+with a later PR whose tested base already contains the new gate.
+
+The run must retain exactly one non-expired
 `postmerge-evidence-<run_id>-<run_attempt>` artifact; the hub checks its name and
 existence, while its contents remain the hosted repository's private contract.
-A `ready` receipt is refused under this policy, even with null `e2e` or an
-already merged PR. E2E must be non-null exactly in `verified`. The verifier takes
-the old coordinator path below only while the live `hosted` policy entry is the
-old coordinator policy.
+Keep that evidence non-expired at least as long as every referencing
+`release-receipt-hosted` artifact: its expiry must be no earlier than theirs,
+including when the uploads occur at different times. Otherwise a later
+validation refuses even an already-published verified receipt with
+"missing/ambiguous postmerge evidence". The existing stored-receipt sweep skip
+can avoid revalidation; callbacks still recheck the evidence.
+
+A `ready` receipt is refused under this policy before E2E is read, with either
+null or non-null `e2e`, even for an already merged PR. E2E must be non-null
+exactly in `verified`. The verifier takes the old coordinator path below only
+while the live `hosted` policy entry is the old coordinator policy.
 There is one live policy per role and no per-event or per-date policy, so after
-the `hosted` key is replaced by the post-merge policy, a retained coordinator-shape
-`verified` receipt is refused with "required check inventory differs from owner policy".
-Retained receipts whose evidence is null (`pending`, `failed`, `superseded`,
-`skipped_by_policy`) are unaffected.
+the `hosted` key is replaced by the post-merge policy:
+
+- A coordinator-shape `verified` receipt is refused with
+  "required check inventory differs from owner policy".
+- Every non-verified coordinator-era snapshot with non-null `e2e` is refused
+  with "postmerge E2E is required exactly in verified state". This includes
+  `pending`, `pr_open`, `testing`, `ready`, `merged`, `deploying`, `failed`,
+  `superseded`, and `skipped_by_policy`.
+- New-policy `merged` and `deploying` receipts with `e2e: null` are accepted
+  when their CI, actual merge, tested base and preview checks pass. Their public
+  receipts contain no `e2e` key.
+
+Retain the coordinator-era artifacts as release records; the hosted rollout
+order below explains how the collector handles their refusals.
 
 **Hosted coordinator binding.** Only consumer `hosted`, with CI workflow
 `release-pr.yml` and E2E workflow `release-coordinator.yml`, can use the base-code
@@ -702,14 +737,33 @@ already stored, so dropping the form earlier makes each such artifact fail
 validation; in a sweep it is reported and skipped (see the collector skip rules
 below), and a callback naming that run still fails closed.
 
-**Legacy offline `previous`.** Only a product receipt with `consumer: offline` may
-record a predecessor that has no `release-lock.json`, and only in `previous`; the
-object is refused in `preview`, `deployed`, every other consumer and every
-facts-only receipt. It has exactly five keys: `legacy` (the boolean `true`),
-`npm_version` (bare canonical semver, no leading `v`), `npm_integrity` (`sha512-`
-plus the canonical base64 encoding of 64 bytes: 86 base64 characters and `==`),
-`git_head` (a commit) and `image_digest` (a digest, never `null`). The hub checks
-shape only; it does not pin the values to a particular release.
+**Legacy offline `previous` (temporary).** Only a product receipt with
+`consumer: offline` may record the real `@pineforge/backtest-mcp` 0.9.40
+predecessor in this form, and only in `previous`; it is refused in `preview`,
+`deployed`, every other consumer and every facts-only receipt. That predecessor
+has no `release-lock.json`. The object has exactly five keys, and every value
+must equal this pin:
+
+```json
+{
+  "legacy": true,
+  "npm_version": "0.9.40",
+  "npm_integrity": "sha512-o1hmSb6FwjkF8lIwLhENJV+YPbYqSwG1KPvHyViPj5Yan3aHoNRCpM5uINaYbjZKjGS95VDClmASOUSD6ZktVw==",
+  "git_head": "b988217f2aa21b6b772fb723adbc89bd4130c3f5",
+  "image_digest": "sha256:129aa9cb5db4400523d1fc12a11671cfb820f934d893e4ee8945cd25c5bc202d"
+}
+```
+
+`legacy` must be the boolean `true`; `npm_version` is bare canonical semver;
+`npm_integrity` is `sha512-` plus the canonical base64 encoding of 64 bytes
+(86 base64 characters and `==`); `git_head` is a commit and `image_digest` is a
+digest, never `null`. The image digest is the multi-architecture OCI index of
+`ghcr.io/pineforge-4pass/pineforge-backtest-mcp:v0.9.40`. The hub enforces the
+exact identity and scope. The receipt's `release_version` identifies the hub
+release, so it does not establish the current offline package version.
+
+**Removal:** remove this legacy exception in the first hub release after offline
+MCP ships its first non-legacy release through the new chain (0.9.43 or later).
 
 **State machine.** Ordered progress is
 `pending → pr_open → testing → ready → merged → deploying → verified`.
@@ -721,7 +775,7 @@ reported state even if earlier snapshots were never collected.
 | `pending` | Target accepted by coordinator; evidence fields may all be null. |
 | `pr_open` | Current same-repository PR with tested base/head recorded. |
 | `testing` | Same PR evidence; tests are in progress, not yet sufficient for ready. |
-| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. Under the hosted post-merge policy, a `ready` receipt is not used: its E2E and preview bind to the merge commit, so the hub refuses a pre-merge `ready` receipt; `e2e` is non-null exactly in `verified`. |
+| `ready` | PR + successful complete CI/E2E inventories + preview source/image/facts identity. Under the hosted post-merge policy, the hub refuses every `ready` receipt before reading E2E, even for an already merged PR; `e2e` is non-null exactly in `verified`. |
 | `merged` | Ready evidence plus actual merge commit, tested first parent and CI/E2E completion before merge (CI only for hosted post-merge). |
 | `deploying` | Same evidence as merged; serving has not yet been verified. |
 | `verified` | All prior gates + successful complete deploy inventory + deployed and previous identities; report source is the merge commit. Hosted post-merge requires its E2E here. Application also requires its post-merge gate when configured. |
@@ -1022,13 +1076,14 @@ their required branch checks, and no consumer may use an admin merge. Configure
 `release/ready` requires successful authz and change detection, then the complete
 suite inventory; only a verified documentation-only PR may skip suites.
 
-The hub's `python-test.yml` and `facts-validate.yml` PR checks use the literal
+The hub's `python-test.yml` and `facts-validate.yml` PR checks use GitHub-hosted
+runners: `authz` uses `runs-on: ubuntu-24.04`; the other PR jobs use
 `runs-on: ubuntu-latest` per owner decision 10-21 (msg 1562390657274748981),
 a standing R6/rule-B exception for pineforge-release, without a `PF_CI_LABELS`
 environment variable. Both workflows run on every pull request without path or
 branch filters. Their first job is the canonical `authz` from
-`ci-labels.md` with the owner-approved runner exception, `name: authz`,
-`runs-on: ubuntu-latest`, `permissions: {}`, no
+`ci-labels.md`, `name: authz`,
+`runs-on: ubuntu-24.04`, `permissions: {}`, no
 condition, checkout or secrets, and the canonical no-timeout comment.
 Its eight payload fields are `EVENT`, `REPO`, `HEAD_REPO`, `HEAD_IS_FORK`,
 `ASSOCIATION`, `PR_AUTHOR`, `WR_HEAD_REPO` and `WR_ACTOR`; the other two
@@ -1043,9 +1098,13 @@ or `write` read from GitHub.
 An author outside the bot allowlist reported as `CONTRIBUTOR`, including a
 member with private organization membership, passes only with `admin`,
 `maintain` or `write` permission read from GitHub; a failed lookup refuses the run.
-For `workflow_run`, authz requires this repository's head and either an
-allowlisted bot or triggering-actor permission `admin`, `maintain` or
-`write`; a failed permission lookup refuses the run.
+For `workflow_run`, authz requires non-empty `WR_HEAD_REPO` and `WR_ACTOR`;
+`WR_HEAD_REPO` must equal `REPO`. The only bots accepted are
+`pineforge-app[bot]` or `pineforge-ci-dispatcher[bot]`.
+`ALLOWED_BOTS` applies only to `pull_request`; `dependabot[bot]` and every other
+`*"[bot]"` login are refused without a permission lookup. Other, non-bot actors
+require `admin`, `maintain` or `write` permission read from GitHub; a failed
+permission lookup refuses the run.
 The allowed ordinary events are `push`, `workflow_dispatch`, `schedule`,
 `merge_group`, `release`, `workflow_call` and `repository_dispatch`;
 `pull_request_target` and unknown events fail red.
@@ -1234,20 +1293,60 @@ expires. Changing any inventory has the same effect.
 **Hosted rollout order.**
 `collect` re-validates every retained `release-receipt-hosted` artifact in ascending
 run-id order, except an artifact the hub already stored (collector skip rules below).
-After the `hosted` policy swap, a retained coordinator-shape `verified` artifact that
-the hub has NOT already stored is refused by validation ("required check inventory
-differs from owner policy"); in a sweep (the scheduled sweep and a manual `--run-id 0`
-sweep) it is reported with a `::warning::` line and one incident issue per role
+After the `hosted` policy swap, retained coordinator-shape `verified` artifacts
+and every non-verified snapshot with non-null `e2e` are refused as listed above
+when they reach validation. This covers `pending`, `pr_open`, `testing`, `ready`,
+`merged`, `deploying`, `failed`, `superseded`, and `skipped_by_policy`, rather
+than only `verified`. In a sweep (the scheduled sweep and a manual `--run-id 0`
+sweep), each refusal is reported with a `::warning::` line and one incident issue per role
 (`Release chain: receipt artifacts skipped (hosted)`) and skipped, and the sweep
-continues with the remaining artifacts. One that the hub already stored with the
-same or a greater `(attempt, sequence)` is not validated at all. A collection
+continues with the remaining artifacts. An artifact is omitted from validation
+when the hub already stored a greater `(attempt, sequence)`, or the same key
+with the same canonical-evidence digest. A collection
 triggered by a callback names one run id, checks only that run and still fails
 closed, so a new post-merge receipt verifies through its callback either way.
-Removing the retained coordinator-shape artifacts from the hosted repository before
-the swap is no longer required; the stored public form is recorded on the hub
-release as `consumer-hosted-<run>-<sequence>.json`.
+Keep the coordinator-era artifacts and their public receipts as release records.
+The stored public form is recorded on the hub release as
+`consumer-hosted-<attempt>-<sequence>.json`, where `attempt` is the receipt's
+automation attempt and `sequence` its snapshot sequence.
 
-**Collector skip rules.** In a sweep, a bad or old-shape artifact is reported with a `::warning::` line and one stable incident issue per role, then skipped. An artifact is not re-validated when the hub already stored a receipt for that role and release with a greater `(attempt, sequence)`, or the same key and the same canonical-evidence digest. Facts-only artifacts are still validated. A callback names one run and still fails closed; `OSError` stays fatal, while `Pending` (unknown release, unavailable artifact) is reported and skipped in a sweep. The incident issue lists at most 50 runs and a count of any additional skipped runs, reasons are reduced to a fixed safe character set, and the issue is not closed automatically when the artifacts expire.
+**KNOWN NOISE until follow-up B.** The reported 30-minute
+`Release chain: receipt failed` reopening caused by retained old-policy artifacts
+is KNOWN NOISE until the collector skips old-policy artifacts using an EXPLICIT
+policy-version marker. That marker is not implemented. This base's sweep already
+isolates validation refusals and continues with the per-role
+`Release chain: receipt artifacts skipped (hosted)` issue, so these refusals
+alone no longer cause the earlier sweep-wide failure. Callbacks still fail closed.
+Keep the warnings and issue reopening visible; preserve the old artifacts.
+
+**Collector skip rules.** In a sweep, a bad or old-shape artifact is reported
+with a `::warning::` line and one stable incident issue per role, then skipped.
+This includes encrypted ZIP entries, unsupported compression and corrupt
+compressed data. An artifact is not re-validated when the hub already stored a
+receipt for that role and release with a greater `(attempt, sequence)`, or the
+same key, canonical-evidence digest **and reporting run ID**. Equal evidence
+from a different reporting run is validated and refused as receipt identity
+reuse. Facts-only artifacts are still validated. A callback names one run and
+still fails closed. Non-404 HTTP errors (including authentication, rate limits
+and server failures) and transport errors from the real client stay fatal;
+`OSError` also stays fatal. `Pending` (unknown release, unavailable artifact)
+is reported and skipped in a sweep. The incident issue lists at most 50 runs
+and a count of any additional skipped runs, reasons are reduced to a fixed safe
+character set, and the issue is not closed automatically when the artifacts
+expire.
+
+After processing all candidates and reporting skips, the sweep checks the
+required product targets for its role. A published, manifest-backed release
+requires a stored receipt when the role is in `RELEASE_READY_CONSUMERS` or the
+release has an accepted `delivery-<role>.json` audit. The audit preserves this
+requirement when only the workflow planner received the product configuration.
+Draft and rejected releases, releases superseded by a newer stable release,
+and the aggregate's prerelease policy skips are exempt. A missing required
+receipt fails the collector, including when no artifact was discovered or
+every candidate was skipped. A valid receipt of an intermediate state
+satisfies collection; aggregate completion still requires its terminal
+completion states. Facts-only polling creates no product delivery requirement
+and retains its separate canonical-history and freshness checks.
 
 ## Rollback and validation
 

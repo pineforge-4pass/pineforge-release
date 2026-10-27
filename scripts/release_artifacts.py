@@ -26,6 +26,10 @@ PRODUCERS = {"engine": "pineforge-4pass/pineforge-engine",
 ENGINE_LINUX_ONLY_FROM = pair.parse("1.8.0")
 
 
+class RequestError(Invalid):
+    """HTTP/transport failure, never a skippable malformed artifact."""
+
+
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, msg, headers, new_url):
         redirected = super().redirect_request(request, fp, code, msg, headers, new_url)
@@ -64,9 +68,9 @@ class Client:
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 raise Pending("published artifact unavailable") from None
-            raise Invalid(f"artifact request failed (HTTP {error.code})") from None
+            raise RequestError(f"artifact request failed (HTTP {error.code})") from None
         except (urllib.error.URLError, TimeoutError, OSError):
-            raise Invalid("artifact transport failed") from None
+            raise RequestError("artifact transport failed") from None
 
     def api(self, route, *, method="GET", data=None):
         return decode(self.request("https://api.github.com/" + route, method=method, data=data, github=True) or b"null")

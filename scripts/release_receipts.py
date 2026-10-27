@@ -14,13 +14,15 @@ import io
 import os
 import sys
 import zipfile
+import zlib
 from pathlib import Path
 
-from release_artifacts import Client
+from release_artifacts import Client, RequestError
 from release_contract import (ASSET, COMMIT, HUB, RECEIPT_ROLES, ROLES, SHA, Invalid, Pending,
                               canonical, decode, keys, match, payload, positive,
                               require, sha256, version)
-from release_pipeline import Store, receipt_roles, receipts, report_issue, run_link
+from release_pipeline import (Store, configured_roles, finalized_version, receipt_roles,
+                              receipts, report_issue, run_link)
 
 STATES = ("pending", "pr_open", "testing", "ready", "merged", "deploying", "verified", "failed", "superseded", "skipped_by_policy")
 RANK = {state: i for i, state in enumerate(STATES[:7])}
@@ -42,6 +44,18 @@ DATA_BOOTSTRAP_PREVIOUS = {
         "pineforge_data-0.3.0-py3-none-any.whl": "609b3e9976ae55fc290c725731cf1dd0266c9b3eb6f3353122c8bcdc05e497bc",
         "pineforge_data-0.3.0.tar.gz": "f29a2bd50f70ff46ebdf31f987260dec3123600ab5bf493741bbbd4e21aaacdc",
     },
+}
+
+# TEMPORARY real offline 0.9.40 predecessor. Remove in the first hub release after
+# offline MCP ships its first non-legacy release through the new chain (0.9.43 or later).
+# See docs/release-chain.md.
+OFFLINE_LEGACY_PREVIOUS = {
+    "legacy": True,
+    "npm_version": "0.9.40",
+    "npm_integrity": "sha512-o1hmSb6FwjkF8lIwLhENJV+YPbYqSwG1KPvHyViPj5Yan3aHoNRCpM5uINaYbjZKjGS95VDClmASOUSD6ZktVw==",
+    "git_head": "b988217f2aa21b6b772fb723adbc89bd4130c3f5",
+    # Multi-architecture index of ghcr.io/pineforge-4pass/pineforge-backtest-mcp:v0.9.40.
+    "image_digest": "sha256:129aa9cb5db4400523d1fc12a11671cfb820f934d893e4ee8945cd25c5bc202d",
 }
 
 
@@ -187,6 +201,14 @@ def check_postmerge(client, repo, evidence, policy, pr, actual, timestamp):
     require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
     require(run["checked_first_finished_at"] >= actual["merged_at"], "postmerge E2E completed before merge")
     require(timestamp >= run["checked_finished_at"], "receipt predates postmerge verification")
+    # The released PR must not supply a different definition of its own gate.
+    workflow_route = f"repos/{repo}/contents/.github/workflows/{policy['e2e']['workflow']}"
+    blobs = []
+    for ref in (pr["base_sha"], pr["merge"]):
+        contents = client.api(f"{workflow_route}?ref={ref}")
+        require(type(contents) is dict and contents.get("type") == "file", "postmerge workflow is not a file")
+        blobs.append(match(COMMIT, contents.get("sha")))
+    require(blobs[0] == blobs[1], "postmerge workflow differs from tested base")
     artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
     name = f"postmerge-evidence-{run['id']}-{run['run_attempt']}"
     found = [a for a in artifacts if a["name"] == name and not a["expired"]]
@@ -198,7 +220,7 @@ def identity(obj, *, facts_only=False, consumer=None, slot=None):
     if type(obj) is dict and "legacy" in obj:
         require(not facts_only and consumer == "offline" and slot == "previous",
                 "legacy identity is only valid for product offline.previous")
-        keys(obj, ("legacy", "npm_version", "npm_integrity", "git_head", "image_digest"))
+        keys(obj, OFFLINE_LEGACY_PREVIOUS)
         require(obj["legacy"] is True, "legacy identity flag must be true")
         try:
             version(obj["npm_version"])
@@ -210,6 +232,8 @@ def identity(obj, *, facts_only=False, consumer=None, slot=None):
                 "invalid npm integrity")
         match(COMMIT, obj["git_head"])
         match("sha256:" + SHA, obj["image_digest"])
+        require(all(obj[name] == value for name, value in OFFLINE_LEGACY_PREVIOUS.items()),
+                "legacy previous identity differs")
         return
     if type(obj) is dict and "provenance" in obj:
         require(not facts_only and consumer == "data" and slot == "previous",
@@ -267,16 +291,16 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         public["facts"] = receipt["facts"]
     else:
         public.update(event_id=receipt["event_id"], release_version=receipt["release_version"])
-    public["evidence_sha256"] = sha256(canonical(receipt))
-    public["reporting_run_id"] = reporting_run["id"]
     state = receipt["state"]
     postmerge = policy["e2e"]["workflow"] == "release-postmerge.yml"
     if postmerge:
         require(receipt["consumer"] == "hosted" and policy["ci"]["workflow"] == "release-pr.yml"
                 and policy["deploy"]["workflow"] == "release.yml", "unexpected postmerge consumer")
+        require(state != "ready", "postmerge policy does not accept ready state")
         require((state == "verified") == (receipt["e2e"] is not None),
                 "postmerge E2E is required exactly in verified state")
-        require(state != "ready", "postmerge policy does not accept ready state")
+    public["evidence_sha256"] = sha256(canonical(receipt))
+    public["reporting_run_id"] = reporting_run["id"]
     if state in ("pending", "failed", "superseded", "skipped_by_policy"):
         require(state != "skipped_by_policy" or (not facts_only and event["prerelease"]), "consumer cannot skip by policy")
         return public
@@ -291,6 +315,9 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     require(actual["head"]["repo"]["full_name"].lower() == repo.lower(), "receipt refers to fork PR")
     if not actual["merged"]:
         require(actual["base"]["sha"] == pr["base_sha"], "PR base moved after candidate verification")
+    if state in ("pr_open", "testing", "ready") and pr["merge"] is not None:
+        match(COMMIT, pr["merge"])
+        require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
     public["pr"] = pr
     if state in ("ready", "merged", "deploying", "verified"):
         ci_run = check_run(client, repo, receipt["ci"], policy["ci"], pr["head"])
@@ -392,10 +419,14 @@ def fetch_artifact(client, repo, run, policy, artifacts=None):
                              github=True)
     if found[0].get("digest"):
         require(found[0]["digest"] == "sha256:" + sha256(archive), "receipt archive digest differs")
-    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
-        require(zipped.namelist() == ["release-receipt.json"], "unexpected receipt archive inventory")
-        require(zipped.getinfo("release-receipt.json").file_size <= 2 * 1024 * 1024, "receipt exceeds size limit")
-        return decode(zipped.read("release-receipt.json"))
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+            require(zipped.namelist() == ["release-receipt.json"], "unexpected receipt archive inventory")
+            require(zipped.getinfo("release-receipt.json").file_size <= 2 * 1024 * 1024, "receipt exceeds size limit")
+            return decode(zipped.read("release-receipt.json"))
+    except (RuntimeError, zlib.error) as error:
+        # zipfile uses RuntimeError for encryption and unsupported compression.
+        raise Invalid("receipt archive cannot be decoded") from error
 
 
 def validate_facts_target(client, target):
@@ -408,6 +439,30 @@ def validate_facts_target(client, target):
     match(COMMIT, main)
     comparison = client.api(f"repos/{HUB}/compare/{target['commit']}...{main}")
     require(comparison["status"] in ("ahead", "identical"), "facts-only target is not canonical main history")
+
+
+def require_product_receipts(store, role):
+    enabled = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+    newest = finalized_version(store)
+    missing = []
+    for row in sorted(store.releases(), key=lambda item: item["tag_name"]):
+        names = {item["name"] for item in row["assets"]}
+        if row["draft"] or ASSET not in names or "release-rejected.json" in names:
+            continue
+        # The verifier also has the accepted-delivery audit when only the
+        # planner received RELEASE_READY_CONSUMERS.
+        if role not in enabled and f"delivery-{role}.json" not in names:
+            continue
+        event = payload(store.read(row, ASSET))
+        require(row["tag_name"] == "v" + event["release_version"], "required receipt release identity differs")
+        # Match aggregate's exemptions; collection does not demand completion.
+        if newest is not None and version(event["release_version"]) < newest:
+            continue
+        if event["prerelease"] and role in ("application", "web", "data", "license"):
+            continue
+        if receipts(store, row, event["event_id"]).get(role) is None:
+            missing.append(row["tag_name"])
+    require(not missing, f"required consumer receipt missing: role={role} releases=" + ",".join(missing))
 
 
 def collect(client, hub_client, store, role, run_id=0):
@@ -459,7 +514,9 @@ def collect(client, hub_client, store, role, run_id=0):
                     old = (previous["attempt"], previous["sequence"])
                     new = (receipt["attempt"], receipt["sequence"])
                     # Only omit work that cannot advance the stored receipt.
-                    if old > new or (old == new and previous.get("evidence_sha256") == sha256(canonical(receipt))):
+                    if old > new or (old == new
+                                     and previous.get("reporting_run_id") == run["id"]
+                                     and previous.get("evidence_sha256") == sha256(canonical(receipt))):
                         return
         public = validate_receipt(client, repo, receipt, event, policy, run)
         if facts_only:
@@ -509,6 +566,10 @@ def collect(client, hub_client, store, role, run_id=0):
         else:
             try:
                 collect_run(run)
+            except RequestError:
+                # Preserve Invalid compatibility for callers without swallowing
+                # HTTP/auth/transport failures as malformed consumer evidence.
+                raise
             except (Invalid, Pending, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
                 # The text can carry consumer-controlled bytes: no markup, mention, marker or line break reaches an issue.
                 safe_characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _.,;()'=-"
@@ -522,6 +583,8 @@ def collect(client, hub_client, store, role, run_id=0):
         report_issue(hub_client, "receipt-skipped-" + role,
                      f"Release chain: receipt artifacts skipped ({role})",
                      "\n".join(skipped_lines))
+    if not run_id:
+        require_product_receipts(store, role)
 
 
 def signal_targets(signal, enabled):

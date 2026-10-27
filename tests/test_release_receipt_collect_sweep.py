@@ -6,10 +6,12 @@ import copy
 import io
 import json
 import os
+import sys
 import unittest
+import urllib.error
 import zipfile
 from contextlib import redirect_stderr
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import test_release_binding as binding
 import test_release_coordinator_receipts as coordinator
@@ -27,13 +29,14 @@ IDENTITY_ERROR = "receipt identity reused with different evidence"
 class SweepFixture(history.HistoryClient):
     """Use the existing archive/discovery fake and real hosted evidence fixture."""
 
-    def __init__(self, run_ids=(90,)):
+    def __init__(self, run_ids=(90,), release_version="1.6.0"):
         hosted = postmerge.HostedPostmergeFixture()
-        manifest = binding.fixture_manifest()
+        manifest = binding.fixture_manifest(release_version)
         self.facts_raw = contract.canonical(binding.facts_for(manifest))
         manifest["facts"]["sha256"] = contract.sha256(self.facts_raw)
         self.event = contract.payload(contract.canonical(manifest))
         hosted.receipt["event_id"] = self.event["event_id"]
+        hosted.receipt["release_version"] = self.event["release_version"]
         for name in ("preview", "deployed"):
             hosted.receipt[name]["facts_sha256"] = manifest["facts"]["sha256"]
         self.routes, self.files, self.archives = [], [], {}
@@ -74,6 +77,32 @@ class SweepFixture(history.HistoryClient):
         artifact["digest"] = "sha256:" + contract.sha256(raw)
         self.archives[self.archive_url(90)] = raw
 
+    def require_delivery(self, role="hosted"):
+        self.store.put(self.row, f"delivery-{role}.json", contract.canonical({
+            "schema": "pineforge/release-delivery/v1", "event_id": self.event["event_id"],
+            "consumer": role, "state": "dispatch_accepted", "attempt": "1",
+            "run_id": 500, "timestamp": "2020-01-01T00:00:00Z",
+        }))
+        self.store.operations.clear()
+
+    def break_zip_entry(self, failure):
+        raw = bytearray(self.archives[self.archive_url(90)])
+        central = raw.index(b"PK\x01\x02")
+        if failure == "encrypted":
+            for offset in (6, central + 8):
+                flags = int.from_bytes(raw[offset:offset + 2], "little") | 1
+                raw[offset:offset + 2] = flags.to_bytes(2, "little")
+        else:
+            compression = 99 if failure == "unsupported" else zipfile.ZIP_DEFLATED
+            for offset in (8, central + 10):
+                raw[offset:offset + 2] = compression.to_bytes(2, "little")
+            if failure == "deflate":
+                name_size = int.from_bytes(raw[26:28], "little")
+                extra_size = int.from_bytes(raw[28:30], "little")
+                # BFINAL=1, BTYPE=3 is a reserved (invalid) deflate block.
+                raw[30 + name_size + extra_size] = 0x07
+        self.replace_archive(bytes(raw))
+
     def archive_url(self, run_id):
         return f"https://api.github.com/repos/{REPO}/actions/artifacts/{run_id + 1000}/zip"
 
@@ -111,6 +140,7 @@ class SweepFixture(history.HistoryClient):
 
 class ReceiptCollectSweepTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": ""}))
         self.output = io.StringIO()
         self.enterContext(redirect_stderr(self.output))
         self.report = self.enterContext(patch.object(receipts, "report_issue"))
@@ -152,6 +182,131 @@ class ReceiptCollectSweepTests(unittest.TestCase):
         f.seal(90)
         self.assert_bad_first_continues(f, INVENTORY_ERROR)
 
+    def test_cli_fails_after_reporting_an_invalid_required_hosted_receipt(self):
+        f = SweepFixture((90,))
+        f.require_delivery()
+        f.documents[90]["ci"]["expected"] = ["old-check"]
+        f.seal(90)
+        with patch.dict(os.environ, {"TARGET_REPOSITORY": "fixture",
+                                     "RELEASE_RECEIPT_POLICY": json.dumps({"hosted": POLICY})}), \
+                patch.object(sys, "argv", ["release_receipts.py", "collect", "--consumer", "hosted"]), \
+                patch.object(receipts, "Client", return_value=f), \
+                patch.object(receipts, "Store", return_value=f.store):
+            self.assertEqual(receipts.main(), 1)
+        self.assertEqual(f.written_names(), [])
+        self.assertEqual(self.output.getvalue(), (
+            f"::warning::receipt artifact skipped: role=hosted run=90: {INVENTORY_ERROR}\n"
+            "::error::consumer evidence invalid or unavailable; no verified state recorded: "
+            "required consumer receipt missing: role=hosted releases=v1.6.0\n"
+        ))
+        self.report.assert_called_once_with(
+            f, "receipt-skipped-hosted", "Release chain: receipt artifacts skipped (hosted)",
+            f"run=90: {INVENTORY_ERROR}",
+        )
+        status = binding.pipeline.aggregate(f.store, f.row, f.event, enabled=("hosted",))
+        self.assertEqual(status["consumers"], {"hosted": "pending"})
+        self.assertFalse(status["complete"])
+
+    def test_required_hosted_target_without_any_retained_artifact_fails(self):
+        f = SweepFixture()
+        f.require_delivery()
+        f.artifacts = []
+        with self.assertRaisesRegex(
+                contract.Invalid, "^required consumer receipt missing: role=hosted releases=v1[.]6[.]0$"):
+            self.collect(f)
+        self.assertEqual(f.routes, [
+            f"repos/{REPO}",
+            f"repos/{REPO}/actions/artifacts?name={POLICY['artifact']}&per_page=100&page=1",
+        ])
+        self.assertEqual(f.written_names(), [])
+        self.assertEqual(self.output.getvalue(), "")
+        self.report.assert_not_called()
+
+    def test_configured_product_target_requires_a_receipt_before_delivery_acceptance(self):
+        f = SweepFixture()
+        f.artifacts = []
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "hosted"}), \
+                self.assertRaisesRegex(
+                    contract.Invalid, "^required consumer receipt missing: role=hosted releases=v1[.]6[.]0$"):
+            self.collect(f)
+        self.assertEqual(f.written_names(), [])
+        self.assertEqual(self.output.getvalue(), "")
+        self.report.assert_not_called()
+
+    def test_missing_required_target_fails_after_collecting_another_release(self):
+        missing = SweepFixture()
+        missing.require_delivery()
+        f = SweepFixture((91,), release_version="1.6.0-rc.1")
+        f.require_delivery()
+        f.store.rows.update(missing.store.rows)
+        f.store.assets.update(missing.store.assets)
+        with self.assertRaisesRegex(
+                contract.Invalid, "^required consumer receipt missing: role=hosted releases=v1[.]6[.]0$"):
+            self.collect(f)
+        self.assertEqual(f.written_names(), ["consumer-hosted-90-7.json"])
+        self.assert_validated(f)
+        self.assertNotIn((missing.row["tag_name"], "consumer-hosted-90-7.json"), f.store.assets)
+        self.assertEqual(self.output.getvalue(), "")
+        self.report.assert_not_called()
+
+    def test_required_target_with_a_stored_receipt_still_reports_invalid_new_evidence(self):
+        f = SweepFixture()
+        f.require_delivery()
+        f.retain()
+        assets = dict(f.store.assets)
+        f.documents[90]["ci"]["expected"] = ["old-check"]
+        f.seal(90)
+        self.assertIsNone(self.collect(f))
+        self.assertEqual(f.store.assets, assets)
+        self.assertEqual(f.written_names(), [])
+        self.assert_skipped(90, INVENTORY_ERROR, f)
+
+    def test_a_valid_pending_receipt_satisfies_collection_but_not_completion(self):
+        f = SweepFixture()
+        f.require_delivery()
+        f.documents[90].update(state="pending", e2e=None)
+        f.seal(90)
+        self.assertIsNone(self.collect(f))
+        self.assertEqual(f.written_names(), ["consumer-hosted-90-7.json"])
+        stored = contract.decode(f.store.assets[(f.row["tag_name"], "consumer-hosted-90-7.json")])
+        self.assertEqual((stored["state"], stored["reporting_run_id"]), ("pending", 90))
+        status = binding.pipeline.aggregate(f.store, f.row, f.event, enabled=("hosted",))
+        self.assertEqual(status["consumers"], {"hosted": "pending"})
+        self.assertFalse(status["complete"])
+        self.assertEqual(self.output.getvalue(), "")
+        self.report.assert_not_called()
+
+    def test_required_set_excludes_drafts_rejections_and_superseded_releases(self):
+        for exclusion in ("draft", "rejected", "superseded"):
+            with self.subTest(exclusion=exclusion):
+                f = SweepFixture()
+                f.require_delivery()
+                f.artifacts = []
+                if exclusion == "draft":
+                    f.row["draft"] = True
+                elif exclusion == "rejected":
+                    f.store.put(f.row, "release-rejected.json", contract.canonical({"state": "rejected"}))
+                else:
+                    newer = SweepFixture(release_version="1.6.1")
+                    f.store.rows.update(newer.store.rows)
+                    f.store.assets.update(newer.store.assets)
+                f.store.operations.clear()
+                self.assertIsNone(self.collect(f))
+                self.assertEqual(f.written_names(), [])
+                self.assertEqual(self.output.getvalue(), "")
+                self.report.assert_not_called()
+
+    def test_prerelease_policy_skips_do_not_require_product_receipts(self):
+        for role in ("application", "web", "data", "license"):
+            with self.subTest(role=role):
+                f = SweepFixture(release_version="1.6.0-rc.1")
+                f.require_delivery(role)
+                f.artifacts = []
+                self.assertIsNone(self.collect(f, role=role))
+                self.assertEqual(f.written_names(), [])
+                self.assertEqual(self.output.getvalue(), "")
+                self.report.assert_not_called()
+
     def test_callback_run_still_fails_closed_on_the_same_invalid_artifact(self):
         f = SweepFixture((90, 91, 92))
         f.documents[90] = f.old_shape
@@ -166,6 +321,27 @@ class ReceiptCollectSweepTests(unittest.TestCase):
         f = SweepFixture((90, 91, 92))
         f.replace_archive(b"not a zip archive")
         self.assert_bad_first_continues(f, "File is not a zip file")
+
+    def test_sweep_skips_encrypted_unsupported_and_corrupt_deflate_entries(self):
+        for failure in ("encrypted", "unsupported", "deflate"):
+            with self.subTest(failure=failure):
+                f = SweepFixture((90, 91, 92))
+                f.break_zip_entry(failure)
+                self.report.reset_mock()
+                self.output.seek(0)
+                self.output.truncate()
+                self.assert_bad_first_continues(f, "receipt archive cannot be decoded")
+
+    def test_callback_rejects_encrypted_unsupported_and_corrupt_deflate_entries(self):
+        for failure in ("encrypted", "unsupported", "deflate"):
+            with self.subTest(failure=failure):
+                f = SweepFixture()
+                f.break_zip_entry(failure)
+                with self.assertRaisesRegex(contract.Invalid, "^receipt archive cannot be decoded$"):
+                    self.collect(f, run_id=90)
+                self.assertEqual(f.written_names(), [])
+                self.assertEqual(self.output.getvalue(), "")
+                self.report.assert_not_called()
 
     def test_sweep_skips_a_malformed_artifact_with_wrong_inventory(self):
         f = SweepFixture((90, 91, 92))
@@ -249,6 +425,38 @@ class ReceiptCollectSweepTests(unittest.TestCase):
         self.assertEqual(self.output.getvalue(), "")
         self.report.assert_not_called()
 
+    def test_real_client_http_and_transport_errors_abort_the_sweep(self):
+        url = f"https://api.github.com/repos/{REPO}/actions/artifacts/1090/zip"
+        failures = [
+            (urllib.error.HTTPError(url, status, "fixture", {}, None),
+             f"artifact request failed (HTTP {status})")
+            for status in (401, 403, 429, 500, 502, 503)
+        ] + [
+            (error, "artifact transport failed")
+            for error in (TimeoutError("timed out"), OSError("transport unavailable"),
+                          urllib.error.URLError("transport unavailable"))
+        ]
+        for error, message in failures:
+            with self.subTest(error=repr(error), message=message):
+                f = SweepFixture((90, 91, 92))
+                opener = Mock()
+                opener.open.side_effect = error
+                self.report.reset_mock()
+                self.output.seek(0)
+                self.output.truncate()
+                # Keep the actual Client.request translation and fail only urllib.
+                with patch.object(f, "request", binding.artifacts.Client(token="dummy").request), \
+                        patch("urllib.request.build_opener", return_value=opener), \
+                        self.assertRaises(contract.Invalid) as caught:
+                    self.collect(f)
+                self.assertEqual(str(caught.exception), message)
+                opener.open.assert_called_once()
+                self.assertEqual(opener.open.call_args.args[0].full_url, f.archive_url(90))
+                self.assertEqual(opener.open.call_args.kwargs, {"timeout": 120})
+                self.assertEqual(f.written_names(), [])
+                self.assertEqual(self.output.getvalue(), "")
+                self.report.assert_not_called()
+
     def test_pending_during_a_sweep_is_reported_and_skipped(self):
         f = SweepFixture((90, 91, 92))
         request = f.request
@@ -292,6 +500,26 @@ class ReceiptCollectSweepTests(unittest.TestCase):
         self.assertEqual(f.store.assets, assets)
         self.assertEqual(self.output.getvalue(), "")
         self.report.assert_not_called()
+
+    def test_equal_evidence_from_another_reporting_run_is_validated_and_reported(self):
+        for retained in (False, True):
+            with self.subTest(retained=retained):
+                f = SweepFixture((90, 91))
+                f.documents[91] = copy.deepcopy(f.documents[90])
+                f.seal(91)
+                if retained:
+                    f.retain()
+                self.report.reset_mock()
+                self.output.seek(0)
+                self.output.truncate()
+                self.assertIsNone(self.collect(f))
+                self.assertEqual(f.written_names(), [] if retained else ["consumer-hosted-90-7.json"])
+                stored = contract.decode(f.store.assets[(f.row["tag_name"], "consumer-hosted-90-7.json")])
+                self.assertEqual(stored["reporting_run_id"], 90)
+                self.assertEqual(stored["evidence_sha256"], contract.sha256(contract.canonical(f.documents[91])))
+                self.assert_validated(f)
+                self.assertEqual(f.routes.count(f"repos/{REPO}/pulls/9"), 1 if retained else 2)
+                self.assert_skipped(91, IDENTITY_ERROR, f)
 
     def test_same_key_different_evidence_is_validated_and_reported_not_stored(self):
         f = SweepFixture()

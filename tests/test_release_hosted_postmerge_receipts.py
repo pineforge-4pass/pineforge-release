@@ -62,6 +62,12 @@ class HostedPostmergeFixture(coordinator.ReceiptFixture):
         ]
         self.artifacts_route = f"repos/{self.repo}/actions/runs/52/artifacts?per_page=100&page=1"
         self.responses[self.artifacts_route] = {"artifacts": self.artifacts}
+        self.workflow_routes, self.workflow_contents = {}, {}
+        for ref in ("base_sha", "merge"):
+            route = f"repos/{self.repo}/contents/.github/workflows/release-postmerge.yml?ref={pr[ref]}"
+            self.workflow_routes[ref] = route
+            self.workflow_contents[ref] = {"type": "file", "sha": "a" * 40}
+            self.responses[route] = self.workflow_contents[ref]
 
 
 class HostedPostmergeReceiptTests(unittest.TestCase):
@@ -152,6 +158,48 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
     def test_e2e_workflow_path_differs_is_refused(self):
         self.f.runs["e2e"]["path"] = ".github/workflows/other.yml"
         self.assert_refused("unexpected checks workflow or head")
+
+    def test_e2e_workflow_blob_changed_at_merge_is_refused(self):
+        self.f.workflow_contents["merge"]["sha"] = "b" * 40
+        self.assert_refused("^postmerge workflow differs from tested base$")
+        for route in self.f.workflow_routes.values():
+            self.assertIn(route, self.f.queries)
+
+    def test_e2e_workflow_blob_changed_at_base_is_refused(self):
+        self.f.workflow_contents["base_sha"]["sha"] = "b" * 40
+        self.assert_refused("^postmerge workflow differs from tested base$")
+
+    def test_e2e_equal_workflow_blobs_are_accepted(self):
+        for sha in ("a" * 40, "b" * 40):
+            with self.subTest(sha=sha):
+                self.f = HostedPostmergeFixture()
+                for contents in self.f.workflow_contents.values():
+                    contents["sha"] = sha
+                public = self.f.verify()
+                self.assertEqual(public["state"], "verified")
+                for route in self.f.workflow_routes.values():
+                    self.assertIn(route, self.f.queries)
+                self.assertEqual(self.f.downloads, [])
+
+    def test_e2e_workflow_must_be_a_file_at_both_commits(self):
+        for ref in ("base_sha", "merge"):
+            with self.subTest(ref=ref):
+                self.f = HostedPostmergeFixture()
+                self.f.responses[self.f.workflow_routes[ref]] = []
+                self.assert_refused("^postmerge workflow is not a file$")
+
+    def test_e2e_workflow_missing_blob_shas_are_refused(self):
+        for route in self.f.workflow_routes.values():
+            self.f.responses[route] = {"type": "file"}
+        self.assert_refused("^malformed identity$")
+
+    def test_e2e_workflow_malformed_blob_shas_are_refused(self):
+        for sha in (None, "", "g" * 40, "a" * 64):
+            with self.subTest(sha=sha):
+                self.f = HostedPostmergeFixture()
+                for contents in self.f.workflow_contents.values():
+                    contents["sha"] = sha
+                self.assert_refused("^malformed identity$")
 
     def test_e2e_missing_verified_job_is_refused(self):
         self.f.jobs["e2e"].pop()
@@ -290,12 +338,78 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
             self.f = HostedPostmergeFixture()
             self.f.receipt["state"] = state
             with self.subTest(state=state):
-                self.assert_refused("postmerge E2E is required exactly in verified state")
+                message = ("postmerge policy does not accept ready state" if state == "ready"
+                           else "postmerge E2E is required exactly in verified state")
+                self.assert_refused("^" + message + "$")
+
+    def test_premerge_states_refuse_forged_merge(self):
+        for state in ("pr_open", "testing"):
+            with self.subTest(state=state):
+                self.f = HostedPostmergeFixture()
+                self.f.receipt.update(state=state, ci=None, e2e=None, preview=None,
+                                      deploy=None, deployed=None, previous=None)
+                self.f.pr["merge"] = "f" * 40
+                self.assert_refused("^PR is not the recorded merge$")
+
+    def test_premerge_states_refuse_malformed_merge(self):
+        for state in ("pr_open", "testing"):
+            for merge in (7, "f" * 39, "F" * 40):
+                with self.subTest(state=state, merge=merge):
+                    self.f = HostedPostmergeFixture()
+                    self.f.receipt.update(state=state, ci=None, e2e=None, preview=None,
+                                          deploy=None, deployed=None, previous=None)
+                    self.f.pr["merge"] = merge
+                    self.assert_refused("^malformed identity$")
+
+    def test_premerge_states_refuse_merge_for_unmerged_pr(self):
+        for state in ("pr_open", "testing"):
+            for actual_merge in (None, "2" * 40):
+                with self.subTest(state=state, actual_merge=actual_merge):
+                    self.f = HostedPostmergeFixture()
+                    self.f.receipt.update(state=state, ci=None, e2e=None, preview=None,
+                                          deploy=None, deployed=None, previous=None)
+                    self.f.actual_pr.update(merged=False, merge_commit_sha=actual_merge, merged_at=None)
+                    self.assert_refused("^PR is not the recorded merge$")
+
+    def test_premerge_states_accept_null_merge(self):
+        for state in ("pr_open", "testing"):
+            for merged in (False, True):
+                with self.subTest(state=state, merged=merged):
+                    self.f = HostedPostmergeFixture()
+                    self.f.receipt.update(state=state, ci=None, e2e=None, preview=None,
+                                          deploy=None, deployed=None, previous=None)
+                    self.f.pr["merge"] = None
+                    if not merged:
+                        self.f.actual_pr.update(merged=False, merge_commit_sha=None, merged_at=None)
+                    public = self.f.verify()
+                    self.assertEqual(public["state"], state)
+                    self.assertIsNone(public["pr"]["merge"])
+                    self.assertEqual(self.f.queries, [f"repos/{self.f.repo}/pulls/9"])
+                    self.assertNotIn("e2e", public)
+
+    def test_premerge_states_accept_actual_merge(self):
+        for state in ("pr_open", "testing"):
+            with self.subTest(state=state):
+                self.f = HostedPostmergeFixture()
+                self.f.receipt.update(state=state, ci=None, e2e=None, preview=None,
+                                      deploy=None, deployed=None, previous=None)
+                expected_pr = copy.deepcopy(self.f.pr)
+                public = self.f.verify()
+                self.assertEqual(public["state"], state)
+                self.assertEqual(public["pr"], expected_pr)
+                self.assertEqual(self.f.queries, [f"repos/{self.f.repo}/pulls/9"])
+
+    def test_ready_with_e2e_is_refused_before_evidence_reads(self):
+        self.f.receipt["state"] = "ready"
+        self.assert_refused("^postmerge policy does not accept ready state$")
+        self.assertEqual(self.f.queries, [])
+        self.assertEqual(self.f.downloads, [])
 
     def test_ready_without_e2e_is_refused(self):
         self.f.receipt["state"] = "ready"
         self.f.receipt["e2e"] = None
         self.assert_refused("^postmerge policy does not accept ready state$")
+        self.assertEqual(self.f.queries, [])
 
     def test_ready_with_unmerged_pr_and_forged_merge_is_refused(self):
         self.f.receipt["state"] = "ready"
@@ -306,6 +420,7 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
         self.f.pr["merge"] = "f" * 40
         self.f.receipt["preview"]["source"] = "f" * 40
         self.assert_refused("^postmerge policy does not accept ready state$")
+        self.assertEqual(self.f.queries, [])
 
     def test_ready_with_merged_pr_and_forged_merge_is_refused(self):
         self.f.receipt["state"] = "ready"
@@ -315,6 +430,19 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
         self.f.pr["merge"] = "f" * 40
         self.f.receipt["preview"]["source"] = "f" * 40
         self.assert_refused("^postmerge policy does not accept ready state$")
+        self.assertEqual(self.f.queries, [])
+
+    def test_merged_without_e2e_is_accepted_without_public_e2e(self):
+        self.f.receipt.update(state="merged", e2e=None)
+        public = self.f.verify()
+        self.assertEqual(public["state"], "merged")
+        self.assertNotIn("e2e", public)
+
+    def test_deploying_without_e2e_is_accepted_without_public_e2e(self):
+        self.f.receipt.update(state="deploying", e2e=None)
+        public = self.f.verify()
+        self.assertEqual(public["state"], "deploying")
+        self.assertNotIn("e2e", public)
 
     def test_other_non_verified_states_without_e2e_are_accepted(self):
         for state in ("pending", "pr_open", "testing", "merged", "deploying", "failed", "superseded", "skipped_by_policy"):
@@ -380,10 +508,23 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
         self.f.receipt["preview"]["image_digest"] = "sha256:" + "f" * 64
         self.assert_refused("preview did not exercise the candidate source/image")
 
-    def test_docs_state_the_true_coordinator_rollout_behaviour(self):
-        doc = (ROOT / "docs/release-chain.md").read_text()
-        self.assertNotIn("still accepted under its old policy for events whose receipts predate 2026-10-21", doc)
-        self.assertIn("**Hosted rollout order.**", doc)
+    def test_coordinator_verified_receipt_is_refused_after_hosted_policy_swap(self):
+        f = coordinator.ReceiptFixture()
+        f.policy = copy.deepcopy(HOSTED_POLICY)
+        with self.assertRaisesRegex(contract.Invalid, "^required check inventory differs from owner policy$"):
+            f.verify()
+
+    def test_coordinator_non_verified_receipts_with_e2e_are_refused_after_hosted_policy_swap(self):
+        for state in ("pending", "pr_open", "testing", "ready", "merged", "deploying", "failed",
+                      "superseded", "skipped_by_policy"):
+            with self.subTest(state=state):
+                f = coordinator.ReceiptFixture()
+                f.receipt["state"] = state
+                f.policy = copy.deepcopy(HOSTED_POLICY)
+                message = ("postmerge policy does not accept ready state" if state == "ready"
+                           else "postmerge E2E is required exactly in verified state")
+                with self.assertRaisesRegex(contract.Invalid, "^" + message + "$"):
+                    f.verify()
 
     def test_documentation_policy_and_example_match_the_hosted_contract(self):
         doc = (ROOT / "docs/release-chain.md").read_text().split("## Supervisor configuration\n", 1)[1]

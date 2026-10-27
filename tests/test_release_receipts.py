@@ -152,6 +152,9 @@ class MemoryStore:
     def facts(self):
         return self.row
 
+    def releases(self):
+        return [self.row]
+
     def read(self, row, name):
         if row != self.row:
             raise AssertionError("unexpected fixture release")
