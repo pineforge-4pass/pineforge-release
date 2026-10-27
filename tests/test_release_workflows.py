@@ -1256,7 +1256,7 @@ class PublishedHpoWheelCiTest(unittest.TestCase):
 
 class GkePythonDiagnosticWorkflowTest(unittest.TestCase):
     JOBS = {"diag-gke-python.yml": {"inspect": "gke-2cpu-4gb-amd64"}}
-    SETUP = "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
+    SETUP = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
     CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
     TEST_COMMAND = (
         "python3 -m unittest discover -s tests -p 'test_release_hpo_image.py' "
