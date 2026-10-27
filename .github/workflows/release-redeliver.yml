@@ -54,6 +54,7 @@ jobs:
           TAG: ${{ inputs.tag }}
           CONSUMER: ${{ inputs.consumer }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_READY_EXCLUDE: ${{ vars.RELEASE_READY_EXCLUDE }}
           RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
         run: |
           set -euo pipefail
@@ -81,6 +82,7 @@ jobs:
           TAG: ${{ inputs.tag }}
           CONSUMER: ${{ inputs.consumer }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_READY_EXCLUDE: ${{ vars.RELEASE_READY_EXCLUDE }}
           RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
         run: |
           python3 scripts/release_pipeline.py redeliver-check --tag "$TAG" --consumer "$CONSUMER"
@@ -113,6 +115,7 @@ jobs:
           TAG: ${{ inputs.tag }}
           CONSUMER: ${{ inputs.consumer }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_READY_EXCLUDE: ${{ vars.RELEASE_READY_EXCLUDE }}
           RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
         run: |
           python3 scripts/release_pipeline.py redeliver --tag "$TAG" --consumer "$CONSUMER" \

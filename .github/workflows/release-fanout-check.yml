@@ -1,0 +1,53 @@
+name: release-fanout-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published vX.Y.Z tag to inspect
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    environment: release-automation
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+      RELEASE_READY_EXCLUDE: ${{ vars.RELEASE_READY_EXCLUDE }}
+      FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
+      FACTS_LICENSE_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}
+      RELEASE_TARGET_OFFLINE_REPOSITORY: pineforge-backtest-mcp
+      RELEASE_TARGET_HOSTED_REPOSITORY: ${{ secrets.RELEASE_HOSTED_MCP_REPOSITORY }}
+      RELEASE_TARGET_APPLICATION_REPOSITORY: ${{ secrets.RELEASE_APPLICATION_REPOSITORY }}
+      RELEASE_TARGET_WEB_REPOSITORY: ${{ secrets.FACTS_WEB_REPOSITORY }}
+      RELEASE_TARGET_DATA_REPOSITORY: pineforge-data
+      RELEASE_TARGET_LICENSE_REPOSITORY: pineforge-license
+      RELEASE_TARGET_COMPUTE_REPOSITORY: ${{ secrets.RELEASE_COMPUTE_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Mint receiver Actions read token
+        id: receiver-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.PINEFORGE_APP_ID }}
+          private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ secrets.RELEASE_HOSTED_MCP_REPOSITORY }},${{ secrets.RELEASE_APPLICATION_REPOSITORY }},${{ secrets.FACTS_WEB_REPOSITORY }},${{ secrets.RELEASE_COMPUTE_REPOSITORY }}
+          permission-contents: read
+          permission-actions: read
+          github-api-url: https://api.github.com
+      - name: Check release fanout
+        env:
+          GH_HUB_TOKEN: ${{ github.token }}
+          GH_RECEIVER_TOKEN: ${{ steps.receiver-token.outputs.token }}
+        run: python3 scripts/release_fanout_check.py check --tag "$TAG"

@@ -1736,7 +1736,8 @@ class NotifyConsumersTest(unittest.TestCase):
             "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
             "owner": "${{ github.repository_owner }}",
             "repositories": "${{ env.TARGET_REPOSITORY }}",
-            "permission-contents": "write", "github-api-url": "https://api.github.com",
+            "permission-contents": "write", "permission-actions": "read",
+            "github-api-url": "https://api.github.com",
         })
         self.assertEqual(set(re.findall(r"secrets\.([A-Z_]+)", text)), {
             "PINEFORGE_APP_ID", "PINEFORGE_APP_PRIVATE_KEY", "RELEASE_HOSTED_MCP_REPOSITORY",
@@ -1759,19 +1760,37 @@ class NotifyConsumersTest(unittest.TestCase):
         finalize = jobs["finalize"]
         self.assertEqual(finalize["outputs"]["compute_configuration_error"],
                          "${{ steps.ready.outputs.compute_configuration_error }}")
-        self.assertEqual(finalize["outputs"]["deliveries"], "${{ steps.ready.outputs.deliveries }}")
+        self.assertEqual(finalize["outputs"]["deliveries"],
+                         "${{ steps.delivery-output.outputs.deliveries }}")
         ready = next(step for step in finalize["steps"] if step.get("id") == "ready")
         self.assertEqual(ready["run"].splitlines(), [
             "set -euo pipefail",
             'python3 scripts/release_pipeline.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"',
+        ])
+        output = next(step for step in finalize["steps"] if step.get("id") == "delivery-output")
+        self.assertEqual(output["if"], "${{ always() }}")
+        self.assertEqual(output["run"].splitlines(), [
+            "set -euo pipefail",
+            'if [[ "${{ steps.ready.outcome }}" == "success" && -f "$RUNNER_TEMP/deliveries.json" ]]; then',
             'echo "deliveries=$(cat "$RUNNER_TEMP/deliveries.json")" >> "$GITHUB_OUTPUT"',
+            "else",
+            "echo 'deliveries=[]' >> \"$GITHUB_OUTPUT\"",
+            "fi",
         ])
         notify = jobs["notify-consumers"]
         self.assertEqual(notify["needs"], "finalize")
-        self.assertEqual(notify["if"], "needs.finalize.outputs.deliveries != '[]'")
+        self.assertEqual(notify["if"],
+                         "${{ needs.finalize.result == 'success' && needs.finalize.outputs.deliveries != '[]' }}")
         self.assertNotIn("compute_configuration_error", notify["if"])
         self.assertEqual(notify["strategy"]["matrix"]["include"],
                          "${{ fromJSON(needs.finalize.outputs.deliveries) }}")
+
+        cleanup = jobs["release-attempt-cleanup"]
+        self.assertEqual(cleanup["needs"], "finalize")
+        self.assertEqual(cleanup["if"], "${{ always() && needs.finalize.result != 'success' }}")
+        self.assertEqual(cleanup["permissions"], {"contents": "write"})
+        self.assertTrue(any("release_pipeline.py release-attempts" in step.get("run", "")
+                            for step in cleanup["steps"]))
 
         reporter = jobs["report-compute-configuration-error"]
         self.assertEqual(reporter["needs"], ["finalize", "notify-consumers"])
@@ -1820,6 +1839,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
         self.assertEqual(check["env"], {
             "TAG": "${{ inputs.tag }}", "CONSUMER": "${{ inputs.consumer }}",
             "RELEASE_READY_CONSUMERS": "${{ vars.RELEASE_READY_CONSUMERS }}",
+            "RELEASE_READY_EXCLUDE": "${{ vars.RELEASE_READY_EXCLUDE }}",
             "RELEASE_COMPUTE_FIRST_PAIR": "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}",
         })
         self.assertEqual(check["run"],
@@ -1873,9 +1893,13 @@ class RedeliverWorkflowTest(unittest.TestCase):
             if any(part in path for part in forbidden) or path.endswith(".env"):
                 self.fail("refused workflow control source path: " + path)
         print("Workflow authorization control follows: " + ", ".join(str(REPO / name) for name in follows))
+        import release_contract as contract
+
         context = {
             "${{ inputs.tag }}": tag, "${{ inputs.consumer }}": consumer,
             "${{ vars.RELEASE_READY_CONSUMERS }}": enabled,
+            "${{ vars.RELEASE_READY_EXCLUDE }}": ",".join(
+                role for role in contract.ROLES if role not in enabled.split(",")),
             "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}": first,
         }
         for step in steps:
@@ -2037,6 +2061,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
             "TARGET_REPOSITORY": "${{ steps.target.outputs.repository }}",
             "TAG": "${{ inputs.tag }}", "CONSUMER": "${{ inputs.consumer }}",
             "RELEASE_READY_CONSUMERS": "${{ vars.RELEASE_READY_CONSUMERS }}",
+            "RELEASE_READY_EXCLUDE": "${{ vars.RELEASE_READY_EXCLUDE }}",
             "RELEASE_COMPUTE_FIRST_PAIR": "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}",
         })
         self.assertEqual(sends[0]["run"],
@@ -2431,7 +2456,9 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         "facts-fanout.yml": {"web", "license"},
         "handle-upstream.yml": {"bump"},
         "publish.yml": {"tag-guard", "prepare", "publish", "failure-report"},
-        "release-finalize.yml": {"finalize", "notify-consumers", "report-compute-configuration-error"},
+        "release-finalize.yml": {"finalize", "release-attempt-cleanup", "notify-consumers",
+                                "report-compute-configuration-error"},
+        "release-fanout-check.yml": {"check"},
         "release-redeliver.yml": {"redeliver"},
         "release-receipts.yml": {"plan", "verify"},
         "release-reconcile.yml": {"producers"},
@@ -2449,8 +2476,10 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         ("publish.yml", "publish"),
         ("publish.yml", "failure-report"),
         ("release-finalize.yml", "finalize"),
+        ("release-finalize.yml", "release-attempt-cleanup"),
         ("release-finalize.yml", "notify-consumers"),
         ("release-finalize.yml", "report-compute-configuration-error"),
+        ("release-fanout-check.yml", "check"),
         ("release-redeliver.yml", "redeliver"),
         ("release-receipts.yml", "plan"),
         ("release-receipts.yml", "verify"),
@@ -2485,8 +2514,8 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
     def test_release_jobs_pin_ubuntu_latest_and_never_accept_pr_events(self):
         self.assert_release_runners(self.release_workflows())
 
-    def test_all_sixteen_release_jobs_pin_ubuntu_latest_under_the_standing_owner_rule(self):
-        self.assertEqual(len(self.HOSTED_JOBS), 16)
+    def test_all_eighteen_release_jobs_pin_ubuntu_latest_under_the_standing_owner_rule(self):
+        self.assertEqual(len(self.HOSTED_JOBS), 18)
         self.assert_hosted_runners(self.release_workflows())
 
     def test_hosted_runner_pin_refuses_the_release_array_on_each_release_job(self):
@@ -2713,8 +2742,10 @@ class PrTierWorkflowTest(unittest.TestCase):
         "publish.yml": {"tag-guard": "ubuntu-latest", "prepare": "ubuntu-latest",
                         "publish": "ubuntu-latest", "notify-consumers": None,
                         "failure-report": "ubuntu-latest"},
-        "release-finalize.yml": {"finalize": "ubuntu-latest", "notify-consumers": "ubuntu-latest",
+        "release-finalize.yml": {"finalize": "ubuntu-latest", "release-attempt-cleanup": "ubuntu-latest",
+                                 "notify-consumers": "ubuntu-latest",
                                  "report-compute-configuration-error": "ubuntu-latest"},
+        "release-fanout-check.yml": {"check": "ubuntu-latest"},
         "release-redeliver.yml": {"redeliver": "ubuntu-latest"},
         "release-receipts.yml": {"plan": "ubuntu-latest", "verify": "ubuntu-latest"},
         "release-reconcile.yml": {"producers": "ubuntu-latest"},
@@ -3940,6 +3971,81 @@ class PrTierWorkflowTest(unittest.TestCase):
                     with self.assertRaises(AssertionError):
                         self.assert_test_inputs_run(workflow, inputs)
         self.assertEqual(self.named_repo_files('# open("facts/README.md").read()\n'), set())
+
+
+class ReleaseFanoutRegressionTest(unittest.TestCase):
+    """Configuration pins and receiver-start regression controls."""
+
+    def test_consumer_environments_pass_the_configured_exclusion_list(self):
+        """Mutation: remove an exclusion binding beside a consumer-list binding."""
+        checked = []
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix not in {".yml", ".yaml"}:
+                continue
+            workflow = _workflow(path.name)
+            scopes = [("env", workflow.get("env", {}))]
+            for name, job in workflow.get("jobs", {}).items():
+                scopes.append((f"jobs.{name}.env", job.get("env", {})))
+                scopes.extend(
+                    (f"jobs.{name}.steps[{index}].env", step.get("env", {}))
+                    for index, step in enumerate(job.get("steps", []))
+                )
+            for scope, environment in scopes:
+                if "RELEASE_READY_CONSUMERS" not in environment:
+                    continue
+                checked.append(path.name)
+                with self.subTest(workflow=path.name, scope=scope):
+                    self.assertEqual(environment.get("RELEASE_READY_EXCLUDE"),
+                                     "${{ vars.RELEASE_READY_EXCLUDE }}")
+        self.assertIn("release-redeliver.yml", checked)
+
+    def test_release_ready_consumers_keeps_explicit_selection_meaning(self):
+        """Selection pin; red on earlier main only because release_roles/excluded_roles were absent."""
+        sys.path.insert(0, str(REPO / "scripts"))
+        import release_pipeline as pipeline
+
+        with patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "hosted",
+                "RELEASE_READY_EXCLUDE": "",
+                "FACTS_WEB_DISPATCH_ENABLED": "false",
+                "FACTS_LICENSE_DISPATCH_ENABLED": "false",
+        }, clear=True):
+            self.assertEqual(pipeline.release_roles(), ["hosted"])
+            self.assertEqual(pipeline.excluded_roles(), [])
+
+    def test_finalizer_requires_a_configured_target_for_each_enabled_role(self):
+        finalizer = _workflow("release-finalize.yml")
+        guard = next(step for step in finalizer["jobs"]["notify-consumers"]["steps"]
+                     if step.get("name") == "Require one configured consumer repository")
+        self.assertIn("ROLE", guard["env"])
+        self.assertIn("for role ${ROLE}", guard["run"])
+        error_line = next(line for line in guard["run"].splitlines() if "::error::" in line)
+        self.assertNotIn("TARGET_REPOSITORY", error_line)
+
+    def test_notify_waits_for_a_receiver_run_and_is_skipped_after_finalizer_failure(self):
+        finalizer = _workflow("release-finalize.yml")
+        notify = finalizer["jobs"]["notify-consumers"]
+        self.assertIn("needs.finalize.result == 'success'", notify["if"])
+        self.assertNotIn("always()", notify["if"])
+        self.assertTrue(any("release_fanout_check.py wait" in step.get("run", "")
+                            for step in notify["steps"]))
+        mint = next(step for step in notify["steps"]
+                    if "create-github-app-token@" in step.get("uses", ""))
+        self.assertEqual(mint["with"]["permission-actions"], "read")
+        cleanup = finalizer["jobs"]["release-attempt-cleanup"]
+        self.assertIn("needs.finalize.result != 'success'", cleanup["if"])
+        self.assertTrue(any("release-attempts" in step.get("run", "")
+                            for step in cleanup["steps"]))
+
+    def test_notify_passes_public_repository_names_or_roles_for_receiver_logs(self):
+        notify = _workflow("release-finalize.yml")["jobs"]["notify-consumers"]
+        wait = next(step for step in notify["steps"] if step.get("name") == "Require receiver run")
+        self.assertEqual(wait["env"]["REPO_DISPLAY"],
+                         "${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || "
+                         "matrix.consumer == 'data' && 'pineforge-data' || "
+                         "matrix.consumer == 'license' && 'pineforge-license' || matrix.consumer }}")
+        self.assertIn('--repo-display "$REPO_DISPLAY"', wait["run"])
+        self.assertIn('--repository "$TARGET_REPOSITORY"', wait["run"])
 
 
 if __name__ == "__main__":

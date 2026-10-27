@@ -36,7 +36,7 @@ jobs:
       packages: write
       issues: write
     outputs:
-      deliveries: ${{ steps.ready.outputs.deliveries }}
+      deliveries: ${{ steps.delivery-output.outputs.deliveries }}
       compute_configuration_error: ${{ steps.ready.outputs.compute_configuration_error }}
     steps:
       - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
@@ -65,6 +65,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           RELEASE_READY_CONSUMERS: ${{ vars.RELEASE_READY_CONSUMERS }}
+          RELEASE_READY_EXCLUDE: ${{ vars.RELEASE_READY_EXCLUDE }}
           RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
           FACTS_WEB_DISPATCH_ENABLED: ${{ vars.FACTS_WEB_DISPATCH_ENABLED }}
           FACTS_LICENSE_DISPATCH_ENABLED: ${{ vars.FACTS_LICENSE_DISPATCH_ENABLED }}
@@ -75,7 +76,17 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/release_pipeline.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"
+      - name: Publish delivery matrix
+        id: delivery-output
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.ready.outcome }}" == "success" && -f "$RUNNER_TEMP/deliveries.json" ]]; then
           echo "deliveries=$(cat "$RUNNER_TEMP/deliveries.json")" >> "$GITHUB_OUTPUT"
+          else
+          echo 'deliveries=[]' >> "$GITHUB_OUTPUT"
+          fi
       - name: Report finalizer failure
         if: ${{ failure() && !cancelled() }}
         env:
@@ -83,9 +94,30 @@ jobs:
           RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
         run: python3 scripts/release_pipeline.py alert --stage finalize
 
+  release-attempt-cleanup:
+    needs: finalize
+    if: ${{ always() && needs.finalize.result != 'success' }}
+    runs-on: ubuntu-latest
+    environment: release-automation
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Release unsent delivery reservations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: python3 scripts/release_pipeline.py release-attempts --tag "$TAG"
+
   notify-consumers:
     needs: finalize
-    if: needs.finalize.outputs.deliveries != '[]'
+    if: ${{ needs.finalize.result == 'success' && needs.finalize.outputs.deliveries != '[]' }}
     # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     runs-on: ubuntu-latest
     environment: release-automation
@@ -115,9 +147,12 @@ jobs:
           persist-credentials: false
       - name: Require one configured consumer repository
         shell: bash
+        env:
+          ROLE: ${{ matrix.consumer }}
+          TAG: ${{ matrix.tag }}
         run: |
           if ! [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
-            echo '::error::Missing or malformed consumer repository setup'; exit 1
+            echo "::error::Missing or malformed consumer repository setup for role ${ROLE} (tag ${TAG})"; exit 1
           fi
       - name: Mint App token (scoped to one target)
         id: app
@@ -128,6 +163,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ env.TARGET_REPOSITORY }}
           permission-contents: write
+          permission-actions: read
           github-api-url: https://api.github.com
       - name: Dispatch pineforge-release from immutable bytes
         env:
@@ -146,6 +182,17 @@ jobs:
         run: |
           python3 scripts/release_receipts.py delivery --tag "$TAG" --consumer "$CONSUMER" \
             --file "$RUNNER_TEMP/delivery.json"
+      - name: Require receiver run
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ROLE: ${{ matrix.consumer }}
+          TAG: ${{ matrix.tag }}
+          TARGET_REPOSITORY: ${{ env.TARGET_REPOSITORY }}
+          REPO_DISPLAY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || matrix.consumer }}
+          DELIVERY_FILE: ${{ runner.temp }}/delivery.json
+        run: |
+          python3 scripts/release_fanout_check.py wait --tag "$TAG" --role "$ROLE" \
+            --repository "$TARGET_REPOSITORY" --repo-display "$REPO_DISPLAY" --delivery "$DELIVERY_FILE"
       - name: Preserve this delivery attempt
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

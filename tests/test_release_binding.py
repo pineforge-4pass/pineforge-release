@@ -520,12 +520,17 @@ class FinalizerTests(unittest.TestCase):
     def finish(self):
         return pipeline.finalize(self.client, self.store, self.registry, self.row)
 
+    def exclude(self, enabled):
+        selected = set(enabled.split(",")) if enabled else set()
+        return ",".join(role for role in contract.ROLES if role not in selected)
+
     def plan(self, release="1.6.0", *, enabled="compute", first="1.6.0"):
         manifest = fixture_manifest(release)
         client, store, registry = FinalizeClient(manifest), MemoryStore(manifest), MemoryRegistry()
         row = store.get("v" + release)
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                "RELEASE_READY_CONSUMERS": enabled, "RELEASE_READY_EXCLUDE": self.exclude(enabled),
+                "RELEASE_COMPUTE_FIRST_PAIR": first,
                 "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "age_minutes", return_value=0), patch.object(pipeline, "report_issue"):
@@ -771,7 +776,8 @@ class FinalizerTests(unittest.TestCase):
             "attempts": 3, "timestamp": "2026-10-23T00:00:00Z"}))
         before = copy.deepcopy(self.store.assets)
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_READY_EXCLUDE": self.exclude("compute"),
+                "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
                 "GITHUB_RUN_ID": "901", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "report_issue") as report:
@@ -909,7 +915,8 @@ class FinalizerTests(unittest.TestCase):
         self.store.put(self.row, "delivery-compute.json", contract.canonical({
             "event_id": event["event_id"], "consumer": "compute", "state": "dispatch_accepted"}))
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_READY_EXCLUDE": self.exclude("compute"),
+                "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
                 "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "age_minutes", return_value=0), patch.object(pipeline, "report_issue") as report:
@@ -934,7 +941,8 @@ class FinalizerTests(unittest.TestCase):
             store.put(row, contract.ASSET, (ROOT / "tests/fixtures/release-manifest.json").read_bytes())
             with self.subTest(enabled=enabled, first=first), tempfile.TemporaryDirectory() as tmp, \
                     patch.dict(os.environ, {
-                        "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                        "RELEASE_READY_CONSUMERS": enabled, "RELEASE_READY_EXCLUDE": self.exclude(enabled),
+                        "RELEASE_COMPUTE_FIRST_PAIR": first,
                         "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                         "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                     patch.object(pipeline, "age_minutes", return_value=0), \
@@ -963,6 +971,52 @@ class FinalizerTests(unittest.TestCase):
         self.assertEqual(status["consumers"], {})
         self.assertTrue(status["complete"])
         self.assertFalse(any(name.startswith("delivery-attempt-") for _, name in store.assets))
+
+    def test_finalize_requires_every_role_to_be_accounted_for_before_reserving(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "offline,hosted,application,data",
+                "RELEASE_READY_EXCLUDE": "",
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}, clear=True), \
+                patch.object(pipeline, "report_issue"):
+            with self.assertRaisesRegex(
+                    pipeline.ConfigurationError,
+                    r"missing role\(s\): web,license,compute; account for every role in "
+                    r"RELEASE_READY_CONSUMERS or RELEASE_READY_EXCLUDE"):
+                pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0",
+                                      Path(tmp) / "deliveries.json")
+        self.assertFalse(any(asset["name"].startswith("delivery-attempt-")
+                             for asset in self.row["assets"]))
+
+    def test_finalize_refuses_a_role_listed_in_both_configuration_variables(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": "offline,hosted,application,data",
+                "RELEASE_READY_EXCLUDE": "data,web,license,compute",
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}, clear=True), \
+                patch.object(pipeline, "report_issue"):
+            with self.assertRaisesRegex(
+                    pipeline.ConfigurationError,
+                    r"listed in both RELEASE_READY_CONSUMERS and RELEASE_READY_EXCLUDE: data"):
+                pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0",
+                                      Path(tmp) / "deliveries.json")
+        self.assertFalse(any(asset["name"].startswith("delivery-attempt-")
+                             for asset in self.row["assets"]))
+
+    def test_all_accounted_roles_keep_the_explicit_dispatch_set(self):
+        enabled = "offline,hosted,application,data"
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                "RELEASE_READY_CONSUMERS": enabled,
+                "RELEASE_READY_EXCLUDE": self.exclude(enabled),
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}, clear=True), \
+                patch.object(pipeline, "age_minutes", return_value=0), \
+                patch.object(pipeline, "report_issue"):
+            output = Path(tmp) / "deliveries.json"
+            pipeline.finalize_all(self.client, self.store, self.registry, "v1.6.0", output)
+            self.assertEqual(contract.decode(output.read_bytes()), [
+                {"consumer": role, "tag": "v1.6.0", "attempt": 1}
+                for role in ("offline", "hosted", "application", "data")])
 
     def test_compute_plan_excludes_pairs_below_the_semver_floor(self):
         for release, first in (("1.6.0-rc.2", "1.6.0-rc.10"),
@@ -998,7 +1052,8 @@ class FinalizerTests(unittest.TestCase):
         manifests = [fixture_manifest(v) for v in ("1.6.0", "1.6.1")]
         client, store, registry = FinalizeClient(*manifests), MemoryStore(*manifests), MemoryRegistry()
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "RELEASE_READY_CONSUMERS": "compute", "RELEASE_READY_EXCLUDE": self.exclude("compute"),
+                "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
                 "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "age_minutes", return_value=0), patch.object(pipeline, "report_issue"):
@@ -1013,7 +1068,9 @@ class FinalizerTests(unittest.TestCase):
         for state in ("failed", "pending"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp, \
                     patch.dict(os.environ, {
-                        "RELEASE_READY_CONSUMERS": "offline,compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                        "RELEASE_READY_CONSUMERS": "offline,compute",
+                        "RELEASE_READY_EXCLUDE": self.exclude("offline,compute"),
+                        "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
                         "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                         "GITHUB_OUTPUT": str(Path(tmp) / "github-output"),
                         "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false",
@@ -1071,7 +1128,8 @@ class FinalizerTests(unittest.TestCase):
             store_type = pipeline.Store
             stderr, stdout = io.StringIO(), io.StringIO()
             with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                    "RELEASE_READY_CONSUMERS": enabled, "RELEASE_COMPUTE_FIRST_PAIR": first,
+                    "RELEASE_READY_CONSUMERS": enabled, "RELEASE_READY_EXCLUDE": self.exclude(enabled),
+                    "RELEASE_COMPUTE_FIRST_PAIR": first,
                     "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                     "GITHUB_OUTPUT": str(Path(tmp) / "github-output") if github_output_enabled else "",
                     "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
@@ -1164,7 +1222,9 @@ class FinalizerTests(unittest.TestCase):
                 store_type = pipeline.Store
                 stderr, stdout = io.StringIO(), io.StringIO()
                 with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                        "RELEASE_READY_CONSUMERS": "offline,web,compute", "RELEASE_COMPUTE_FIRST_PAIR": "v1.7.0",
+                        "RELEASE_READY_CONSUMERS": "offline,web,compute",
+                        "RELEASE_READY_EXCLUDE": self.exclude("offline,web,compute"),
+                        "RELEASE_COMPUTE_FIRST_PAIR": "v1.7.0",
                         "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                         "GITHUB_OUTPUT": str(Path(tmp) / "github-output"),
                         "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
@@ -1197,7 +1257,8 @@ class FinalizerTests(unittest.TestCase):
         event = self.finish()
         self.store.put(self.row, "delivery-offline.json", contract.canonical({"event_id": event["event_id"], "state": "dispatch_accepted"}))
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": "offline", "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                "RELEASE_READY_CONSUMERS": "offline", "RELEASE_READY_EXCLUDE": self.exclude("offline"),
+                "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "report_issue"):
             output = Path(tmp) / "deliveries.json"
@@ -1208,7 +1269,8 @@ class FinalizerTests(unittest.TestCase):
 
     def test_finalize_all_delivery_retries_back_off_then_fail_once_and_stop(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
-                "RELEASE_READY_CONSUMERS": "offline", "GITHUB_RUN_ATTEMPT": "1",
+                "RELEASE_READY_CONSUMERS": "offline", "RELEASE_READY_EXCLUDE": self.exclude("offline"),
+                "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "report_issue") as report:
             output = Path(tmp) / "deliveries.json"
@@ -1234,6 +1296,141 @@ class FinalizerTests(unittest.TestCase):
             self.assertEqual(len(self.store.assets), before)
             self.assertEqual(self.store.read(self.row, "delivery-failed-offline.json"), failed)
             report.assert_not_called()
+
+    def test_release_delivery_attempts_marks_this_runs_unsent_reservation(self):
+        event = self.finish()
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}), \
+                patch.object(pipeline, "now", return_value="2026-10-27T00:00:00Z"):
+            self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"),
+                             ({"consumer": "offline", "tag": "v1.6.0", "attempt": 1}, False))
+            reservation = self.store.read(self.row, "delivery-attempt-offline-1.json")
+            pipeline.release_delivery_attempts(self.client, self.store, self.row["tag_name"])
+        released = self.store.read(self.row, "delivery-attempt-released-offline-1-100-1.json")
+        self.assertIsNotNone(released)
+        self.assertEqual(contract.decode(released), {
+            "event_id": event["event_id"], "consumer": "offline", "attempt": 1,
+            "state": "released", "run_id": 100, "run_attempt": 1,
+            "timestamp": "2026-10-27T00:00:00Z",
+        })
+        self.assertEqual(self.store.read(self.row, "delivery-attempt-offline-1.json"), reservation)
+
+    def test_release_delivery_attempts_preserves_another_runs_reservation(self):
+        event = self.finish()
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "99", "GITHUB_RUN_ATTEMPT": "1"}):
+            pipeline.plan_delivery(self.store, self.row, event, "offline")
+        before = dict(self.store.assets)
+        operations = list(self.store.operations)
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}):
+            pipeline.release_delivery_attempts(self.client, self.store)
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.store.operations, operations)
+
+    def test_release_delivery_attempts_preserves_accepted_delivery(self):
+        event = self.finish()
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}):
+            pipeline.plan_delivery(self.store, self.row, event, "offline")
+            self.store.put(self.row, "delivery-offline.json", contract.canonical({
+                "schema": "pineforge/release-delivery/v1", "event_id": event["event_id"],
+                "consumer": "offline", "state": "dispatch_accepted", "attempt": 1,
+                "run_id": 100, "timestamp": pipeline.now(),
+            }))
+            before = dict(self.store.assets)
+            operations = list(self.store.operations)
+            pipeline.release_delivery_attempts(self.client, self.store, self.row["tag_name"])
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.store.operations, operations)
+        self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"), (None, False))
+
+    def test_release_delivery_attempts_frees_the_same_attempt_for_the_next_plan(self):
+        event = self.finish()
+        # Model an existing reservation written before run-attempt metadata.
+        reservation = contract.canonical({
+            "event_id": event["event_id"], "consumer": "offline", "attempt": 1,
+            "run_id": 100, "timestamp": "2026-10-27T00:00:00Z",
+        })
+        self.store.put(self.row, "delivery-attempt-offline-1.json", reservation)
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}):
+            pipeline.release_delivery_attempts(self.client, self.store, self.row["tag_name"])
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "1"}), \
+                patch.object(pipeline, "age_minutes", return_value=0):
+            planned = pipeline.plan_delivery(self.store, self.row, event, "offline")
+        self.assertEqual(planned, ({"consumer": "offline", "tag": "v1.6.0", "attempt": 1}, False))
+        self.assertEqual(self.store.read(self.row, "delivery-attempt-offline-1.json"), reservation)
+
+    def test_release_delivery_attempts_is_idempotent(self):
+        event = self.finish()
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}):
+            pipeline.plan_delivery(self.store, self.row, event, "offline")
+            with patch.object(pipeline, "now", return_value="2026-10-27T00:00:01Z"):
+                pipeline.release_delivery_attempts(self.client, self.store, self.row["tag_name"])
+            before = dict(self.store.assets)
+            operations = list(self.store.operations)
+            with patch.object(pipeline, "now", return_value="2026-10-27T00:01:01Z"):
+                pipeline.release_delivery_attempts(self.client, self.store, self.row["tag_name"])
+        self.assertEqual(self.store.assets, before)
+        self.assertEqual(self.store.operations, operations)
+        self.assertEqual(len([name for _, name in self.store.assets
+                              if name.startswith("delivery-attempt-released-offline-")]), 1)
+
+    def test_release_delivery_attempts_rerun_has_its_own_marker_and_reservation(self):
+        event = self.finish()
+        expected = ({"consumer": "offline", "tag": "v1.6.0", "attempt": 1}, False)
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}), \
+                patch.object(pipeline, "now", return_value="2026-10-27T00:00:00Z"), \
+                patch.object(pipeline, "age_minutes", return_value=0):
+            self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"), expected)
+            pipeline.release_delivery_attempts(self.client, self.store, self.row["tag_name"])
+            first_marker = self.store.read(self.row, "delivery-attempt-released-offline-1-100-1.json")
+            os.environ["GITHUB_RUN_ATTEMPT"] = "2"
+            self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"), expected)
+            # Attempt 1's release must not free the fresh reservation from attempt 2.
+            self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"), (None, False))
+            before = len(self.store.assets)
+            pipeline.release_delivery_attempts(self.client, self.store, self.row["tag_name"])
+            self.assertEqual(len(self.store.assets), before + 1)
+            second_marker = self.store.read(self.row, "delivery-attempt-released-offline-1-100-2.json")
+            self.assertIsNotNone(first_marker)
+            self.assertIsNotNone(second_marker)
+            self.assertEqual(contract.decode(second_marker)["run_attempt"], 2)
+            self.assertEqual(self.store.read(self.row, "delivery-attempt-released-offline-1-100-1.json"),
+                             first_marker)
+            os.environ["GITHUB_RUN_ID"] = "101"
+            os.environ["GITHUB_RUN_ATTEMPT"] = "1"
+            self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"), expected)
+
+    def test_release_delivery_attempts_rerun_preserves_unreleased_first_run_reservation(self):
+        event = self.finish()
+        expected = ({"consumer": "offline", "tag": "v1.6.0", "attempt": 1}, False)
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}), \
+                patch.object(pipeline, "now", return_value="2026-10-27T00:00:00Z"):
+            self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"), expected)
+        self.assertIsNotNone(self.store.read(self.row, "delivery-attempt-offline-1.json"))
+        self.assertIsNone(self.store.read(self.row, "delivery-attempt-released-offline-1-100-1.json"))
+        self.assertIsNone(self.store.read(self.row, "delivery-offline.json"))
+        before = dict(self.store.assets)
+        operations = list(self.store.operations)
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "2"}):
+            pipeline.release_delivery_attempts(self.client, self.store, self.row["tag_name"])
+            self.assertEqual(self.store.assets, before)
+            self.assertEqual(self.store.operations, operations)
+            with patch.object(pipeline, "age_minutes", return_value=0):
+                self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"),
+                                 (None, False))
+
+    def test_plan_delivery_reads_legacy_reservation_release_markers(self):
+        event = self.finish()
+        self.store.put(self.row, "delivery-attempt-offline-1.json", contract.canonical({
+            "event_id": event["event_id"], "consumer": "offline", "attempt": 1,
+            "run_id": 100, "timestamp": "2026-10-27T00:00:00Z",
+        }))
+        self.store.put(self.row, "delivery-attempt-released-offline-1-100.json", contract.canonical({
+            "event_id": event["event_id"], "consumer": "offline", "attempt": 1,
+            "state": "released", "run_id": 100, "timestamp": "2026-10-27T00:00:01Z",
+        }))
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "1"}), \
+                patch.object(pipeline, "age_minutes", return_value=0):
+            self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"),
+                             ({"consumer": "offline", "tag": "v1.6.0", "attempt": 1}, False))
 
     def test_queued_delivery_rechecks_acceptance_and_exhaustion_before_sending(self):
         self.finish()
