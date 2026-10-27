@@ -201,6 +201,14 @@ def check_postmerge(client, repo, evidence, policy, pr, actual, timestamp):
     require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
     require(run["checked_first_finished_at"] >= actual["merged_at"], "postmerge E2E completed before merge")
     require(timestamp >= run["checked_finished_at"], "receipt predates postmerge verification")
+    # The released PR must not supply a different definition of its own gate.
+    workflow_route = f"repos/{repo}/contents/.github/workflows/{policy['e2e']['workflow']}"
+    blobs = []
+    for ref in (pr["base_sha"], pr["merge"]):
+        contents = client.api(f"{workflow_route}?ref={ref}")
+        require(type(contents) is dict and contents.get("type") == "file", "postmerge workflow is not a file")
+        blobs.append(match(COMMIT, contents.get("sha")))
+    require(blobs[0] == blobs[1], "postmerge workflow differs from tested base")
     artifacts = object_pages(client, f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
     name = f"postmerge-evidence-{run['id']}-{run['run_attempt']}"
     found = [a for a in artifacts if a["name"] == name and not a["expired"]]
@@ -283,16 +291,16 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         public["facts"] = receipt["facts"]
     else:
         public.update(event_id=receipt["event_id"], release_version=receipt["release_version"])
-    public["evidence_sha256"] = sha256(canonical(receipt))
-    public["reporting_run_id"] = reporting_run["id"]
     state = receipt["state"]
     postmerge = policy["e2e"]["workflow"] == "release-postmerge.yml"
     if postmerge:
         require(receipt["consumer"] == "hosted" and policy["ci"]["workflow"] == "release-pr.yml"
                 and policy["deploy"]["workflow"] == "release.yml", "unexpected postmerge consumer")
+        require(state != "ready", "postmerge policy does not accept ready state")
         require((state == "verified") == (receipt["e2e"] is not None),
                 "postmerge E2E is required exactly in verified state")
-        require(state != "ready", "postmerge policy does not accept ready state")
+    public["evidence_sha256"] = sha256(canonical(receipt))
+    public["reporting_run_id"] = reporting_run["id"]
     if state in ("pending", "failed", "superseded", "skipped_by_policy"):
         require(state != "skipped_by_policy" or (not facts_only and event["prerelease"]), "consumer cannot skip by policy")
         return public
@@ -307,6 +315,9 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
     require(actual["head"]["repo"]["full_name"].lower() == repo.lower(), "receipt refers to fork PR")
     if not actual["merged"]:
         require(actual["base"]["sha"] == pr["base_sha"], "PR base moved after candidate verification")
+    if state in ("pr_open", "testing", "ready") and pr["merge"] is not None:
+        match(COMMIT, pr["merge"])
+        require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
     public["pr"] = pr
     if state in ("ready", "merged", "deploying", "verified"):
         ci_run = check_run(client, repo, receipt["ci"], policy["ci"], pr["head"])
