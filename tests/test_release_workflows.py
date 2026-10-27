@@ -2620,10 +2620,11 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
 
 class PrTierWorkflowTest(unittest.TestCase):
     ROUTED_JOBS = {
-        "python-test.yml": {"fingerprint-canonical", "release-rules", "description-renderer",
+        "python-test.yml": {"fingerprint-canonical", "description-renderer",
                             "release-ready-replay", "release-ready"},
         "facts-validate.yml": {"validate"},
     }
+    HOSTED_ONLY_RUNNERS = {"authz": "ubuntu-24.04", "release-rules": "ubuntu-latest"}
     # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
     HOSTED_JOBS = {
         ("python-test.yml", "authz"),
@@ -2640,12 +2641,11 @@ class PrTierWorkflowTest(unittest.TestCase):
     RUNNER = ["self-hosted", "pf-ci", "pf-ci-x64"]
     PUSH_RUNNER = "${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}"
     RUNNER_LINE = "    runs-on: " + PUSH_RUNNER
-    RUNNER_COUNTS = {"python-test.yml": 6, "facts-validate.yml": 1}
+    RUNNER_COUNTS = {"python-test.yml": 5, "facts-validate.yml": 1}
     PUSH_PACKAGES = {
         "validate": "ca-certificates diffutils git python3",
         "changes": "python3",
         "fingerprint-canonical": "ca-certificates git",
-        "release-rules": "ca-certificates curl git jq",
         "description-renderer": "ca-certificates git",
         "release-ready-replay": "ca-certificates git jq",
         "release-ready": "python3",
@@ -2775,8 +2775,11 @@ class PrTierWorkflowTest(unittest.TestCase):
         ("release-receipts.yml", "plan"),
     }
 
+    def expected_runner(self, identity):
+        return self.HOSTED_ONLY_RUNNERS.get(identity, self.PUSH_RUNNER)
+
     def assert_runner(self, runner, identity):
-        expected = "ubuntu-24.04" if identity == "authz" else self.PUSH_RUNNER
+        expected = self.expected_runner(identity)
         self.assertEqual(runner, expected, f"runs-on must be {expected}")
 
     def assert_hosted_job(self, job, identity):
@@ -2785,12 +2788,13 @@ class PrTierWorkflowTest(unittest.TestCase):
 
     def assert_hosted_runners(self, workflows):
         for name, identity in sorted(self.HOSTED_JOBS):
-            expected = "ubuntu-24.04" if identity == "authz" else self.PUSH_RUNNER
+            expected = self.expected_runner(identity)
             self.assertEqual(workflows[name]["jobs"][identity]["runs-on"], expected,
                              f"{name}:{identity}: runs-on must be {expected}")
 
     def assert_push_tools(self, job, identity):
-        if identity == "authz":
+        self.assertNotIn("container", job)
+        if identity in self.HOSTED_ONLY_RUNNERS:
             self.assertNotIn("Install push runner tools", json.dumps(job))
             return
         expected = {
@@ -2802,7 +2806,6 @@ class PrTierWorkflowTest(unittest.TestCase):
             expected = self.READY_TOOLS_STEP
         self.assertEqual(job["steps"][0], expected)
         self.assertEqual(sum(step.get("name") == expected["name"] for step in job["steps"]), 1)
-        self.assertNotIn("container", job)
 
     def assert_no_pr_pool_runner_labels(self, workflows):
         for name, workflow in workflows.items():
@@ -2919,7 +2922,8 @@ class PrTierWorkflowTest(unittest.TestCase):
         self.assertIn("authz", [needs] if isinstance(needs, str) else needs)
 
     def assert_job_inventory(self, name, workflow):
-        expected = self.ROUTED_JOBS[name] | {"authz"} | ({"changes"} if name == "python-test.yml" else set())
+        expected = (self.ROUTED_JOBS[name] | {"authz"} |
+                    ({"changes", "release-rules"} if name == "python-test.yml" else set()))
         self.assertEqual(set(workflow["jobs"]), expected)
         self.assertEqual(next(iter(workflow["jobs"])), "authz")
         self.assert_authz(workflow["jobs"]["authz"])
@@ -2956,7 +2960,7 @@ class PrTierWorkflowTest(unittest.TestCase):
             block = re.search(rf"(?ms)^  {re.escape(identity)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
             self.assertIsNotNone(block, identity)
             runner_lines = re.findall(r"(?m)^    runs-on:.*$", block[1])
-            expected = self.AUTHZ_RUNNER_LINE if identity == "authz" else self.RUNNER_LINE
+            expected = "    runs-on: " + self.expected_runner(identity)
             self.assertEqual(runner_lines, [expected], identity)
 
     def test_all_pr_jobs_pin_literal_hosted_routes_conditions_and_authz(self):
@@ -3010,7 +3014,7 @@ class PrTierWorkflowTest(unittest.TestCase):
                     mutant = copy.deepcopy(original)
                     mutant[name]["jobs"][identity]["runs-on"] = runner
                     self.assertNotEqual(mutant, original)
-                    expected = "ubuntu-24.04" if identity == "authz" else self.PUSH_RUNNER
+                    expected = self.expected_runner(identity)
                     with self.assertRaisesRegex(AssertionError, re.escape(f"runs-on must be {expected}")):
                         self.assert_hosted_runners(mutant)
                     with self.assertRaisesRegex(AssertionError, "runs-on must not contain"):
@@ -3025,7 +3029,7 @@ class PrTierWorkflowTest(unittest.TestCase):
                 for runner in (
                     self.RUNNER.copy(),
                     "ubuntu-latest" if identity == "authz" else "ubuntu-24.04",
-                    "ubuntu-latest",
+                    self.PUSH_RUNNER if identity == "release-rules" else "ubuntu-latest",
                     "gke-2cpu-4gb-amd64",
                     "${{ github.event_name == 'pull_request' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
                     "${{ github.event_name == 'merge_group' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
@@ -3052,7 +3056,7 @@ class PrTierWorkflowTest(unittest.TestCase):
                         self.assert_hosted_job(mutant, identity)
                 block = re.search(rf"(?ms)^  {re.escape(identity)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
                 self.assertIsNotNone(block)
-                original = self.AUTHZ_RUNNER_LINE if identity == "authz" else self.RUNNER_LINE
+                original = "    runs-on: " + self.expected_runner(identity)
                 replacement = self.AUTHZ_POOL_RUNNER_LINE if identity == "authz" else self.POOL_RUNNER_LINE
                 self.assertEqual(block[0].count(original + "\n"), 1, identity)
                 altered = block[0].replace(original, replacement, 1)
@@ -3065,7 +3069,22 @@ class PrTierWorkflowTest(unittest.TestCase):
         for name in self.ROUTED_JOBS:
             for identity, job in _workflow(name)["jobs"].items():
                 self.assert_push_tools(job, identity)
-                if identity == "authz":
+                if identity in self.HOSTED_ONLY_RUNNERS:
+                    mutants = []
+                    mutant = copy.deepcopy(job)
+                    mutant["steps"].insert(0, {
+                        "name": "Install push runner tools",
+                        "if": "github.event_name == 'push'",
+                        "run": "sudo apt-get update && sudo apt-get install -y python3",
+                    })
+                    mutants.append(mutant)
+                    mutant = copy.deepcopy(job)
+                    mutant["container"] = "ubuntu:24.04"
+                    mutants.append(mutant)
+                    for index, mutant in enumerate(mutants):
+                        with self.subTest(workflow=name, job=identity, mutation=index):
+                            with self.assertRaises(AssertionError):
+                                self.assert_push_tools(mutant, identity)
                     continue
                 mutants = []
                 mutant = copy.deepcopy(job)
@@ -3842,7 +3861,8 @@ class PrTierWorkflowTest(unittest.TestCase):
         self.assert_push_tools(changes, "changes")
         self.assertEqual(changes["steps"][1]["with"]["fetch-depth"], "0")
         self.assertEqual(changes["steps"][1]["if"], "github.event_name == 'pull_request'")
-        for identity in self.ROUTED_JOBS["python-test.yml"] - {"release-ready"}:
+        suites = self.ROUTED_JOBS["python-test.yml"] - {"release-ready"} | {"release-rules"}
+        for identity in suites:
             job = workflow["jobs"][identity]
             self.assertEqual(job["needs"], ["authz", "changes"])
             self.assert_job_condition(identity, job)
@@ -3852,7 +3872,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         self.assertEqual(aggregate["name"], "release/ready")
         self.assert_job_condition("release-ready", aggregate)
         self.assertEqual(set(aggregate["needs"]),
-                         self.ROUTED_JOBS["python-test.yml"] - {"release-ready"} | {"authz", "changes"})
+                         suites | {"authz", "changes"})
         self.assert_authz_refusal_first(aggregate)
         self.assertEqual(aggregate["steps"][2]["env"]["AUTHZ_OK"], "${{ needs.authz.result == 'success' }}")
         facts = _workflow("facts-validate.yml")

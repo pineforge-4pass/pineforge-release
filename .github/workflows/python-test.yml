@@ -164,11 +164,8 @@ jobs:
   release-rules:
     needs: [authz, changes]
     if: ${{ !github.event.pull_request.draft && (needs.changes.outputs.docs-only == 'false') }}
-    runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
-      - name: Install push runner tools
-        if: github.event_name == 'push'
-        run: sudo apt-get update && sudo apt-get install -y ca-certificates curl git jq
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
