@@ -196,7 +196,7 @@ Pushing a tag alone does not start publication.
 
 The release, facts-automation and PR-CI jobs use GitHub-hosted runners.
 The `authz` jobs use `runs-on: ubuntu-24.04`; the other jobs use
-`runs-on: ubuntu-latest`, including candidate preparation, receipt planning and failure reporting.
+`runs-on: ubuntu-latest`, including candidate preparation, receipt planning and failure reporting; the PR-CI jobs that also run on pushes to main use the push-triggered runner `runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}`.
 Those other jobs have the standing R6/rule-B exception (owner decision 10-21, msg 1562390657274748981).
 The [release runner policy](docs/release-chain.md#release-runner-isolation) lists
 the jobs and the class boundary.
