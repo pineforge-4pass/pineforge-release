@@ -79,8 +79,10 @@ class ReadyWiringTests(unittest.TestCase):
         # Translate the workflow's actual step comparisons for this shell
         # replay. The separate inventory replays below bypass these wrappers
         # so a correct first refusal cannot hide a broken inventory program.
+        # These pull-request replays skip the exactly pinned push-only bootstrap.
+        self.assertEqual(job["steps"][0], wiring.PrTierWorkflowTest.READY_TOOLS_STEP)
         programs = []
-        steps = job["steps"][:1] if first_only else job["steps"]
+        steps = job["steps"][1:2] if first_only else job["steps"][1:]
         for step in steps:
             condition = step.get("if", "").removeprefix("${{").removesuffix("}}").strip()
             comparison = re.fullmatch(r"needs\.authz\.result (==|!=) 'success'", condition)
@@ -91,8 +93,9 @@ class ReadyWiringTests(unittest.TestCase):
 
     def test_security_819_actual_first_refusal_and_full_aggregate_reject_non_success_authz(self):
         job = workflow("python-test.yml")["jobs"]["release-ready"]
-        self.assertEqual(job["steps"][0], wiring.PrTierWorkflowTest.AUTHZ_REFUSAL_STEP)
-        self.assertEqual(job["steps"][1]["if"], "needs.authz.result == 'success'")
+        self.assertEqual(job["steps"][0], wiring.PrTierWorkflowTest.READY_TOOLS_STEP)
+        self.assertEqual(job["steps"][1], wiring.PrTierWorkflowTest.AUTHZ_REFUSAL_STEP)
+        self.assertEqual(job["steps"][2]["if"], "needs.authz.result == 'success'")
         for docs_only in ("false", "true"):
             expected = {name: {"result": "skipped" if docs_only == "true" else "success"}
                         for name in job["needs"]}
@@ -178,7 +181,7 @@ class ReadyWiringTests(unittest.TestCase):
         self.assertEqual(job.get("if"), "${{ always() }}")
         self.assertEqual(set(job["needs"]), {"authz", "changes", "fingerprint-canonical", "release-rules",
                                             "description-renderer", "release-ready-replay"})
-        script = job["steps"][1]["run"]
+        script = job["steps"][2]["run"]
         # Execute the workflow's actual aggregate program in a child process.
         expected = {name: {"result": "success"} for name in job["needs"]}
         expected["changes"]["outputs"] = {"docs-only": "false"}
@@ -219,7 +222,7 @@ class ReadyWiringTests(unittest.TestCase):
         cases.append(("extra job", "pull_request", results, False))
         for label, event, results, accepted in cases:
             with self.subTest(case=label):
-                done = self.aggregate_shell(job["steps"][1]["run"], results, event)
+                done = self.aggregate_shell(job["steps"][2]["run"], results, event)
                 self.assertEqual(done.returncode == 0, accepted, done.stderr)
 
     def assert_aggregate_requires_authz_success(self, job):
@@ -228,8 +231,9 @@ class ReadyWiringTests(unittest.TestCase):
             "authz", "changes", "fingerprint-canonical", "release-rules",
             "description-renderer", "release-ready-replay",
         })
-        self.assertEqual(job["steps"][0], wiring.PrTierWorkflowTest.AUTHZ_REFUSAL_STEP)
-        step = job["steps"][1]
+        self.assertEqual(job["steps"][0], wiring.PrTierWorkflowTest.READY_TOOLS_STEP)
+        self.assertEqual(job["steps"][1], wiring.PrTierWorkflowTest.AUTHZ_REFUSAL_STEP)
+        step = job["steps"][2]
         self.assertEqual(step.get("if"), "needs.authz.result == 'success'")
         self.assertEqual(step["env"]["AUTHZ_OK"], "${{ needs.authz.result == 'success' }}")
         for docs_only in ("false", "true"):
@@ -257,7 +261,7 @@ class ReadyWiringTests(unittest.TestCase):
         job = workflow("python-test.yml")["jobs"]["release-ready"]
         self.assert_aggregate_requires_authz_success(job)
         condition = "if os.environ['AUTHZ_OK'] != 'true' or results['authz']['result'] != 'success':"
-        script = job["steps"][1]["run"]
+        script = job["steps"][2]["run"]
         self.assertIn(condition, script)
         mutants = []
         for replacement in (
@@ -267,10 +271,10 @@ class ReadyWiringTests(unittest.TestCase):
             "if False:",
         ):
             mutant = copy.deepcopy(job)
-            mutant["steps"][1]["run"] = script.replace(condition, replacement, 1)
+            mutant["steps"][2]["run"] = script.replace(condition, replacement, 1)
             mutants.append(mutant)
         mutant = copy.deepcopy(job)
-        mutant["steps"][1]["env"]["AUTHZ_OK"] = (
+        mutant["steps"][2]["env"]["AUTHZ_OK"] = (
             "${{ needs.authz.result == 'success' || needs.authz.result == 'skipped' }}"
         )
         mutants.append(mutant)
@@ -287,10 +291,10 @@ class ReadyWiringTests(unittest.TestCase):
                 mutant["if"] = condition
             mutants.append(mutant)
         mutant = copy.deepcopy(job)
-        mutant["steps"][1].pop("if")
+        mutant["steps"][2].pop("if")
         mutants.append(mutant)
         mutant = copy.deepcopy(job)
-        mutant["steps"][1]["if"] = "needs.authz.result != 'success'"
+        mutant["steps"][2]["if"] = "needs.authz.result != 'success'"
         mutants.append(mutant)
         for missing_need in job["needs"]:
             mutant = copy.deepcopy(job)

@@ -2638,8 +2638,27 @@ class PrTierWorkflowTest(unittest.TestCase):
     }
     # Old pool labels remain negative-control fixtures.
     RUNNER = ["self-hosted", "pf-ci", "pf-ci-x64"]
-    RUNNER_LINE = "    runs-on: ubuntu-latest"
+    PUSH_RUNNER = "${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}"
+    RUNNER_LINE = "    runs-on: " + PUSH_RUNNER
     RUNNER_COUNTS = {"python-test.yml": 6, "facts-validate.yml": 1}
+    PUSH_PACKAGES = {
+        "validate": "ca-certificates diffutils git python3",
+        "changes": "python3",
+        "fingerprint-canonical": "ca-certificates git",
+        "release-rules": "ca-certificates curl git jq",
+        "description-renderer": "ca-certificates git",
+        "release-ready-replay": "ca-certificates git jq",
+        "release-ready": "python3",
+    }
+    READY_TOOLS_STEP = {
+        "name": "Install push runner tools",
+        "if": "needs.authz.result == 'success' && (github.event_name == 'push')",
+        "run": "sudo apt-get update && sudo apt-get install -y python3",
+    }
+    READY_TOOLS_TEXT = """      - name: Install push runner tools
+        if: needs.authz.result == 'success' && (github.event_name == 'push')
+        run: sudo apt-get update && sudo apt-get install -y python3
+"""
     POOL_RUNNER_LINE = '    runs-on: ["self-hosted","pf-ci","pf-ci-x64"]'
     PR_GUARD = ("github.event_name != 'pull_request' || "
                 "github.event.pull_request.head.repo.full_name == github.repository")
@@ -2757,7 +2776,7 @@ class PrTierWorkflowTest(unittest.TestCase):
     }
 
     def assert_runner(self, runner, identity):
-        expected = "ubuntu-24.04" if identity == "authz" else "ubuntu-latest"
+        expected = "ubuntu-24.04" if identity == "authz" else self.PUSH_RUNNER
         self.assertEqual(runner, expected, f"runs-on must be {expected}")
 
     def assert_hosted_job(self, job, identity):
@@ -2766,9 +2785,24 @@ class PrTierWorkflowTest(unittest.TestCase):
 
     def assert_hosted_runners(self, workflows):
         for name, identity in sorted(self.HOSTED_JOBS):
-            expected = "ubuntu-24.04" if identity == "authz" else "ubuntu-latest"
+            expected = "ubuntu-24.04" if identity == "authz" else self.PUSH_RUNNER
             self.assertEqual(workflows[name]["jobs"][identity]["runs-on"], expected,
                              f"{name}:{identity}: runs-on must be {expected}")
+
+    def assert_push_tools(self, job, identity):
+        if identity == "authz":
+            self.assertNotIn("Install push runner tools", json.dumps(job))
+            return
+        expected = {
+            "name": "Install push runner tools",
+            "if": "github.event_name == 'push'",
+            "run": "sudo apt-get update && sudo apt-get install -y " + self.PUSH_PACKAGES[identity],
+        }
+        if identity == "release-ready":
+            expected = self.READY_TOOLS_STEP
+        self.assertEqual(job["steps"][0], expected)
+        self.assertEqual(sum(step.get("name") == expected["name"] for step in job["steps"]), 1)
+        self.assertNotIn("container", job)
 
     def assert_no_pr_pool_runner_labels(self, workflows):
         for name, workflow in workflows.items():
@@ -2805,14 +2839,25 @@ class PrTierWorkflowTest(unittest.TestCase):
     def assert_authz_refusal_first(self, job):
         self.assertNotIn("continue-on-error", job)
         self.assertTrue(job.get("steps"), "authz status overrides must have a refusal step")
-        # Exact shape pins the failure comparison and exit, and rejects
-        # continue-on-error or any action/code inserted before the gate.
-        self.assertEqual(job["steps"][0], self.AUTHZ_REFUSAL_STEP)
+        # Only the exact push-only, successful-authz bootstrap may precede the refusal.
+        index = self.authz_refusal_index(job)
+        self.assertGreater(len(job["steps"]), index)
+        self.assertEqual(job["steps"][index], self.AUTHZ_REFUSAL_STEP)
+
+    def authz_refusal_index(self, job):
+        if job.get("name") == "release/ready":
+            self.assertTrue(job.get("steps"))
+            self.assertEqual(job["steps"][0], self.READY_TOOLS_STEP)
+            return 1
+        return 0
 
     def assert_authz_success_steps(self, job):
         # R5b also covers third-party actions here. An existing condition may
         # follow the mandatory success term only inside one balanced group.
-        for index, step in enumerate(job["steps"][1:], start=2):
+        refusal = self.authz_refusal_index(job)
+        for index, step in enumerate(job["steps"], start=1):
+            if index - 1 == refusal:
+                continue
             condition = step.get("if", "")
             self.assertIsInstance(condition, str, f"step {index}")
             if condition == self.AUTHZ_SUCCESS:
@@ -2852,7 +2897,8 @@ class PrTierWorkflowTest(unittest.TestCase):
             self.assertIsNotNone(block, identity)
             steps = block[1].split("    steps:\n", 1)
             self.assertEqual(len(steps), 2, identity)
-            self.assertTrue(steps[1].startswith(self.AUTHZ_REFUSAL_TEXT), identity)
+            prefix = self.READY_TOOLS_TEXT if identity == "release-ready" else ""
+            self.assertTrue(steps[1].startswith(prefix + self.AUTHZ_REFUSAL_TEXT), identity)
 
     def assert_job_condition(self, identity, job):
         self.assert_no_fork_condition(job)
@@ -2937,6 +2983,7 @@ class PrTierWorkflowTest(unittest.TestCase):
                                      "release/ready" if identity == "release-ready" else identity)
                     self.assertNotIn("uses", job, "PR coverage must not hide a reusable hosted job")
                     self.assert_hosted_job(job, identity)
+                    self.assert_push_tools(job, identity)
                     if identity == "authz":
                         self.assert_authz(job)
                     else:
@@ -2963,8 +3010,8 @@ class PrTierWorkflowTest(unittest.TestCase):
                     mutant = copy.deepcopy(original)
                     mutant[name]["jobs"][identity]["runs-on"] = runner
                     self.assertNotEqual(mutant, original)
-                    expected = "ubuntu-24.04" if identity == "authz" else "ubuntu-latest"
-                    with self.assertRaisesRegex(AssertionError, f"runs-on must be {expected}"):
+                    expected = "ubuntu-24.04" if identity == "authz" else self.PUSH_RUNNER
+                    with self.assertRaisesRegex(AssertionError, re.escape(f"runs-on must be {expected}")):
                         self.assert_hosted_runners(mutant)
                     with self.assertRaisesRegex(AssertionError, "runs-on must not contain"):
                         self.assert_no_pr_pool_runner_labels(mutant)
@@ -2978,6 +3025,12 @@ class PrTierWorkflowTest(unittest.TestCase):
                 for runner in (
                     self.RUNNER.copy(),
                     "ubuntu-latest" if identity == "authz" else "ubuntu-24.04",
+                    "ubuntu-latest",
+                    "gke-2cpu-4gb-amd64",
+                    "${{ github.event_name == 'pull_request' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
+                    "${{ github.event_name == 'merge_group' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
+                    "${{ github.event_name != 'pull_request' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
+                    "${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'gke-2cpu-4gb-amd64' }}",
                     self.LEGACY_RUNNER,
                     """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') }}""",
                     """${{ fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}""",
@@ -3007,6 +3060,39 @@ class PrTierWorkflowTest(unittest.TestCase):
                 self.assertNotEqual(mutant_text, text)
                 with self.assertRaises(AssertionError):
                     self.assert_literal_routes(mutant_text, {identity})
+
+    def test_push_tools_refuse_missing_late_unguarded_or_changed_installation(self):
+        for name in self.ROUTED_JOBS:
+            for identity, job in _workflow(name)["jobs"].items():
+                self.assert_push_tools(job, identity)
+                if identity == "authz":
+                    continue
+                mutants = []
+                mutant = copy.deepcopy(job)
+                mutant["steps"].pop(0)
+                mutants.append(mutant)
+                mutant = copy.deepcopy(job)
+                mutant["steps"].append(mutant["steps"].pop(0))
+                mutants.append(mutant)
+                for condition in (None, "always()", "github.event_name != 'pull_request'",
+                                  "github.event_name == 'pull_request'",
+                                  "github.event_name == 'merge_group'"):
+                    mutant = copy.deepcopy(job)
+                    if condition is None:
+                        mutant["steps"][0].pop("if")
+                    else:
+                        mutant["steps"][0]["if"] = condition
+                    mutants.append(mutant)
+                mutant = copy.deepcopy(job)
+                mutant["steps"][0]["run"] += " || true"
+                mutants.append(mutant)
+                mutant = copy.deepcopy(job)
+                mutant["container"] = "ubuntu:24.04"
+                mutants.append(mutant)
+                for index, mutant in enumerate(mutants):
+                    with self.subTest(workflow=name, job=identity, mutation=index):
+                        with self.assertRaises(AssertionError):
+                            self.assert_push_tools(mutant, identity)
 
     def test_every_job_refuses_reintroduced_job_level_fork_conditions(self):
         for name in self.ROUTED_JOBS:
@@ -3107,12 +3193,13 @@ class PrTierWorkflowTest(unittest.TestCase):
             workflow = _workflow(name)
             for identity in self.assert_status_override_refusals(workflow):
                 job = workflow["jobs"][identity]
+                refusal = self.authz_refusal_index(job)
                 mutants = []
                 mutant = copy.deepcopy(job)
-                mutant["steps"].pop(0)
+                mutant["steps"].pop(refusal)
                 mutants.append(("drop refusal", mutant))
                 mutant = copy.deepcopy(job)
-                mutant["steps"].append(mutant["steps"].pop(0))
+                mutant["steps"].append(mutant["steps"].pop(refusal))
                 mutants.append(("move after aggregate", mutant))
                 mutant = copy.deepcopy(job)
                 mutant["steps"] = []
@@ -3124,11 +3211,12 @@ class PrTierWorkflowTest(unittest.TestCase):
                     {"run": "python3 scripts/must-not-run.py"},
                 ):
                     protected = copy.deepcopy(job)
-                    protected["steps"].insert(1, {**earlier, "if": self.AUTHZ_SUCCESS})
+                    protected["steps"].insert(refusal + 1, {**earlier, "if": self.AUTHZ_SUCCESS})
                     self.assertEqual(self.assert_status_override_refusals(
                         {"jobs": {identity: protected}}), {identity})
                     mutant = copy.deepcopy(protected)
-                    mutant["steps"][0], mutant["steps"][1] = mutant["steps"][1], mutant["steps"][0]
+                    mutant["steps"][refusal], mutant["steps"][refusal + 1] = (
+                        mutant["steps"][refusal + 1], mutant["steps"][refusal])
                     mutants.append(("move after " + str(earlier), mutant))
                 for key, value in (
                     ("name", "Authorization is optional"),
@@ -3151,7 +3239,7 @@ class PrTierWorkflowTest(unittest.TestCase):
                     ("run", "true"),
                 ):
                     mutant = copy.deepcopy(job)
-                    mutant["steps"][0][key] = value
+                    mutant["steps"][refusal][key] = value
                     mutants.append((key + ":" + str(value), mutant))
                 mutant = copy.deepcopy(job)
                 mutant["continue-on-error"] = "true"
@@ -3234,9 +3322,10 @@ class PrTierWorkflowTest(unittest.TestCase):
                 ):
                     guarded = copy.deepcopy(job)
                     guarded["if"] = condition
-                    if guarded["steps"][0] != self.AUTHZ_REFUSAL_STEP:
-                        guarded["steps"].insert(0, copy.deepcopy(self.AUTHZ_REFUSAL_STEP))
-                    for step in guarded["steps"][1:]:
+                    refusal = self.authz_refusal_index(guarded)
+                    if guarded["steps"][refusal] != self.AUTHZ_REFUSAL_STEP:
+                        guarded["steps"].insert(refusal, copy.deepcopy(self.AUTHZ_REFUSAL_STEP))
+                    for step in guarded["steps"][refusal + 1:]:
                         previous = step.get("if")
                         if previous != self.AUTHZ_SUCCESS:
                             step["if"] = (f"{self.AUTHZ_SUCCESS} && ({previous})"
@@ -3245,7 +3334,7 @@ class PrTierWorkflowTest(unittest.TestCase):
                         self.assertEqual(self.assert_status_override_refusals(
                             {"jobs": {identity: guarded}}), {identity})
                         mutant = copy.deepcopy(guarded)
-                        mutant["steps"].pop(0)
+                        mutant["steps"].pop(refusal)
                         self.assertNotEqual(mutant, guarded)
                         with self.assertRaises(AssertionError):
                             self.assert_status_override_refusals({"jobs": {identity: mutant}})
@@ -3255,7 +3344,10 @@ class PrTierWorkflowTest(unittest.TestCase):
             workflow = _workflow(name)
             for identity in self.assert_status_override_refusals(workflow):
                 job = workflow["jobs"][identity]
-                for index in range(1, len(job["steps"])):
+                refusal = self.authz_refusal_index(job)
+                for index in range(len(job["steps"])):
+                    if index == refusal:
+                        continue
                     mutant = copy.deepcopy(job)
                     mutant["steps"][index].pop("if")
                     with self.subTest(workflow=name, job=identity, step=index + 1):
@@ -3747,8 +3839,9 @@ class PrTierWorkflowTest(unittest.TestCase):
         self.assertEqual(workflow["on"]["push"]["branches"], ["main", "master"])
         changes = workflow["jobs"]["changes"]
         self.assertEqual(changes["outputs"], {"docs-only": "${{ steps.paths.outputs.docs-only }}"})
-        self.assertEqual(changes["steps"][0]["with"]["fetch-depth"], "0")
-        self.assertEqual(changes["steps"][0]["if"], "github.event_name == 'pull_request'")
+        self.assert_push_tools(changes, "changes")
+        self.assertEqual(changes["steps"][1]["with"]["fetch-depth"], "0")
+        self.assertEqual(changes["steps"][1]["if"], "github.event_name == 'pull_request'")
         for identity in self.ROUTED_JOBS["python-test.yml"] - {"release-ready"}:
             job = workflow["jobs"][identity]
             self.assertEqual(job["needs"], ["authz", "changes"])
@@ -3761,7 +3854,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         self.assertEqual(set(aggregate["needs"]),
                          self.ROUTED_JOBS["python-test.yml"] - {"release-ready"} | {"authz", "changes"})
         self.assert_authz_refusal_first(aggregate)
-        self.assertEqual(aggregate["steps"][1]["env"]["AUTHZ_OK"], "${{ needs.authz.result == 'success' }}")
+        self.assertEqual(aggregate["steps"][2]["env"]["AUTHZ_OK"], "${{ needs.authz.result == 'success' }}")
         facts = _workflow("facts-validate.yml")
         self.assertEqual(set(facts["on"]), {"pull_request", "push"})
         self.assertEqual(facts["on"]["push"]["branches"], ["main"])
@@ -3773,9 +3866,10 @@ class PrTierWorkflowTest(unittest.TestCase):
         validate = facts["jobs"]["validate"]
         self.assert_job_condition("validate", validate)
         self.assertEqual(validate["needs"], "authz")
-        self.assertEqual(validate["steps"][0]["with"]["fetch-depth"],
+        self.assert_push_tools(validate, "validate")
+        self.assertEqual(validate["steps"][1]["with"]["fetch-depth"],
                          "${{ github.event_name == 'pull_request' && '0' || '1' }}")
-        for step in validate["steps"][2:]:
+        for step in validate["steps"][3:]:
             self.assertEqual(step["if"], "steps.paths.outputs.docs-only == 'false'")
 
     def detector(self, workflow):
