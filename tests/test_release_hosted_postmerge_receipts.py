@@ -188,6 +188,22 @@ class HostedPostmergeReceiptTests(unittest.TestCase):
                 self.f.responses[self.f.workflow_routes[ref]] = []
                 self.assert_refused("^postmerge workflow is not a file$")
 
+    def test_e2e_workflow_404_at_either_commit_is_refused_as_a_non_file(self):
+        class MissingWorkflowRoute(HostedPostmergeFixture):
+            def __init__(self, ref):
+                super().__init__()
+                self.missing_route = self.workflow_routes[ref]
+
+            def api(self, route):
+                if route == self.missing_route:
+                    raise contract.Pending("published artifact unavailable")
+                return super().api(route)
+
+        for ref in ("base_sha", "merge"):
+            with self.subTest(ref=ref):
+                self.f = MissingWorkflowRoute(ref)
+                self.assert_refused("^postmerge workflow is not a file$")
+
     def test_e2e_workflow_missing_blob_shas_are_refused(self):
         for route in self.f.workflow_routes.values():
             self.f.responses[route] = {"type": "file"}

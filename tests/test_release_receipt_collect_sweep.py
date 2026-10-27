@@ -8,10 +8,12 @@ import json
 import os
 import shlex
 import sys
+import tempfile
 import unittest
 import urllib.error
 import zipfile
 from contextlib import redirect_stderr
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import test_release_binding as binding
@@ -21,10 +23,15 @@ import test_release_receipts as history
 
 contract = history.contract
 receipts = history.receipts
+pipeline = binding.pipeline
 REPO = history.REPO
 POLICY = postmerge.HOSTED_POLICY
 INVENTORY_ERROR = "required check inventory differs from owner policy"
 IDENTITY_ERROR = "receipt identity reused with different evidence"
+RECEIPT_EXCLUSION_REASON = (
+    "hosted MCP runs 1.6.3 and the application's 1.7.0 is a dev-only change, "
+    "so neither posts a 1.7.0 receipt."
+)
 
 
 class SweepFixture(history.HistoryClient):
@@ -146,6 +153,14 @@ class ReceiptCollectSweepTests(unittest.TestCase):
         self.enterContext(redirect_stderr(self.output))
         self.report = self.enterContext(patch.object(receipts, "report_issue"))
 
+    def assert_invalid_exclusion_file(self, document):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt-exclusions.json"
+            if document is not None:
+                path.write_bytes(document if isinstance(document, bytes) else contract.canonical(document))
+            with self.assertRaises(contract.Invalid):
+                pipeline.load_receipt_exclusions(path)
+
     def collect(self, client, store=None, role="hosted", run_id=0):
         policy = POLICY if role == "hosted" else history.POLICY
         with patch.dict(os.environ, {"TARGET_REPOSITORY": "fixture",
@@ -263,6 +278,98 @@ class ReceiptCollectSweepTests(unittest.TestCase):
         self.assertEqual(f.written_names(), [])
         self.assertEqual(self.output.getvalue(), "")
         self.report.assert_not_called()
+
+    def test_v170_excludes_hosted_and_application_but_keeps_compute_required(self):
+        f = SweepFixture(release_version="1.7.0")
+        f.artifacts = []
+        f.store.put(f.row, "delivery-compute.json", contract.canonical({
+            "event_id": f.event["event_id"], "consumer": "compute",
+            "state": "dispatch_accepted",
+        }))
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "hosted,application,compute"}):
+            receipts.require_product_receipts(f.store, "hosted")
+            receipts.require_product_receipts(f.store, "application")
+            status = pipeline.aggregate(f.store, f.row, f.event,
+                                        enabled=("hosted", "application", "compute"))
+        self.assertEqual(status["consumers"], {"compute": "delivered"})
+        self.assertTrue(status["complete"])
+        for role in ("hosted", "application"):
+            self.assertIn(
+                f"::notice::receipt requirement excluded: release=v1.7.0 role={role} "
+                f"reason={RECEIPT_EXCLUSION_REASON}",
+                self.output.getvalue(),
+            )
+
+    def test_v170_exclusion_does_not_remove_compute_obligation(self):
+        f = SweepFixture(release_version="1.7.0")
+        f.artifacts = []
+        with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "hosted,application,compute"}):
+            receipts.require_product_receipts(f.store, "hosted")
+            receipts.require_product_receipts(f.store, "application")
+            status = pipeline.aggregate(f.store, f.row, f.event,
+                                        enabled=("hosted", "application", "compute"))
+        self.assertEqual(status["consumers"], {"compute": "pending"})
+        self.assertFalse(status["complete"])
+
+    def test_v180_hosted_missing_is_still_required(self):
+        f = SweepFixture(release_version="1.8.0")
+        f.require_delivery()
+        f.artifacts = []
+        with self.assertRaisesRegex(
+                contract.Invalid, "^required consumer receipt missing: role=hosted releases=v1[.]8[.]0$"):
+            self.collect(f)
+        self.assertNotIn("v1.8.0", pipeline.load_receipt_exclusions())
+
+    def test_v170_prerelease_hosted_missing_is_not_excluded(self):
+        f = SweepFixture(release_version="1.7.0-rc.1")
+        f.require_delivery()
+        f.artifacts = []
+        with self.assertRaisesRegex(
+                contract.Invalid,
+                "^required consumer receipt missing: role=hosted releases=v1[.]7[.]0-rc[.]1$"):
+            self.collect(f)
+        self.assertNotIn("v1.7.0-rc.1", pipeline.load_receipt_exclusions())
+
+    def test_committed_receipt_exclusion_data_is_exact(self):
+        self.assertEqual(
+            pipeline.load_receipt_exclusions(),
+            {"v1.7.0": {
+                "application": RECEIPT_EXCLUSION_REASON,
+                "hosted": RECEIPT_EXCLUSION_REASON,
+            }},
+        )
+
+    def test_receipt_exclusion_loader_rejects_invalid_records(self):
+        entry = {
+            "release": "v1.7.0",
+            "roles": ["application", "hosted"],
+            "reason": RECEIPT_EXCLUSION_REASON,
+        }
+        cases = [
+            ("unknown role", {"schema": pipeline.RECEIPT_EXCLUSIONS_SCHEMA,
+                              "exclusions": [{**copy.deepcopy(entry), "roles": ["application", "unknown"]}]}),
+            ("extra entry key", {"schema": pipeline.RECEIPT_EXCLUSIONS_SCHEMA,
+                                 "exclusions": [{**copy.deepcopy(entry), "extra": True}]}),
+            ("extra root key", {"schema": pipeline.RECEIPT_EXCLUSIONS_SCHEMA,
+                                "exclusions": [entry], "extra": True}),
+            ("empty reason", {"schema": pipeline.RECEIPT_EXCLUSIONS_SCHEMA,
+                              "exclusions": [{**copy.deepcopy(entry), "reason": " "}]}),
+            ("non-string reason", {"schema": pipeline.RECEIPT_EXCLUSIONS_SCHEMA,
+                                   "exclusions": [{**copy.deepcopy(entry), "reason": None}]}),
+            ("duplicate release", {"schema": pipeline.RECEIPT_EXCLUSIONS_SCHEMA,
+                                   "exclusions": [copy.deepcopy(entry), copy.deepcopy(entry)]}),
+            ("bad tag", {"schema": pipeline.RECEIPT_EXCLUSIONS_SCHEMA,
+                         "exclusions": [{**copy.deepcopy(entry), "release": "1.7.0"}]}),
+            ("empty roles", {"schema": pipeline.RECEIPT_EXCLUSIONS_SCHEMA,
+                             "exclusions": [{**copy.deepcopy(entry), "roles": []}]}),
+            ("unsorted roles", {"schema": pipeline.RECEIPT_EXCLUSIONS_SCHEMA,
+                                "exclusions": [{**copy.deepcopy(entry), "roles": ["hosted", "application"]}]}),
+            ("invalid JSON", b"{"),
+            ("missing file", None),
+        ]
+        for label, document in cases:
+            with self.subTest(case=label):
+                self.assert_invalid_exclusion_file(document)
 
     def test_workflow_requires_configured_receipts_through_delivery_repair(self):
         for delivery in ("not_started", "attempted", "failed", "redelivered"):

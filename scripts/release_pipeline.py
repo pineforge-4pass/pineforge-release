@@ -25,6 +25,8 @@ from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYP
 
 FACTS_RECEIPTS_TAG = "facts-receipts"
 COMPLETE_STATES = ("verified", "skipped_by_policy", "superseded", "delivered")
+RECEIPT_EXCLUSIONS_SCHEMA = "pineforge/receipt-exclusions/v1"
+RECEIPT_EXCLUSIONS_PATH = Path(__file__).resolve().parent.parent / "facts" / "receipt-exclusions.json"
 # The public consumer-<role>-<attempt>-<sequence>.json receipt that release_receipts publishes. That
 # module imports this one, so these are repeated here; tests compare them with its real output.
 RECEIPT_SCHEMA = "pineforge/consumer-receipt/v1"
@@ -268,6 +270,41 @@ def configured_roles(raw):
     return roles
 
 
+def load_receipt_exclusions(path=None):
+    path = RECEIPT_EXCLUSIONS_PATH if path is None else Path(path)
+    try:
+        document = decode(path.read_bytes())
+    except FileNotFoundError as error:
+        raise Invalid("receipt exclusion data file missing") from error
+    except OSError as error:
+        raise Invalid("receipt exclusion data file unavailable") from error
+    keys(document, ("schema", "exclusions"))
+    require(document["schema"] == RECEIPT_EXCLUSIONS_SCHEMA, "unsupported receipt exclusion schema")
+    require(type(document["exclusions"]) is list, "receipt exclusions must be a list")
+    result = {}
+    for exclusion in document["exclusions"]:
+        keys(exclusion, ("release", "roles", "reason"))
+        release = exclusion["release"]
+        require(type(release) is str and release.startswith("v"), "invalid receipt exclusion release")
+        try:
+            parsed = version(release[1:])
+        except (TypeError, ValueError):
+            raise Invalid("invalid receipt exclusion release") from None
+        require(release == "v" + str(parsed), "invalid receipt exclusion release")
+        require(release not in result, "duplicate receipt exclusion release")
+        roles = exclusion["roles"]
+        require(type(roles) is list and roles, "receipt exclusion roles must be nonempty")
+        require(all(type(role) is str and role in ROLES for role in roles),
+                "unknown receipt exclusion role")
+        require(len(roles) == len(set(roles)) and roles == sorted(roles),
+                "receipt exclusion roles must be unique and sorted")
+        reason = exclusion["reason"]
+        require(type(reason) is str and bool(reason.strip()),
+                "receipt exclusion reason must be nonempty")
+        result[release] = {role: reason for role in roles}
+    return result
+
+
 class ConfigurationError(Invalid):
     pass
 
@@ -436,9 +473,13 @@ def delivery_accepted(store, row, event_id, role):
 
 def aggregate(store, row, event, *, enabled=(), newest=None):
     by_role = receipts(store, row, event["event_id"])
+    exclusions = load_receipt_exclusions()
+    release = "v" + event["release_version"]
     states = {}
     for role in ROLES:
         if role not in enabled:
+            continue
+        if role in exclusions.get(release, {}):
             continue
         obj = by_role.get(role)
         if role in DELIVERY_ONLY:

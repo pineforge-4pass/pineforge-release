@@ -1,0 +1,13 @@
+{
+  "schema": "pineforge/receipt-exclusions/v1",
+  "exclusions": [
+    {
+      "release": "v1.7.0",
+      "roles": [
+        "application",
+        "hosted"
+      ],
+      "reason": "hosted MCP runs 1.6.3 and the application's 1.7.0 is a dev-only change, so neither posts a 1.7.0 receipt."
+    }
+  ]
+}

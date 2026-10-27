@@ -745,7 +745,7 @@ stored `release-receipt-data` artifact whose receipt carries the bootstrap
 `previous` has expired (data uploads it with 90-day retention): the scheduled
 collector re-validates every retained receipt artifact that the hub has not
 already stored, so dropping the form earlier makes each such artifact fail
-validation; in a sweep it is reported and skipped (see the collector skip rules
+validation; a sweep reports this refusal and continues (see the collector skip rules
 below), and a callback naming that run still fails closed.
 
 **Legacy offline `previous` (temporary).** Only a product receipt with
@@ -1327,7 +1327,8 @@ is KNOWN NOISE until the collector skips old-policy artifacts using an EXPLICIT
 policy-version marker. That marker is not implemented. This base's sweep already
 isolates validation refusals and continues with the per-role
 `Release chain: receipt artifacts skipped (hosted)` issue, so these refusals
-alone no longer cause the earlier sweep-wide failure. Callbacks still fail closed.
+alone no longer cause the earlier sweep-wide failure. Request errors and `Pending`
+still abort the sweep. Callbacks still fail closed.
 Keep the warnings and issue reopening visible; preserve the old artifacts.
 
 **Collector skip rules.** In a sweep, a bad or old-shape artifact is reported
@@ -1345,7 +1346,7 @@ reuse, including when a newer receipt is also stored. Facts-only artifacts are
 still validated. A callback names one run and still fails closed. Non-404 HTTP
 errors (including authentication, rate limits and server failures), transport
 errors from the real client and `OSError` stay fatal. `Pending` (including a
-404, unknown release or unavailable artifact) also aborts the sweep before any
+404, an unknown release or an unavailable artifact) aborts the sweep before any
 later receipt can advance against the missing earlier state. On retry the
 earlier receipt is processed first, so terminal-state and state-regression
 checks still apply to the later receipt. The incident issue lists at most 50 runs
@@ -1365,6 +1366,15 @@ every candidate was skipped. A valid receipt of an intermediate state
 satisfies collection; aggregate completion still requires its terminal
 completion states. Facts-only polling creates no product delivery requirement
 and retains its separate canonical-history and freshness checks.
+
+Per-release receipt exclusions are recorded in [`facts/receipt-exclusions.json`](../facts/receipt-exclusions.json).
+The versioned data file names a canonical release tag, a sorted nonempty list of
+roles, and a plain sentence explaining each exclusion. The sweep and aggregate
+omit a role only for the named release/role pair; later releases are checked in
+full, and compute plus every other unlisted role stays checked. Add an entry
+with its release, sorted roles and reason when a reviewed exemption is needed,
+and remove that entry when the exemption no longer applies. A missing or
+malformed file aborts the check; `RELEASE_READY_CONSUMERS` remains unchanged.
 
 ## Rollback and validation
 

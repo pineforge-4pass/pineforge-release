@@ -22,7 +22,8 @@ from release_contract import (ASSET, COMMIT, HUB, RECEIPT_ROLES, ROLES, SHA, Inv
                               canonical, decode, keys, match, payload, positive,
                               require, sha256, version)
 from release_pipeline import (Store, configured_roles, receipt_roles, receipts,
-                              release_superseded, report_issue, run_link)
+                              load_receipt_exclusions, release_superseded,
+                              report_issue, run_link)
 
 STATES = ("pending", "pr_open", "testing", "ready", "merged", "deploying", "verified", "failed", "superseded", "skipped_by_policy")
 RANK = {state: i for i, state in enumerate(STATES[:7])}
@@ -205,7 +206,10 @@ def check_postmerge(client, repo, evidence, policy, pr, actual, timestamp):
     workflow_route = f"repos/{repo}/contents/.github/workflows/{policy['e2e']['workflow']}"
     blobs = []
     for ref in (pr["base_sha"], pr["merge"]):
-        contents = client.api(f"{workflow_route}?ref={ref}")
+        try:
+            contents = client.api(f"{workflow_route}?ref={ref}")
+        except Pending:
+            raise Invalid("postmerge workflow is not a file") from None
         require(type(contents) is dict and contents.get("type") == "file", "postmerge workflow is not a file")
         blobs.append(match(COMMIT, contents.get("sha")))
     require(blobs[0] == blobs[1], "postmerge workflow differs from tested base")
@@ -454,6 +458,7 @@ def validate_facts_target(client, target):
 
 def require_product_receipts(store, role):
     enabled = configured_roles(os.environ.get("RELEASE_READY_CONSUMERS", ""))
+    exclusions = load_receipt_exclusions()
     rows = store.releases()
     missing = []
     for row in sorted(rows, key=lambda item: item["tag_name"]):
@@ -471,6 +476,11 @@ def require_product_receipts(store, role):
         if release_superseded(event, rows):
             continue
         if event["prerelease"] and role in ("application", "web", "data", "license"):
+            continue
+        reason = exclusions.get(row["tag_name"], {}).get(role)
+        if reason is not None:
+            print(f"::notice::receipt requirement excluded: release={row['tag_name']} "
+                  f"role={role} reason={reason}", file=sys.stderr)
             continue
         if receipts(store, row, event["event_id"]).get(role) is None:
             missing.append(row["tag_name"])
