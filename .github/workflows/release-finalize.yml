@@ -83,9 +83,9 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ steps.ready.outcome }}" == "success" && -f "$RUNNER_TEMP/deliveries.json" ]]; then
-            echo "deliveries=$(cat "$RUNNER_TEMP/deliveries.json")" >> "$GITHUB_OUTPUT"
+          echo "deliveries=$(cat "$RUNNER_TEMP/deliveries.json")" >> "$GITHUB_OUTPUT"
           else
-            echo 'deliveries=[]' >> "$GITHUB_OUTPUT"
+          echo 'deliveries=[]' >> "$GITHUB_OUTPUT"
           fi
       - name: Report finalizer failure
         if: ${{ failure() && !cancelled() }}
@@ -182,7 +182,7 @@ jobs:
         run: |
           python3 scripts/release_receipts.py delivery --tag "$TAG" --consumer "$CONSUMER" \
             --file "$RUNNER_TEMP/delivery.json"
-      - name: Require receiver workflow run
+      - name: Require receiver run
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           ROLE: ${{ matrix.consumer }}

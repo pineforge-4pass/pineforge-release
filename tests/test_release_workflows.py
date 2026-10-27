@@ -1839,6 +1839,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
         self.assertEqual(check["env"], {
             "TAG": "${{ inputs.tag }}", "CONSUMER": "${{ inputs.consumer }}",
             "RELEASE_READY_CONSUMERS": "${{ vars.RELEASE_READY_CONSUMERS }}",
+            "RELEASE_READY_EXCLUDE": "${{ vars.RELEASE_READY_EXCLUDE }}",
             "RELEASE_COMPUTE_FIRST_PAIR": "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}",
         })
         self.assertEqual(check["run"],
@@ -1892,9 +1893,13 @@ class RedeliverWorkflowTest(unittest.TestCase):
             if any(part in path for part in forbidden) or path.endswith(".env"):
                 self.fail("refused workflow control source path: " + path)
         print("Workflow authorization control follows: " + ", ".join(str(REPO / name) for name in follows))
+        import release_contract as contract
+
         context = {
             "${{ inputs.tag }}": tag, "${{ inputs.consumer }}": consumer,
             "${{ vars.RELEASE_READY_CONSUMERS }}": enabled,
+            "${{ vars.RELEASE_READY_EXCLUDE }}": ",".join(
+                role for role in contract.ROLES if role not in enabled.split(",")),
             "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}": first,
         }
         for step in steps:
@@ -2056,6 +2061,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
             "TARGET_REPOSITORY": "${{ steps.target.outputs.repository }}",
             "TAG": "${{ inputs.tag }}", "CONSUMER": "${{ inputs.consumer }}",
             "RELEASE_READY_CONSUMERS": "${{ vars.RELEASE_READY_CONSUMERS }}",
+            "RELEASE_READY_EXCLUDE": "${{ vars.RELEASE_READY_EXCLUDE }}",
             "RELEASE_COMPUTE_FIRST_PAIR": "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}",
         })
         self.assertEqual(sends[0]["run"],
@@ -3969,6 +3975,29 @@ class PrTierWorkflowTest(unittest.TestCase):
 
 class ReleaseFanoutRegressionTest(unittest.TestCase):
     """Red-first controls for stable fanout and receiver-start enforcement."""
+
+    def test_consumer_environments_pass_the_configured_exclusion_list(self):
+        """Mutation: remove an exclusion binding beside a consumer-list binding."""
+        checked = []
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix not in {".yml", ".yaml"}:
+                continue
+            workflow = _workflow(path.name)
+            scopes = [("env", workflow.get("env", {}))]
+            for name, job in workflow.get("jobs", {}).items():
+                scopes.append((f"jobs.{name}.env", job.get("env", {})))
+                scopes.extend(
+                    (f"jobs.{name}.steps[{index}].env", step.get("env", {}))
+                    for index, step in enumerate(job.get("steps", []))
+                )
+            for scope, environment in scopes:
+                if "RELEASE_READY_CONSUMERS" not in environment:
+                    continue
+                checked.append(path.name)
+                with self.subTest(workflow=path.name, scope=scope):
+                    self.assertEqual(environment.get("RELEASE_READY_EXCLUDE"),
+                                     "${{ vars.RELEASE_READY_EXCLUDE }}")
+        self.assertIn("release-redeliver.yml", checked)
 
     def test_release_ready_consumers_keeps_explicit_selection_meaning(self):
         sys.path.insert(0, str(REPO / "scripts"))

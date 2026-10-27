@@ -254,6 +254,8 @@ class RedeliverTest(unittest.TestCase):
             "${{ inputs.tag }}": tag,
             "${{ inputs.consumer }}": consumer,
             "${{ vars.RELEASE_READY_CONSUMERS }}": configured,
+            "${{ vars.RELEASE_READY_EXCLUDE }}": ",".join(
+                role for role in contract.ROLES if role not in configured.split(",")),
             "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}": os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", ""),
         }
         result, diagnostic = None, ""
@@ -662,6 +664,7 @@ class RedeliverTest(unittest.TestCase):
         deliveries = self.output.with_name("deliveries.json")
         with patch.dict(os.environ, {
                 "RELEASE_READY_CONSUMERS": "compute", "RELEASE_COMPUTE_FIRST_PAIR": "1.6.0",
+                "RELEASE_READY_EXCLUDE": ",".join(role for role in contract.ROLES if role != "compute"),
                 "GITHUB_RUN_ID": "899", "GITHUB_RUN_ATTEMPT": "1",
                 "FACTS_WEB_DISPATCH_ENABLED": "false", "FACTS_LICENSE_DISPATCH_ENABLED": "false"}), \
                 patch.object(pipeline, "age_minutes", return_value=1000), \
