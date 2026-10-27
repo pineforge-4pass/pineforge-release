@@ -1398,6 +1398,25 @@ class FinalizerTests(unittest.TestCase):
             os.environ["GITHUB_RUN_ATTEMPT"] = "1"
             self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"), expected)
 
+    def test_release_delivery_attempts_rerun_preserves_unreleased_first_run_reservation(self):
+        event = self.finish()
+        expected = ({"consumer": "offline", "tag": "v1.6.0", "attempt": 1}, False)
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}), \
+                patch.object(pipeline, "now", return_value="2026-10-27T00:00:00Z"):
+            self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"), expected)
+        self.assertIsNotNone(self.store.read(self.row, "delivery-attempt-offline-1.json"))
+        self.assertIsNone(self.store.read(self.row, "delivery-attempt-released-offline-1-100-1.json"))
+        self.assertIsNone(self.store.read(self.row, "delivery-offline.json"))
+        before = dict(self.store.assets)
+        operations = list(self.store.operations)
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "2"}):
+            pipeline.release_delivery_attempts(self.client, self.store, self.row["tag_name"])
+            self.assertEqual(self.store.assets, before)
+            self.assertEqual(self.store.operations, operations)
+            with patch.object(pipeline, "age_minutes", return_value=0):
+                self.assertEqual(pipeline.plan_delivery(self.store, self.row, event, "offline"),
+                                 (None, False))
+
     def test_plan_delivery_reads_legacy_reservation_release_markers(self):
         event = self.finish()
         self.store.put(self.row, "delivery-attempt-offline-1.json", contract.canonical({

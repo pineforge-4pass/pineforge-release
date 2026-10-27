@@ -566,6 +566,9 @@ def release_delivery_attempts(client, store, tag=""):
                 if not asset["name"].startswith(prefix):
                     continue
                 obj = decode(store.read(row, asset["name"]))
+                # Only reservations written before run attempts existed (live rows
+                # of the 1.7.0 release) can be legacy; only a rerun of that same
+                # run id can hit this default.
                 if (obj.get("run_id") != current_run
                         or obj.get("run_attempt", current_attempt) != current_attempt):
                     continue

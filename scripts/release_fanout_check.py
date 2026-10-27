@@ -439,6 +439,8 @@ def main():
         }).decode("utf-8"), end="")
         return 0
     except (Invalid, Pending, ValueError, OSError, KeyError, TypeError) as error:
+        # Paths reaching this handler outside wait_for_receiver do not include a
+        # receiver repository name; GitHub masks secret values in logs.
         print("::error::" + str(error), file=sys.stderr)
         return 1
 
