@@ -3980,11 +3980,18 @@ class PrTierWorkflowTest(unittest.TestCase):
                 r"`authz`(?: jobs)? uses? `runs-on: ([^`]+)`; "
                 r"the other (?:PR )?jobs use `runs-on: ([^`]+)`", normalized)
             self.assertTrue(runner_pairs, f"{label}: distinguish authz from the other hosted jobs")
+            # The jobs that run on pushes to main use the documented push-triggered runner; every other
+            # non-authz job uses the documented hosted runner.
+            push_runners = set(re.findall(r"push-triggered runner `runs-on: ([^`]+)`", normalized))
+            self.assertTrue(push_runners, f"{label}: document the push-triggered runner of the PR-CI jobs")
             for runners in runner_pairs:
                 for name, workflow in workflows.items():
                     for identity, job in workflow["jobs"].items():
-                        self.assertEqual(runners[0 if identity == "authz" else 1], job["runs-on"],
-                                         f"{label}: {name}:{identity}")
+                        if identity == "authz":
+                            self.assertEqual(runners[0], job["runs-on"], f"{label}: {name}:{identity}")
+                        else:
+                            self.assertIn(job["runs-on"], {runners[1], *push_runners},
+                                          f"{label}: {name}:{identity}")
 
     def test_authz_runner_documentation_matches_workflows_and_refuses_stale_runners(self):
         documents = {"chain": (REPO / "docs/release-chain.md").read_text(),

@@ -34,7 +34,7 @@ with Contents or Issues write access. The `publish.yml` reusable
 `pull_request` and `pull_request_target` workflows must never use this class.
 The PR jobs in `python-test.yml` and `facts-validate.yml` also use GitHub-hosted runners.
 Their `authz` jobs use `runs-on: ubuntu-24.04`; the other PR jobs use
-`runs-on: ubuntu-latest` per the owner decision.
+`runs-on: ubuntu-latest` per the owner decision; the jobs that also run on pushes to main use the push-triggered runner `runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}`.
 The hub runs these jobs on GitHub-hosted runners without waiting for
 the release pool. These hosted jobs do not require a release runner group allowlist.
 
@@ -1078,7 +1078,8 @@ suite inventory; only a verified documentation-only PR may skip suites.
 
 The hub's `python-test.yml` and `facts-validate.yml` PR checks use GitHub-hosted
 runners: `authz` uses `runs-on: ubuntu-24.04`; the other PR jobs use
-`runs-on: ubuntu-latest` per owner decision 10-21 (msg 1562390657274748981),
+`runs-on: ubuntu-latest` per owner decision 10-21 (msg 1562390657274748981)
+(the jobs that also run on pushes to main use the push-triggered runner `runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}`),
 a standing R6/rule-B exception for pineforge-release, without a `PF_CI_LABELS`
 environment variable. Both workflows run on every pull request without path or
 branch filters. Their first job is the canonical `authz` from
