@@ -452,6 +452,17 @@ a neutral receipt. Its planner excludes `DELIVERY_ONLY` roles, so compute has
 no policy lookup, read token or workflow poll; compute callbacks and consumer
 receipts are refused. Acceptance of a dispatch or callback never means verified.
 
+The planner and collector both receive `RELEASE_READY_CONSUMERS`. A configured
+product consumer requires an event-bound receipt even before delivery acceptance,
+after automatic retries are exhausted, or after manual redelivery; a missing
+`delivery-<consumer>.json` does not exempt it. A sweep reports skipped invalid
+artifacts before failing for missing required receipts. Supersession follows
+dispatch and redelivery: a stable release yields to a newer stable release,
+while a prerelease yields to any newer published, non-rejected manifest-backed
+release. Drafts and releases without a manifest cannot supersede a target.
+Receipt ZIP entries are read with a bounded decompressed-byte limit of 2 MiB;
+malformed entry streams are invalid evidence.
+
 ## Consumer receipt contract v1
 
 This is the single consumer-to-hub contract for the six receipt lanes;
@@ -734,7 +745,7 @@ stored `release-receipt-data` artifact whose receipt carries the bootstrap
 `previous` has expired (data uploads it with 90-day retention): the scheduled
 collector re-validates every retained receipt artifact that the hub has not
 already stored, so dropping the form earlier makes each such artifact fail
-validation; in a sweep it is reported and skipped (see the collector skip rules
+validation; a sweep reports this refusal and continues (see the collector skip rules
 below), and a callback naming that run still fails closed.
 
 **Legacy offline `previous` (temporary).** Only a product receipt with
@@ -1301,9 +1312,9 @@ when they reach validation. This covers `pending`, `pr_open`, `testing`, `ready`
 than only `verified`. In a sweep (the scheduled sweep and a manual `--run-id 0`
 sweep), each refusal is reported with a `::warning::` line and one incident issue per role
 (`Release chain: receipt artifacts skipped (hosted)`) and skipped, and the sweep
-continues with the remaining artifacts. An artifact is omitted from validation
-when the hub already stored a greater `(attempt, sequence)`, or the same key
-with the same canonical-evidence digest. A collection
+continues with the remaining artifacts. One that the hub already stored with the
+same `(attempt, sequence)`, canonical-evidence digest and reporting run ID is
+not validated again, including when a newer receipt is also stored. A collection
 triggered by a callback names one run id, checks only that run and still fails
 closed, so a new post-merge receipt verifies through its callback either way.
 Keep the coordinator-era artifacts and their public receipts as release records.
@@ -1317,21 +1328,29 @@ is KNOWN NOISE until the collector skips old-policy artifacts using an EXPLICIT
 policy-version marker. That marker is not implemented. This base's sweep already
 isolates validation refusals and continues with the per-role
 `Release chain: receipt artifacts skipped (hosted)` issue, so these refusals
-alone no longer cause the earlier sweep-wide failure. Callbacks still fail closed.
+alone no longer cause the earlier sweep-wide failure. Request errors and `Pending`
+still abort the sweep. Callbacks still fail closed.
 Keep the warnings and issue reopening visible; preserve the old artifacts.
 
 **Collector skip rules.** In a sweep, a bad or old-shape artifact is reported
 with a `::warning::` line and one stable incident issue per role, then skipped.
 This includes encrypted ZIP entries, unsupported compression and corrupt
-compressed data. An artifact is not re-validated when the hub already stored a
-receipt for that role and release with a greater `(attempt, sequence)`, or the
-same key, canonical-evidence digest **and reporting run ID**. Equal evidence
+compressed data, JSON `null` and other non-object receipt documents. The sweep
+omits validation of a product artifact only when the hub retains its own
+`(attempt, sequence)`, canonical-evidence digest **and reporting run ID** for
+the same role and release. A greater stored key alone does not establish that
+an earlier artifact was validated. An unmatched older artifact is validated
+and reported; even otherwise-valid older evidence is reported as having no
+matching retained evidence, without rewriting the newer receipt. Equal evidence
 from a different reporting run is validated and refused as receipt identity
-reuse. Facts-only artifacts are still validated. A callback names one run and
-still fails closed. Non-404 HTTP errors (including authentication, rate limits
-and server failures) and transport errors from the real client stay fatal;
-`OSError` also stays fatal. `Pending` (unknown release, unavailable artifact)
-is reported and skipped in a sweep. The incident issue lists at most 50 runs
+reuse, including when a newer receipt is also stored. Facts-only artifacts are
+still validated. A callback names one run and still fails closed. Non-404 HTTP
+errors (including authentication, rate limits and server failures), transport
+errors from the real client and `OSError` stay fatal. `Pending` (including a
+404, an unknown release or an unavailable artifact) aborts the sweep before any
+later receipt can advance against the missing earlier state. On retry the
+earlier receipt is processed first, so terminal-state and state-regression
+checks still apply to the later receipt. The incident issue lists at most 50 runs
 and a count of any additional skipped runs, reasons are reduced to a fixed safe
 character set, and the issue is not closed automatically when the artifacts
 expire.
@@ -1348,6 +1367,15 @@ every candidate was skipped. A valid receipt of an intermediate state
 satisfies collection; aggregate completion still requires its terminal
 completion states. Facts-only polling creates no product delivery requirement
 and retains its separate canonical-history and freshness checks.
+
+Per-release receipt exclusions are recorded in [`facts/receipt-exclusions.json`](../facts/receipt-exclusions.json).
+The versioned data file names a canonical release tag, a sorted nonempty list of
+roles, and a plain sentence explaining each exclusion. The sweep and aggregate
+omit a role only for the named release/role pair; later releases are checked in
+full, and compute plus every other unlisted role stays checked. Add an entry
+with its release, sorted roles and reason when a reviewed exemption is needed,
+and remove that entry when the exemption no longer applies. A missing or
+malformed file aborts the check; `RELEASE_READY_CONSUMERS` remains unchanged.
 
 ## Rollback and validation
 

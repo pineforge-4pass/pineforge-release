@@ -25,6 +25,8 @@ from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYP
 
 FACTS_RECEIPTS_TAG = "facts-receipts"
 COMPLETE_STATES = ("verified", "skipped_by_policy", "superseded", "delivered")
+RECEIPT_EXCLUSIONS_SCHEMA = "pineforge/receipt-exclusions/v1"
+RECEIPT_EXCLUSIONS_PATH = Path(__file__).resolve().parent.parent / "facts" / "receipt-exclusions.json"
 # The public consumer-<role>-<attempt>-<sequence>.json receipt that release_receipts publishes. That
 # module imports this one, so these are repeated here; tests compare them with its real output.
 RECEIPT_SCHEMA = "pineforge/consumer-receipt/v1"
@@ -196,6 +198,18 @@ def finalized_version(store):
     return max(ready) if ready else None
 
 
+def release_superseded(event, rows):
+    """Stable targets yield to stable releases; prereleases yield to either channel."""
+    ready = []
+    for row in rows:
+        names = {asset["name"] for asset in row["assets"]}
+        if row["draft"] or ASSET not in names or "release-rejected.json" in names:
+            continue
+        if event["prerelease"] or not row["prerelease"]:
+            ready.append(pair.parse(row["tag_name"]))
+    return bool(ready and version(event["release_version"]) < max(ready))
+
+
 def finalize(client, store, registry, row):
     """No image rebuild and no alias or fan-out until every ready prerequisite exists."""
     if store.read(row, "release-rejected.json") is not None:
@@ -254,6 +268,41 @@ def configured_roles(raw):
     roles = raw.split(",") if raw else []
     require(len(roles) == len(set(roles)) and set(roles) <= set(ROLES), "invalid release consumer role configuration")
     return roles
+
+
+def load_receipt_exclusions(path=None):
+    path = RECEIPT_EXCLUSIONS_PATH if path is None else Path(path)
+    try:
+        document = decode(path.read_bytes())
+    except FileNotFoundError as error:
+        raise Invalid("receipt exclusion data file missing") from error
+    except OSError as error:
+        raise Invalid("receipt exclusion data file unavailable") from error
+    keys(document, ("schema", "exclusions"))
+    require(document["schema"] == RECEIPT_EXCLUSIONS_SCHEMA, "unsupported receipt exclusion schema")
+    require(type(document["exclusions"]) is list, "receipt exclusions must be a list")
+    result = {}
+    for exclusion in document["exclusions"]:
+        keys(exclusion, ("release", "roles", "reason"))
+        release = exclusion["release"]
+        require(type(release) is str and release.startswith("v"), "invalid receipt exclusion release")
+        try:
+            parsed = version(release[1:])
+        except (TypeError, ValueError):
+            raise Invalid("invalid receipt exclusion release") from None
+        require(release == "v" + str(parsed), "invalid receipt exclusion release")
+        require(release not in result, "duplicate receipt exclusion release")
+        roles = exclusion["roles"]
+        require(type(roles) is list and roles, "receipt exclusion roles must be nonempty")
+        require(all(type(role) is str and role in ROLES for role in roles),
+                "unknown receipt exclusion role")
+        require(len(roles) == len(set(roles)) and roles == sorted(roles),
+                "receipt exclusion roles must be unique and sorted")
+        reason = exclusion["reason"]
+        require(type(reason) is str and bool(reason.strip()),
+                "receipt exclusion reason must be nonempty")
+        result[release] = {role: reason for role in roles}
+    return result
 
 
 class ConfigurationError(Invalid):
@@ -424,9 +473,13 @@ def delivery_accepted(store, row, event_id, role):
 
 def aggregate(store, row, event, *, enabled=(), newest=None):
     by_role = receipts(store, row, event["event_id"])
+    exclusions = load_receipt_exclusions()
+    release = "v" + event["release_version"]
     states = {}
     for role in ROLES:
         if role not in enabled:
+            continue
+        if role in exclusions.get(release, {}):
             continue
         obj = by_role.get(role)
         if role in DELIVERY_ONLY:
@@ -627,12 +680,8 @@ def redelivery_source(tag, consumer):
             raise Invalid("RELEASE_COMPUTE_FIRST_PAIR value was not accepted") from None
         require(enabled, "redelivery consumer is not enabled for this pair")
     else:
-        # Keep dispatch's channel-aware newer-release rule, including its exclusions.
-        newer = [pair.parse(r["tag_name"]) for r in public.pages(f"repos/{HUB}/releases")
-                 if not r["draft"] and (event["prerelease"] or not r["prerelease"])
-                 and any(a["name"] == ASSET for a in r["assets"])
-                 and not any(a["name"] == "release-rejected.json" for a in r["assets"])]
-        require(not newer or version(event["release_version"]) >= max(newer), "release superseded before redelivery")
+        require(not release_superseded(event, public.pages(f"repos/{HUB}/releases")),
+                "release superseded before redelivery")
     event_type = EVENT_TYPES[consumer]
     client_payload = event
     if event_type == "release-pair":
@@ -967,11 +1016,8 @@ def main():
             require(args.tag == "v" + event["release_version"], "dispatch release differs")
             # Delivery-only compute records each pair; a newer pair cannot cancel it.
             if args.consumer not in DELIVERY_ONLY:
-                newer = [pair.parse(r["tag_name"]) for r in public.pages(f"repos/{HUB}/releases")
-                         if not r["draft"] and (event["prerelease"] or not r["prerelease"])
-                         and any(a["name"] == ASSET for a in r["assets"])
-                         and not any(a["name"] == "release-rejected.json" for a in r["assets"])]
-                require(not newer or version(event["release_version"]) >= max(newer), "release superseded before dispatch")
+                require(not release_superseded(event, public.pages(f"repos/{HUB}/releases")),
+                        "release superseded before dispatch")
             event_type = EVENT_TYPES[args.consumer]
             client_payload = event
             if event_type == "release-pair":

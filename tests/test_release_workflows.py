@@ -2074,6 +2074,56 @@ class NotifyConsumersTest(unittest.TestCase):
             self.assertNotIn(forbidden, text)
 
 
+class ReceiptCollectorWorkflowTest(unittest.TestCase):
+    @staticmethod
+    def collectors(workflow):
+        return [(job_id, index, step)
+                for job_id, job in workflow["jobs"].items()
+                for index, step in enumerate(job.get("steps", []))
+                if re.search(r"\brelease_receipts[.]py\s+collect\b", step.get("run", ""))]
+
+    def assert_configured_collectors(self, workflow):
+        collectors = self.collectors(workflow)
+        self.assertTrue(collectors, "receipt collector step missing")
+        for job_id, index, step in collectors:
+            self.assertEqual(
+                step.get("env", {}).get("RELEASE_READY_CONSUMERS"),
+                "${{ vars.RELEASE_READY_CONSUMERS }}",
+                f"{job_id} step {index}: configured receipt roles must reach collect",
+            )
+
+    def test_every_workflow_collector_receives_the_configured_roles(self):
+        found = set()
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            workflow = _workflow(path.name)
+            if self.collectors(workflow):
+                found.add(path.name)
+                with self.subTest(workflow=path.name):
+                    self.assert_configured_collectors(workflow)
+        self.assertIn("release-receipts.yml", found)
+
+    def test_removing_or_replacing_each_collector_environment_is_detected(self):
+        workflow = _workflow("release-receipts.yml")
+        self.assert_configured_collectors(workflow)
+        for job_id, index, _ in self.collectors(workflow):
+            for replacement in (None, "", "${{ vars.OTHER_CONSUMERS }}"):
+                mutant = copy.deepcopy(workflow)
+                env = mutant["jobs"][job_id]["steps"][index]["env"]
+                env.pop("RELEASE_READY_CONSUMERS")
+                if replacement is not None:
+                    env["RELEASE_READY_CONSUMERS"] = replacement
+                with self.subTest(job=job_id, step=index, replacement=replacement):
+                    with self.assertRaisesRegex(AssertionError, "configured receipt roles"):
+                        self.assert_configured_collectors(mutant)
+        mutant = copy.deepcopy(workflow)
+        job_id, _, collector = self.collectors(mutant)[0]
+        unwired = copy.deepcopy(collector)
+        unwired["env"].pop("RELEASE_READY_CONSUMERS")
+        mutant["jobs"][job_id]["steps"].append(unwired)
+        with self.assertRaisesRegex(AssertionError, "configured receipt roles"):
+            self.assert_configured_collectors(mutant)
+
+
 class RedeliverWorkflowTest(unittest.TestCase):
     def test_public_eligibility_is_checked_before_target_token_mint(self):
         """Mutation: move or remove the public eligibility step, or let it follow the repository guard."""
