@@ -717,6 +717,8 @@ class SourceRetentionTest(unittest.TestCase):
 
     def test_no_source_deletion_command_in_real_repository_automation(self):
         paths = list((REPO / ".github" / "workflows").glob("*"))
+        self.assertIn(REPO / ".github" / "workflows" / "diag-gke-python.yml", paths,
+                      "the diagnostic workflow must remain in the complete retention scan")
         paths += list((REPO / "scripts").glob("*"))
         paths += list((REPO / "tools").rglob("*"))
         found = []
@@ -726,6 +728,23 @@ class SourceRetentionTest(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             found += [f"{path.relative_to(REPO)}: {command}" for command in _deletion_commands(text)]
         self.assertEqual(found, [])
+
+    def test_diagnostic_workflow_retention_scan_refuses_added_deletion_commands(self):
+        text = (REPO / ".github" / "workflows" / "diag-gke-python.yml").read_text(encoding="utf-8")
+        self.assertEqual(_deletion_commands(text), [])
+        anchor = "      - name: Install runner tools\n"
+        self.assertEqual(text.count(anchor), 1)
+        for command in (
+            "gh release delete v1.0.0 --yes",
+            "gh release delete-asset v1.0.0 source.tar",
+            "gh api --method DELETE repos/example/project/releases/assets/123",
+            "git push --delete origin v1.0.0",
+            "git push origin :refs/tags/v1.0.0",
+        ):
+            with self.subTest(command=command):
+                mutant = text.replace(anchor, "      - run: " + command + "\n" + anchor, 1)
+                self.assertNotEqual(mutant, text)
+                self.assertIn("- run: " + command, _deletion_commands(mutant))
 
     def test_readme_has_the_retention_sentence_and_notice_path(self):
         readme = (REPO / "README.md").read_text(encoding="utf-8")

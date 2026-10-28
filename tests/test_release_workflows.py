@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import io
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1250,6 +1252,267 @@ class PublishedHpoWheelCiTest(unittest.TestCase):
         parser = next(step for step in steps if "pip install" in step.get("run", ""))
         self.assertIn("PyYAML==", parser["run"])
         self.assertLess(steps.index(parser), steps.index(tests))
+
+
+class GkePythonDiagnosticWorkflowTest(unittest.TestCase):
+    JOBS = {"diag-gke-python.yml": {"inspect": "gke-2cpu-4gb-amd64"}}
+    SETUP = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+    CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    TEST_COMMAND = (
+        "python3 -m unittest discover -s tests -p 'test_release_hpo_image.py' "
+        "-k 'HpoResolutionTest.test_published_transpile_bounds_against_codegen_1_5_0' -v"
+    )
+
+    def text(self):
+        return (WORKFLOWS / "diag-gke-python.yml").read_text(encoding="utf-8")
+
+    def parse(self, text):
+        import yaml
+        return yaml.load(text, Loader=yaml.BaseLoader)
+
+    def assert_diagnostic(self, text):
+        workflow = self.parse(text)
+        self.assertEqual(set(workflow), {"name", "on", "permissions", "jobs"})
+        self.assertEqual(workflow["name"], "Diagnose GKE Python and pip")
+        self.assertEqual(workflow["on"], {"workflow_dispatch": ""})
+        self.assertEqual(workflow["permissions"], {})
+        self.assertEqual(set(workflow["jobs"]), set(self.JOBS["diag-gke-python.yml"]))
+        job = workflow["jobs"]["inspect"]
+        self.assertEqual(set(job), {"runs-on", "timeout-minutes", "permissions", "steps"})
+        self.assertEqual(job["runs-on"], self.JOBS["diag-gke-python.yml"]["inspect"])
+        self.assertEqual(re.findall(r"(?m)^    runs-on:.*$", text),
+                         ["    runs-on: gke-2cpu-4gb-amd64"])
+        self.assertEqual(job["timeout-minutes"], "15")
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertNotRegex(text, r"(?i)\bsecrets\s*(?:\.|\[)")
+        self.assertNotRegex(text, r"(?i)\bgithub\s*(?:\.\s*token|\[\s*['\"]token['\"]\s*\])")
+        self.assertNotIn("GITHUB_TOKEN", text.upper())
+        steps = job["steps"]
+        self.assertEqual(len(steps), 7)
+        self.assertEqual(steps[0], {
+            "name": "Install runner tools",
+            "run": "sudo apt-get update && sudo apt-get install -y ca-certificates curl git",
+        })
+        setup = {"uses": self.SETUP, "with": {"python-version": "3.12"}}
+        self.assertEqual(steps[1], setup)
+        self.assertEqual(set(steps[2]), {"name", "shell", "run"})
+        self.assertEqual(steps[2]["name"], "Inspect Python and pip visibility")
+        self.assertEqual(steps[2]["shell"], "bash")
+        self.assertEqual(steps[3], {
+            "uses": self.CHECKOUT, "id": "source", "if": "${{ !cancelled() }}",
+            "with": {"persist-credentials": "false"},
+        })
+        release = _workflow("python-test.yml")["jobs"]["release-rules"]["steps"]
+        self.assertEqual(setup, next(step for step in release
+                                    if step.get("uses", "").startswith("actions/setup-python@")))
+        checkout = next(step for step in release
+                        if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout, {"uses": self.CHECKOUT,
+                                    "with": {"persist-credentials": "false"}})
+        parser = next(step for step in release if step.get("name") == "Install workflow YAML parser")
+        download = next(step for step in release if step.get("name") == "Download published hpo wheels")
+        self.assertEqual(steps[4], {
+            **parser, "id": "dependencies",
+            "if": "${{ !cancelled() && steps.source.outcome == 'success' }}",
+        })
+        self.assertEqual(steps[5], {
+            **download, "id": "wheels",
+            "if": "${{ !cancelled() && steps.dependencies.outcome == 'success' }}",
+        })
+        self.assertEqual(steps[6], {
+            "name": "Reproduce published transpile bounds",
+            "if": "${{ !cancelled() && steps.dependencies.outcome == 'success' && "
+                  "steps.wheels.outcome == 'success' }}",
+            "continue-on-error": "true", "run": self.TEST_COMMAND,
+        })
+        for step in steps:
+            self.assertNotIn("${{", step.get("run", ""))
+            if "uses" in step:
+                self.assertRegex(step["uses"], r"^actions/(?:checkout|setup-python)@[0-9a-f]{40}$")
+
+    def diagnostic_source(self, text):
+        run = self.parse(text)["jobs"]["inspect"]["steps"][2]["run"]
+        self.assertTrue(run.startswith("set -eu\npython3 -B - <<'PY'\n"))
+        self.assertTrue(run.endswith("\nPY\n"))
+        return run.split("python3 -B - <<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0]
+
+    def assert_probe_output(self, text, failed_call=None, config_failure=False):
+        source = self.diagnostic_source(text)
+        environment = {
+            "HOME": "/private/diagnostic-home",
+            "PATH": "/private/diagnostic-bin:/usr/bin",
+            "PYTHONPATH": "/private/first-site:/private/second-site",
+            "PIP_TARGET": "/private/install-target",
+            "PIP_INDEX_URL": "https://example-user:example-password@example.invalid/simple",
+            "DIAGNOSTIC_TOKEN": "example-token-never-print",
+            "DIAGNOSTIC_PATH": "/",
+        }
+        extra_url = "https://unlisted-user:unlisted-password@example.invalid/diagnostic"
+        private_output = "\n".join([
+            *environment.values(), *environment["PYTHONPATH"].split(os.pathsep), extra_url,
+        ]) + "\n"
+        commands = []
+
+        def launch(command, **options):
+            commands.append((command, options))
+            status = int(len(commands) == failed_call)
+            return subprocess.CompletedProcess(command, status, private_output, private_output)
+
+        output = io.StringIO()
+        with patch.dict(os.environ, environment, clear=True), \
+                patch("pip._internal.configuration.Configuration") as configuration, \
+                patch.object(subprocess, "run", side_effect=launch), redirect_stdout(output):
+            configuration.return_value.items.return_value = [
+                ("install.target", environment["PIP_TARGET"]),
+                (":env:.target", environment["PIP_TARGET"]),
+                ("global.index-url", environment["PIP_INDEX_URL"]),
+            ]
+            if config_failure:
+                configuration.return_value.load.side_effect = ValueError(environment["PIP_INDEX_URL"])
+            with self.assertRaises(SystemExit) as stopped:
+                exec(compile(source, "<diagnostic workflow>", "exec"), {})
+        self.assertEqual(stopped.exception.code, int(failed_call is not None or config_failure))
+        log = output.getvalue()
+        for value in environment.values():
+            self.assertNotIn(value, log)
+        for component in environment["PYTHONPATH"].split(os.pathsep):
+            self.assertNotIn(component, log)
+        for index in range(2):
+            self.assertIn("<environment:PYTHONPATH[" + str(index) + "]>", log)
+        self.assertNotIn("example-user", log)
+        self.assertNotIn("example-password", log)
+        self.assertNotIn("unlisted-user", log)
+        self.assertNotIn("unlisted-password", log)
+        self.assertNotIn("global.index-url", log)
+        self.assertIn("environment variable names only:", log)
+        for name in ("HOME", "PYTHONPATH", "PIP_TARGET", "PIP_INDEX_URL"):
+            self.assertIn(name, log)
+        if not config_failure:
+            self.assertIn('pip location settings (values withheld): [":env:.target", "install.target"]', log)
+        self.assertEqual(len(commands), 6, "one failed command must not hide the remaining modes")
+        self.assertEqual(commands[0][0], ["which", "-a", "python3"])
+        self.assertEqual(commands[1][0], ["python3", "-B", "-m", "pip", "--version"])
+        modes = (
+            ("normal", [], None),
+            ("isolated", ["-I"], None),
+            ("stripped", [], {"PATH": os.defpath}),
+            ("isolated and stripped", ["-I"], {"PATH": os.defpath}),
+        )
+        for (label, flags, env), (command, options) in zip(modes, commands[2:]):
+            self.assertIn("\n" + label + "\n", log)
+            self.assertEqual(command[:-1], [sys.executable, *flags, "-B", "-c"])
+            self.assertEqual(options, {
+                "env": env, "capture_output": True, "text": True, "timeout": 30,
+            })
+            ast.parse(command[-1])
+        probe = commands[2][0][-1]
+        self.assertTrue(all(command[-1] == probe for command, _ in commands[2:]))
+        tree = ast.parse(probe)
+        fields = {key.value for node in ast.walk(tree) if isinstance(node, ast.Dict)
+                  for key in node.keys if isinstance(key, ast.Constant)}
+        self.assertEqual(fields, {
+            "executable", "real_executable", "base_executable", "version", "prefix", "base_prefix",
+            "path", "global_sites", "user_site", "user_site_enabled", "home_present", "isolated",
+            "sitecustomize", "usercustomize", "pip_origin", "vendored_import_error", "libpython_mapped",
+        })
+        self.assertIn('importlib.util.find_spec("pip")', probe)
+        self.assertIn("from pip._vendor.packaging.requirements import Requirement", probe)
+        self.assertIn("from pip._vendor.packaging.version import Version", probe)
+
+    def test_dispatch_only_secret_free_diagnostic_and_reproduction_are_exact(self):
+        self.assert_diagnostic(self.text())
+
+    def test_diagnostic_refuses_other_triggers_credentials_permissions_and_environments(self):
+        text = self.text()
+        mutations = [
+            ("on:\n", "on:\n  " + event + ":\n")
+            for event in ("push", "pull_request", "pull_request_target", "schedule",
+                          "workflow_call", "repository_dispatch", "release", "workflow_run")
+        ] + [
+            ("  workflow_dispatch:\n", "  workflow_dispatch:\n    inputs:\n      extra:\n        type: string\n"),
+            ("on:\n  workflow_dispatch:\n", "on: push\n"),
+            ("on:\n  workflow_dispatch:\n", "on: [workflow_dispatch, pull_request]\n"),
+            ("permissions: {}", "permissions: {contents: write}"),
+            ("      contents: read", "      contents: write"),
+            ("      contents: read", "      contents: read\n      actions: write"),
+            ("  inspect:\n", "  inspect:\n    environment: diagnostic\n"),
+            ("  inspect:\n", "  extra:\n    runs-on: ubuntu-latest\n    steps: []\n  inspect:\n"),
+            ("  inspect:\n", "  renamed:\n"),
+            ("        shell: bash\n", "        env:\n          TOKEN: ${{ secrets.DIAGNOSTIC_SECRET }}\n        shell: bash\n"),
+            ("        shell: bash\n", "        env:\n          TOKEN: ${{ secrets['DIAGNOSTIC_SECRET'] }}\n        shell: bash\n"),
+            ("        shell: bash\n", "        env:\n          TOKEN: ${{ github.token }}\n        shell: bash\n"),
+            ("          set -eu\n", "          set -eu\n          echo changed >> \"$GITHUB_TOKEN\"\n"),
+            ("          set -eu\n", "          set -eu\n          echo '${{ SECRETS.DIAGNOSTIC_SECRET }}'\n"),
+            ("          set -eu\n", "          set -eu\n          echo '${{ vars.DIAGNOSTIC_VALUE }}'\n"),
+            ("        shell: bash\n", "        continue-on-error: true\n        shell: bash\n"),
+            ("          persist-credentials: false", "          persist-credentials: true"),
+            (self.SETUP, "actions/setup-python@v7"),
+            (self.CHECKOUT, "actions/checkout@v7"),
+        ]
+        for before, after in mutations:
+            with self.subTest(replacement=after):
+                self.assertEqual(text.count(before), 1)
+                mutant = text.replace(before, after, 1)
+                self.assertNotEqual(mutant, text)
+                with self.assertRaises(AssertionError):
+                    self.assert_diagnostic(mutant)
+
+    def test_diagnostic_refuses_runner_substitution_arrays_and_hosted_fallbacks(self):
+        text = self.text()
+        for runner in (
+            "ubuntu-latest", "ubuntu-24.04", "gke-4cpu-8gb-amd64",
+            "[self-hosted, gke-2cpu-4gb-amd64]",
+            "${{ github.event_name == 'workflow_dispatch' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
+        ):
+            with self.subTest(runner=runner):
+                mutant = text.replace("runs-on: gke-2cpu-4gb-amd64", "runs-on: " + runner, 1)
+                self.assertNotEqual(mutant, text)
+                with self.assertRaises(AssertionError):
+                    self.assert_diagnostic(mutant)
+
+    def test_all_four_modes_run_and_sensitive_values_are_withheld_even_on_failure(self):
+        text = self.text()
+        self.assert_probe_output(text)
+        for failed_call in range(1, 7):
+            with self.subTest(failed_call=failed_call):
+                self.assert_probe_output(text, failed_call=failed_call)
+        self.assert_probe_output(text, config_failure=True)
+
+    def test_output_checks_refuse_environment_config_and_subprocess_value_leaks(self):
+        text = self.text()
+        for before, after in (
+            ("redact(result.stdout)", "result.stdout"),
+            ("redact(result.stderr)", "result.stderr"),
+            ("text = re.sub(", "text = text # re.sub("),
+            ("k for k, _ in config.items() if k in location_keys",
+             "(k, v) for k, v in config.items() if k in location_keys"),
+            ('print("environment variable names only:", json.dumps(sorted(',
+             'print("environment values:", dict(os.environ)); print("environment variable names only:", json.dumps(sorted('),
+        ):
+            with self.subTest(replacement=after):
+                self.assertEqual(text.count(before), 1)
+                mutant = text.replace(before, after, 1)
+                with self.assertRaises(AssertionError):
+                    self.assert_probe_output(mutant)
+
+    def test_probe_checks_refuse_changed_modes_executables_fields_and_failure_status(self):
+        text = self.text()
+        for before, after in (
+            ('("isolated", ["-I"], None)', '("isolated", [], None)'),
+            ('("stripped", [], {"PATH": os.defpath})', '("stripped", [], None)'),
+            ('("isolated and stripped", ["-I"], {"PATH": os.defpath})',
+             '("isolated and stripped", ["-I"], None)'),
+            ('[sys.executable, *flags, "-B", "-c", probe]',
+             '["python3", *flags, "-B", "-c", probe]'),
+            ('"pip_origin": None if spec is None else spec.origin, ', ""),
+            ("failed |= result.returncode != 0", "failed = False"),
+            ("sys.exit(int(failed))", "sys.exit(0)"),
+        ):
+            with self.subTest(replacement=after):
+                self.assertEqual(text.count(before), 1)
+                mutant = text.replace(before, after, 1)
+                with self.assertRaises(AssertionError):
+                    self.assert_probe_output(mutant, failed_call=3)
 
 
 class HpoWorkflowTest(unittest.TestCase):
@@ -4362,7 +4625,13 @@ class PrTierWorkflowTest(unittest.TestCase):
         # This repository has no macOS jobs; its complete workflow/job inventory
         # below also refuses adding an unreviewed macOS/pool matrix.
         self.assertEqual({path.name for path in WORKFLOWS.glob("*.yml")},
-                         set(self.ROUTED_JOBS) | set(self.EXEMPT_RUNNERS))
+                         set(self.ROUTED_JOBS) | set(self.EXEMPT_RUNNERS) |
+                         set(GkePythonDiagnosticWorkflowTest.JOBS))
+        for name, expected in GkePythonDiagnosticWorkflowTest.JOBS.items():
+            jobs = _workflow(name)["jobs"]
+            self.assertEqual(set(jobs), set(expected))
+            for identity, runner in expected.items():
+                self.assertEqual(jobs[identity]["runs-on"], runner)
         for name, expected in self.EXEMPT_RUNNERS.items():
             jobs = _workflow(name)["jobs"]
             self.assertEqual(set(jobs), set(expected))
