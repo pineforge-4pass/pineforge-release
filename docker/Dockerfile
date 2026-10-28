@@ -113,15 +113,17 @@ RUN mkdir -p /opt/pineforge/bin
 COPY --from=engine  /opt/pineforge/lib       /opt/pineforge/lib
 COPY --from=engine  /opt/pineforge/include   /opt/pineforge/include
 COPY --from=codegen /opt/codegen             /opt/pineforge/pycodegen
-# The harness is the engine's runtime files for the pinned engine tag, all ten and nothing
+# The harness is the engine's runtime files for the pinned engine tag, all twelve and nothing
 # else: scripts/sync-harness.sh writes them into docker/ and records their sha256 in
 # HARNESS-SHA256SUMS, which the build checks below. entrypoint.sh calls
-# bind_compiled_inventory.py; run_json.py imports the other modules from its own directory.
+# bind_compiled_inventory.py; Python helpers import modules from this directory.
 COPY docker/run_json.py   /opt/pineforge/bin/run_json.py
 COPY docker/entrypoint.sh /opt/pineforge/bin/entrypoint.sh
 COPY docker/bind_compiled_inventory.py /opt/pineforge/bin/bind_compiled_inventory.py
 COPY docker/pf_bars.py                  /opt/pineforge/bin/pf_bars.py
 COPY docker/pf_sink.py                  /opt/pineforge/bin/pf_sink.py
+COPY docker/pineforge_sink_finalize.py  /opt/pineforge/bin/pineforge_sink_finalize.py
+COPY docker/pineforge_sink_to_json.py   /opt/pineforge/bin/pineforge_sink_to_json.py
 COPY docker/request_feed_inventory.py  /opt/pineforge/bin/request_feed_inventory.py
 COPY docker/run_execution_observer.py  /opt/pineforge/bin/run_execution_observer.py
 COPY docker/run_phase_transport.py     /opt/pineforge/bin/run_phase_transport.py
@@ -133,18 +135,18 @@ RUN chmod +x /opt/pineforge/bin/entrypoint.sh /opt/pineforge/bin/run_json.py
 # Every harness file in the image must be byte for byte the engine's file at the ref that
 # scripts/sync-harness.sh synced from: the script recorded the sha256 of each fetched file in
 # HARNESS-SHA256SUMS and the build recomputes them here, on the installed files. The sums file
-# must name exactly the ten files above, in sorted order, and nothing else may sit in bin/;
+# must name exactly the twelve files above, in sorted order, and nothing else may sit in bin/;
 # a missing, extra, changed or empty entry fails the build.
 RUN set -eu; \
     cd /opt/pineforge/bin; \
-    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \
+    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_sink_finalize.py pineforge_sink_to_json.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \
     listed="$(sed 's/^[0-9a-f]\{64\}  //' HARNESS-SHA256SUMS | tr '\n' ' ' | sed 's/ $//')"; \
     present="$(LC_ALL=C ls -A | grep -v '^HARNESS-SHA256SUMS$' | tr '\n' ' ' | sed 's/ $//')"; \
     if [ "$listed" != "$want" ] || [ "$present" != "$want" ]; then \
       echo "ERROR: HARNESS-SHA256SUMS lists [${listed}] and bin/ holds [${present}]; both must be exactly [${want}]" >&2; exit 1; \
     fi; \
     sha256sum -c --strict HARNESS-SHA256SUMS; \
-    echo "harness: the ten files match HARNESS-SHA256SUMS"
+    echo "harness: the twelve files match HARNESS-SHA256SUMS"
 
 # The harness (run_json.py) mirrors the engine's C structs; it must be the copy
 # from the pinned engine tag. Fail the build if its ABI differs from the header
@@ -314,7 +316,7 @@ COPY --from=hpo-wheel /opt/hpo              /opt/pineforge/hpo
 COPY --from=hpo-wheel /opt/hpo-licenses     /opt/pineforge/licenses
 COPY --from=hpo-native /tmp/hpo-build/bin/pineforge-hpo-native /opt/pineforge/pineforge-hpo-native
 COPY --from=hpo-native /opt/hpo-native-licenses /opt/pineforge/licenses/pineforge-hpo/THIRD_PARTY_LICENSES
-# Hub-owned additions live outside the engine's ten-file bin/ directory.
+# Hub-owned additions live outside the engine's twelve-file bin/ directory.
 COPY docker/entrypoint-dispatch.sh /opt/pineforge/entrypoint-dispatch.sh
 COPY docker/LICENSE-SHA256SUMS /opt/pineforge/licenses/LICENSE-SHA256SUMS
 RUN chmod +x /opt/pineforge/entrypoint-dispatch.sh /opt/pineforge/pineforge-hpo-native

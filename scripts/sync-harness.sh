@@ -17,6 +17,8 @@ FILES=(
   entrypoint.sh
   pf_bars.py
   pf_sink.py
+  pineforge_sink_finalize.py
+  pineforge_sink_to_json.py
   request_feed_inventory.py
   run_execution_observer.py
   run_json.py
