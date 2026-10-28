@@ -16,10 +16,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 import release_pair as pair
-from release_artifacts import Client, PRODUCERS, SafeRedirect, command, npm, producer
+from release_artifacts import Client, PRODUCERS, SafeRedirect, command, producer, verified_assets
 from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYPES,
                               HUB, IMAGE, RECEIPT_ROLES, ROLES, SCHEMA, SHA, Invalid,
-                              Pending, bind_facts, canonical, decode, keys, match,
+                              Pending, asset_descriptor, bind_facts, canonical, decode, keys, match,
                               pair_payload, payload, positive, require, sha256,
                               validate, validate_candidate, version)
 
@@ -99,6 +99,36 @@ class Store:
         self.client.request(f"https://uploads.github.com/repos/{HUB}/releases/{release['id']}/assets?name={quote(name)}",
                             method="POST", data=raw, github=True, binary=True)
         require(self.read(release, name) == raw, "hub asset upload readback differs")
+
+    @staticmethod
+    def check_binary(raw, descriptor):
+        require(type(raw) is bytes and len(raw) == descriptor["size"], "hub attachment size differs")
+        require(sha256(raw) == descriptor["sha256"], "hub attachment sha256 differs")
+
+    def verify_binary(self, release, descriptor, versions):
+        asset_descriptor(descriptor, versions)
+        try:
+            raw = self.read(release, descriptor["name"])
+        except Pending:
+            raise Invalid("hub attachment unavailable") from None
+        self.check_binary(raw, descriptor)
+        return raw
+
+    def put_binary(self, release, descriptor, raw, versions):
+        """Append only a verified producer archive; never widen the JSON writer."""
+        asset_descriptor(descriptor, versions)
+        self.check_binary(raw, descriptor)
+        name = descriptor["name"]
+        try:
+            previous = self.read(release, name)
+        except Pending:
+            raise Invalid("hub attachment unavailable") from None
+        if previous is not None:
+            require(previous == raw, "immutable hub attachment already exists with different bytes")
+            return
+        self.client.request(f"https://uploads.github.com/repos/{HUB}/releases/{release['id']}/assets?name={quote(name)}",
+                            method="POST", data=raw, github=True, binary=True)
+        self.verify_binary(release, descriptor, versions)
 
     def ensure_candidate_release(self, tag, notes):
         try:
@@ -223,15 +253,17 @@ def finalize(client, store, registry, row):
     require(client.tag_commit(HUB, row["tag_name"]) == candidate["hub_commit"], "hub tag source changed")
     raw = store.read(row, ASSET)
     if raw is None:
-        pins = dict(candidate["versions"])
-        pins["codegen"] = npm(client, pins["codegen"], candidate["inventories"]["codegen"])
+        pins, staged = verified_assets(client, candidate["versions"], candidate["inventories"]["codegen"])
         facts_commit = client.api(f"repos/{HUB}/git/ref/heads/main")["object"]["sha"]
         facts_raw = client.file(HUB, facts_commit, "facts/facts.json")
         facts = bind_facts(facts_raw, facts_commit, str(v), pins)
         manifest = validate({"schema": SCHEMA, "release_version": str(v), "prerelease": v.prerelease,
                              "hub_commit": candidate["hub_commit"], "versions": pins, "image": candidate["image"],
-                             "facts": facts, "run_id": candidate["run_id"]})
+                             "facts": facts, "run_id": candidate["run_id"],
+                             "assets": [descriptor for descriptor, _ in staged]})
         raw = canonical(manifest)
+        for descriptor, data in staged:
+            store.put_binary(row, descriptor, data, pins)
         store.put(row, ASSET, raw)
     event = payload(raw)
     require(event["image"] == candidate["image"] and event["hub_commit"] == candidate["hub_commit"],
@@ -242,6 +274,8 @@ def finalize(client, store, registry, row):
         if role == "codegen":
             actual = {key: value for key, value in actual.items() if key not in ("npm_version", "npm_integrity")}
         require(actual == expected, "manifest producer identity differs from candidate")
+    for descriptor in decode(raw).get("assets", []):
+        store.verify_binary(row, descriptor, event["versions"])
     # An immutable manifest is the commit point. Every step below can replay.
     registry.point(str(v), event["image"]["digest"], fixed=True)
     # Preserve the existing fixed alias formats, but only after readiness.

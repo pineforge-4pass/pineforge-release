@@ -358,5 +358,78 @@ class ReceiptCollectionTests(unittest.TestCase):
             self.assertIn(str(error), output.getvalue())
 
 
+class ExtendedProductReceiptTests(unittest.TestCase):
+    def prepare(self):
+        from test_release_assets import AttachmentHTTP
+        from test_release_binding import MemoryStore as ProductStore
+        http, client = AttachmentHTTP(), HistoryClient()
+        manifest = copy.deepcopy(http.extended)
+        # Bind the fixture's measured entry for retained-facts verification.
+        facts = json.loads(client.file(contract.HUB, FACTS_COMMIT, "facts/facts.json"))
+        entry = copy.deepcopy(next(iter(facts["releases"].values())))
+        entry["source"] = (
+            f"https://github.com/pineforge-4pass/pineforge-engine/blob/v{manifest['release_version']}"
+            "/README.md#validation-scoreboard")
+        facts["releases"][manifest["release_version"]] = entry
+        facts_raw = contract.canonical(facts)
+        manifest["facts"].update(commit=FACTS_COMMIT, sha256=hashlib.sha256(facts_raw).hexdigest(),
+                                 release_key=manifest["release_version"])
+        raw = contract.canonical(manifest)
+        event = contract.payload(raw)
+        store = ProductStore(manifest)
+        row = store.get("v" + manifest["release_version"])
+        row.update(draft=False, prerelease=manifest["prerelease"])
+        store.put(row, contract.ASSET, raw)
+        for descriptor in manifest["assets"]:
+            store.put(row, descriptor["name"], http.originals[descriptor["source"]])
+        for run_id, receipt in client.documents.items():
+            receipt.pop("facts")
+            receipt.update(schema=receipts.PRODUCT_SCHEMA, event_id=event["event_id"],
+                           release_version=event["release_version"])
+            for name in ("preview", "deployed", "previous"):
+                if receipt.get(name):
+                    receipt[name].update(image_digest=event["image"]["digest"],
+                                         facts_commit=FACTS_COMMIT, facts_sha256=manifest["facts"]["sha256"])
+            client.seal(run_id)
+        client.responses[f"repos/{contract.HUB}/compare/{FACTS_COMMIT}...{FACTS_COMMIT}"] = {"status": "identical"}
+        return client, store, row, raw, facts_raw, event
+
+    def test_extended_product_collection_keeps_receipt_fields_evidence_and_binary_bytes(self):
+        client, store, row, raw, facts_raw, event = self.prepare()
+        before = copy.deepcopy(store.assets)
+        with patch.dict(os.environ, {"TARGET_REPOSITORY": "fixture", "RELEASE_READY_CONSUMERS": "license",
+                                     "RELEASE_RECEIPT_POLICY": json.dumps({"license": POLICY})}), \
+                patch.object(client, "file", return_value=facts_raw):
+            receipts.collect(client, client, store, "license")
+            written = copy.deepcopy(store.assets)
+            receipts.collect(client, client, store, "license")
+        self.assertEqual(store.assets, written)
+        for key, data in before.items():
+            self.assertEqual(store.assets[key], data)
+        self.assertEqual(store.read(row, contract.ASSET), raw)
+        for run_id, receipt in client.documents.items():
+            name = f"consumer-license-{receipt['attempt']}-{receipt['sequence']}.json"
+            public = json.loads(store.read(row, name))
+            legacy = json.loads((FIXTURES / ("stored-ready.json" if run_id == 1007 else "stored-verified.json")).read_bytes())
+            self.assertEqual(set(public), (set(legacy) - {"facts"}) | {"event_id", "release_version"})
+            self.assertEqual(public["event_id"], event["event_id"])
+            self.assertEqual(public["evidence_sha256"], hashlib.sha256(contract.canonical(receipt)).hexdigest())
+            self.assertNotIn("assets", public)
+            self.assertNotIn("assets", receipt)
+
+    def test_extended_product_collection_rejects_wrong_event_before_writing(self):
+        client, store, row, _, facts_raw, _ = self.prepare()
+        client.documents[1007]["event_id"] = "sha256:" + "0" * 64
+        client.seal(1007)
+        before = copy.deepcopy(store.assets)
+        with patch.dict(os.environ, {"TARGET_REPOSITORY": "fixture",
+                                     "RELEASE_RECEIPT_POLICY": json.dumps({"license": POLICY})}), \
+                patch.object(client, "file", return_value=facts_raw), \
+                self.assertRaisesRegex(contract.Invalid, "^receipt event differs$"):
+            receipts.collect(client, client, store, "license", 1007)
+        self.assertEqual(store.assets, before)
+        self.assertFalse(any(a["name"].startswith("consumer-") for a in row["assets"]))
+
+
 if __name__ == "__main__":
     unittest.main()

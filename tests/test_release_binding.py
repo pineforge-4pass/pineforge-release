@@ -23,6 +23,7 @@ import zipfile
 from itertools import permutations
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -101,6 +102,27 @@ def candidate(manifest):
                         "list_sha256": "a" * 64, "amd64_sha256": "b" * 64, "arm64_sha256": "c" * 64}}
 
 
+def synthetic_ready_assets(client, pins, inventory):
+    """Producer boundary for older state-machine tests; HTTP gates have their own fixtures."""
+    pins = copy.deepcopy(pins)
+    original = fixture_manifest(pins["codegen"]["version"])["versions"]["codegen"]
+    pins["codegen"].update({key: original[key] for key in ("npm_version", "npm_integrity")})
+    urls = [
+        "https://registry.npmjs.org/@pineforge/codegen-pyodide/-/fixture.tgz",
+        "https://files.pythonhosted.org/fixture.tar.gz",
+    ]
+    engine = pins["engine"]
+    urls += [f"https://github.com/{artifacts.PRODUCERS['engine']}/releases/download/{engine['tag']}/"
+             f"pineforge-v{engine['version']}-linux-{arch}.tar.gz" for arch in ("x86_64", "aarch64")]
+    staged = []
+    for url in urls:
+        name = url.rsplit("/", 1)[1]
+        raw = ("synthetic producer boundary " + name).encode()
+        staged.append(({"name": name, "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                        "source": url}, raw))
+    return pins, sorted(staged, key=lambda item: item[0]["name"])
+
+
 def expected_pair_payload(manifest_raw, candidate_raw):
     """Independent P04/P05 mapping; no production payload/hash helpers."""
     manifest, built = json.loads(manifest_raw), json.loads(candidate_raw)
@@ -176,6 +198,13 @@ class MemoryStore:
         raise AssertionError("unmodeled hub route " + route)
 
     def request(self, url, **kwargs):
+        upload = f"https://uploads.github.com/repos/{contract.HUB}/releases/"
+        if url.startswith(upload):
+            release_id = int(url.removeprefix(upload).split("/", 1)[0])
+            row = next(row for row in self.rows.values() if row["id"] == release_id)
+            name = parse_qs(urlsplit(url).query)["name"][0]
+            self.put(row, name, kwargs["data"])
+            return b"{}"
         prefix = f"https://api.github.com/repos/{contract.HUB}/releases/assets/"
         if url.startswith(prefix):
             asset_id = int(url.removeprefix(prefix))
@@ -203,6 +232,12 @@ class MemoryStore:
             row["assets"].append({"name": name, "id": len(self.assets), "state": "uploaded",
                                   "digest": "sha256:" + contract.sha256(raw)})
             self.operations.append(("asset", name))
+
+    def put_binary(self, row, descriptor, raw, versions):
+        return pipeline.Store(self).put_binary(row, descriptor, raw, versions)
+
+    def verify_binary(self, row, descriptor, versions):
+        return pipeline.Store(self).verify_binary(row, descriptor, versions)
 
     def publish(self, row, latest):
         row["draft"] = False
@@ -511,9 +546,9 @@ class FinalizerTests(unittest.TestCase):
         self.store = MemoryStore(self.m)
         self.registry = MemoryRegistry()
         self.row = self.store.get("v1.6.0")
-        # Only npm transport is substituted; manifest/facts/candidate rules run.
-        self.npm = patch.object(pipeline, "npm", side_effect=lambda c, pin, inventory: {
-            **pin, "npm_version": pin["version"], "npm_integrity": self.m["versions"]["codegen"]["npm_integrity"]})
+        # Substitute the producer boundary for these state-machine tests only.
+        # test_release_assets drives the real producer and storage paths via HTTP.
+        self.npm = patch.object(pipeline, "verified_assets", side_effect=synthetic_ready_assets)
         self.npm.start()
         self.addCleanup(self.npm.stop)
 
@@ -565,7 +600,7 @@ class FinalizerTests(unittest.TestCase):
         for missing in ("npm", "facts"):
             with self.subTest(missing=missing):
                 if missing == "npm":
-                    context = patch.object(pipeline, "npm", side_effect=contract.Pending("npm missing"))
+                    context = patch.object(pipeline, "verified_assets", side_effect=contract.Pending("npm missing"))
                 else:
                     self.client.facts["releases"].pop("1.6.0")
                     context = patch.object(self.client, "file", return_value=contract.canonical(self.client.facts))
@@ -598,11 +633,22 @@ class FinalizerTests(unittest.TestCase):
     def test_duplicate_replay_keeps_manifest_bytes_event_and_original_run_id(self):
         first = self.finish()
         original = self.store.read(self.row, contract.ASSET)
-        with patch.object(pipeline, "npm", side_effect=AssertionError("must not re-resolve packages")), \
+        with patch.object(pipeline, "verified_assets", side_effect=AssertionError("must not re-resolve packages")), \
                 patch.object(self.client, "file", side_effect=AssertionError("must not bind newer facts")):
             second = self.finish()
         self.assertEqual(original, self.store.read(self.row, contract.ASSET))
         self.assertEqual(first, second)
+
+    def test_stored_legacy_fixture_replays_without_resolution_or_rewriting(self):
+        raw = (ROOT / "tests/fixtures/release-manifest.json").read_bytes()
+        expected = contract.decode((ROOT / "tests/fixtures/release-ready.json").read_bytes())
+        self.store.put(self.row, contract.ASSET, raw)
+        with patch.object(pipeline, "verified_assets", side_effect=AssertionError("legacy replay resolved producers")), \
+                patch.object(self.client, "file", side_effect=AssertionError("legacy replay resolved facts")):
+            self.assertEqual(self.finish(), expected)
+            self.assertEqual(self.finish(), expected)
+        self.assertEqual(self.store.read(self.row, contract.ASSET), raw)
+        self.assertFalse(any(name.endswith((".tgz", ".tar.gz")) for _, name in self.store.assets))
 
     def test_older_completion_and_its_receipt_cannot_move_newer_alias_or_consumer(self):
         newer = fixture_manifest("1.6.1")
@@ -1514,6 +1560,43 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(fetches[0].args[0].endswith("/release-manifest.json"))
         self.assertEqual(json.loads(written)["consumer"], "application")
         self.assertEqual(json.loads(written)["event_id"], json.loads(ready_raw)["event_id"])
+
+    def test_extended_manifest_dispatch_projects_ten_fields_for_every_receipt_role(self):
+        from test_release_assets import AttachmentHTTP
+        manifest = AttachmentHTTP().extended
+        raw = contract.canonical(manifest)
+        digest = hashlib.sha256(raw).hexdigest()
+        for role in contract.RECEIPT_ROLES:
+            store = self.ready_store(manifest)
+            with self.subTest(role=role):
+                result, sender, written, _, _ = self.send(store, role, "v" + manifest["release_version"])
+                self.assertEqual(result, 0)
+                body = sender.api.call_args.kwargs["data"]
+                self.assertEqual(body["event_type"], "pineforge-release")
+                event = body["client_payload"]
+                self.assertEqual(set(event), contract.MANIFEST_KEYS | {"event_id", "manifest"})
+                self.assertEqual(len(event), 10)
+                self.assertNotIn("assets", event)
+                self.assertEqual(event["manifest"], {"asset": contract.ASSET, "sha256": digest})
+                self.assertEqual(event["event_id"], "sha256:" + digest)
+                self.assertEqual(json.loads(written)["event_id"], event["event_id"])
+                self.assertEqual(store.read(store.get("v" + manifest["release_version"]), contract.ASSET), raw)
+
+    def test_compute_dispatch_hashes_the_complete_extended_manifest(self):
+        from test_release_assets import AttachmentHTTP
+        manifest = AttachmentHTTP().extended
+        store = self.ready_store(manifest)
+        tag = "v" + manifest["release_version"]
+        result, sender, _, _, _ = self.send(store, "compute", tag)
+        self.assertEqual(result, 0)
+        body = sender.api.call_args.kwargs["data"]
+        self.assertEqual(body["event_type"], "release-pair")
+        self.assertEqual(len(body["client_payload"]), 8)
+        self.assertEqual(body["client_payload"]["receipt_sha256"],
+                         hashlib.sha256(store.read(store.get(tag), contract.ASSET)).hexdigest())
+        self.assertEqual(body["client_payload"],
+                         expected_pair_payload(store.read(store.get(tag), contract.ASSET),
+                                               store.read(store.get(tag), contract.CANDIDATE)))
 
     def test_pair_dispatch_posts_release_pair_with_exact_eight_key_payload(self):
         for consumer, release in (("compute", "1.6.0"), ("compute", "1.6.0-rc.1")):
