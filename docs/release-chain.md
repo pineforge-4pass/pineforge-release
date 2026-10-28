@@ -139,6 +139,23 @@ pending and creates/updates a neutral incident. All other failures are errors.
 through its existing evidence/PR process; this hub never fabricates evidence or
 receives private registry credentials.
 
+For a candidate without a stored manifest, finalization stages the original
+outer npm tarball, codegen PyPI sdist and both Linux engine tarballs. Filenames
+and versions come from the candidate pins and selected producer URLs. It checks
+the npm registry's mandatory SHA-512 integrity, PyPI's version-specific sdist
+SHA-256 and the candidate's sdist digest, and each engine archive's mandatory
+companion `.sha256` with its filename binding. Refetched producer commits must
+equal the candidate. Any supplied GitHub asset digest must also agree.
+All producer verification and facts binding finish before the first upload.
+Public npm/PyPI downloads remain anonymous and use the existing fixed origins;
+the hub token is used only for the authenticated GitHub API and upload origins.
+
+The separate binary writer attaches those four compressed files without
+unpacking/repacking them. It reads each upload back and checks its size and
+SHA-256, including when GitHub supplies no digest. Identical existing bytes are
+reused; conflicting bytes are never overwritten. A partial upload leaves the
+draft and its attachments for retry, with no manifest or authorized promotion.
+Missing producer checksums stay pending; corruption fails finalization.
 Only then does finalization attach `release-manifest.json`, assign the fixed
 version image tag, move eligible aliases, publish the GitHub release, and fan
 out. Alias decisions and delivery reservations share job-level `release-finalize`
@@ -150,7 +167,7 @@ The previous alias digests are preserved before the first promotion.
 ## Exact ready event contract
 
 The `offline`, `hosted`, `application`, `web`, `data` and `license` event type remains
-**`pineforge-release`**, with unchanged payload bytes. Its ten payload fields are
+**`pineforge-release`**. Its ten payload fields remain
 exactly section 3.2 of the design: `schema`, `event_id`, `release_version`,
 `prerelease`, `hub_commit`, `versions`, `image`, `facts`, `manifest`, `run_id`.
 The `compute` role uses **`release-pair`**, described below.
@@ -163,11 +180,48 @@ Fixtures for consumer implementations:
 - [Strict validator](../scripts/release_contract.py)
 
 Fixture identities are synthetic, never live release evidence. The manifest is
-UTF-8 JSON with sorted keys, compact separators and one final LF. It contains
+UTF-8 JSON with sorted keys, compact separators and one final LF. Its legacy form contains
 the eight fields above other than `event_id` and `manifest`. Both omitted fields
 contain its SHA-256; excluding them avoids a circular hash. `run_id` is the
 original candidate build run, a JSON integer. Replays fetch the existing bytes;
 attempt IDs occur only in receipts. HPO is explicitly null before the cutoff.
+
+New manifests also contain exactly one additional root field, `assets`: an
+array sorted by unique `name`, with exactly four entries: one npm outer tarball,
+one codegen sdist and engine Linux x86_64 and aarch64 tarballs. Engine names are
+`pineforge-v<versions.engine.version>-linux-<arch>.tar.gz`; npm and sdist names
+are the selected producer URL basenames. Each entry has exactly these fields:
+
+| Asset field | Type and meaning |
+|---|---|
+| `name` | Safe original producer basename, starting with an ASCII letter or digit and otherwise containing only letters, digits, `_`, `.`, `-`; audit namespaces `release-`, `consumer-`, `facts-`, `delivery-` are reserved. |
+| `size` | Positive JSON integer, at most 9007199254740991, never a boolean; length of the original compressed bytes. |
+| `sha256` | Exactly 64 lowercase hexadecimal characters, computed after producer-authority verification. |
+| `source` | Selected HTTPS producer download URL with the same basename: the fixed engine repository/tag on `github.com`, the `@pineforge/codegen-pyodide/-/` package path on `registry.npmjs.org`, or `files.pythonhosted.org` for the codegen sdist. No credentials, query, fragment, traversal or encoded path is accepted. |
+
+Consumers fetch mirrors by `name` from the matching hub release and verify
+`size` and `sha256`. `source` records provenance and grants no permission to
+fetch an arbitrary URL.
+
+Readers accept exactly the legacy eight root keys or that set plus validated
+`assets`, retaining the existing schema and nested fields. The ready payload
+projects only the original eight fields and adds `event_id` and `manifest`;
+`assets` is obtained from the manifest, never an eleventh dispatch field. Both
+hashes cover the entire original raw manifest, including `assets`. Readers
+that enforce eight manifest keys, echo every manifest field into the payload,
+or drop unknown keys before hashing need this update. Readers that ignore the
+extension must still hash the original bytes and compare all ten payload fields.
+Consumer implementations and release-record readers must confirm compatibility
+before consuming newly extended releases.
+
+Once a manifest is stored, finalization checks its mirrored hub attachments
+against every descriptor before promotion or delivery planning, without resolving
+producers or newer facts again. A missing or corrupt attachment blocks replay.
+Legacy manifests remain valid and are never extended or rewritten on replay;
+their raw bytes, event IDs and original build run IDs remain unchanged. Receipt
+fields, signatures, evidence hashes and stored receipt bytes are unchanged.
+Producer binaries are release attachments; consumer receipt ZIPs still contain
+only `release-receipt.json`.
 
 `image.repository` must equal EXACTLY one of two values, the image path before
 and after the GitHub organization rename:

@@ -24,7 +24,7 @@ import release_pipeline as pipeline  # noqa: E402
 import release_contract as contract  # noqa: E402
 import test_release_workflows as wiring  # noqa: E402
 from test_release_binding import (FinalizeClient, MemoryRegistry, MemoryStore,  # noqa: E402
-                                  ProducerFixture, fixture_manifest)
+                                  ProducerFixture, fixture_manifest, synthetic_ready_assets)
 
 
 def workflow(name):
@@ -52,9 +52,20 @@ def assert_ready_wiring(case, publish, finalizer):
                   named["Image metadata"]["with"]["labels"])
     case.assertEqual(publish["jobs"]["notify-consumers"]["uses"], "./.github/workflows/release-finalize.yml")
     finalize = finalizer["jobs"]["finalize"]
-    case.assertTrue(any("scripts/release_pipeline.py finalize" in row.get("run", "") for row in finalize["steps"]))
+    ready = [row for row in finalize["steps"] if "scripts/release_pipeline.py finalize" in row.get("run", "")]
+    case.assertEqual(len(ready), 1)
+    case.assertEqual(ready[0]["name"], "Finalize or record missing prerequisites")
+    case.assertEqual(ready[0]["env"]["GH_TOKEN"], "${{ github.token }}")
+    case.assertNotIn("continue-on-error", ready[0])
+    case.assertNotIn("if", ready[0])
+    case.assertEqual(set(finalizer["on"]["workflow_call"]["inputs"]), {"tag"})
+    checkouts = [row for row in finalize["steps"] if row.get("uses", "").startswith("actions/checkout@")]
+    case.assertEqual(len(checkouts), 1)
+    case.assertEqual(checkouts[0]["with"]["ref"], "main")
+    case.assertLess(finalize["steps"].index(checkouts[0]), finalize["steps"].index(ready[0]))
     dispatch = finalizer["jobs"]["notify-consumers"]
     case.assertEqual(dispatch["needs"], "finalize")
+    case.assertEqual(dispatch["if"], "${{ needs.finalize.result == 'success' && needs.finalize.outputs.deliveries != '[]' }}")
     case.assertEqual(dispatch["strategy"]["fail-fast"], "false")
     case.assertEqual(dispatch["strategy"]["matrix"]["include"], "${{ fromJSON(needs.finalize.outputs.deliveries) }}")
     case.assertNotIn("concurrency", finalizer)
@@ -120,6 +131,24 @@ class ReadyWiringTests(unittest.TestCase):
 
     def test_actual_workflows_require_verified_candidate_before_ready_fanout(self):
         assert_ready_wiring(self, workflow("publish.yml"), workflow("release-finalize.yml"))
+
+    def test_attachment_wiring_refuses_skipped_finalizer_wrong_checkout_or_another_input(self):
+        for mutation in ("continue", "conditional", "checkout", "input", "fanout"):
+            finalizer = workflow("release-finalize.yml")
+            steps = finalizer["jobs"]["finalize"]["steps"]
+            ready = next(s for s in steps if s.get("name") == "Finalize or record missing prerequisites")
+            if mutation == "continue":
+                ready["continue-on-error"] = "true"
+            elif mutation == "conditional":
+                ready["if"] = "false"
+            elif mutation == "checkout":
+                next(s for s in steps if s.get("uses", "").startswith("actions/checkout@"))["with"]["ref"] = "${{ inputs.tag }}"
+            elif mutation == "input":
+                finalizer["on"]["workflow_call"]["inputs"]["assets"] = {"type": "boolean"}
+            else:
+                finalizer["jobs"]["notify-consumers"]["if"] = "${{ always() }}"
+            with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
+                assert_ready_wiring(self, workflow("publish.yml"), finalizer)
 
     def test_dispatch_origin_and_validated_tag_are_pinned_alongside_readiness(self):
         pins = wiring.ReleaseTriggerWorkflowTest()
@@ -365,8 +394,7 @@ class ArrivalReplayTests(unittest.TestCase):
                     manifest = fixture_manifest(ver)
                     client, store, registry = FinalizeClient(manifest), MemoryStore(manifest), MemoryRegistry()
                     tag = "v" + ver
-                    with patch.object(pipeline, "npm", side_effect=lambda c, pin, inv: {
-                            **pin, "npm_version": ver, "npm_integrity": manifest["versions"]["codegen"]["npm_integrity"]}):
+                    with patch.object(pipeline, "verified_assets", side_effect=synthetic_ready_assets):
                         event = pipeline.finalize(client, store, registry, store.get(tag))
                         raw = store.read(store.get(tag), contract.ASSET)
                         self.assertEqual(event, pipeline.finalize(client, store, registry, store.get(tag)))
