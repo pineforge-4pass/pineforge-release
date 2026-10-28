@@ -790,6 +790,47 @@ class DockerfileHarnessTest(unittest.TestCase):
         self.assertIn("PF_ABI_VERSION", _run_block(release.text, 'echo "harness ABI'))
 
 
+class RunIdForwardingTest(unittest.TestCase):
+    FORWARDING_LINE = (
+        '[[ -n "${PINEFORGE_RUN_ID+x}" ]] && extra+=(--run-id "${PINEFORGE_RUN_ID}")'
+        '  # set values incl. empty; run_json.py validates'
+    )
+
+    def _forwarding_line(self) -> str:
+        lines = (REPO / "docker" / "entrypoint.sh").read_bytes().decode("utf-8").split("\n")
+        matches = [line for line in lines if line == self.FORWARDING_LINE]
+        self.assertEqual(len(matches), 1,
+                         "entrypoint.sh must contain exactly one exact run-id forwarding line")
+        return matches[0]
+
+    def test_entrypoint_contains_the_exact_forwarding_line_once(self):
+        self._forwarding_line()
+
+    def test_real_forwarding_line_preserves_unset_empty_and_nonempty_values(self):
+        line = self._forwarding_line()
+        # Include the array length so zero arguments and an empty argument differ.
+        script = "extra=()\n" + line + '\nprintf \'%s|\' "${#extra[@]}" "${extra[@]}"\n'
+        for value, expected in ((None, "0|"), ("", "2|--run-id||"),
+                                ("run-1", "2|--run-id|run-1|")):
+            with self.subTest(run_id=value):
+                env = {"PATH": os.defpath}
+                if value is not None:
+                    env["PINEFORGE_RUN_ID"] = value
+                done = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-c", script],
+                    cwd=REPO, env=env, stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(done.stderr, "")
+                self.assertEqual(done.stdout, expected)
+
+    def test_dispatcher_bytes_are_the_pinned_ones(self):
+        # The consumer of the image pins this script's bytes; a change is a deliberate act, not a side effect of a sync.
+        dispatcher = (REPO / "docker" / "entrypoint-dispatch.sh").read_bytes()
+        self.assertEqual(hashlib.sha256(dispatcher).hexdigest(),
+                         "0ad1d54706c5fcb4ece5112804a8a8336725ec128b8ec354fdf9d14237972e1a")
+
+
 class LicenceChecksumTest(unittest.TestCase):
     """Exercise the actual Dockerfile RUN on copied bytes in temp directories.
 
