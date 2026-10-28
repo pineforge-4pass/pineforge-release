@@ -805,7 +805,7 @@ class ReceiptCollectSweepTests(unittest.TestCase):
         for source in ("pending", "http404"):
             for earlier, later, reason in (
                 ("failed", "verified", "terminal consumer state requires a new attempt"),
-                ("deploying", "ready", "consumer state regressed"),
+                ("deploying", "merged", "consumer state regressed"),
             ):
                 with self.subTest(source=source, earlier=earlier, later=later):
                     f = SweepFixture((90, 91))
