@@ -2,7 +2,7 @@
 """Wiring checks: the release workflows run scripts/release_pair.py where its
 rules apply and never fall back to an rc-unsafe version sort, the
 notify-consumers decision (no dispatch to the application for a prerelease) is
-run under bash, and the engine's runtime harness (ten files) is synced from
+run under bash, and the engine's runtime harness (twelve files) is synced from
 the pinned engine tag by one script and checked against recorded sha256 values
 when the image is built (the Dockerfile's check is run under bash on temporary
 directories). The source mirror wiring checks use PyYAML to parse the workflows."""
@@ -2417,12 +2417,13 @@ class RedeliverWorkflowTest(unittest.TestCase):
 
 
 class HarnessSyncTest(unittest.TestCase):
-    """The release image carries exactly the engine's ten runtime harness files. One script holds
+    """The release image carries exactly the engine's twelve runtime harness files. One script holds
     the list and syncs it from the pinned engine tag; the Dockerfile installs that list and checks
     the installed files against the sums the script recorded. Text checks only: nothing is fetched
     or built here."""
 
-    MODULES = ("bind_compiled_inventory.py", "pf_bars.py", "pf_sink.py", "request_feed_inventory.py",
+    MODULES = ("bind_compiled_inventory.py", "pf_bars.py", "pf_sink.py",
+               "pineforge_sink_finalize.py", "pineforge_sink_to_json.py", "request_feed_inventory.py",
                "run_execution_observer.py", "run_phase_transport.py",
                "selected_window_plan.py", "selected_window_report.py")
     HARNESS = tuple(sorted(MODULES + ("entrypoint.sh", "run_json.py")))
@@ -2436,13 +2437,13 @@ class HarnessSyncTest(unittest.TestCase):
         cls.listed = array.group(1).split() if array else []
         cls.copied = re.findall(r"^COPY docker/(\S+)\s+/opt/pineforge/bin/(\S+)\s*$", cls.dockerfile, re.M)
 
-    def test_the_list_is_the_ten_engine_harness_files(self):
+    def test_the_list_is_the_twelve_engine_harness_files(self):
         self.assertEqual(self.listed, list(self.HARNESS))
         for name in self.MODULES:
             with self.subTest(module=name):
                 self.assertIn(name, self.listed)
 
-    def test_the_ten_files_are_committed_in_docker(self):
+    def test_the_twelve_files_are_committed_in_docker(self):
         for name in self.HARNESS:
             with self.subTest(file=name):
                 self.assertTrue((REPO / "docker" / name).is_file())
@@ -2462,7 +2463,7 @@ class HarnessSyncTest(unittest.TestCase):
         for name in names:
             if name.endswith("_test.py") or name.upper().startswith("README"):
                 problems.append(f"test or readme: {name}")
-        # the ten files, in the order of the script's list and of the build's check: none missing, extra or twice
+        # the twelve files, in the order of the script's list and of the build's check: none missing, extra or twice
         if names != list(cls.HARNESS):
             problems.append("names")
         for digest, name in entries:
@@ -2483,7 +2484,7 @@ class HarnessSyncTest(unittest.TestCase):
         digest, name = lines[3].rstrip("\n").split("  ")
         ghost = "ghost.py"
         self.assertFalse((docker / ghost).exists(), ghost)
-        # a real file that is not one of the ten, with its real hash: an extra entry that is neither wrong nor absent
+        # a real file that is not one of the twelve, with its real hash: an extra entry that is neither wrong nor absent
         extra = f"{hashlib.sha256((docker / 'Dockerfile').read_bytes()).hexdigest()}  Dockerfile\n"
         flipped = ("1" if digest[0] == "0" else "0") + digest[1:]
         forced = {
@@ -2591,7 +2592,7 @@ class HarnessBuildCheckTest(unittest.TestCase):
 
     CHECK = "sha256sum -c --strict HARNESS-SHA256SUMS"
     IMAGE_BIN = "/opt/pineforge/bin"
-    SUCCESS = "harness: the ten files match HARNESS-SHA256SUMS"
+    SUCCESS = "harness: the twelve files match HARNESS-SHA256SUMS"
     SUMS = HarnessSyncTest.SUMS
     HARNESS = HarnessSyncTest.HARNESS
     TOOLS = ("bash", "grep", "ls", "sed", "sha256sum", "tr")  # bash runs the check; the rest are the check's own commands
@@ -2657,7 +2658,7 @@ class HarnessBuildCheckTest(unittest.TestCase):
         path.write_bytes("".join(f"{digest}  {name}\n" for digest, name in edit(entries)).encode("utf-8"))
 
     def _error(self, listed: list[str], present: list[str]) -> str:
-        """The line the check prints when the name lists are not the ten, for these two lists."""
+        """The line the check prints when the name lists are not the twelve, for these two lists."""
         return (f"ERROR: HARNESS-SHA256SUMS lists [{' '.join(listed)}] and bin/ holds [{' '.join(present)}]; "
                 f"both must be exactly [{' '.join(self.HARNESS)}]")
 
@@ -2702,7 +2703,7 @@ class HarnessBuildCheckTest(unittest.TestCase):
             victim.write_bytes(data[:middle] + bytes([data[middle] ^ 1]) + data[middle + 1:])
             self._fails_on_hash(bin_dir, victim.name)
 
-    def test_an_eleventh_file_in_the_directory_fails_the_check(self):
+    def test_a_thirteenth_file_in_the_directory_fails_the_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = self._layout(Path(tmp))
             self._passes(bin_dir)
@@ -2723,7 +2724,7 @@ class HarnessBuildCheckTest(unittest.TestCase):
             self._edit_sums(bin_dir, lambda entries: [entry for entry in entries if entry[1] != "run_execution_observer.py"])
             self._fails_on_names(bin_dir)
 
-    def test_a_sums_line_for_an_eleventh_name_fails_the_check(self):
+    def test_a_sums_line_for_a_thirteenth_name_fails_the_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = self._layout(Path(tmp))
             self._passes(bin_dir)

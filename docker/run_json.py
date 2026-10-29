@@ -193,8 +193,9 @@ import tempfile
 import time
 import traceback
 import types
-from contextlib import ExitStack, closing
+from contextlib import ExitStack
 from datetime import datetime, timezone
+from itertools import chain
 from pathlib import Path
 
 
@@ -688,6 +689,18 @@ def build_fingerprint(provenance: dict) -> dict:
         "provenance": provenance,
     }
 # <<< fingerprint helpers
+
+
+_BAR_HEADER = b"timestamp,open,high,low,close,volume\n"
+_BAR_FLOAT = (
+    rb"[+-]?(?:(?:[0-9]+\.[0-9]*|\.[0-9]+)"
+    rb"(?:[eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+)"
+)
+_BAR_CANONICAL_LINE = re.compile(
+    rb"([0-9]{13}),(" + _BAR_FLOAT + rb"),(" + _BAR_FLOAT
+    + rb"),(" + _BAR_FLOAT + rb"),(" + _BAR_FLOAT + rb"),("
+    + _BAR_FLOAT + rb")\n")
+_BAR_BULK_SLAB_ROWS = 4096
 
 
 _RELEASE_OVERRIDE_TYPES = {
@@ -2146,7 +2159,7 @@ def normalize_release_provenance(provenance, cpp_text, receipt, checked):
 
 # --- The failure line -------------------------------------------------------
 #
-# Every failure prints ONE line on stdout, written by failure_line:
+# Every failure publishes ONE line on the report channel, written by failure_line:
 #     {"engine":"pineforge","error":"<text>","code":"<code>","args":{...}}
 # "engine" and "error" lead, so the line still starts with
 # {"engine":"pineforge","error":" and "error" is the English text, unchanged
@@ -2258,7 +2271,7 @@ class _SigtermAbort:
     def close(self):
         if self.mask is None:
             return
-        # Keep the native handler through cleanup AND the single stdout line.
+        # Keep the native handler through cleanup AND the single report line.
         # Consume blocked repeats before restoring an embedding caller's mask.
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         if self.lib is not None and self.lib.pf_run_abort_restore_sigterm_v1() != 0:
@@ -2348,8 +2361,8 @@ def failure_line(text, code=None, code_args=None) -> str:
 
 
 def write_failure(text, code=None, code_args=None) -> None:
-    sys.stdout.write(failure_line(text, code, code_args))
-    sys.stdout.flush()
+    line = failure_line(text, code, code_args)
+    _publish_failure(line)
 
 
 def _c_text(raw) -> str:
@@ -2575,10 +2588,10 @@ def engine_version(lib: ctypes.CDLL) -> dict:
 
 # pf_report_t is CALLER-allocated: a .so built against a different ABI
 # writes past (or short of) our ReportC buffer. Assert version up front.
-# v4 appended the live-runtime accessors and grew pf_report_t with the
-# broker_state_hash array after equity_curve_len (ReportC above already
-# carries both fields).
-EXPECTED_PF_ABI = 4
+# v4 added the live accessors and broker_state_hash after equity_curve_len.
+# The mirrors already carry those fields; v5 requires rebuilt 1.8.0 modules
+# without growing the C report/trade layouts.
+EXPECTED_PF_ABI = 5
 
 
 def check_abi(lib: ctypes.CDLL) -> None:
@@ -2610,17 +2623,101 @@ def _bars_unreadable(text: str, reason: str) -> ChartBarsError:
     return ChartBarsError(text, reason)
 
 
-def load_bars(csv_path: Path) -> tuple[ctypes.Array, int, str]:
-    """Load the source tape once and return bars, count, and canonical hash.
-    A file it cannot read is a ChartBarsError (a ValueError),
-    chart_bars_unreadable{reason}: io (the file cannot be opened or read),
-    columns (a row lacks a column), value (a value is not a number, or the file
-    is not a UTF-8 CSV). An empty tape is returned as zero bars (main refuses
-    it: reason empty)."""
+def _bar_bulk_layout_matches() -> bool:
+    return (
+        sys.byteorder == "little"
+        and ctypes.sizeof(BarC) == _SOURCE_FEED_RECORD.size
+        and [getattr(BarC, name).offset for name in (
+            "open", "high", "low", "close", "volume", "timestamp"
+        )] == [0, 8, 16, 24, 32, 40]
+    )
+
+
+def _read_bar_bytes(csv_path: Path) -> bytes:
+    try:
+        with csv_path.open("rb", buffering=0) as source:
+            pieces = []
+            while True:
+                piece = source.read(64 * 1024)
+                if not piece:
+                    break
+                pieces.append(piece)
+    except OSError as error:
+        raise _bars_unreadable(
+            f"--ohlcv: {csv_path}: {error.strerror or error}", "io") from None
+    return b"".join(pieces)
+
+
+def _pack_bar_bulk_slab(matches):
+    columns = tuple(zip(*matches))
+    timestamps = list(map(int, columns[0]))
+    float_columns = [list(map(float, values)) for values in columns[1:]]
+    for raw_values, values in zip(columns[1:], float_columns):
+        for raw, value in zip(raw_values, values):
+            text = raw.decode("ascii")
+            if (not math.isfinite(value)
+                    or (value == 0.0 and text.startswith("-"))
+                    or repr(value) != text):
+                return None
+    packed = bytearray(_SOURCE_FEED_RECORD.size * len(timestamps))
+    struct.pack_into(
+        "<" + "5dq" * len(timestamps),
+        packed,
+        0,
+        *chain.from_iterable(zip(*float_columns, timestamps)),
+    )
+    return packed
+
+
+def _load_bars_bulk(raw: bytes):
+    if not _bar_bulk_layout_matches() or not raw.startswith(_BAR_HEADER):
+        return None
+    body = raw[len(_BAR_HEADER):]
+    packed = bytearray()
+    hasher = _new_source_feed_hasher()
+    count = 0
+    batch = []
+    cursor = 0
+    for match in _BAR_CANONICAL_LINE.finditer(body):
+        if match.start() != cursor:
+            return None
+        batch.append(match.groups())
+        cursor = match.end()
+        if len(batch) == _BAR_BULK_SLAB_ROWS:
+            slab = _pack_bar_bulk_slab(batch)
+            if slab is None:
+                return None
+            packed.extend(slab)
+            hasher.update(slab)
+            count += len(batch)
+            batch.clear()
+    if cursor != len(body):
+        return None
+    if batch:
+        slab = _pack_bar_bulk_slab(batch)
+        if slab is None:
+            return None
+        packed.extend(slab)
+        hasher.update(slab)
+        count += len(batch)
+    bars = (BarC * count)()
+    if packed:
+        source = (ctypes.c_char * len(packed)).from_buffer(packed)
+        ctypes.memmove(ctypes.addressof(bars), ctypes.addressof(source), len(packed))
+    return bars, count, hasher.hexdigest()
+
+
+def _load_bars_legacy(csv_path: Path, raw: bytes | None = None):
+    """The original DictReader path, optionally replayed from retained bytes."""
     rows: list[tuple[float, float, float, float, float, int]] = []
     feed_hasher = _new_source_feed_hasher()
+    source = None
     try:
-        with csv_path.open(newline="", encoding="utf-8") as f:
+        source = (
+            io.TextIOWrapper(io.BytesIO(raw), newline="", encoding="utf-8")
+            if raw is not None else csv_path.open(newline="", encoding="utf-8")
+        )
+        with source as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
@@ -2655,6 +2752,17 @@ def load_bars(csv_path: Path) -> tuple[ctypes.Array, int, str]:
         bars[i].volume    = v
         bars[i].timestamp = ts
     return bars, n, feed_hasher.hexdigest()
+
+
+def load_bars(csv_path: Path) -> tuple[ctypes.Array, int, str]:
+    """Load the source tape once and return bars, count, and canonical hash.
+    Canonical ASCII tapes use the bounded packed path; every other tape is
+    replayed through the unchanged DictReader/conversion contract."""
+    raw = _read_bar_bytes(csv_path)
+    bulk = _load_bars_bulk(raw)
+    if bulk is not None:
+        return bulk
+    return _load_bars_legacy(csv_path, raw)
 
 
 class _MappedBars(dict):
@@ -2850,6 +2958,15 @@ def load_strategy(so_path: Path) -> ctypes.CDLL:
     ]
     lib.run_backtest_full.restype = None
 
+    for name in ("strategy_net_profit_sum", "strategy_report_pointvalue"):
+        if hasattr(lib, name):
+            getattr(lib, name).argtypes = [ctypes.c_void_p]
+            getattr(lib, name).restype = ctypes.c_double
+    if hasattr(lib, "strategy_set_report_replay_v1"):
+        lib.strategy_set_report_replay_v1.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+        lib.strategy_set_report_replay_v1.restype = ctypes.c_int
+
     _bind_scratch_tables(lib)  # optional unless the host selects the jailed profile
 
     if hasattr(lib, "strategy_get_last_error"):
@@ -2936,7 +3053,7 @@ def load_strategy(so_path: Path) -> ctypes.CDLL:
     # refuses --outputs by name on a library that lacks them.
     _bind_outputs(lib)
     _bind_report_sink(lib)
-
+    _bind_metrics_streaming(lib)
     lib.strategy_free.argtypes = [ctypes.c_void_p]
     lib.report_free.argtypes   = [ctypes.POINTER(ReportC)]
     return lib
@@ -2973,7 +3090,7 @@ def default_scratch_manifest(bars: int | None) -> ScratchTablesC:
     return ScratchTablesC(
         ctypes.sizeof(ScratchTablesC), 1, 1, 0,  # bounded_memory
         0, 0,  # q is removed; retain its ABI fields with zero capacity
-        8192, 3145728, 4096, 2101248, 4096, 1048576, 27, 6912, roots)
+        262144, 25165824, 32768, 4227072, 65536, 4194304, 27, 6912, roots)
 
 
 def apply_scratch_tables(lib, state, manifest: ScratchTablesC) -> None:
@@ -3979,7 +4096,8 @@ EQUITY_REPORT_KEYS = {"sharpe_monthly": "sharpe_tv", "sortino_monthly": "sortino
 MIN_ANNUALIZATION_SPAN_MS = 86_400_000
 
 
-def _annualization_diagnostics(curve, metrics, trades=(), window_anchor=False):
+def _annualization_diagnostics(curve, metrics, trades=(), window_anchor=False,
+                               initial_capital=None):
     """Name the simple proportional form of cagr, and of the calmar made from it.
 
     No span makes cagr, calmar, sharpe_bar or sortino_bar null, so the writer
@@ -3987,14 +4105,17 @@ def _annualization_diagnostics(curve, metrics, trades=(), window_anchor=False):
     the simple form: a finite cagr on a positive sub-day span is flagged. From
     one day on it takes the compounded form unless that is not finite, so the
     writer repeats the kernel's arithmetic on the curve's own marks: the ratio
-    of the last mark to the initial capital. The initial capital is the first
-    mark only when the rows prove it untouched: the selected-window anchor
-    (window_anchor), or no open profit and no trade entered at it. With no such
-    proof the writer makes no claim and names nothing. calmar is cagr over the
-    drawdown percent, so it carries the same flag as the cagr it was computed
-    from: its key is present exactly when the cagr key is and calmar is not
-    null (zero drawdown leaves it null: then no calmar key). The bar ratios use
-    one formula on every span and have no reason.
+    of the last mark to the engine's initial capital when the optional
+    strategy_initial_capital export supplied a finite positive value. Older
+    libraries without that export fall back to the first mark only when the
+    rows prove it untouched: the selected-window anchor (window_anchor), or no
+    open profit and no trade entered at it. An invalid exported value also uses
+    that fallback. With no such proof the writer makes no claim and names
+    nothing. calmar is cagr over the drawdown percent, so it carries the same
+    flag as the cagr it was computed from: its key is present exactly when the
+    cagr key is and calmar is not null (zero drawdown leaves it null: then no
+    calmar key). The bar ratios use one formula on every span and have no
+    reason.
     Python's integer subtraction is exact across the full int64 timestamp
     domain; convert the difference to double just as the kernel does.
     """
@@ -4008,10 +4129,18 @@ def _annualization_diagnostics(curve, metrics, trades=(), window_anchor=False):
     if span_ms < MIN_ANNUALIZATION_SPAN_MS:
         form = "simple_proportional_subday"
     else:
-        if not window_anchor and (curve[0]["open_profit"] != 0
-                                  or any(row["entry_bar_index"] <= 0 for row in trades)):
-            return {}
-        capital, final = curve[0]["equity"], curve[-1]["equity"]
+        capital = initial_capital
+        try:
+            valid_capital = (
+                capital is not None and math.isfinite(capital) and capital > 0)
+        except (TypeError, ValueError, OverflowError):
+            valid_capital = False
+        if not valid_capital:
+            if not window_anchor and (curve[0]["open_profit"] != 0
+                                      or any(row["entry_bar_index"] <= 0 for row in trades)):
+                return {}
+            capital = curve[0]["equity"]
+        final = curve[-1]["equity"]
         if not (math.isfinite(capital) and capital > 0 and math.isfinite(final) and final > 0):
             return {}
         span_years = span_ms / (365.25 * 86400.0 * 1000.0)
@@ -4027,9 +4156,11 @@ def _annualization_diagnostics(curve, metrics, trades=(), window_anchor=False):
     return {"cagr": form, "calmar": form}
 
 
-def _annualization_block(curve, metrics, trades=(), window_anchor=False) -> dict:
+def _annualization_block(curve, metrics, trades=(), window_anchor=False,
+                         initial_capital=None) -> dict:
     """The diagnostics entry for revision 3.1: present only when cagr used a simple form."""
-    reasons = _annualization_diagnostics(curve, metrics, trades, window_anchor)
+    reasons = _annualization_diagnostics(
+        curve, metrics, trades, window_anchor, initial_capital)
     return {"annualization": reasons} if reasons else {}
 
 
@@ -4055,9 +4186,17 @@ def build_report_dict(report: ReportC, ohlcv_path: Path,
                       applied_overrides: dict[str, str],
                       applied_runtime: dict[str, object] | None = None,
                       trade_entry_incarnations=None,
-                      window_anchor: bool = False) -> dict:
-    # window_anchor: the curve's first point is the selected-window anchor, the
-    # engine's own initial capital by construction (_annualization_diagnostics).
+                      window_anchor: bool = False,
+                      initial_capital=None, replay=None, replay_rows=None) -> dict:
+    if replay is not None or replay_rows is not None:
+        return _annotate_replay_report(
+            _canonical_report_dict(
+                report, ohlcv_path, n_bars, first_ts, last_ts, elapsed,
+                applied_inputs, applied_overrides, applied_runtime,
+                trade_entry_incarnations, window_anchor, initial_capital),
+            replay, replay_rows)
+    # window_anchor: the curve's first point is the selected-window anchor. It
+    # remains the fallback proof when the runtime lacks strategy_initial_capital.
     def trade_at(i):
         t = report.trades[i]
         return {
@@ -4165,7 +4304,8 @@ def build_report_dict(report: ReportC, ohlcv_path: Path,
             "magnifier_sub_bars_total":     int(report.magnifier_sub_bars_total),
             "magnifier_sample_ticks_total": int(report.magnifier_sample_ticks_total),
             "bar_magnifier_enabled":        bool(report.bar_magnifier_enabled),
-            **_annualization_block(equity_curve, metrics, trades, window_anchor),
+            **_annualization_block(
+                equity_curve, metrics, trades, window_anchor, initial_capital),
         },
         "trades": trades,
         "metrics": metrics,
@@ -4173,48 +4313,50 @@ def build_report_dict(report: ReportC, ohlcv_path: Path,
     }
 
 
-def _validate_report_result(out: dict, *, validate_summary: bool = True) -> None:
+def _validate_report_result(out: dict, *, validate_summary: bool = True,
+                            equity_only: bool = False) -> None:
     """Required results are finite; only native metric absence is nullable.
     Metric keys come from the producer's ctypes descriptors and alias map,
     after native computation has distinguished absence from computed NaN.
-    The sink pre-pass validates one trade here at a time; its completed summary
-    is checked by the default full validation before the report is serialized."""
-    for trade in out["trades"]:
+    Sink read-back validates one trade/point at a time, deferring its first refusal until assembly.
+    Keep the equity guard here for the ownership checker; equity_only skips small-field checks."""
+    if "replay" in out:
+        _validate_replay_result(out, equity_only=equity_only)
+    if not equity_only:
+        for trade in out["trades"]:
+            for key, field in (
+                ("entry_price", "trades.entry_price"),
+                ("exit_price", "trades.exit_price"),
+                ("qty", "trades.qty"), ("pnl", "trades.pnl"), ("pnl_pct", "trades.pnl_pct"),
+                ("max_runup", "trades.max_runup"),
+                ("max_drawdown", "trades.max_drawdown"),
+                ("commission", "trades.commission"),
+            ):
+                if trade[key] is None or not math.isfinite(trade[key]):
+                    raise RunFailure(f"the report result {field} is not finite",
+                                     "report_result_invalid",
+                                     {"field": field, "reason": "nonfinite"})
+        if not validate_summary:
+            return
         for key, field in (
-            ("entry_price", "trades.entry_price"),
-            ("exit_price", "trades.exit_price"),
-            ("qty", "trades.qty"),
-            ("pnl", "trades.pnl"),
-            ("pnl_pct", "trades.pnl_pct"),
-            ("max_runup", "trades.max_runup"),
-            ("max_drawdown", "trades.max_drawdown"),
-            ("commission", "trades.commission"),
+            ("win_rate_pct", "summary.win_rate_pct"),
+            ("net_pnl", "summary.net_pnl"),
+            ("avg_trade", "summary.avg_trade"),
+            ("best_trade", "summary.best_trade"),
+            ("worst_trade", "summary.worst_trade"),
+            ("max_drawdown", "summary.max_drawdown"),
         ):
-            if trade[key] is None or not math.isfinite(trade[key]):
+            if not math.isfinite(out["summary"][key]):
                 raise RunFailure(f"the report result {field} is not finite",
                                  "report_result_invalid",
                                  {"field": field, "reason": "nonfinite"})
-    if not validate_summary:
-        return
-    for key, field in (
-        ("win_rate_pct", "summary.win_rate_pct"),
-        ("net_pnl", "summary.net_pnl"),
-        ("avg_trade", "summary.avg_trade"),
-        ("best_trade", "summary.best_trade"),
-        ("worst_trade", "summary.worst_trade"),
-        ("max_drawdown", "summary.max_drawdown"),
-    ):
-        if not math.isfinite(out["summary"][key]):
-            raise RunFailure(f"the report result {field} is not finite",
-                             "report_result_invalid",
-                             {"field": field, "reason": "nonfinite"})
-    for block in ("all", "longs", "shorts", "equity"):
-        for name, value in out["metrics"][block].items():
-            if value is not None and not math.isfinite(value):
-                metric_field = f"metrics.{block}.{name}"
-                raise RunFailure(f"the report result {metric_field} is not finite",
-                                 "report_result_invalid",
-                                 {"field": metric_field, "reason": "nonfinite"})
+        for block in ("all", "longs", "shorts", "equity"):
+            for name, value in out["metrics"][block].items():
+                if value is not None and not math.isfinite(value):
+                    metric_field = f"metrics.{block}.{name}"
+                    raise RunFailure(f"the report result {metric_field} is not finite",
+                                     "report_result_invalid",
+                                     {"field": metric_field, "reason": "nonfinite"})
     for point in out["equity_curve"]:
         for key, field in (
             ("equity", "equity_curve.equity"),
@@ -4367,6 +4509,9 @@ class _ArgumentParser(argparse.ArgumentParser):
     run_request_invalid{option}; it still prints the usage and the message to
     stderr and exits 2."""
 
+    def print_help(self, file=None):
+        super().print_help(file=_report_output() if file is None else file)
+
     def error(self, message):
         self.print_usage(sys.stderr)
         text = f"{self.prog}: error: {message}"
@@ -4423,7 +4568,7 @@ def run_failure(lib, strat):
 #      Afterwards the retained callback exception is raised first, the native counts must equal
 #      the plan, the report is assembled (the engine supplies the selected trades, curve and
 #      metrics; nothing is recalculated here) and serialized once the serialization phase has
-#      begun; completed follows the stdout flush.
+#      begun; completed follows the report-channel flush.
 
 _TYPED_ERROR_NAMES = frozenset({"SelectedWindowError", "InventoryAdmissionError",
                                 "PlanBridgeError", "ObserverBindingError",
@@ -4644,33 +4789,37 @@ def _syminfo_clock(syminfo_path) -> tuple:
 
 
 def _write_report(text, phases=None) -> int:
-    """Write the whole document to stdout and flush: 0, or 1 when stdout cannot take it. No
-    failure line (no second JSON document) may follow part of a report, so the reason goes to
-    stderr, stdout is pointed at /dev/null, the exit status is 1 and the phase writer is left
+    """Write the whole document to the report channel and flush: 0, or 1 when it cannot
+    take it. No failure line (no second JSON document) may follow part of a report, so the reason
+    goes to stderr, the report descriptor is discarded, the exit status is 1 and the phase writer is left
     where it is (serialization): the watchdog sees the terminal status and the last phase.
     With a phase session (a run past the boundary) any exception from the write is that
     outcome, and the stderr line names it as report_post_execution_failed with the real
-    phase and the reason (resource, io or exception); without one, only OSError and ValueError
-    are, and the line is the ordinary one."""
-    caught = (OSError, ValueError) if phases is None else Exception
+    phase and the reason (resource, io or exception); without one, the line is the ordinary
+    one and library calls retain their OSError/ValueError handling."""
+    caught = (OSError, ValueError) if phases is None and _REPORT_OUTPUT is None else Exception
+    already_published = _report_published()
     try:
+        _begin_report()
         if isinstance(text, str):
-            sys.stdout.write(text)
+            _report_output().write(text)
         else:
             # A fully prepared, ASCII JSON temporary. No report byte is
             # published until serialization and native cleanup have succeeded.
             try:
                 while chunk := text.read(1024 * 1024):
-                    written = sys.stdout.write(chunk)
+                    written = _report_output().write(chunk)
                     if written is not None and written != len(chunk):
                         raise OSError("short report write")
             finally:
                 # Close errors after publication obey the same stderr-only
-                # rule as stdout errors; the outer resource stack is idempotent.
+                # rule as report-channel errors; the outer resource stack is idempotent.
                 text.close()
-        sys.stdout.flush()
+        _finish_report()
     except caught as error:
-        _discard_stdout()
+        # A rejected second library publication must not discard the caller's stdout.
+        if _REPORT_OUTPUT is not None or not already_published:
+            _discard_stdout()
         if phases is None:
             print(f"run_json: the report could not be written: {error}", file=sys.stderr)
         else:
@@ -4843,8 +4992,11 @@ def _selected_run(args, inputs, overrides, input_tf, script_tf, bar_magnifier,
                 enable_outputs(lib, st)
             if args.profile == "jailed":
                 apply_scratch_tables(lib, st, default_scratch_manifest(fed_count))
-                _require_jailed_arena(lib, st)
+                args._scratch_arena_admitted = _require_jailed_arena(lib, st)
             sink = _new_report_sink(lib, st, args)
+            if getattr(args, "report_replay", False) or getattr(args, "report_replay_sink", None):
+                args._replay_capture = binary_inputs.enter_context(
+                    _ReplayCapture(lib, st, args, sink))
         except BaseException:
             try:
                 lib.strategy_free(st)
@@ -4950,15 +5102,17 @@ def _selected_run(args, inputs, overrides, input_tf, script_tf, bar_magnifier,
             # list pre-pass. These read-only values are revisited during output.
             for i in range(report.trades_len):
                 trade_entry_incarnations(i)
+        engine_initial_capital = _read_strategy_initial_capital(lib, state)
+        replay_options = _read_report_replay(lib, state, args, sink)
         builder = _build_sink_report if sink is not None else build_report_dict
         out = builder(
             report, args.ohlcv, fed_count, plan["fed_first_data_ms"], plan["fed_last_data_ms"],
             elapsed, inputs, overrides, applied_runtime,
             sink if sink is not None else trade_entry_incarnations,
-            window_anchor=True)
+            window_anchor=True, initial_capital=engine_initial_capital, **replay_options)
         if sink is None:
             _validate_report_result(out)
-        _add_scratch_arena_diagnostics(lib, out["diagnostics"])
+        _add_scratch_arena_diagnostics(lib, out["diagnostics"], args)
         out["report_window"] = window
         out["report_shape"] = swr.report_shape_full(
             equity_points, sink.counts["T"] if sink is not None else len(out["trades"]))
@@ -4997,14 +5151,15 @@ def _selected_run(args, inputs, overrides, input_tf, script_tf, bar_magnifier,
             # verify() checked every record and the receipt. The engine's
             # selected latches own the window observations; only the anchor
             # and trailer count are needed here, including the M = 0 case.
-            with closing(sink.records("E")) as points:
-                anchor = next(points, None)
-                swr.check_selected_sink_curve(
-                    anchor.as_dict() if anchor is not None else None, equity_points,
-                    request.start_ms, plan["window_script_bars"], initial_capital)
+            anchor = sink.diagnostics.first
+            swr.check_selected_sink_curve(
+                anchor.as_dict() if hasattr(anchor, "as_dict") else anchor,
+                equity_points, request.start_ms,
+                plan["window_script_bars"], initial_capital)
         elif sink is None:
             swr.check_selected_curve(out["equity_curve"], request.start_ms,
-                                     plan["window_script_bars"], initial_capital)
+                                     plan["window_script_bars"], initial_capital,
+                                     report_replay=bool(replay_options))
         # Fd mode trusts the native selected presentation and the checked
         # observation/counts. No E point is available for a Python anchor
         # recheck: the stream goes directly to the trusted finalizer.
@@ -5013,7 +5168,7 @@ def _selected_run(args, inputs, overrides, input_tf, script_tf, bar_magnifier,
         out["diagnostics"]["phase_timing"] = phases.writer.phase_timing()
         buffer = _prepare_report_json(out, binary_inputs, args, sink)
         if output_files is not None:
-            output_files.close()  # surface column close failures before stdout
+            output_files.close()  # surface column close failures before report publication
     except Exception as error:
         # Once the engine has acknowledged result_assembly (the REAL writer phase), an
         # unclassified failure is report_post_execution_failed{phase, reason}; typed faults,
@@ -5051,7 +5206,7 @@ def _csv2bin_main(argv) -> int:
     """Standalone conversion: no strategy library, one refusal line on stderr."""
     import pf_bars
 
-    class ConverterParser(argparse.ArgumentParser):
+    class ConverterParser(_ArgumentParser):
         def error(self, message):
             raise RunFailure(f"csv2bin: {message}", "run_request_invalid",
                              {"option": "arguments"}, exit_status=2)
@@ -5084,42 +5239,44 @@ def _csv2bin_main(argv) -> int:
 
 
 def main(argv=None) -> int:
-    """Run the harness. Every failure ends as the one failure line on stdout:
+    """Run the harness. Every failure ends as the one failure line on the report channel:
     run_json's own (RunFailure) with its code, a selected-window helper's typed error
     (_typed_failure) with its code, and anything unexpected as
     harness_internal_error (its traceback on stderr). Exit status 1, or 2 for a
-    command line argparse refuses. The one exception is a success report stdout
+    command line argparse refuses. The one exception is a success report publication
     cannot take whole (_main): exit 1 with the reason on stderr and no line after
     the part written. The csv2bin subcommand instead returns 2 on refusal and
-    writes its one failure line to stderr (CR-150's converter contract)."""
-    tokens = sys.argv[1:] if argv is None else argv
-    if tokens and tokens[0] == "csv2bin":
-        return _csv2bin_main(tokens[1:])
-    abort = _SigtermAbort()
-    try:
-        with ExitStack() as binary_inputs:
-            binary_inputs._sigterm_abort = abort
-            return _main(argv, binary_inputs)
-    except RunFailure as failure:
-        if not abort.started and abort.requested():
-            failure = abort.failure()
-        write_failure(str(failure), failure.code, failure.code_args)
-        return failure.exit_status
-    except Exception as error:
-        if not abort.started and abort.requested():
-            failure = abort.failure()
+    writes its one failure line to stderr (the converter contract)."""
+    with _LibraryReportRun():
+        tokens = sys.argv[1:] if argv is None else argv
+        if tokens and tokens[0] == "csv2bin":
+            return _csv2bin_main(tokens[1:])
+        abort = _SigtermAbort()
+        try:
+            with ExitStack() as binary_inputs:
+                binary_inputs._sigterm_abort = abort
+                return _main(argv, binary_inputs)
+        except RunFailure as failure:
+            if not abort.started and abort.requested():
+                failure = abort.failure()
             write_failure(str(failure), failure.code, failure.code_args)
+            return failure.exit_status
+        except Exception as error:
+            if not abort.started and abort.requested():
+                failure = abort.failure()
+                write_failure(str(failure), failure.code, failure.code_args)
+                return 1
+            typed = _typed_failure(error)
+            if typed is not None:
+                write_failure(str(typed), typed.code, typed.code_args)
+                return typed.exit_status
+            traceback.print_exc(file=sys.stderr)
+            write_failure(f"harness internal error: {type(error).__name__}: {error}",
+                          "harness_internal_error")
             return 1
-        typed = _typed_failure(error)
-        if typed is not None:
-            write_failure(str(typed), typed.code, typed.code_args)
-            return typed.exit_status
-        traceback.print_exc(file=sys.stderr)
-        write_failure(f"harness internal error: {type(error).__name__}: {error}",
-                      "harness_internal_error")
-        return 1
-    finally:
-        abort.close()
+        finally:
+            abort.close()
+    return 1  # A fault after library publication was diagnosed by the run guard.
 
 
 def _legacy_abbreviations(argv, legacy_long, all_long):
@@ -5153,7 +5310,7 @@ def _legacy_abbreviations(argv, legacy_long, all_long):
 def _main(argv, binary_inputs) -> int:
     # Host startup only: freeze the profile before any library/handle/run.
     environment_profile = os.environ.get("PINEFORGE_RUN_JSON_PROFILE", "unjailed")
-    ap = _ArgumentParser(description=__doc__,
+    ap = _MetricsArgumentParser(description=__doc__,
                          formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--so",        type=Path, default=None, help="strategy.so path")
     ap.add_argument("--ohlcv", type=Path, default=None, help="OHLCV CSV path")
@@ -5225,6 +5382,10 @@ def _main(argv, binary_inputs) -> int:
                          "emit summary JSON without report files and close N after capture.")
     ap.add_argument("--report-sink-format", type=int, choices=(1, 2), default=1,
                     help="Sink wire format (default 1); format 2 requires the external transcoder.")
+    ap.add_argument("--report-replay", action="store_true",
+                    help="Include authoritative settlement and equity replay operands.")
+    ap.add_argument("--report-replay-sink", type=Path, default=None, metavar="PATH",
+                    help="Write the separate pf-report-replay/v1 companion; enables replay.")
     ap.add_argument("--run-id", default="",
                     help="Caller run identifier copied into the report sink header (default empty).")
     ap.add_argument("--spill-dir", type=Path, default=None, metavar="DIR",
@@ -5273,20 +5434,19 @@ def _main(argv, binary_inputs) -> int:
                     help="FULL uses the legacy report route, identical to omitting this option. "
                          "SUMMARY_ONLY and STREAMED require a pineforge-report/v1 provider "
                          "bridge and are refused before execution by this host.")
+    pre_metrics_long = tuple(s for s in ap._option_string_actions if s.startswith("--"))
+    ap._legacy_usage = ap.format_usage()
+    ap.add_argument("--metrics-only", nargs="?", const="auto", choices=("auto", "legacy"),
+                    default=None, help="Omit trade/curve arrays and volatile counters; bare = auto.")
     all_long = tuple(s for s in ap._option_string_actions if s.startswith("--"))
     argv = _legacy_abbreviations(argv, legacy_long, all_long)
     argv = _legacy_abbreviations(argv, pre_profile_long, all_long)
+    argv = _legacy_abbreviations(argv, pre_metrics_long, all_long)
     if not argv:
-        # With no request, both the library and chart are missing. Preserve
-        # the legacy aggregate refusal now that --ohlcv has alternatives.
         ap.error("the following arguments are required: --so, --ohlcv")
     args = ap.parse_args(argv)
     if args.profile not in ("unjailed", "jailed"):
         raise _request_invalid("PINEFORGE_RUN_JSON_PROFILE must be unjailed or jailed", "arguments")
-
-    # Validate both required inputs together: chart data may now come from
-    # CSV, binary, or the index. Checking only --so inside argparse would hide
-    # the missing chart and change the empty request's existing error code.
     missing = []
     if args.so is None:
         missing.append("--so")
@@ -5295,6 +5455,7 @@ def _main(argv, binary_inputs) -> int:
         missing.append("--ohlcv")
     if missing:
         ap.error("the following arguments are required: " + ", ".join(missing))
+    _validate_metrics_only_options(args)
     if args.report_mode in ("SUMMARY_ONLY", "STREAMED"):
         # report_mode.h declares data, not a C provider bridge. This ctypes
         # host has only the legacy run/report API; neither ABI 4 nor the v1
@@ -5386,21 +5547,19 @@ def _main(argv, binary_inputs) -> int:
     # Other symbols' bars, read once before the first state (None without
     # --symbol-feeds).
     symbol_feeds = None
-
-    def _make_state(*, body=False):
-        """Create + fully configure a fresh strategy state — everything EXCEPT the
-        timed run_backtest_full call. Mirrors scripts/run_strategy.py's setup so the
-        engine behaves identically to the ctypes validation harness. The handle is
-        checked before anything is set on it; a state that fails to configure is
-        freed before its failure propagates."""
+    metrics = _MetricsOnlyRun(lib, args, checked) if args.metrics_only is not None else None
+    def _make_state(*, body=False, metrics_legacy=False):
+        """Fully configure a fresh handle outside the timed run_backtest_full call.
+        Match the validation harness's setup and free a state whose
+        configuration fails before propagating its failure."""
         nonlocal syminfo_applied
         st = create_strategy(lib, checked)
         sink = None
         try:
             apply_settings(lib, st, inputs, overrides, checked)
             if args.syminfo:
-                # A replacement apply_syminfo may return None (or another non-dict).
-                r = apply_syminfo(lib, st, args.syminfo)
+                r = (metrics.apply_syminfo(st) if metrics is not None
+                     else apply_syminfo(lib, st, args.syminfo))
                 syminfo_applied = r if isinstance(r, dict) else {}
             if symbol_feeds:
                 install_symbol_feeds(lib, st, symbol_feeds)
@@ -5414,8 +5573,14 @@ def _main(argv, binary_inputs) -> int:
                 enable_outputs(lib, st)
             if args.profile == "jailed":
                 apply_scratch_tables(lib, st, default_scratch_manifest(n))
-                _require_jailed_arena(lib, st)
+                args._scratch_arena_admitted = _require_jailed_arena(lib, st)
             sink = _new_report_sink(lib, st, args, body=body)
+            if body and (getattr(args, "report_replay", False)
+                         or getattr(args, "report_replay_sink", None)):
+                args._replay_capture = binary_inputs.enter_context(
+                    _ReplayCapture(lib, st, args, sink))
+            if metrics is not None:
+                metrics.configure(st, legacy=metrics_legacy)
         except BaseException:
             try:
                 lib.strategy_free(st)
@@ -5440,7 +5605,7 @@ def _main(argv, binary_inputs) -> int:
     # isolates the engine hot loop (closest to the GBench harness). dlopen
     # already happened above (load_strategy), outside any loop. A rejected
     # --syminfo / --symbol-feeds / setting raises its RunFailure before any
-    # stdout; main() prints it.
+    # publication; main() writes it.
     timing = None
     if args.symbol_feeds:
         symbol_feeds = _run_symbol_feeds(args, binary_inputs)
@@ -5475,32 +5640,33 @@ def _main(argv, binary_inputs) -> int:
     report = ReportC()
     binding = None
     state, sink = _make_state(body=True)
+    if metrics is not None:
+        metrics.own(state, sink, report)
     try:
-        # The last state owns CSV copies. Borrowed binary views stay alive
-        # through native cleanup and the outer input stack's cleanup.
         _release_copied_feeds(symbol_feeds)
         started = time.time()
         settings_receipt = _release_settings_receipt(lib, state, checked)
         if phases is not None:
             binding = _observer_binding(lib, state, phases.writer)
             binding.attach()
-        _run(state, report)
+        if metrics is None:
+            _run(state, report)
+        else:
+            state, sink, report, settings_receipt = metrics.execute(
+                _run, _make_state, settings_receipt, abort)
         elapsed = time.time() - started
         if binding is not None:
             binding.raise_if_failed()  # the callback's exception, before any report access
-        failure = run_failure(lib, state)
+        failure = metrics.failure if metrics is not None else run_failure(lib, state)
         if failure is not None:
-            # Unchanged without --run-phase-fd; with it, an out_of_memory or unclassified engine
-            # failure after the acknowledged boundary is report_post_execution_failed.
+            # Phase transport classifies failures after the acknowledged boundary.
             if getattr(sink, "fd_mode", False):
                 raise RunFailure(*_post_boundary_engine_failure(failure, phases))
             write_failure(*_post_boundary_engine_failure(failure, phases))
             return 1
         if phases is not None:
             _require_result_assembly(phases)
-        # The report spells the first and last bar as UTC dates (fmt_utc).
-        # Checked after the run, so the engine's own refusal of the same tape
-        # keeps its line.
+        # Check UTC dates after the run so the engine's refusal keeps its line.
         for ts in (first_ts, last_ts):
             try:
                 fmt_utc(ts)
@@ -5544,14 +5710,19 @@ def _main(argv, binary_inputs) -> int:
         if trade_entry_incarnations is not None:
             for i in range(report.trades_len):
                 trade_entry_incarnations(i)
+        engine_initial_capital = _read_strategy_initial_capital(lib, state)
+        replay_options = _read_report_replay(lib, state, args, sink)
         builder = _build_sink_report if sink is not None else build_report_dict
         out = builder(
             report, args.ohlcv, n, first_ts, last_ts,
             elapsed, inputs, overrides, applied_runtime,
-            sink if sink is not None else trade_entry_incarnations)
+            sink if sink is not None else trade_entry_incarnations,
+            initial_capital=engine_initial_capital, **replay_options)
+        if metrics is not None:
+            metrics.add_annualization(out)
         if sink is None:
             _validate_report_result(out)
-        _add_scratch_arena_diagnostics(lib, out["diagnostics"])
+        _add_scratch_arena_diagnostics(lib, out["diagnostics"], args)
         if timing is not None:
             out["diagnostics"]["timing"] = timing
             out["diagnostics"]["throughput"] = _throughput_block(
@@ -5560,9 +5731,7 @@ def _main(argv, binary_inputs) -> int:
         if outputs_block is not None:
             out["outputs"] = outputs_block
         try:
-            # The frozen helpers' regex readers never see the C++: the release
-            # reader below owns every declared value, and only the digest of
-            # the file is taken here.
+            # The release reader owns declarations; provenance takes the file digest.
             provenance = build_provenance(
                 engine_version(lib),
                 None,
@@ -5573,9 +5742,10 @@ def _main(argv, binary_inputs) -> int:
                 source_feed_sha256=source_feed_sha256,
             )
             provenance["codegen"]["generated_cpp_sha256"] = (
-                _sha256_file(args.generated_cpp) if args.generated_cpp else None)
-            cpp_text = ""
-            if args.generated_cpp:
+                (metrics.cpp_digest if metrics is not None else _sha256_file(args.generated_cpp))
+                if args.generated_cpp else None)
+            cpp_text = metrics.cpp_source() if metrics is not None else ""
+            if args.generated_cpp and metrics is None:
                 with open(args.generated_cpp, encoding="utf-8", errors="replace") as source:
                     cpp_text = source.read()
             provenance = normalize_release_provenance(
@@ -5583,14 +5753,14 @@ def _main(argv, binary_inputs) -> int:
             out["fingerprint"] = build_fingerprint(provenance)
         except Exception:
             out["fingerprint"] = None
+        if metrics is not None:
+            _metrics_only_document(out)
         _advance(phases, "serialization")  # phase records only: the report gains no field
-        # Serialized whole before any byte is written (the same JSON encoder), so
-        # a failure while it is built never follows half a report.
+        # Serialize whole before publishing any byte.
         try:
             buffer = _prepare_report_json(out, binary_inputs, args, sink)
         except ValueError as error:
-            # Match only the encoder's allow_nan=False refusal, including the
-            # versions that append repr(value); other ValueErrors keep their code.
+            # Match only the encoder's allow_nan=False refusal.
             if (_boundary_phase(phases) is None and str(error) in (
                 "Out of range float values are not JSON compliant",
                 "Out of range float values are not JSON compliant: nan",
@@ -5602,21 +5772,21 @@ def _main(argv, binary_inputs) -> int:
                                  {"field": "report.document", "reason": "nonfinite"}) from error
             raise
         if output_files is not None:
-            output_files.close()  # detect column close errors before any stdout
+            output_files.close()  # detect column close errors before report publication
     except Exception as error:
-        # Without --run-phase-fd the writer above types its non-finite refusal;
-        # other errors keep their existing classification.
+        # Preserve classification outside phase transport.
         classified = _post_boundary_failure(error, phases)
         if classified is None:
             raise
         raise classified from error
     finally:
         detach_error = _detach_observer(binding)  # None without --run-phase-fd
-        _free_sink_run(lib, state, report, sink)
+        if metrics is None:
+            _free_sink_run(lib, state, report, sink)
+        else:
+            metrics.close()
         if detach_error is not None and sys.exc_info()[1] is None:
             raise _typed_failure(detach_error) or detach_error
-    # A closed pipe or a full disk while the report is written: a failure line now would
-    # follow part of a report, so none is written (see _write_report).
     status = _write_report(buffer, phases)
     if status:
         return status
@@ -5632,7 +5802,7 @@ def _main(argv, binary_inputs) -> int:
     return 0
 
 
-# --- CR-150 L9A/L9B: full and summary JSON from the fixed v1 report sink -------
+# --- Full and summary JSON from the fixed v1 report sink -----------------------
 
 class ReportSinkC(ctypes.Structure):
     """Exact pf_report_sink_v1; the setter copies all three strings."""
@@ -5694,7 +5864,15 @@ def _bind_report_sink(lib) -> None:
             function.restype, function.argtypes = restype, argtypes
 
 
-def _add_scratch_arena_diagnostics(lib, diagnostics):
+def _add_scratch_arena_diagnostics(lib, diagnostics, args=None):
+    _add_scratch_arena_counters(lib, diagnostics)
+    if args is not None:
+        diagnostics["run_profile"] = args.profile
+        diagnostics["scratch_arena_jailed"] = (
+            args.profile == "jailed" and getattr(args, "_scratch_arena_admitted", False) is True)
+
+
+def _add_scratch_arena_counters(lib, diagnostics):
     # Attachment-lifetime counters: read after report finalization, before
     # strategy_free can detach. Never add them to a sink trailer or fingerprint.
     getter = getattr(lib, "pf_report_scratch_arena_stats", None)
@@ -5708,8 +5886,9 @@ def _add_scratch_arena_diagnostics(lib, diagnostics):
 
 
 def _refuse_jailed_path_sink(args):
-    if (getattr(args, "profile", "unjailed") == "jailed"
-            and getattr(args, "report_sink", None) is not None):
+    if (_validate_report_fd_separation(args)
+            or (getattr(args, "profile", "unjailed") == "jailed"
+            and getattr(args, "report_sink", None) is not None)):
         raise _request_invalid("error: --profile jailed refuses --report-sink paths; "
                                "use --report-sink-fd", "arguments")
     if (getattr(args, "profile", "unjailed") == "jailed"
@@ -5730,6 +5909,7 @@ def _require_jailed_arena(lib, state):
             raise RunFailure(*failure)
         raise RunFailure("the jailed profile requires an attached scratch arena",
                          "report_sink_failed", {"reason": "arena_backing"})
+    return True
 
 
 def _validate_sink_options(args):
@@ -5780,6 +5960,7 @@ def _validate_sink_options(args):
 
 def _new_report_sink(lib, state, args, *, body=True):
     _refuse_jailed_path_sink(args)
+    _validate_metrics_only_options(args)
     jailed = getattr(args, "profile", "unjailed") == "jailed"
     if getattr(args, "report_sink_fd", None) is not None:
         names = ("pf_report_sink_version", "strategy_set_report_sink_fd_v1",
@@ -5794,7 +5975,7 @@ def _new_report_sink(lib, state, args, *, body=True):
         return _FdReportSink(lib, state, fd=args.report_sink_fd,
                              run_id=getattr(args, "run_id", ""),
                              owner=args._sink_fd_owner)
-    if jailed:
+    if jailed or getattr(args, "metrics_only", None) is not None:
         return None
     names = ("pf_report_sink_version", "strategy_set_report_sink_v1",
              "strategy_report_sink_receipt_v1")
@@ -5806,8 +5987,7 @@ def _new_report_sink(lib, state, args, *, body=True):
         return None  # old modules keep their existing report ABI
     if not all(present) or int(lib.pf_report_sink_version()) != 1:
         raise _engine_invariant("the strategy library has an incompatible report sink ABI")
-    # Only the body run may create/truncate the caller's sink. Bench states
-    # use their own temporary paths, unlinked at close.
+    # Only the body run may create/truncate the caller's sink.
     return _ReportSink(lib, state, directory=getattr(args, "spill_dir", None),
                        run_id=getattr(args, "run_id", ""),
                        path=getattr(args, "report_sink", None) if body else None)
@@ -5953,6 +6133,329 @@ def _disk_report_directory(directory=None):
         + "; set TMPDIR or --spill-dir to a disk-backed directory", "arguments")
 
 
+_BULK_E_ENABLED = True
+_BULK_E_WINDOW = 64 * 1024
+# A finite double's repr is at most 24 ASCII bytes. The lookahead bounds
+# rejected tokens too, avoiding unbounded regex work on a malformed line.
+_BULK_E_FLOAT = (
+    rb"(?=[-+0-9.e]{1,24}[,\]])-?(?:0|[1-9][0-9]*)"
+    rb"(?:\.[0-9]+(?:e[+-]?[0-9]+)?|e[+-]?[0-9]+)"
+)
+_BULK_E_LINE = re.compile(
+    rb'\["E",(0|-?[1-9][0-9]{0,15}),(' + _BULK_E_FLOAT
+    + rb"),(" + _BULK_E_FLOAT + rb")\]\n")
+# Lines per regex call. The engine matches a repeated group with its whole
+# backtracking state on a heap stack that is freed only when the call returns:
+# every alternation and bounded repeat of a line nests a frame, about 2 KiB per
+# canonical line. A call over a full window of 33-byte lines (about 2,000)
+# would therefore hold several MiB, and a call over a shorter file less, so the
+# transient memory would follow the window and the file instead of staying flat.
+# The bound keeps that stack, and every list built from one batch, the same for
+# any window and any file length; a window is consumed in successive batches.
+_BULK_E_BATCH = 128
+_BULK_E_RUN = re.compile(rb"(?:" + _BULK_E_LINE.pattern + (rb"){1,%d}" % _BULK_E_BATCH))
+_BULK_E_LINE_BYTES = 80
+
+
+class _BulkEquity:
+    """One accepted batch of lines, with only its two decoded endpoints retained."""
+    def __init__(self, raw, count, first, last):
+        self.raw, self.count, self.first, self.last = raw, count, first, last
+
+
+def _bulk_equity(raw):
+    """Accept a strict subset; a failed proof never supplies an error.
+
+    ``raw`` is one run of at most _BULK_E_BATCH lines; a longer one is no match.
+    """
+    if not raw or _BULK_E_RUN.fullmatch(raw) is None:
+        return None
+    times, equities, profits = zip(*_BULK_E_LINE.findall(raw))
+    timestamps = list(map(int, times))
+    if min(timestamps) < -((1 << 53) - 1) or max(timestamps) > (1 << 53) - 1:
+        return None
+    texts = list(map(bytes.decode, equities + profits))
+    numbers = list(map(float, texts))
+    if not all(map(math.isfinite, numbers)) or list(map(repr, numbers)) != texts:
+        return None
+    count = len(timestamps)
+    first = dict(time_ms=timestamps[0], equity=numbers[0], open_profit=numbers[count])
+    last = dict(time_ms=timestamps[-1], equity=numbers[count - 1], open_profit=numbers[-1])
+    return _BulkEquity(raw, count, first, last)
+
+
+def _bulk_equity_ascii(batch):
+    rows = _BULK_E_LINE.sub(
+        rb'{"time_ms":\1,"equity":\2,"open_profit":\3},' + b"\n",
+        batch.raw).splitlines()
+    return b"".join(rows)[:-1] if rows else b""
+
+
+class _BulkEquityFile:
+    """Look ahead within a loaded direct page; replay all other bytes strictly."""
+    def __init__(self, file):
+        self.file, self.data, self.cursor, self.eof = file, b"", 0, False
+
+    def _fill(self):
+        self.data, self.cursor = self.data[self.cursor:], 0
+        room = _BULK_E_WINDOW - len(self.data)
+        if not room or self.eof:
+            return
+        first = self.file.read(1)  # populate exactly the page readline would use
+        if not first:
+            self.eof = True
+            return
+        self.data += first
+        available = self.file.read_base + self.file.read_size - self.file.position
+        take = min(room - 1, available)
+        if take:
+            self.data += self.file.read(take)
+
+    def window(self):
+        if self.cursor == len(self.data):
+            self._fill()
+        # A canonical line can cross a page. Carry only its bounded tail;
+        # longer or malformed lines go back to the strict readline limit.
+        while (not self.eof and len(self.data) - self.cursor < _BULK_E_LINE_BYTES
+               and len(self.data) - self.cursor < _BULK_E_WINDOW
+               and self.data.find(b"\n", self.cursor) < 0):
+            self._fill()
+        return self.data, self.cursor
+
+    def readline(self, limit):
+        stop = min(len(self.data), self.cursor + limit)
+        newline = self.data.find(b"\n", self.cursor, stop)
+        if newline >= 0:
+            stop = newline + 1
+        head = self.data[self.cursor:stop]
+        self.cursor = stop
+        if newline >= 0 or len(head) == limit:
+            return head
+        return head + self.file.readline(limit - len(head))
+
+    def read(self, count):
+        stop = min(len(self.data), self.cursor + count)
+        head = self.data[self.cursor:stop]
+        self.cursor = stop
+        return head if len(head) == count else head + self.file.read(count - len(head))
+
+    def close(self):
+        self.data = b""
+        self.file.close()
+
+
+class _BulkEquityHash:
+    """Keep the strict reader's byte order, updating SHA only by window."""
+    def __init__(self, digest):
+        self.digest, self.pending = digest, bytearray()
+
+    def update(self, data):
+        view, offset = memoryview(data), 0
+        while offset < len(view):
+            take = min(_BULK_E_WINDOW - len(self.pending), len(view) - offset)
+            self.pending.extend(view[offset:offset + take])
+            offset += take
+            if len(self.pending) == _BULK_E_WINDOW:
+                self.digest.update(self.pending)
+                self.pending.clear()
+
+    def hexdigest(self):
+        if self.pending:
+            self.digest.update(self.pending)
+            self.pending.clear()
+        return self.digest.hexdigest()
+
+
+def _bulk_equity_records(reader):
+    """Advance the real strict reader only after a complete E-batch proof."""
+    import pf_sink
+    # Alternate readers retain their own iteration and refusal semantics.
+    if (not _BULK_E_ENABLED or not isinstance(reader, pf_sink.SinkReader)
+            or not isinstance(reader._file, _UncachedSinkFile)):
+        yield from reader
+        return
+    file = reader._file = _BulkEquityFile(reader._file)
+    reader._hash = _BulkEquityHash(reader._hash)
+    while not reader.complete:
+        try:
+            data, cursor = file.window()
+        except OSError as error:
+            # _readline increments only after a successful read.
+            reader._refuse(error)
+        match = _BULK_E_RUN.match(data, cursor)
+        if match is not None:
+            batch = _bulk_equity(data[cursor:match.end()])
+            if batch is None or reader._counts["E"] + batch.count > pf_sink.I53_MAX:
+                yield from reader
+                return
+            reader._counts["E"] += batch.count
+            reader._line_number += batch.count
+            reader._hash.update(batch.raw)
+            file.cursor = match.end()
+            yield batch
+            continue
+        try:
+            record = next(reader)
+        except StopIteration:
+            return
+        yield record
+        if record.tag == "E":
+            # Includes nulls, escaped tags and accepted noncanonical integers.
+            # No second failed proof is attempted later in this file.
+            yield from reader
+            return
+
+
+class _SinkReportDiagnostics:
+    """Only the two E endpoints, their count and the first result refusal."""
+
+    def __init__(self):
+        self.count_e = 0
+        self.first = self.last = None
+        self.trade_at_start = False
+        self.equity_failure = None
+
+    def __len__(self):
+        return self.count_e
+
+    def __getitem__(self, index):
+        if self.count_e:
+            if index == 0:
+                return self.first
+            if index == -1:
+                return self.last
+        raise IndexError(index)
+
+    def trades(self, reader, sink=None):
+        # The existing strict reader exhausts its trailer in this same pass;
+        # canonical E windows need only their count and decoded endpoints.
+        # O/V/K/X/H do not enter the trade fold. A fused sink supplies the
+        # optional sink argument so those records can be dispatched to their
+        # bounded artifacts while the reader hashes every record.
+        for record in _bulk_equity_records(reader):
+            if isinstance(record, _BulkEquity):
+                if not self.count_e:
+                    self.first = record.first
+                self.last = record.last
+                self.count_e += record.count
+                if sink is not None:
+                    sink._append_equity_batch(record)
+            elif record.tag == "E":
+                point = record.as_dict()
+                if not self.count_e:
+                    self.first = point
+                self.last = point
+                self.count_e += 1
+                if self.equity_failure is None:
+                    try:
+                        _validate_report_result({"equity_curve": (point,)}, equity_only=True)
+                    except RunFailure as error:
+                        # Preserve the exception, but drop its fold traceback
+                        # so it cannot retain the reader or per-row frames.
+                        # Assembly raises it after trade/summary/metric checks.
+                        self.equity_failure = error
+                        error.__traceback__ = None
+                if sink is not None:
+                    sink._append_equity_record(point)
+            elif record.tag == "T":
+                self.trade_at_start |= record.values[12] <= 0
+                if sink is not None:
+                    sink._append_trade_record(record)
+                yield record
+            elif sink is not None:
+                sink._append_output_record(record)
+
+
+class _FusedOutputState:
+    """Bounded output columns produced while the verified sink is dispatched."""
+
+    def __init__(self, sink, lib, state):
+        self.named = sink.named
+        self.failure = None
+        self.raw_manifest = None
+        self.slots = 0
+        self.manifest = None
+        self.outputs = {}
+        self.entries = []
+        self.constant_encodings = {}
+        self.constants = ()
+        self.expected_row = 0
+        self.opens = self.closes = self.events = None
+        self.columns = []
+        if self.named:
+            return
+        try:
+            descriptor = next(
+                entry for entry in sink.header["records"] if entry["type"] == "O")
+            self.slots = len(descriptor["fields"]) - 3
+            self.raw_manifest = _outputs_manifest(lib, state)
+            metadata = _outputs_metadata(self.raw_manifest, self.slots, ())
+            self.manifest = metadata["manifest"]
+            self.outputs = {
+                entry["index"]: entry
+                for entry in _manifest_entries(
+                    self.manifest, "outputs", ("index", "id"))
+            }
+            self.entries = sorted(
+                _manifest_entries(
+                    self.manifest, "series", ("slot", "output")),
+                key=lambda entry: entry["slot"])
+            self.constant_encodings = {
+                entry["index"]: entry.get("encoding")
+                for entry in _manifest_entries(
+                    self.manifest, "constants", ("index",))
+            }
+            resources = sink._spool_resources
+            directory = sink.directory
+            self.opens = _JSONColumn(resources, directory)
+            self.closes = _JSONColumn(resources, directory)
+            self.columns = [
+                _JSONColumn(resources, directory) for _ in self.entries
+            ]
+            self.events = _JSONColumn(resources, directory)
+        except Exception as error:
+            self.remember(error)
+
+    def remember(self, error):
+        if self.failure is None:
+            if isinstance(error, OSError):
+                error = RunFailure(
+                    "report sink write failed", "report_sink_failed",
+                    {"reason": "scratch_io"})
+            self.failure = error
+            if hasattr(error, "__traceback__"):
+                error.__traceback__ = None
+
+    def append(self, record):
+        if record.tag == "K":
+            self.constants = tuple(
+                float("nan") if value is None else value
+                for value in record.values)
+            return
+        if self.named or self.failure is not None:
+            return
+        try:
+            if record.tag == "O":
+                row, open_ms, close_ms, *values = record.values
+                if row != self.expected_row:
+                    self.remember(
+                        _engine_invariant("the report sink output rows are out of order"))
+                    return
+                self.expected_row += 1
+                self.opens.append(None if open_ms is None else _output_time(open_ms))
+                self.closes.append(None if close_ms is None else _output_time(close_ms))
+                for entry, column in zip(self.entries, self.columns):
+                    value = values[entry["slot"]]
+                    column.append(
+                        None if value is None
+                        else _output_value(value, entry.get("encoding")))
+            elif record.tag == "V":
+                self.events.append(
+                    _report_output_event(record.as_dict(), self.outputs))
+        except Exception as error:
+            self.remember(error)
+
+
 class _ReportSink:
     """A caller-owned path or an owner-only (0600) temporary sink file.
 
@@ -5971,6 +6474,15 @@ class _ReportSink:
     def __init__(self, lib, state, *, directory=None, run_id="", path=None):
         self.directory = _disk_report_directory(directory)
         self.header, self.counts, self.sha256 = {}, {}, ""
+        self._identity = None
+        self.summary = self.summary_failure = self.diagnostics = None
+        self._fused_pass = True
+        self._spool_resources = ExitStack()
+        self._equity_spool = self._trades_spool = None
+        self._spool_failure = None
+        self._spool_open_failure = False
+        self._equity_spool_failed = self._trades_spool_failed = False
+        self._fused_outputs = None
         self.named, self.run_id = path is not None, run_id
         self.keep, self.closed = False, False
         if self.named:
@@ -5989,16 +6501,33 @@ class _ReportSink:
             descriptor = ReportSinkC(ctypes.sizeof(ReportSinkC), 1, os.fsencode(self.path),
                                      run_id.encode("utf-8"), os.fsencode(self.directory))
             if lib.strategy_set_report_sink_v1(state, ctypes.byref(descriptor)) != 0:
+                failure = run_failure(lib, state)
+                recorded = engine_failure_code(lib, state)
+                if failure is not None and recorded is not None and recorded[0]:
+                    raise RunFailure(*failure)
                 raise _engine_invariant("the fresh strategy refused its report sink")
         except BaseException:
             self.close()
             raise
 
-    def verify(self, lib, state, report):
+    def _verify_legacy(self, lib, state, report):
         from pf_sink import SinkFormatError
+        diagnostics = _SinkReportDiagnostics()
+        summary = summary_failure = None
         try:
             with _open_uncached_sink(self.path) as reader:
-                for _ in reader:
+                trades = diagnostics.trades(reader)
+                try:
+                    summary = _sink_summary(report, self, records=trades)
+                except RunFailure as error:
+                    # Format/digest/receipt refusals used to precede result
+                    # validation. Defer the first trade refusal and finish the
+                    # very same reader, even when the trade fold stopped early.
+                    summary_failure = error
+                    # Drop the fold traceback so the saved exception cannot
+                    # retain the reader or per-row frames until assembly.
+                    error.__traceback__ = None
+                for _ in trades:
                     pass
                 self.header, self.counts, self.sha256 = reader.header, reader.counts, reader.sha256
         except SinkFormatError as error:
@@ -6014,8 +6543,190 @@ class _ReportSink:
                 or bytes(receipt.sha256_hex) != self.sha256.encode("ascii")
                 or int(report.total_trades) != self.counts["T"]):
             raise _engine_invariant("the report sink trailer differs from its engine receipt")
+        try:
+            status = os.stat(self.path)
+        except OSError as error:
+            raise _engine_invariant(f"the engine's report sink is invalid: {error}") from error
+        # Identity is an early check alongside the verified receipt; the
+        # subsequent scan still proves content against A's digest.
+        self._identity = status.st_ino, status.st_size
+        self.summary, self.summary_failure, self.diagnostics = summary, summary_failure, diagnostics
+
+    def _remember_spool_failure(self, error, *, open_failure=False):
+        if self._spool_failure is None:
+            if isinstance(error, OSError):
+                error = RunFailure(
+                    "report sink write failed", "report_sink_failed",
+                    {"reason": "scratch_io"})
+            self._spool_failure = error
+            if hasattr(error, "__traceback__"):
+                error.__traceback__ = None
+        self._spool_open_failure |= open_failure
+
+    def _prepare_fused_artifacts(self, lib, state):
+        if not self.named:
+            try:
+                self._equity_spool = _JSONColumn(
+                    self._spool_resources, self.directory, indexed=True)
+                self._trades_spool = _JSONColumn(
+                    self._spool_resources, self.directory, indexed=True)
+            except Exception as error:
+                self._remember_spool_failure(error, open_failure=True)
+                self._equity_spool = self._trades_spool = None
+        if any(entry["type"] in "OVK" for entry in self.header["records"]):
+            self._fused_outputs = _FusedOutputState(self, lib, state)
+
+    def _append_equity_batch(self, batch):
+        if (self.named or self._equity_spool is None
+                or self._equity_spool_failed):
+            return
+        try:
+            self._equity_spool.append_ascii(_bulk_equity_ascii(batch), row_count=batch.count)
+        except Exception as error:
+            self._equity_spool_failed = True
+            self._remember_spool_failure(error)
+
+    def _append_equity_record(self, point):
+        if (self.named or self._equity_spool is None
+                or self._equity_spool_failed):
+            return
+        try:
+            self._equity_spool.append(point)
+        except Exception as error:
+            self._equity_spool_failed = True
+            self._remember_spool_failure(error)
+
+    def _append_trade_record(self, record):
+        if (self.named or self._trades_spool is None
+                or self._trades_spool_failed):
+            return
+        try:
+            self._trades_spool.append(_sink_trade(record))
+        except Exception as error:
+            self._trades_spool_failed = True
+            self._remember_spool_failure(error)
+
+    def _append_output_record(self, record):
+        if self._fused_outputs is not None:
+            self._fused_outputs.append(record)
+
+    def _close_fused_artifacts(self):
+        resources = getattr(self, "_spool_resources", None)
+        if resources is not None:
+            resources.close()
+
+    @staticmethod
+    def _check_fused_identity(reader, path, named):
+        start = reader._open_identity
+        try:
+            end = os.fstat(reader._open_fd)
+        except OSError as error:
+            raise _engine_invariant(
+                f"the engine's report sink is invalid: {error}") from error
+        if (
+            end.st_dev != start.st_dev
+            or end.st_ino != start.st_ino
+            or end.st_size != start.st_size
+            or end.st_mtime_ns != start.st_mtime_ns
+        ):
+            raise _engine_invariant(
+                "the report sink changed after verification: file identity differs")
+        if named:
+            try:
+                path_status = os.stat(path)
+            except OSError as error:
+                raise _engine_invariant(
+                    f"the engine's report sink is invalid: {error}") from error
+            if (path_status.st_dev, path_status.st_ino) != (
+                    start.st_dev, start.st_ino):
+                raise _engine_invariant(
+                    "the report sink changed after verification: file identity differs")
+        return end
+
+    @staticmethod
+    def _close_fused_reader(reader):
+        if reader._file is None:
+            return
+        try:
+            reader.close()
+        except OSError as error:
+            from pf_sink import SinkFormatError
+            raise SinkFormatError(
+                f"line {reader._line_number}: {error}") from error
+
+    def _verify_fused(self, lib, state, report):
+        from pf_sink import SinkFormatError
+        diagnostics = _SinkReportDiagnostics()
+        summary = summary_failure = None
+        try:
+            with _open_uncached_sink(self.path) as reader:
+                self.header, self.counts = reader.header, reader.counts
+                self._prepare_fused_artifacts(lib, state)
+                trades = diagnostics.trades(reader, sink=self)
+                try:
+                    summary = _sink_summary(report, self, records=trades)
+                except RunFailure as error:
+                    # Keep strict/trailer/receipt/identity refusals ahead of
+                    # deferred result checks, and do not retain fold frames.
+                    summary_failure = error
+                    error.__traceback__ = None
+                for _ in trades:
+                    pass
+                self.header, self.counts, self.sha256 = (
+                    reader.header, reader.counts, reader.sha256)
+                if self.header["run_id"] != self.run_id:
+                    raise _engine_invariant(
+                        "the report sink run id differs from the request")
+                receipt = ReportSinkReceiptC()
+                receipt.struct_size, receipt.version = ctypes.sizeof(receipt), 1
+                if (lib.strategy_report_sink_receipt_v1(
+                        state, ctypes.byref(receipt)) != 0
+                        or receipt.complete != 1):
+                    raise _engine_invariant(
+                        "the engine's report sink receipt is incomplete")
+                counts = {
+                    tag: getattr(receipt, "count_" + tag.lower())
+                    for tag in "ETOVKXH"
+                }
+                if (
+                    any(counts[tag] != self.counts.get(tag, 0)
+                        for tag in counts)
+                    or bytes(receipt.sha256_hex) != self.sha256.encode("ascii")
+                    or int(report.total_trades) != self.counts["T"]
+                ):
+                    raise _engine_invariant(
+                        "the report sink trailer differs from its engine receipt")
+                self._check_fused_identity(reader, self.path, self.named)
+                self._close_fused_reader(reader)
+        except SinkFormatError as error:
+            raise _engine_invariant(
+                f"the engine's report sink is invalid: {error}") from error
+        self._identity = (
+            reader._open_identity.st_ino, reader._open_identity.st_size)
+        self.summary, self.summary_failure, self.diagnostics = (
+            summary, summary_failure, diagnostics)
+
+    def verify(self, lib, state, report):
+        if not getattr(self, "_fused_pass", False):
+            return self._verify_legacy(lib, state, report)
+        try:
+            return self._verify_fused(lib, state, report)
+        except BaseException:
+            # Verification selected its refusal before artifact cleanup. A
+            # failing auxiliary close must not replace that exception.
+            try:
+                self._close_fused_artifacts()
+            except BaseException:
+                pass
+            raise
 
     def records(self, tag=None):
+        if tag == "T":
+            yield from self._trade_records()
+            return
+        if tag == "E":
+            yield from self._tagged_records(tag)
+            return
         from pf_sink import SinkFormatError
         try:
             with _open_uncached_sink(self.path) as reader:
@@ -6027,14 +6738,194 @@ class _ReportSink:
         except SinkFormatError as error:
             raise _engine_invariant(f"the engine's report sink is invalid: {error}") from error
 
+    def _trade_records(self):
+        yield from self._tagged_records("T")
+
+    def _tagged_records(self, tag, *, bulk=False):
+        """Hash and extract one tag from the same fresh sequential raw reads."""
+        import pf_sink
+        bulk = bulk and _BULK_E_ENABLED and tag == "E"
+        try:
+            file = _open_uncached_sink(self.path, raw=True)
+            try:
+                status = os.fstat(file.fileno())
+                if (status.st_ino, status.st_size) != self._identity:
+                    raise _engine_invariant(
+                        "the report sink changed after verification: file identity differs")
+                parser = pf_sink.RecordParser(self.header)
+                decode = parser.parse_verified if tag == "E" else parser.parse
+                needle = f'\n["{tag}",'.encode("ascii")
+                digest = hashlib.sha256()
+                count = offset = processed = 0
+                carry = b""
+                pending = bytearray()
+                kind = "header"
+                tag_escaped = False
+                last_byte = trailer_start = None
+                done = False
+                while not done:
+                    chunk = file.read(min(file.window, _BULK_E_WINDOW) if bulk else file.window)
+                    if not chunk:
+                        if pending or (last_byte is not None and last_byte != 0x0A):
+                            raise pf_sink.SinkFormatError("line does not end with LF")
+                        raise pf_sink.SinkFormatError("missing header or trailer")
+                    data = carry + chunk
+                    base, end = offset - len(carry), len(data)
+                    last_byte = chunk[-1]
+                    if trailer_start is None:
+                        marker = data.find(b"\n{")
+                        if marker >= 0:
+                            trailer_start = base + marker + 1
+                    # Only new bytes enter the hash. Remember the absolute cut
+                    # even while a trailer continues across later windows.
+                    hash_end = (len(chunk) if trailer_start is None
+                                else max(0, trailer_start - offset))
+                    if hash_end:
+                        digest.update(chunk[:hash_end])
+                    cursor = len(carry) if kind is not None else max(0, processed - base)
+                    record_at = escaped_at = None
+                    while cursor < end:
+                        if bulk and kind == "record" and not pending:
+                            match = _BULK_E_RUN.match(data, cursor)
+                            if match is not None:
+                                batch = _bulk_equity(data[cursor:match.end()])
+                                if batch is not None:
+                                    cursor = match.end()
+                                    processed = base + cursor
+                                    kind = None
+                                    count += batch.count
+                                    yield batch
+                                    del batch
+                                    continue
+                                bulk = False
+                        if kind == "tag":
+                            # The fallback decodes only the first string token;
+                            # skipped bodies are never walked or retained.
+                            while cursor < end:
+                                byte = data[cursor]
+                                pending.append(byte)
+                                cursor += 1
+                                if len(pending) > pf_sink.MAX_LINE_BYTES:
+                                    raise pf_sink.SinkFormatError("line exceeds 1 MiB including LF")
+                                if byte == 0x0A:
+                                    raise pf_sink.SinkFormatError(
+                                        "invalid UTF-8 or JSON: unterminated record tag")
+                                if tag_escaped:
+                                    tag_escaped = False
+                                elif byte == 0x5C:
+                                    tag_escaped = True
+                                elif byte == 0x22:
+                                    try:
+                                        line_tag = json.loads(bytes(pending[1:]).decode("utf-8"))
+                                    except (UnicodeError, ValueError, RecursionError) as error:
+                                        raise pf_sink.SinkFormatError(
+                                            f"invalid UTF-8 or JSON: {error}") from error
+                                    if line_tag == tag:
+                                        kind = "record"
+                                    else:
+                                        kind = None
+                                        pending.clear()
+                                        processed = base + cursor
+                                    del line_tag
+                                    break
+                            if kind == "tag":
+                                break
+                            continue
+                        if kind is not None:
+                            limit = min(end, cursor + pf_sink.MAX_LINE_BYTES + 1 - len(pending))
+                            newline = data.find(b"\n", cursor, limit)
+                            stop = newline + 1 if newline >= 0 else limit
+                            pending.extend(data[cursor:stop])
+                            cursor = stop
+                            if len(pending) > pf_sink.MAX_LINE_BYTES:
+                                raise pf_sink.SinkFormatError("line exceeds 1 MiB including LF")
+                            if newline < 0:
+                                break
+                            if kind == "trailer":
+                                # A verified its receipt; B/C need only framing
+                                # and EOF, without parsing or hashing the trailer.
+                                if cursor != end or file.read(file.window):
+                                    raise pf_sink.SinkFormatError("bytes after the trailer")
+                                done = True
+                                break
+                            if kind == "header":
+                                # Parse the raw header exactly once: malformed
+                                # JSON must be a format refusal before digest.
+                                pf_sink._parse(bytes(pending))
+                                record = None
+                            else:
+                                record = _bulk_equity(bytes(pending)) if bulk else None
+                                if record is None:
+                                    bulk = False
+                                    record = decode(bytes(pending))
+                                    count += 1
+                                else:
+                                    count += record.count
+                            pending.clear()
+                            kind = None
+                            processed = base + cursor
+                            if record is not None:
+                                yield record
+                                del record
+                            continue
+                        # Cache each next needle so a skipped escaped tag does
+                        # not rescan the window for a distant matching record.
+                        # Literal skipped lines need no per-line Python work.
+                        if record_at is None or record_at < cursor:
+                            marker = data.find(needle, max(0, cursor - 1))
+                            record_at = marker + 1 if marker >= 0 else end
+                        if escaped_at is None or escaped_at < cursor:
+                            marker = data.find(b'\n["\\', max(0, cursor - 1))
+                            escaped_at = marker + 1 if marker >= 0 else end
+                        trailer_at = (trailer_start - base
+                                      if trailer_start is not None
+                                      and trailer_start >= base + cursor else end)
+                        cursor = min(record_at, escaped_at, trailer_at)
+                        if cursor == end:
+                            break
+                        if cursor == trailer_at:
+                            kind = "trailer"
+                        elif cursor == record_at:
+                            kind = "record"
+                        else:
+                            kind = "tag"
+                            pending.extend(data[cursor:cursor + 2])
+                            cursor += 2
+                            tag_escaped = False
+                    offset += len(chunk)
+                    carry = data[-5:]
+                # Streamed records remain provisional until exhaustion.
+                if digest.hexdigest() != self.sha256:
+                    raise _engine_invariant(
+                        "the report sink changed after verification: digest differs")
+                if count != self.counts[tag]:
+                    raise _engine_invariant(
+                        f"the report sink {tag} scan disagrees with its verified count")
+            finally:
+                file.close()
+        except (OSError, pf_sink.SinkFormatError) as error:
+            # Includes raw read failures (EIO or a mid-scan short read), not
+            # just framing/parser failures; never relabel these as changes.
+            raise _engine_invariant(f"the engine's report sink is invalid: {error}") from error
+
     def close(self):
         if not self.closed:
-            if not self.named and not self.keep:
+            preserve_failure = (sys.exc_info()[1] is not None
+                                or getattr(self, "_spool_failure", None) is not None)
+            try:
+                self._close_fused_artifacts()
+            except BaseException:
+                if not preserve_failure:
+                    raise
+            finally:
                 try:
-                    os.unlink(self.path)
-                except FileNotFoundError:
-                    pass
-            self.closed = True
+                    if not self.named and not self.keep:
+                        try:
+                            os.unlink(self.path)
+                        except FileNotFoundError:
+                            pass
+                finally:
+                    self.closed = True
 
 
 # The harness uses the temporary-only spelling with no caller-owned path.
@@ -6061,6 +6952,10 @@ def _check_bench_run(lib, state):
 
 class _JSONRecordArray:
     """A repeatable iterator factory, never a retained list of report rows."""
+    # An empty sink iterator still reads and checks its header on consumption.
+    # Keep construction and iteration identical for every array length.
+    # Replay-only empty values are handled after canonical report assembly.
+
     def __init__(self, records, length=None, item=None):
         self.records = records
         self.length, self.item = length, item
@@ -6081,6 +6976,13 @@ class _JSONRecordArray:
         if not 0 <= index < len(self):
             raise IndexError(index)
         return self.item(index)
+
+
+class _JSONEquityArray(_JSONRecordArray):
+    """The ordinary record interface plus an opt-in encoded path-sink scan."""
+    def __init__(self, sink):
+        super().__init__(lambda: (row.as_dict() for row in sink.records("E")), sink.counts["E"])
+        self.sink = sink
 
 
 class _JSONUTF8:
@@ -6107,8 +7009,9 @@ class _BoundedJSONFile:
     Disk files use Linux O_DIRECT or Darwin F_NOCACHE. Legacy libraries with
     no engine sink can also use tmpfs/ramfs for the unjailed JSON artifact.
     Engine sink and scratch directories are selected by _disk_report_directory.
-    One aligned 64 KiB anonymous window is the I/O working set. Every write
-    window is synchronized before reuse. Jailed and fd routes use StringIO.
+    One aligned 64 KiB anonymous window is the I/O working set. Full windows
+    are written before reuse; flush synchronizes pending writes before readback.
+    Jailed and fd routes use UTF-8 memory buffers.
     """
     window = 64 * 1024
 
@@ -6119,6 +7022,7 @@ class _BoundedJSONFile:
         self.used = self.base = self.size = self.position = 0
         self.read_base, self.read_size = -1, 0
         self.reading = False
+        self._dirty = False
         self.binary = False
         self.libc = ctypes.CDLL(None, use_errno=True)
         fd = file.fileno()
@@ -6168,11 +7072,8 @@ class _BoundedJSONFile:
             self._io_error()
         if written != aligned:
             raise OSError("short report artifact write")
-        os.ftruncate(self.file.fileno(), self.size)
-        if hasattr(os, "fdatasync"):
-            os.fdatasync(self.file.fileno())
-        else:
-            os.fsync(self.file.fileno())
+        if aligned != self.used:
+            os.ftruncate(self.file.fileno(), self.size)
         if self.used == self.window:
             self.base += self.window
             self.used = 0
@@ -6181,22 +7082,36 @@ class _BoundedJSONFile:
         if self.reading:
             raise ValueError("a prepared report artifact is read-only")
         for offset in range(0, len(text), self.window):
-            data = text[offset:offset + self.window].encode("ascii")
-            position = 0
-            while position < len(data):
-                count = min(self.window - self.used, len(data) - position)
-                self.buffer[self.used:self.used + count] = data[position:position + count]
-                self.used += count
-                self.size += count
-                position += count
-                if self.used == self.window:
-                    self._sync_window()
+            self.write_ascii(text[offset:offset + self.window].encode("ascii"))
         return len(text)
+
+    def write_ascii(self, data):
+        """Append already encoded ASCII through the same aligned I/O window."""
+        if self.reading:
+            raise ValueError("a prepared report artifact is read-only")
+        position = 0
+        while position < len(data):
+            count = min(self.window - self.used, len(data) - position)
+            self.buffer[self.used:self.used + count] = data[position:position + count]
+            self.used += count
+            self.size += count
+            self._dirty = True
+            position += count
+            if self.used == self.window:
+                self._sync_window()
+        return len(data)
 
     def flush(self):
         self.file.flush()  # retain checked flush/close failure behavior
-        if not self.reading:
+        if not self.reading and self._dirty:
             self._sync_window()
+            # A full last window has no buffered bytes, but still needs a
+            # barrier. A following rewind must not sync unchanged bytes again.
+            if hasattr(os, "fdatasync"):
+                os.fdatasync(self.file.fileno())
+            else:
+                os.fsync(self.file.fileno())
+            self._dirty = False
 
     def seek(self, position):
         if position != 0:
@@ -6205,6 +7120,34 @@ class _BoundedJSONFile:
         self.reading = True
         self.position, self.read_base, self.read_size = 0, -1, 0
         return 0
+
+    def read_at(self, offset, count):
+        """Read up to one aligned window without moving the sequential cursor."""
+        if offset < 0 or count < 0:
+            raise ValueError("report artifact read offsets and counts must be nonnegative")
+        if not self.reading:
+            self.flush()
+            self.reading = True
+            self.read_base, self.read_size = -1, 0
+        if not count or offset >= self.size:
+            return b"" if self.binary else ""
+        base = offset // self.window * self.window
+        if base != self.read_base:
+            while True:
+                copied = self.libc.pread(self.file.fileno(), self.address, self.window, base)
+                if copied >= 0 or ctypes.get_errno() != 4:  # EINTR
+                    break
+            if copied < 0:
+                self._io_error()
+            if copied == 0:
+                raise OSError("short report artifact read")
+            self.read_base, self.read_size = base, copied
+        within = offset - base
+        take = min(count, self.read_size - within, self.size - offset)
+        if take <= 0:
+            raise OSError("short report artifact read")
+        data = self.buffer[within:within + take]
+        return data if self.binary else data.decode("ascii")
 
     def read(self, count=-1):
         if not self.reading:
@@ -6241,7 +7184,7 @@ class _BoundedJSONFile:
 
 
 class _UncachedSinkFile(_BoundedJSONFile):
-    """Binary readback after the fixed sink reader has validated its header."""
+    """Uncached binary readback with an independent bounded window."""
     def __init__(self, file):
         position = file.tell()
         super().__init__(file)  # path sinks are unjailed only
@@ -6271,29 +7214,140 @@ class _UncachedSinkFile(_BoundedJSONFile):
         return b"".join(pieces)
 
 
-def _open_uncached_sink(path):
-    """Reuse the strict reader; only its bounded header uses buffered I/O.
-
-    The header's existing 1 MiB line bound also bounds that initial cache
-    footprint. All subsequent reads bypass cache through a fixed 64 KiB window.
-    """
-    from pf_sink import SinkReader
-    reader = SinkReader(path)
+def _open_uncached_sink(path, *, raw=False):
+    """Open one unbuffered fd, including the header, through a bounded window."""
+    file = open(path, "rb", buffering=0)
     try:
-        reader._file = _UncachedSinkFile(reader._file)
-    except OSError as error:
-        reader._refuse(error)
+        uncached = _UncachedSinkFile(file)
+        if raw:
+            return uncached
+        from pf_sink import SinkReader
+        identity = os.fstat(file.fileno())
+        try:
+            reader = SinkReader(stream=uncached, keep_open=True)
+        except TypeError:
+            # Keep compatibility with the pre-fused reader seam used by the
+            # older summary harness. The product reader above always accepts
+            # the stream form and remains the one-fd path.
+            uncached.close()
+            reader = SinkReader(path)
+            reader._keep_open = True
+            reader._open_fd = reader._file.fileno()
+            reader._open_identity = os.fstat(reader._open_fd)
+            return reader
+        reader._open_fd = file.fileno()
+        reader._open_identity = identity
+        return reader
     except BaseException:
-        reader.close()
+        try:
+            file.close()
+        except BaseException:
+            pass
         raise
-    return reader
 
 
-class _JSONColumn:
+class _JSONColumn(_JSONRecordArray):
     """A comma-separated, already encoded column in an unlinked temporary."""
-    def __init__(self, resources, directory):
+    # Some serializer callers supply only .file via object.__new__.
+    length = 0
+
+    def __init__(self, resources, directory, *, indexed=False):
+        super().__init__(lambda: iter(self), 0, self._item_at if indexed else None)
         self.file = _json_temporary(resources, directory)
         self.empty = True
+        # One cursor: the next row number and its byte offset, never a row.
+        self._cursor_index = self._cursor_offset = 0
+
+    def __len__(self):
+        return self.length
+
+    def __iter__(self):
+        """Decode rows lazily, with a fresh independent iterator on each call.
+
+        The first read freezes the report spool, after which it accepts no
+        more rows. Iterate before the report's resources are closed;
+        afterwards iteration raises ValueError, even for an empty column.
+        A single row larger than one 64 KiB window is decoded again after
+        each further window, taking time proportional to its size times the
+        number of windows (bounded by the sink's 1 MiB record cap).
+        Indexed columns support [i], which costs O(i) from the cursor;
+        callers should iterate.
+        """
+        if self.file.closed:
+            raise ValueError(
+                "a report column cannot be iterated after the report resources were closed")
+        return (value for value, _ in self._iter_rows())
+
+    def _item_at(self, index):
+        if index < self._cursor_index:
+            self._cursor_index = self._cursor_offset = 0
+        # The decoder lives only for this call. Retaining its generator would
+        # also retain the last yielded row and a private encoded window.
+        for value, offset in self._iter_rows(self._cursor_offset):
+            self._cursor_index += 1
+            self._cursor_offset = offset
+            if self._cursor_index == index + 1:
+                return value
+        raise ValueError("invalid JSON report column: row count differs")
+
+    def _iter_rows(self, offset=0):
+        """Yield each decoded row and the byte offset following its separator."""
+        if self.file.closed:
+            raise ValueError(
+                "a report column cannot be iterated after the report resources were closed")
+
+        def invalid_constant(token):
+            raise ValueError(f"invalid JSON report column: non-JSON number {token}")
+
+        decoder = json.JSONDecoder(parse_constant=invalid_constant)
+        buffer, position = "", 0
+        eof = needs_value = False
+        while True:
+            while position < len(buffer) and buffer[position] in " \t\r\n":
+                position += 1
+            if position == len(buffer):
+                if eof:
+                    if needs_value:
+                        raise ValueError("invalid JSON report column: trailing comma")
+                    return
+            else:
+                try:
+                    value, end = decoder.raw_decode(buffer, position)
+                except json.JSONDecodeError as error:
+                    if eof:
+                        raise ValueError(f"invalid JSON report column: {error.msg}") from error
+                else:
+                    delimiter = end
+                    while delimiter < len(buffer) and buffer[delimiter] in " \t\r\n":
+                        delimiter += 1
+                    if delimiter < len(buffer):
+                        if buffer[delimiter] == ",":
+                            position = delimiter + 1
+                            needs_value = True
+                            yield value, offset - len(buffer) + position
+                            del value
+                            continue
+                        # A window can end in "1e-" or "1.", for which
+                        # raw_decode accepts just the leading integer.
+                        if (eof or delimiter != end or type(value) not in (int, float)
+                                or buffer[delimiter] not in ".eE"):
+                            raise ValueError("invalid JSON report column: expected comma")
+                    elif eof:
+                        yield value, offset
+                        return
+                    # A successful decode at a window's end can still be a
+                    # number prefix. Confirm its separator or EOF first.
+                    del value
+            # Discard consumed rows before reading more. Only the current
+            # encoded value can span windows; each iterator owns its offset.
+            buffer, position = buffer[position:], 0
+            try:
+                chunk = self.file.read_at(offset, self.file.window)
+            except UnicodeDecodeError as error:
+                raise ValueError("invalid JSON report column: non-ASCII data") from error
+            offset += len(chunk)
+            eof = not chunk
+            buffer += chunk
 
     def append(self, value):
         try:
@@ -6304,6 +7358,20 @@ class _JSONColumn:
             raise RunFailure("report sink write failed", "report_sink_failed",
                              {"reason": "scratch_io"}) from error
         self.empty = False
+        self.length += 1
+
+    def append_ascii(self, data, *, row_count=1):
+        if not data and row_count == 0:
+            return
+        try:
+            if not self.empty:
+                self.file.write_ascii(b",")
+            self.file.write_ascii(data)
+        except OSError as error:
+            raise RunFailure("report sink write failed", "report_sink_failed",
+                             {"reason": "scratch_io"}) from error
+        self.empty = False
+        self.length += row_count
 
 
 def _json_temporary(resources, directory):
@@ -6358,6 +7426,81 @@ def _stream_json(value, destination):
             del destination._json_active
 
 
+_JSON_SCALAR_TYPES = (int, float, bool, str, type(None))
+# Keep fast dumps to one window's worth of string values; 4096 is the same
+# size as the windowed writer's window below.
+_STREAM_FAST_STR_LIMIT = 4096
+# Equity rows are normally under 128 ASCII bytes: 512 rows use about 64 KiB
+# of joined text (ordinary trade rows stay below about 512 KiB per batch).
+# The record count is fixed, independent of the array length or bar count.
+_STREAM_BATCH_RECORDS = 512
+
+# Cap joined text at 256 KiB too; json.dumps' default ensure_ascii makes
+# len(encoded) a byte count. One oversized record is written alone, unsplit.
+_STREAM_BATCH_BYTES = 262144
+
+
+def _json_scalar_record(value):
+    # The piecewise writer encodes non-string keys as standalone values.
+    # Subclasses can also override items() or string slicing; keep that path.
+    return type(value) is dict and all(
+        type(key) is str and type(item) in _JSON_SCALAR_TYPES
+        for key, item in value.items())
+
+
+def _json_fast_value(value):
+    if type(value) in _JSON_SCALAR_TYPES:
+        return type(value) is not str or len(value) <= _STREAM_FAST_STR_LIMIT
+    if not _json_scalar_record(value):
+        return False
+    return sum(len(item) for item in value.values() if type(item) is str) <= _STREAM_FAST_STR_LIMIT
+
+
+def _write_json_ascii(destination, data):
+    if isinstance(destination, _BoundedJSONFile):
+        destination.write_ascii(data)
+    else:
+        destination.write(data.decode("ascii"))
+
+
+def _stream_equity_array(value, destination):
+    destination.write("[")
+    pending, count, first = [], 0, True
+    # Fixed E fields, a <=17-byte integer and two <=24-byte reprs make an
+    # encoded row plus comma <=103 bytes. The ordinary 512-row boundary
+    # therefore precedes its 256 KiB byte boundary, including strict fallback.
+    try:
+        for record in value.sink._tagged_records("E", bulk=True):
+            if isinstance(record, _BulkEquity):
+                # sub and splitlines walk the entire batch in C. No Python
+                # loop, decoder or serializer visits its individual points.
+                rows = _BULK_E_LINE.sub(
+                    rb'{"time_ms":\1,"equity":\2,"open_profit":\3},' + b"\n",
+                    record.raw).splitlines()
+            else:
+                # The existing verified decoder owns all noncanonical cases.
+                rows = [json.dumps(record.as_dict(), separators=(",", ":"),
+                                   allow_nan=False).encode("ascii") + b","]
+            offset = 0
+            while offset < len(rows):
+                take = min(_STREAM_BATCH_RECORDS - count, len(rows) - offset)
+                chunk = b"".join(rows[offset:offset + take])[:-1]
+                pending.append(chunk if first else b"," + chunk)
+                first = False
+                count += take
+                offset += take
+                if count == _STREAM_BATCH_RECORDS:
+                    chunk = b"".join(pending)
+                    pending.clear()  # never retry a failed write
+                    count = 0
+                    _write_json_ascii(destination, chunk)
+    finally:
+        # Match the ordinary array writer's completed prefix on producer error.
+        if pending:
+            _write_json_ascii(destination, b"".join(pending))
+    destination.write("]")
+
+
 def _stream_json_value(value, destination):
     if isinstance(value, _JSONColumn):
         destination.write("[")
@@ -6365,16 +7508,64 @@ def _stream_json_value(value, destination):
         while chunk := value.file.read(64 * 1024):
             destination.write(chunk)
         destination.write("]")
+    elif isinstance(value, _JSONEquityArray) and _BULK_E_ENABLED:
+        _stream_equity_array(value, destination)
     elif isinstance(value, _JSONRecordArray):
         destination.write("[")
         first = True
-        for item in value.records():
-            if not first:
-                destination.write(",")
-            _stream_json(item, destination)
-            first = False
+        pending = []
+        pending_bytes = 0
+        try:
+            for item in value.records():
+                if _json_fast_value(item):
+                    try:
+                        encoded = json.dumps(item, separators=(",", ":"), allow_nan=False)
+                    except ValueError:
+                        # Replay the failing item below to preserve both the
+                        # old partial record bytes and its precise exception.
+                        pass
+                    else:
+                        encoded_bytes = len(encoded) + (0 if first else 1)
+                        if pending and pending_bytes + encoded_bytes > _STREAM_BATCH_BYTES:
+                            chunk = "".join(pending)
+                            pending.clear()  # never retry a failed write
+                            pending_bytes = 0
+                            destination.write(chunk)
+                        pending.append(encoded if first else "," + encoded)
+                        pending_bytes += encoded_bytes
+                        first = False
+                        if (len(pending) == _STREAM_BATCH_RECORDS
+                                or pending_bytes >= _STREAM_BATCH_BYTES):
+                            chunk = "".join(pending)
+                            pending.clear()  # never retry a failed write
+                            pending_bytes = 0
+                            destination.write(chunk)
+                        continue
+                if pending:
+                    chunk = "".join(pending)
+                    pending.clear()
+                    pending_bytes = 0
+                    destination.write(chunk)
+                if not first:
+                    destination.write(",")
+                _stream_json(item, destination)
+                first = False
+        finally:
+            # A producer can raise after yielding rows. Those completed rows
+            # already belonged to the old writer's prefix, even on failure.
+            if pending:
+                destination.write("".join(pending))
         destination.write("]")
     elif isinstance(value, dict):
+        if _json_fast_value(value):
+            try:
+                encoded = json.dumps(value, separators=(",", ":"), allow_nan=False)
+            except ValueError:
+                # Preserve the piecewise prefix before a non-finite value.
+                pass
+            else:
+                destination.write(encoded)
+                return
         destination.write("{")
         for index, (key, item) in enumerate(value.items()):
             if index:
@@ -6412,7 +7603,7 @@ def _prepare_stream_report(document, resources, directory, *, sink_errors=True):
             file = _json_temporary(prepared, directory)
             _stream_json(document, file)
             file.write("\n")
-            file.flush()  # disk errors must precede the first stdout byte
+            file.flush()  # disk errors must precede the first report byte
             file.seek(0)
             # A failed serialization closes its artifact immediately, even
             # when the caller catches the error inside its resource scope.
@@ -6434,14 +7625,34 @@ def _prepare_report_json(document, resources, args, sink):
     # arrays. The fd route contains only the bounded summary. Neither may
     # create a report file, even when no sink is installed.
     if args.profile == "jailed" or getattr(sink, "fd_mode", False):
-        buffer = resources.enter_context(io.StringIO())
+        buffer = resources.enter_context(io.TextIOWrapper(io.BytesIO(), encoding="utf-8", newline="\n"))
         _stream_json(document, buffer)
         buffer.write("\n")
         buffer.seek(0)
         return buffer
-    return _prepare_stream_report(
-        document, resources, sink.directory if sink is not None else args.spill_dir,
-        sink_errors=sink is not None)
+    fused = getattr(sink, "_fused_pass", False)
+    try:
+        if fused and sink._spool_failure is not None:
+            # A rewind flushes the source column. Do not retry a write that
+            # already failed while verification was still in progress.
+            raise sink._spool_failure
+        # Keep the final artifact provisional until auxiliary files have closed.
+        with ExitStack() as prepared_files:
+            prepared = _prepare_stream_report(
+                document, prepared_files,
+                sink.directory if sink is not None else args.spill_dir,
+                sink_errors=sink is not None)
+            if fused:
+                sink._close_fused_artifacts()
+            resources.enter_context(prepared_files.pop_all())
+    except BaseException:
+        if fused:
+            try:
+                sink._close_fused_artifacts()
+            except BaseException:
+                pass
+        raise
+    return prepared
 
 
 def _sink_trade(record):
@@ -6450,11 +7661,17 @@ def _sink_trade(record):
     return dict(zip(record.fields[:16], record.values[:16]))
 
 
-def _sink_summary(report, sink):
+def _sink_summary(report, sink, *, records=None):
     n, wins, losses = 0, 0, 0
     cum, peak, max_dd = 0.0, 0.0, 0.0
     best, worst = 0.0, 0.0
     fd_mode = getattr(sink, "fd_mode", False)
+    if not fd_mode and records is None:
+        if sink.summary_failure is not None:
+            raise sink.summary_failure
+        if sink.summary is None:
+            raise _engine_invariant("the engine's report sink summary is incomplete")
+        return dict(sink.summary)
     if fd_mode:
         summary = sink.summary
         if summary is None or summary.complete != 1 or summary.count_t != sink.counts["T"]:
@@ -6485,7 +7702,7 @@ def _sink_summary(report, sink):
         n, wins, losses = int(summary.count_t), int(summary.wins), int(summary.losses)
         best, worst = float(summary.best_trade), float(summary.worst_trade)
         max_dd = float(summary.max_drawdown)
-    for record in () if fd_mode else sink.records("T"):
+    for record in () if fd_mode else records:
         trade = _sink_trade(record)
         if trade["n"] != n + 1:
             raise _engine_invariant("the report sink trade rows are out of report order")
@@ -6521,14 +7738,18 @@ def _sink_summary(report, sink):
 
 def _build_sink_report(report, ohlcv_path, n_bars, first_ts, last_ts, elapsed,
                        applied_inputs, applied_overrides, applied_runtime, sink,
-                       window_anchor=False):
+                       window_anchor=False, initial_capital=None, replay=None, replay_rows=None):
     if report.trades or report.trades_len or report.equity_curve or report.equity_curve_len:
         raise _engine_invariant("a report with a sink must contain summary scalars only")
-    # Reuse the unchanged producer for its small fields and exact key order.
-    # The C ABI supplied no arrays, so this cannot walk native report rows.
+    if replay is not None or replay_rows is not None:
+        return _build_replay_sink_report(
+            report, ohlcv_path, n_bars, first_ts, last_ts, elapsed,
+            applied_inputs, applied_overrides, applied_runtime, sink,
+            window_anchor, initial_capital, replay, replay_rows)
     out = build_report_dict(report, ohlcv_path, n_bars, first_ts, last_ts, elapsed,
                             applied_inputs, applied_overrides, applied_runtime,
-                            window_anchor=window_anchor)
+                            window_anchor=window_anchor,
+                            initial_capital=initial_capital)
     out["summary"] = _sink_summary(report, sink)
     if getattr(sink, "fd_mode", False):
         _validate_report_result(out)  # the engine's summary checked every T
@@ -6540,34 +7761,61 @@ def _build_sink_report(report, ohlcv_path, n_bars, first_ts, last_ts, elapsed,
         ] if diagnostics.count_e else ()
         first_bar_trade = ({"entry_bar_index": 0},) if diagnostics.trade_at_start else ()
         out["diagnostics"].update(
-            _annualization_block(endpoints, out["metrics"], first_bar_trade, window_anchor))
+            _annualization_block(
+                endpoints, out["metrics"], first_bar_trade, window_anchor, initial_capital))
         # stdout.json has the small report only. The wrapper/finalizer owns
         # the stream's artifact and receipt; no child-local path names it.
         out.pop("trades")
         out.pop("equity_curve")
         return out
-
-    def point_at(index):
-        # Diagnostics need only the endpoints. Revisit the verified sink in
-        # bounded memory rather than retaining its equity history. Consume
-        # the pass through its trailer so records() checks its digest and
-        # closes the reader even when the requested point is the first one.
-        point = None
-        for i, row in enumerate(sink.records("E")):
-            if i == index:
-                point = row.as_dict()
-        if point is None:
-            raise _engine_invariant("the report sink equity count differs from its receipt")
-        return point
-
+    # verify() already checked E in record/field order and retained only its
+    # endpoints. Validate the small fields first, exactly where the old E
+    # validation pass began, then surface its first refusal before diagnostics.
+    _validate_report_result(out)
+    diagnostics = sink.diagnostics
+    if diagnostics.equity_failure is not None:
+        raise diagnostics.equity_failure
+    if getattr(sink, "_fused_pass", False):
+        if sink._spool_open_failure:
+            raise sink._spool_failure
+        first_bar_trade = (
+            {"entry_bar_index": 0},) if diagnostics.trade_at_start else ()
+        out["diagnostics"].update(
+            _annualization_block(
+                diagnostics, out["metrics"], first_bar_trade, window_anchor, initial_capital))
+        if sink.named:
+            reference = {
+                "path": sink.path,
+                "schema": sink.header["schema"],
+                "version": sink.header["version"],
+                "run_id": sink.header["run_id"],
+                "counts": sink.counts,
+                "sha256": sink.sha256,
+            }
+            return {
+                ("report_sink" if key == "trades" else key):
+                    (reference if key == "trades" else value)
+                for key, value in out.items() if key != "equity_curve"
+            }
+        out["trades"] = sink._trades_spool
+        out["equity_curve"] = sink._equity_spool
+        return out
+    # Equity count still equals the receipt without the old point_at walk:
+    # pf_sink.py's strict reader compares trailer counts with records read
+    # ("trailer count mismatch"), and verify() compares receipt counts with
+    # those verified trailer counts.
     trades = _JSONRecordArray(
         lambda: (_sink_trade(row) for row in sink.records("T")), sink.counts["T"])
     equity_curve = _JSONRecordArray(
-        lambda: (row.as_dict() for row in sink.records("E")), sink.counts["E"], point_at)
+        lambda: (row.as_dict() for row in sink.records("E")), sink.counts["E"])
+    if _BULK_E_ENABLED and type(sink) is _ReportSink:
+        # Preserve subclass-provided readers and the non-path report routes.
+        equity_curve = _JSONEquityArray(sink)
     out["equity_curve"] = equity_curve
-    _validate_report_result(out)  # the summary pre-pass already checked every T
+    first_bar_trade = ({"entry_bar_index": 0},) if diagnostics.trade_at_start else ()
     out["diagnostics"].update(
-        _annualization_block(equity_curve, out["metrics"], trades, window_anchor))
+        _annualization_block(
+            diagnostics, out["metrics"], first_bar_trade, window_anchor, initial_capital))
     if sink.named:
         reference = {
             "path": sink.path,
@@ -6692,7 +7940,50 @@ def _legacy_streamed_outputs_block(lib, state, *, validate=False):
     return block
 
 
+def _fused_sink_outputs_block(lib, state, sink, *, summary_only=False):
+    fused = sink._fused_outputs
+    if sink.counts.get("K") != 1:
+        raise _engine_invariant(
+            "the report sink must contain one output constants record")
+    if fused.named:
+        descriptor = next(
+            entry for entry in sink.header["records"] if entry["type"] == "O")
+        slots = len(descriptor["fields"]) - 3
+        raw_manifest = _outputs_manifest(lib, state)
+        block = _outputs_metadata(raw_manifest, slots, fused.constants)
+        if summary_only:
+            return {key: block[key] for key in (
+                "schema_version", "message_format", "manifest_sha256",
+                "manifest", "constants", "hlines")}
+        raise _engine_invariant(
+            "the named report sink cannot publish output arrays")
+    if fused.raw_manifest is None:
+        if fused.failure is not None:
+            raise fused.failure
+        raise _outputs_incompatible(
+            "the report sink has no output manifest", "outputs_manifest_invalid")
+    if fused.failure is not None and fused.opens is None:
+        raise fused.failure
+    block = _outputs_metadata(
+        fused.raw_manifest, fused.slots, fused.constants)
+    if summary_only:
+        return {key: block[key] for key in (
+            "schema_version", "message_format", "manifest_sha256",
+            "manifest", "constants", "hlines")}
+    if fused.failure is not None:
+        raise fused.failure
+    block["bars"] = {"open_ms": fused.opens, "close_ms": fused.closes}
+    for entry, column in zip(block["series"], fused.columns):
+        entry["values"] = column
+    block["events"] = fused.events
+    return block
+
+
 def _sink_outputs_block(lib, state, sink, resources, *, summary_only=False):
+    if (getattr(sink, "_fused_pass", False)
+            and getattr(sink, "_fused_outputs", None) is not None):
+        return _fused_sink_outputs_block(
+            lib, state, sink, summary_only=summary_only)
     if getattr(sink, "fd_mode", False):
         if sink.counts.get("K") != 1:
             raise _engine_invariant("the report sink must contain one output constants record")
@@ -6753,9 +8044,269 @@ def _sink_outputs_block(lib, state, sink, resources, *, summary_only=False):
     return block
 
 
+def _read_strategy_initial_capital(lib, state):
+    accessor = getattr(lib, "strategy_initial_capital", None)
+    if accessor is None:
+        return None
+    accessor.argtypes = [ctypes.c_void_p]
+    accessor.restype = ctypes.c_double
+    return accessor(state)
+
+
+_REPORT_OUTPUT = None
+_LIBRARY_REPORT_RUN = None
+
+
+class _LibraryReportRun:
+    """Scope publication state to one main() call without owning any descriptor."""
+
+    def __enter__(self):
+        global _LIBRARY_REPORT_RUN
+        self.previous = _LIBRARY_REPORT_RUN
+        self.published = False
+        _LIBRARY_REPORT_RUN = self
+        return self
+
+    def __exit__(self, kind, error, tb):
+        global _LIBRARY_REPORT_RUN
+        _LIBRARY_REPORT_RUN = self.previous
+        if (_REPORT_OUTPUT is None and self.published
+                and isinstance(error, Exception)):
+            _write_diagnostic(f"run_json: fault after report publication: "
+                              f"{type(error).__name__}: {error}\n")
+            return True
+        return False
+
+
+class _ReportOutput:
+    """Own the caller's report descriptor and route native fd 1 to stderr."""
+
+    def __init__(self):
+        if _same_open_file(1, 2):
+            _write_diagnostic("report channel not isolated: "
+                              "stdout and stderr are the same file\n")
+        fd = os.dup(1)
+        try:
+            if fd == 5:
+                replacement = os.dup(1)
+                os.close(fd)
+                fd = replacement
+            os.set_inheritable(fd, False)
+            os.dup2(2, 1)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        self.fd = fd
+        self._state = "open"
+
+    @property
+    def published(self):
+        return self._state != "open"
+
+    def write(self, text):
+        if self._state == "open":
+            self._state = "publishing"
+        elif self._state != "publishing":
+            raise OSError("the report channel has already been published")
+        data = text.encode("utf-8")
+        offset = 0
+        while offset < len(data):
+            try:
+                written = os.write(self.fd, data[offset:])
+            except InterruptedError:
+                continue
+            if written <= 0:
+                raise OSError("short report write")
+            offset += written
+        return len(text)
+
+    def flush(self):
+        return None
+
+    def finish(self):
+        if self._state != "publishing":
+            raise OSError("the report channel has already been published")
+        self.flush()
+        self._state = "published"
+
+    def discard(self):
+        self._state = "published"
+        if self.fd is None:
+            return
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, self.fd, inheritable=False)
+            finally:
+                os.close(devnull)
+        except OSError:
+            pass
+
+    def close(self):
+        fd = self.fd
+        if fd is None:
+            return
+        self._state = "published"
+        try:
+            self.flush()
+        finally:
+            self.fd = None
+            try:
+                os.close(fd)
+            except OSError as error:
+                if error.errno != errno.EBADF:
+                    raise
+
+
+def _report_output():
+    # Library callers may replace sys.stdout between writes or between runs.
+    return sys.stdout if _REPORT_OUTPUT is None else _REPORT_OUTPUT
+
+
+def _report_published():
+    if _REPORT_OUTPUT is not None:
+        return _REPORT_OUTPUT.published
+    return _LIBRARY_REPORT_RUN is not None and _LIBRARY_REPORT_RUN.published
+
+
+def _begin_report():
+    if _report_published():
+        raise OSError("the report channel has already been published")
+    if _REPORT_OUTPUT is None and _LIBRARY_REPORT_RUN is not None:
+        _LIBRARY_REPORT_RUN.published = True
+
+
+def _finish_report():
+    if _REPORT_OUTPUT is None:
+        sys.stdout.flush()
+    else:
+        _REPORT_OUTPUT.finish()
+
+
+def _same_open_file(left, right):
+    if left is None or right is None:
+        return False
+    if left == right:
+        return True
+    sameopenfile = getattr(os.path, "sameopenfile", None)
+    if sameopenfile is None:
+        return False
+    try:
+        return bool(sameopenfile(left, right))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _validate_report_fd_separation(args):
+    owner = _REPORT_OUTPUT
+    if owner is None or owner.fd is None:
+        return None
+
+    def check(fd, label):
+        if isinstance(fd, int) and 3 <= fd <= (1 << (ctypes.sizeof(ctypes.c_int) * 8 - 1)) - 1 and (
+                fd == owner.fd or _same_open_file(owner.fd, fd)):
+            raise _request_invalid(
+                f"error: {label} collides with the reserved report descriptor",
+                "arguments", exit_status=2)
+
+    sink_fd = getattr(args, "report_sink_fd", None)
+    check(sink_fd, "--report-sink-fd")
+    phase_fd = getattr(args, "run_phase_fd", None)
+    if isinstance(phase_fd, int):
+        check(phase_fd, "--run-phase-fd")
+    elif (isinstance(phase_fd, str)
+          and re.fullmatch(r"[0-9]{1,10}", phase_fd) is not None):
+        check(int(phase_fd), "--run-phase-fd")
+    check(5, "PF_SCRATCH_ARENA_FD")
+    sink_path = getattr(args, "report_sink", None)
+    if sink_path is not None:
+        try:
+            report_target = os.path.realpath(os.fspath(sink_path))
+            saved_target = os.path.realpath(f"/proc/self/fd/{owner.fd}")
+        except (OSError, TypeError, ValueError):
+            report_target = saved_target = None
+        if report_target is not None and report_target == saved_target:
+            raise _request_invalid(
+                "error: --report-sink aliases the reserved report descriptor",
+                "arguments", exit_status=2)
+    return None
+
+
+_REPORT_MAIN = main
+
+
+def _host_main(argv=None) -> int:
+    global _REPORT_OUTPUT
+    try:
+        output = _ReportOutput()
+    except Exception as error:
+        sys.stderr.write(f"run_json: report channel setup failed: {error}\n")
+        sys.stderr.flush()
+        return 1
+    _REPORT_OUTPUT = output
+    status = 1
+    try:
+        status = _REPORT_MAIN(argv)
+    except Exception as error:
+        status = 1
+        if output.published:
+            _write_diagnostic(f"run_json: fault after report publication: "
+                              f"{type(error).__name__}: {error}\n")
+        else:
+            try:
+                write_failure(f"harness internal error: {type(error).__name__}: {error}",
+                              "harness_internal_error")
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+    finally:
+        try:
+            output.close()
+        except Exception as error:
+            status = 1
+            if output.published:
+                sys.stderr.write(f"run_json: report channel close failed: {error}\n")
+                sys.stderr.flush()
+            else:
+                try:
+                    write_failure(f"harness internal error: {type(error).__name__}: {error}",
+                                  "harness_internal_error")
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
+        _REPORT_OUTPUT = None
+    return status
+
+
+def _write_diagnostic(text):
+    sys.stderr.write(text)
+    sys.stderr.flush()
+
+
+def _publish_failure(line):
+    if _report_published():
+        _write_diagnostic(f"run_json: fault after report publication: {line}")
+        return
+    _begin_report()
+    if _REPORT_OUTPUT is None:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        return
+    try:
+        output = _report_output()
+        output.write(line)
+        output.finish()
+    except (OSError, ValueError) as error:
+        _discard_stdout()
+        _write_diagnostic(f"run_json: the failure could not be written: {error}\n")
+
+
 def _discard_stdout() -> None:
-    """Point stdout's file descriptor at /dev/null after a failed report write,
-    so what stdout still buffers is dropped instead of written again at exit."""
+    """Discard the host's report descriptor, or the library caller's current stdout."""
+    if _REPORT_OUTPUT is not None:
+        _REPORT_OUTPUT.discard()
+        return
     try:
         fd = sys.stdout.fileno()
     except (AttributeError, OSError, ValueError):  # not a file: nothing to drop
@@ -6767,5 +8318,697 @@ def _discard_stdout() -> None:
         os.close(devnull)
 
 
+def read_replay_values(lib, state, initial_capital, pointvalue):
+    """Read raw N exactly once; capital/pointvalue are actual engine operands."""
+    accessor = lib.strategy_net_profit_sum
+    if hasattr(accessor, "argtypes"):
+        accessor.argtypes, accessor.restype = [ctypes.c_void_p], ctypes.c_double
+    return {"initial_capital": initial_capital, "pointvalue": pointvalue,
+            "net_profit_sum": float(accessor(state))}
+
+
+def _replay_array_length(array, sink, tag):
+    """Length of a report array: resident, or the verified count of a spooled stream."""
+    try:
+        return len(array)
+    except TypeError:
+        if sink is None:
+            raise
+        return sink.counts[tag]
+
+
+def _annotate_replay_report(out, replay, replay_rows, sink=None):
+    """Add the opt-in operands after the canonical POD report is assembled."""
+    if replay is not None:
+        out["replay"] = {key: replay[key] for key in
+                         ("initial_capital", "pointvalue", "net_profit_sum")}
+    if replay_rows is not None:
+        replay_rows.join(out, sink)
+    for key, tag in (("trades", "T"), ("equity_curve", "E")):
+        if key in out and _replay_array_length(out[key], sink, tag) == 0:
+            out[key] = []
+    return out
+
+
+def _build_replay_sink_report(report, ohlcv_path, n_bars, first_ts, last_ts, elapsed,
+                              applied_inputs, applied_overrides, applied_runtime, sink,
+                              window_anchor, initial_capital, replay, replay_rows):
+    if replay is not None:
+        for key in ("initial_capital", "pointvalue", "net_profit_sum"):
+            _replay_finite(replay[key], "replay." + key)
+    out = _build_sink_report(
+        report, ohlcv_path, n_bars, first_ts, last_ts, elapsed,
+        applied_inputs, applied_overrides, applied_runtime, sink,
+        window_anchor=window_anchor, initial_capital=initial_capital)
+    if replay_rows is not None and "trades" in out:
+        # The fused path hands back already encoded JSON columns, which hold
+        # no rows to annotate: replay reads the verified sink records instead.
+        if isinstance(out["trades"], _JSONColumn):
+            out["trades"] = _JSONRecordArray(
+                lambda: (_sink_trade(row) for row in sink.records("T")), sink.counts["T"])
+        if isinstance(out.get("equity_curve"), _JSONColumn):
+            out["equity_curve"] = _JSONRecordArray(
+                lambda: (row.as_dict() for row in sink.records("E")), sink.counts["E"])
+    return _annotate_replay_report(
+        out, replay, replay_rows if "trades" in out else None, sink)
+
+
+def _replay_finite(value, field):
+    if type(value) not in (int, float) or not math.isfinite(value):
+        # Keep the producer's field vocabulary explicit, as for the canonical
+        # report guard. The ownership manifest registers this closed domain.
+        for operand, owned_field in (
+                ("S1", "replay.initial_capital"),
+                ("S2", "replay.pointvalue"),
+                ("S3", "replay.net_profit_sum"),
+                ("R8", "trades.recut.transaction_qty"),
+                ("R9", "trades.recut.whole_qty"),
+                ("R10", "trades.recut.whole_pnl"),
+                ("R11", "trades.recut.whole_commission"),
+                ("R12", "trades.recut.whole_max_runup"),
+                ("R13", "trades.recut.whole_max_drawdown"),
+                ("R14", "trades.recut.whole_exit_fee"),
+                ("R15", "trades.recut.transaction_fee"),
+                ("Q4", "equity_curve.net_profit_sum"),
+                ("Q6", "equity_curve.equity_term")):
+            if field == owned_field:
+                raise RunFailure(f"the report result {field} is not finite", "report_result_invalid",
+                                 {"field": owned_field, "reason": "nonfinite"})
+        raise _engine_invariant("unknown replay result field: " + field)
+
+
+def _validate_replay_result(out, *, equity_only=False):
+    # Called once only for an annotated report. The old OFF row/point
+    # validation loops perform no replay field lookup or extra iteration.
+    if not equity_only:
+        for key, value in out["replay"].items():
+            _replay_finite(value, "replay." + key)
+        for trade in out["trades"]:
+            marker = trade.get("recut")
+            if marker is not None:
+                for key in ("transaction_qty", "whole_qty", "whole_pnl", "whole_commission",
+                            "whole_max_runup", "whole_max_drawdown", "whole_exit_fee", "transaction_fee"):
+                    if marker[key] is not None:
+                        _replay_finite(marker[key], "trades.recut." + key)
+    for point in out.get("equity_curve", ()):
+        for key in ("net_profit_sum", "equity_term"):
+            if key in point and point[key] is not None:
+                _replay_finite(point[key], "equity_curve." + key)
+
+
+def _replay_record_finite(record):
+    row = record.as_dict()
+    if record.tag == "S":
+        for key, value in row.items():
+            _replay_finite(value, "replay." + key)
+    elif record.tag == "R" and row["parent_id"] is not None:
+        for key in ("transaction_qty", "whole_qty", "whole_pnl", "whole_commission",
+                    "whole_max_runup", "whole_max_drawdown", "whole_exit_fee", "transaction_fee"):
+            if row[key] is not None:
+                _replay_finite(row[key], "trades.recut." + key)
+    elif record.tag == "Q":
+        for key in ("net_profit_sum", "equity_term"):
+            if row[key] is not None:
+                _replay_finite(row[key], "equity_curve." + key)
+
+
+class _ReplayCapture:
+    """Run-owned companion; joins re-read verified records in bounded memory."""
+    def __init__(self, lib, state, args, sink):
+        if getattr(args, "profile", "unjailed") == "jailed":
+            raise _request_invalid("the jailed profile does not admit replay companion paths", "arguments")
+        names = ("strategy_net_profit_sum", "strategy_report_pointvalue",
+                 "strategy_initial_capital", "strategy_set_report_replay_v1")
+        for name in names:
+            if not hasattr(lib, name):
+                raise StrategyLibraryError("the strategy library has no report replay API",
+                                           {"reason": "symbol_missing", "missing": name})
+        self.named = getattr(args, "report_replay_sink", None) is not None
+        if not self.named and sink is not None and (
+                sink.named or getattr(sink, "fd_mode", False)):
+            raise _request_invalid(
+                "a named or fd primary requires --report-replay-sink PATH for exact replay", "arguments")
+        self.run_id = getattr(args, "run_id", "")
+        self.closed, self.sha256, self.counts = False, "", {}
+        self.scalars = None
+        self.primary_path = (sink.path if sink is not None
+                             and not getattr(sink, "fd_mode", False) else None)
+        if self.named:
+            self.path = os.path.abspath(os.fspath(args.report_replay_sink))
+        else:
+            directory = _disk_report_directory(getattr(args, "spill_dir", None))
+            try:
+                fd, self.path = tempfile.mkstemp(
+                    prefix="pineforge-report-replay-", suffix=".jsonl", dir=directory)
+            except OSError as error:
+                raise RunFailure("replay companion open failed", "report_sink_failed",
+                                 {"reason": "sink_io"}) from error
+            os.close(fd)
+        try:
+            if self.primary_path is not None and (
+                    os.path.realpath(self.primary_path) == os.path.realpath(self.path)
+                    or (os.path.exists(self.path) and os.path.exists(self.primary_path)
+                        and os.path.samefile(self.path, self.primary_path))):
+                raise _request_invalid("primary and replay sinks must be separate files", "arguments")
+            if lib.strategy_set_report_replay_v1(
+                    state, os.fsencode(self.path), self.run_id.encode("utf-8")) != 0:
+                _check_bench_run(lib, state)
+                raise _engine_invariant("the fresh strategy refused report replay")
+        except BaseException:
+            self.close()
+            raise
+
+    def verify(self, lib, state, sink):
+        from pf_sink import ReplaySinkReader, ReplaySinkFormatError
+        if sink is not None and getattr(sink, "fd_mode", False):
+            receipt = ReportSinkReceiptC()
+            receipt.struct_size, receipt.version = ctypes.sizeof(receipt), 1
+            if lib.strategy_report_sink_receipt_v1(state, ctypes.byref(receipt)) != 0 or receipt.complete != 1:
+                raise _engine_invariant("the primary receipt is incomplete for replay binding")
+            sink.sha256 = bytes(receipt.sha256_hex).decode("ascii")
+        try:
+            with ReplaySinkReader(self.path, primary_path=self.primary_path) as reader:
+                for record in reader:
+                    _replay_record_finite(record)
+                    if record.tag == "S":
+                        self.scalars = record.as_dict()
+                if reader.header["run_id"] != self.run_id:
+                    raise _engine_invariant("the replay run id differs from the request")
+                if sink is not None and reader.trailer.get("base_sha256") != sink.sha256:
+                    raise _engine_invariant("the replay companion is not bound to the primary")
+                if sink is not None and (
+                        reader.counts.get("R") != sink.counts["T"]
+                        or reader.counts.get("Q") != sink.counts["E"]):
+                    raise _engine_invariant("the replay companion does not cover the primary")
+                self.sha256, self.counts = reader.sha256, reader.counts
+        except ReplaySinkFormatError as error:
+            raise _engine_invariant("the engine's replay companion is invalid: " + str(error)) from error
+        expected = read_replay_values(
+            lib, state, _read_strategy_initial_capital(lib, state),
+            float(lib.strategy_report_pointvalue(state)))
+        for key, value in expected.items():
+            _replay_finite(value, "replay." + key)
+            if struct.pack(">d", float(value)) != struct.pack(">d", float(self.scalars[key])):
+                raise _engine_invariant("replay S differs from its engine accessor: " + key)
+
+    def records(self, tag):
+        from pf_sink import ReplaySinkReader, ReplaySinkFormatError
+        try:
+            with ReplaySinkReader(self.path) as reader:
+                for record in reader:
+                    _replay_record_finite(record)
+                    if record.tag == tag:
+                        yield record
+                if reader.sha256 != self.sha256:
+                    raise _engine_invariant("the replay companion changed after verification")
+        except ReplaySinkFormatError as error:
+            raise _engine_invariant("the engine's replay companion is invalid: " + str(error)) from error
+
+    def join(self, out, sink=None):
+        trades, points = out["trades"], out["equity_curve"]
+        trade_count = _replay_array_length(trades, sink, "T")
+        point_count = _replay_array_length(points, sink, "E")
+        if trade_count != self.counts.get("R") or point_count != self.counts.get("Q"):
+            raise _engine_invariant("replay R/Q coverage differs from the JSON arrays")
+
+        def joined_trades():
+            annotations = self.records("R")
+            try:
+                for trade in trades:
+                    record = next(annotations, None)
+                    if record is None:
+                        raise _engine_invariant("replay R coverage is incomplete")
+                    row = record.as_dict()
+                    if row["n"] != trade["n"] or (row["settlement_index"] is None) != trade["open_at_end"]:
+                        raise _engine_invariant("replay R is associated with another trade")
+                    yield dict(trade, settlement_index=row["settlement_index"],
+                               recut=None if row["parent_id"] is None else
+                               {key: row[key] for key in record.fields[2:]})
+                if next(annotations, None) is not None:
+                    raise _engine_invariant("replay R coverage exceeds the JSON trades")
+            finally:
+                annotations.close()
+
+        def joined_points():
+            annotations = self.records("Q")
+            try:
+                for index, point in enumerate(points):
+                    record = next(annotations, None)
+                    if record is None:
+                        raise _engine_invariant("replay Q coverage is incomplete")
+                    row = record.as_dict()
+                    if row["point_index"] != index or row["time_ms"] != point["time_ms"]:
+                        raise _engine_invariant("replay Q is associated with another equity point")
+                    yield dict(point, **{key: row[key] for key in record.fields[2:]})
+                if next(annotations, None) is not None:
+                    raise _engine_invariant("replay Q coverage exceeds the JSON points")
+            finally:
+                annotations.close()
+        out["trades"] = _JSONRecordArray(joined_trades, trade_count)
+        out["equity_curve"] = _JSONRecordArray(joined_points, point_count)
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            if not self.named:
+                try:
+                    os.unlink(self.path)
+                except FileNotFoundError:
+                    pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
+def _read_report_replay(lib, state, args, sink):
+    capture = getattr(args, "_replay_capture", None)
+    if capture is None:
+        return {}
+    capture.verify(lib, state, sink)
+    return {"replay": capture.scalars, "replay_rows": capture}
+
+
+def _report_wire(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
+
+
+def _report_descriptor(tag, columns):
+    return {"type": tag, "fields": [column[0] for column in columns],
+            "types": [column[1] for column in columns], "units": [column[2] for column in columns]}
+
+
+def write_replay_sink(path, *, run_id, initial_capital, pointvalue, net_profit_sum,
+                      base_sha256=None, records=None):
+    """Serialize supplied replay operands; native runs use their C++ writer."""
+    from pf_sink import REPLAY_COLUMNS, _replay_record
+    tags = ("S",) if records is None else ("S", "Q", "R")
+    counts = {tag: 0 for tag in tags}
+    header = {"schema": "pf-report-replay", "version": 1, "run_id": run_id,
+              "engine": "pineforge",
+              "records": [_report_descriptor(tag, REPLAY_COLUMNS[tag]) for tag in tags]}
+    digest = hashlib.sha256()
+    with open(path, "wb") as stream:
+        def emit(value):
+            line = _report_wire(value)
+            digest.update(line)
+            stream.write(line)
+        emit(header)
+        scalars = ["S", initial_capital, pointvalue, net_profit_sum]
+        _replay_record(scalars, counts)
+        emit(scalars)
+        counts["S"] = 1
+        for row in () if records is None else records:
+            record = _replay_record(row, counts)
+            if record.tag == "S":
+                raise ValueError("supplied records must not repeat S")
+            emit(row)
+            counts[record.tag] += 1
+        trailer = {"trailer": "pf-report-replay", "version": 1, "counts": counts,
+                   "sha256": digest.hexdigest()}
+        if base_sha256 is not None:
+            trailer["base_sha256"] = base_sha256
+        stream.write(_report_wire(trailer))
+
+
+def write_report_sinks(*, primary_path, replay_path, run_id,
+                       initial_capital, pointvalue, net_profit_sum,
+                       primary_records=(), replay_records=None):
+    """Write supplied primary rows, optionally accompanied by replay operands."""
+    from pf_sink import _E, _T, RecordParser
+    header = {"schema": "pf-report-sink", "version": 1, "run_id": run_id,
+              "engine": "pineforge",
+              "records": [_report_descriptor("E", _E), _report_descriptor("T", _T)]}
+    parser, counts, digest = RecordParser(header), {"E": 0, "T": 0}, hashlib.sha256()
+    with open(primary_path, "wb") as stream:
+        line = _report_wire(header)
+        stream.write(line)
+        digest.update(line)
+        for row in primary_records:
+            line = _report_wire(row)
+            record = parser.parse(line)
+            counts[record.tag] += 1
+            stream.write(line)
+            digest.update(line)
+        stream.write(_report_wire({"trailer": "pf-report-sink", "version": 1,
+                                  "counts": counts, "sha256": digest.hexdigest()}))
+    if replay_path is not None:
+        write_replay_sink(replay_path, run_id=run_id, initial_capital=initial_capital,
+                          pointvalue=pointvalue, net_profit_sum=net_profit_sum,
+                          base_sha256=digest.hexdigest(), records=replay_records)
+
+
+# Keep the canonical builder stable when callers instrument its public seam.
+_canonical_report_dict = build_report_dict
+
+
+class _MetricsArgumentParser(_ArgumentParser):
+    _metrics_requested = False
+
+    def parse_args(self, args=None, namespace=None):
+        tokens = list(sys.argv[1:] if args is None else args)
+        self._metrics_requested = False
+        for token in tokens:
+            if token == "--":
+                break
+            if not isinstance(token, str):
+                continue
+            name = token.partition("=")[0]
+            if name.startswith("--") and "--metrics-only".startswith(name):
+                matches = self._get_option_tuples(token)
+                if len(matches) == 1 and matches[0][1] == "--metrics-only":
+                    self._metrics_requested = True
+                    break
+        return super().parse_args(tokens, namespace)
+
+    def print_usage(self, file=None):
+        if not self._metrics_requested and hasattr(self, "_legacy_usage"):
+            self._print_message(self._legacy_usage, sys.stdout if file is None else file)
+        else:
+            super().print_usage(file)
+
+    def _get_option_tuples(self, option_string):
+        matches = super()._get_option_tuples(option_string)
+        # Formerly ambiguous prefixes (notably --m) retain their exact
+        # refusal text; formerly unique ones are expanded before parsing.
+        previous = [match for match in matches if match[1] != "--metrics-only"]
+        return previous if len(previous) > 1 else matches
+
+
+class MetricsExtentV1(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_int64) for name in
+                ("count", "first_time_ms", "last_time_ms")] + [
+        ("empty", ctypes.c_uint32), ("reserved", ctypes.c_uint32)]
+
+
+class MetricsExtentPlanV1(ctypes.Structure):
+    _fields_ = [("extent", MetricsExtentV1)] + [
+        (name, ctypes.c_uint64) for name in
+        ("attempt", "input_generation", "admitted_view", "spec_identity")] + [
+        ("present", ctypes.c_uint32), ("reserved", ctypes.c_uint32)]
+
+
+class MetricsStopBoundaryV1(ctypes.Structure):
+    _fields_ = [("completed_marks", ctypes.c_int64), ("input_index", ctypes.c_int64),
+                ("kind", ctypes.c_uint32), ("reserved", ctypes.c_uint32)]
+
+
+class MetricsExtentReceiptV1(ctypes.Structure):
+    _fields_ = [("struct_size", ctypes.c_uint32), ("version", ctypes.c_uint32),
+                ("extent_plan", MetricsExtentPlanV1), ("actual_extent", MetricsExtentV1)] + [
+        (name, ctypes.c_uint64) for name in
+        ("actual_attempt", "actual_input_generation", "actual_admitted_view",
+         "actual_spec_identity", "eligible_returns", "mismatch_fields",
+         "failed_plain_inputs", "metrics_needed")] + [
+        ("stop_boundary", MetricsStopBoundaryV1)] + [
+        (name, ctypes.c_uint32) for name in
+        ("witness", "route", "route_reason", "streaming_sharpe", "plain_subset",
+         "replay_attempts")] + [("authoritative_attempt", ctypes.c_uint64),
+                               ("actual_last_equity", ctypes.c_double),
+                               ("actual_last_equity_valid", ctypes.c_uint32)]
+
+
+for _pod, _size in ((MetricsExtentV1, 32), (MetricsExtentPlanV1, 72),
+                    (MetricsStopBoundaryV1, 24), (MetricsExtentReceiptV1, 248)):
+    if ctypes.sizeof(_pod) != _size:
+        raise RuntimeError(f"unsupported native metrics layout: {_pod.__name__}")
+
+
+def _bind_metrics_streaming(lib) -> None:
+    signatures = {
+        "strategy_set_metrics_streaming_v1": (
+            ctypes.c_int32, [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64]),
+        "strategy_metrics_extent_receipt_v1": (
+            ctypes.c_int32, [ctypes.c_void_p, ctypes.POINTER(MetricsExtentReceiptV1)]),
+    }
+    for name, (restype, argtypes) in signatures.items():
+        if hasattr(lib, name):
+            function = getattr(lib, name)
+            function.restype, function.argtypes = restype, argtypes
+
+
+def _metrics_only_supported(lib) -> bool:
+    """The module must certify its run adapter, plain inputs and recovery.
+
+    The module's own capability export answers: Ok (0) only for a host that
+    certified itself. Binding the preference/receipt exports alone certifies
+    nothing; never declare a module plain from Python. A missing export, any
+    other status or a failing call means no.
+    """
+    try:
+        probe = lib.strategy_metrics_only_capability_v1
+    except AttributeError:
+        return False
+    try:
+        probe.restype = ctypes.c_int32
+        probe.argtypes = []
+        return int(probe()) == 0
+    except Exception:
+        return False
+
+
+def _validate_metrics_only_options(args) -> None:
+    if getattr(args, "metrics_only", None) is None:
+        return
+    for name in (
+            "report_sink", "report_sink_fd", "run_phase_fd", "report_policy",
+            "window_start_ms", "window_end_ms", "preroll_bars", "fed_start_ms",
+            "request_feed_inventory", "report_shape", "curve_point_budget",
+            "results_digest", "symbol_feeds"):
+        if getattr(args, name, None) is not None:
+            label = "--" + name.replace("_", "-")
+            raise _request_invalid(f"error: --metrics-only cannot be combined with {label}",
+                                   "arguments", exit_status=2)
+    for name in ("outputs", "bench", "validate_window_only", "capabilities_json"):
+        if getattr(args, name, False):
+            label = "--" + name.replace("_", "-")
+            raise _request_invalid(f"error: --metrics-only cannot be combined with {label}",
+                                   "arguments", exit_status=2)
+
+
+def _metrics_only_document(out) -> None:
+    # Called once, after the ordinary report's validation and diagnostics.
+    for name in ("trades", "equity_curve", "elapsed_seconds"):
+        out.pop(name, None)
+    for name in ("scratch_arena_high_water_bytes", "scratch_arena_bytes"):
+        out["diagnostics"].pop(name, None)
+
+
+def _metrics_extent_receipt(lib, state):
+    getter = getattr(lib, "strategy_metrics_extent_receipt_v1", None)
+    if getter is None:
+        return None
+    # ctypes zero-initializes every reserved word, including nested PODs.
+    receipt = MetricsExtentReceiptV1()
+    receipt.struct_size, receipt.version = ctypes.sizeof(receipt), 1
+    try:
+        status = getter(state, ctypes.byref(receipt))
+    except Exception:
+        return None  # an unobserved speculative report cannot be published
+    if status != 0 or receipt.struct_size != 248 or receipt.version != 1:
+        return None
+    return receipt
+
+
+def _metrics_streaming_complete(receipt, report, failure, initial_capital=None) -> bool:
+    if (failure is not None or receipt.route != 1 or receipt.route_reason != 11
+            or receipt.streaming_sharpe != 1 or receipt.metrics_needed != 0x37
+            or receipt.plain_subset != 1 or receipt.failed_plain_inputs
+            or receipt.witness != 1 or receipt.mismatch_fields
+            or receipt.extent_plan.present != 1):
+        return False
+    plan, actual = receipt.extent_plan, receipt.actual_extent
+    for name in ("attempt", "input_generation", "admitted_view", "spec_identity"):
+        if getattr(plan, name) != getattr(receipt, "actual_" + name):
+            return False
+    for name in ("count", "empty", "first_time_ms", "last_time_ms"):
+        if getattr(plan.extent, name) != getattr(actual, name):
+            return False
+    # A curve-free annualization diagnostic needs the fold's own final mark
+    # and exported capital. The older first-mark proof requires a real curve.
+    if (actual.count > 0 and (not report.equity_curve or report.equity_curve_len <= 0)
+            and math.isfinite(report.metrics.equity.cagr)):
+        if (receipt.actual_last_equity_valid != 1
+                or not math.isfinite(receipt.actual_last_equity)
+                or initial_capital is None or not math.isfinite(initial_capital)
+                or initial_capital <= 0):
+            return False
+    return True
+
+
+class _MetricsSyminfoSnapshot:
+    """Record only validated setter values, using apply_syminfo's parser."""
+    def __init__(self, lib):
+        self.lib, self.calls = lib, []
+
+    def __getattr__(self, name):
+        function = getattr(self.lib, name)  # preserve missing-setter refusals
+
+        def record(_state, *values):
+            self.calls.append((function, values))
+        return record
+
+
+class _MetricsOnlyRun:
+    """Own at most two complete executions; publish only the authoritative one."""
+    def __init__(self, lib, args, checked):
+        self.lib, self.args, self.checked = lib, args, checked
+        self.active = None
+        self.streaming = False
+        self.failure = None
+        self.first_receipt = self.first_failure = self.first_status = None
+        self.recovery_receipt = None
+        self.annualization_endpoints = None
+        self.annualization_capital = None
+        self.syminfo = self.syminfo_applied = None
+        self.cpp_digest, self.cpp_text, self.cpp_error = None, "", None
+        if args.generated_cpp:
+            try:
+                raw = args.generated_cpp.read_bytes()
+                self.cpp_digest = hashlib.sha256(raw).hexdigest()
+                self.cpp_text = raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+            except Exception as error:
+                self.cpp_error = error  # preserve best-effort fingerprint handling
+
+    def cpp_source(self):
+        if self.cpp_error is not None:
+            raise self.cpp_error
+        return self.cpp_text
+
+    def apply_syminfo(self, state):
+        if self.syminfo is None:
+            snapshot = _MetricsSyminfoSnapshot(self.lib)
+            self.syminfo_applied = apply_syminfo(snapshot, state, self.args.syminfo)
+            self.syminfo = snapshot
+        for function, values in self.syminfo.calls:
+            function(state, *values)
+        return self.syminfo_applied
+
+    def configure(self, state, *, legacy=False):
+        self.streaming = False
+        setter = getattr(self.lib, "strategy_set_metrics_streaming_v1", None)
+        if setter is None:
+            return  # older modules retain the actual curve under their default mask
+        candidate = (not legacy and self.args.metrics_only == "auto"
+                     and _metrics_only_supported(self.lib)
+                     and hasattr(self.lib, "strategy_metrics_extent_receipt_v1"))
+        status = setter(state, 1 if candidate else 0, 0x37 if candidate else 0x7f)
+        if status == 0:
+            self.streaming = candidate
+            return
+        if candidate:
+            status = setter(state, 0, 0x7f)
+        if status not in (0, -1):  # NotImplemented leaves the legacy defaults intact
+            _check_bench_run(self.lib, state)  # existing native-failure forwarding
+            raise _engine_invariant("the metrics preference could not be configured")
+
+    def own(self, state, sink, report):
+        self.active = state, sink, report
+
+    def close(self):
+        active, self.active = self.active, None
+        if active is not None:
+            state, sink, report = active
+            _free_sink_run(self.lib, state, report, sink)
+
+    def result(self, settings_receipt):
+        state, sink, report = self.active or (None, None, None)
+        return state, sink, report, settings_receipt
+
+    def add_annualization(self, out):
+        if self.annualization_endpoints is not None:
+            out["diagnostics"].update(_annualization_block(
+                self.annualization_endpoints, out["metrics"],
+                initial_capital=self.annualization_capital))
+
+    def execute(self, run, make_state, settings_receipt, abort):
+        state, sink, report = self.active
+        run(state, report)
+        self.failure = run_failure(self.lib, state)
+        if not self.streaming:
+            return self.result(settings_receipt)
+        failure = self.first_failure = self.failure
+        status_getter = getattr(self.lib, "strategy_last_run_status", None)
+        self.first_status = status_getter(state) if status_getter is not None else None
+        # Do not finalize again through a receipt getter after a latched
+        # scratch failure. Cancellation is invocation-wide and stays sticky.
+        if failure is not None and failure[1] in ("report_sink_failed", "run_aborted"):
+            return self.result(settings_receipt)
+        if abort is not None and abort.requested():
+            if failure is not None:
+                return self.result(settings_receipt)
+            raise abort.failure()
+        receipt = self.first_receipt = _metrics_extent_receipt(self.lib, state)
+        finalized_failure = run_failure(self.lib, state)
+        if finalized_failure is not None:
+            self.failure = finalized_failure
+            if finalized_failure[1] in ("report_sink_failed", "run_aborted"):
+                return self.result(settings_receipt)
+            failure = self.first_failure = finalized_failure
+            self.first_status = status_getter(state) if status_getter is not None else None
+        if receipt is not None:
+            if receipt.route == 2:  # admission retained the actual curve from bar one
+                return self.result(settings_receipt)
+            capital = _read_strategy_initial_capital(self.lib, state)
+            if _metrics_streaming_complete(receipt, report, failure, capital):
+                if (receipt.actual_extent.count > 0
+                        and (not report.equity_curve or report.equity_curve_len <= 0)
+                        and math.isfinite(report.metrics.equity.cagr)):
+                    # With validated exported capital the shared helper reads
+                    # only these three endpoint fields. No first mark is inferred.
+                    self.annualization_endpoints = (
+                        {"time_ms": receipt.actual_extent.first_time_ms},
+                        {"time_ms": receipt.actual_extent.last_time_ms,
+                         "equity": receipt.actual_last_equity},
+                    )
+                    self.annualization_capital = capital
+                return self.result(settings_receipt)
+        # LegacyRerun, an unavailable receipt or an invalid streaming proof:
+        # free report before state, then rebuild settings, trades/orders/lots,
+        # counters, outputs, caches and scratch regions on a fresh strategy.
+        # The loaded module, chart allocation, parsed inputs/overrides and
+        # captured syminfo/source values outlive both attempts.
+        self.close()
+        report = ReportC()
+        try:
+            state, sink = make_state(body=True, metrics_legacy=True)
+            self.own(state, sink, report)
+            recovered_settings = _release_settings_receipt(self.lib, state, self.checked)
+            if recovered_settings != settings_receipt:
+                raise _engine_invariant("the metrics recovery changed effective settings")
+            run(state, report)
+        except Exception:
+            if failure is not None:
+                self.failure = failure
+                return self.result(settings_receipt)
+            raise
+        recovered_failure = self.failure = run_failure(self.lib, state)
+        if recovered_failure is not None and recovered_failure[1] in ("report_sink_failed", "run_aborted"):
+            return self.result(recovered_settings)
+        # A failed authoritative attempt follows the ordinary failure writer.
+        # A failed speculative attempt may never turn into a successful report.
+        if failure is not None:
+            recovered_status = status_getter(state) if status_getter is not None else None
+            recovered = self.recovery_receipt = _metrics_extent_receipt(self.lib, state)
+            boundary = lambda r: (r.stop_boundary.completed_marks,
+                                  r.stop_boundary.input_index, r.stop_boundary.kind)
+            if (recovered_failure != failure or recovered_status != self.first_status
+                    or receipt is None or recovered is None
+                    or not receipt.stop_boundary.kind
+                    or not recovered.stop_boundary.kind
+                    or boundary(receipt) != boundary(recovered)):
+                # The current Off receipt cannot independently witness all
+                # native stops. Preserve the saved failure if proof is absent.
+                self.failure = failure
+        elif recovered_failure is None:
+            recovered = self.recovery_receipt = _metrics_extent_receipt(self.lib, state)
+            self.failure = run_failure(self.lib, state)
+            if self.failure is None and recovered is not None and recovered.route == 3:
+                raise _engine_invariant("the legacy metrics recovery requested another run")
+        return self.result(recovered_settings)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_host_main())

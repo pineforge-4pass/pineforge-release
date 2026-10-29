@@ -334,22 +334,26 @@ def _restore_original_doc_cleanup(text: str) -> str:
 
 
 def _restore_original_harness_manifest(text: str) -> str:
-    """Undo exactly CR-150's approved harness list changes for the old runtime pin."""
+    """Undo exactly the harness list additions for the original runtime pin."""
     changes = (
-        ("# The harness is the engine's runtime files for the pinned engine tag, all ten and nothing\n",
+        ("# The harness is the engine's runtime files for the pinned engine tag, all twelve and nothing\n",
          "# The harness is the engine's runtime files for the pinned engine tag, all eight and nothing\n"),
+        ("# bind_compiled_inventory.py; Python helpers import modules from this directory.\n",
+         "# bind_compiled_inventory.py; run_json.py imports the other modules from its own directory.\n"),
         ("COPY docker/pf_bars.py                  /opt/pineforge/bin/pf_bars.py\n", ""),
         ("COPY docker/pf_sink.py                  /opt/pineforge/bin/pf_sink.py\n", ""),
-        ("# must name exactly the ten files above, in sorted order, and nothing else may sit in bin/;\n",
+        ("COPY docker/pineforge_sink_finalize.py  /opt/pineforge/bin/pineforge_sink_finalize.py\n", ""),
+        ("COPY docker/pineforge_sink_to_json.py   /opt/pineforge/bin/pineforge_sink_to_json.py\n", ""),
+        ("# must name exactly the twelve files above, in sorted order, and nothing else may sit in bin/;\n",
          "# must name exactly the eight files above, in this order, and nothing else may sit in bin/;\n"),
-        ('    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \\\n',
+        ('    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_sink_finalize.py pineforge_sink_to_json.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \\\n',
          '    want="bind_compiled_inventory.py entrypoint.sh request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \\\n'),
-        ('    echo "harness: the ten files match HARNESS-SHA256SUMS"\n',
+        ('    echo "harness: the twelve files match HARNESS-SHA256SUMS"\n',
          '    echo "harness: the eight files match HARNESS-SHA256SUMS"\n'),
     )
     for current, original in changes:
         if text.count(current) != 1:
-            raise ValueError("expected exactly one approved CR-150 harness manifest fragment")
+            raise ValueError("expected exactly one approved harness manifest fragment")
         text = text.replace(current, original, 1)
     return text
 
@@ -453,7 +457,7 @@ class DockerfileTargetTest(unittest.TestCase):
     # plain `docker build` built then), kept the way _dockerfile_stages keeps a stage: from its FROM line
     # to the line before the next heading, bytes unchanged. It is pinned here, not read from git history,
     # because a shallow CI checkout and a main reached by a squash merge do not contain that commit.
-    # Restore exactly the approved CR-150 harness list changes before checking this historical pin.
+    # Restore exactly the harness list additions before checking this historical pin.
     ORIGINAL_RUNTIME_STAGE_SHA256 = "a632a13892deaeb350733b8ca8917b9889db69d0894a611498c3ab6da8c333a2"
 
     def test_release_stage_matches_original_runtime_after_notice_and_harness_changes(self):
@@ -463,14 +467,16 @@ class DockerfileTargetTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
                          "after restoring the one /usr/share/doc token and removing the marked "
-                         "notice and approved CR-150 harness changes, release must remain "
+                         "notice and approved harness changes, release must remain "
                          "byte for byte the original runtime stage")
 
-    def test_original_harness_normalization_requires_both_new_modules(self):
+    def test_original_harness_normalization_requires_all_added_modules(self):
         text = _without_sources_notice(_without_stage_alias(self.named["release"]))
         for name, copy_line in (
                 ("pf_bars.py", "COPY docker/pf_bars.py                  /opt/pineforge/bin/pf_bars.py\n"),
-                ("pf_sink.py", "COPY docker/pf_sink.py                  /opt/pineforge/bin/pf_sink.py\n")):
+                ("pf_sink.py", "COPY docker/pf_sink.py                  /opt/pineforge/bin/pf_sink.py\n"),
+                ("pineforge_sink_finalize.py", "COPY docker/pineforge_sink_finalize.py  /opt/pineforge/bin/pineforge_sink_finalize.py\n"),
+                ("pineforge_sink_to_json.py", "COPY docker/pineforge_sink_to_json.py   /opt/pineforge/bin/pineforge_sink_to_json.py\n")):
             self.assertEqual(text.count(copy_line), 1)
             self.assertEqual(text.count(" " + name + " "), 1)
             for scenario, altered in (
@@ -480,7 +486,7 @@ class DockerfileTargetTest(unittest.TestCase):
                     ("missing checksum name", text.replace(" " + name + " ", " ", 1))):
                 with self.subTest(module=name, scenario=scenario):
                     self.assertNotEqual(altered, text)
-                    with self.assertRaisesRegex(ValueError, "approved CR-150 harness manifest fragment"):
+                    with self.assertRaisesRegex(ValueError, "approved harness manifest fragment"):
                         _restore_original_harness_manifest(altered)
 
     def test_original_doc_cleanup_normalization_requires_one_exact_line(self):
@@ -756,21 +762,22 @@ source "$dispatch"
 
 
 class DockerfileHarnessTest(unittest.TestCase):
-    HARNESS = ("bind_compiled_inventory.py", "entrypoint.sh", "pf_bars.py", "pf_sink.py", "request_feed_inventory.py",
+    HARNESS = ("bind_compiled_inventory.py", "entrypoint.sh", "pf_bars.py", "pf_sink.py",
+               "pineforge_sink_finalize.py", "pineforge_sink_to_json.py", "request_feed_inventory.py",
                "run_execution_observer.py", "run_json.py", "run_phase_transport.py",
                "selected_window_plan.py", "selected_window_report.py")
-    # The complete byte-check RUN is the contract, including all ten names
+    # The complete byte-check RUN is the contract, including all twelve names
     # and the check for an extra bin/ file.
     CHECK = r'''RUN set -eu; \
     cd /opt/pineforge/bin; \
-    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \
+    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_sink_finalize.py pineforge_sink_to_json.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \
     listed="$(sed 's/^[0-9a-f]\{64\}  //' HARNESS-SHA256SUMS | tr '\n' ' ' | sed 's/ $//')"; \
     present="$(LC_ALL=C ls -A | grep -v '^HARNESS-SHA256SUMS$' | tr '\n' ' ' | sed 's/ $//')"; \
     if [ "$listed" != "$want" ] || [ "$present" != "$want" ]; then \
       echo "ERROR: HARNESS-SHA256SUMS lists [${listed}] and bin/ holds [${present}]; both must be exactly [${want}]" >&2; exit 1; \
     fi; \
     sha256sum -c --strict HARNESS-SHA256SUMS; \
-    echo "harness: the ten files match HARNESS-SHA256SUMS"'''
+    echo "harness: the twelve files match HARNESS-SHA256SUMS"'''
 
     def test_harness_copy_list_and_full_build_check_are_unchanged(self):
         dockerfile = (REPO / "docker" / "Dockerfile").read_text(encoding="utf-8")
@@ -923,12 +930,11 @@ class ReadmePairRuleTest(unittest.TestCase):
     # this value in the same commit.
     PAIR_RULE_SHA256 = "35b72f7f5c7466cfc212a71eaf05df98f45e92411fd34a67bfff761556c61601"
 
-    # The README was 430 lines when this pin was written; the harness documentation for engine 1.7.0 added 14
-    # lines (the pf_bars.py / pf_sink.py change) and the pair payload documentation added 2 more, so the published
-    # layout on main is 446 lines. The pair-rule digest above covers lines 215-244, which did not change.
-    def test_runner_documentation_keeps_the_446_line_published_layout(self):
+    # The converter documentation adds 30 lines to the previous 446-line layout.
+    # The pair-rule digest above still covers the unchanged lines 215-244.
+    def test_runner_documentation_keeps_the_476_line_layout(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
-        self.assertEqual(len(lines), 446)
+        self.assertEqual(len(lines), 476)
 
     def test_lines_215_to_244_are_byte_identical_to_the_published_rule(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)

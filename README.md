@@ -335,13 +335,15 @@ to 1.0.0 carry `Apache-2.0`.
 
 ## Harness / engine ABI
 
-`scripts/sync-harness.sh <engine-version>` vendors exactly ten engine runtime
+`scripts/sync-harness.sh <engine-version>` vendors exactly twelve engine runtime
 harness files into `docker/` from the pinned `pineforge-engine` tag, in sorted order:
 
 - `bind_compiled_inventory.py`
 - `entrypoint.sh`
 - `pf_bars.py`
 - `pf_sink.py`
+- `pineforge_sink_finalize.py`
+- `pineforge_sink_to_json.py`
 - `request_feed_inventory.py`
 - `run_execution_observer.py`
 - `run_json.py`
@@ -350,10 +352,38 @@ harness files into `docker/` from the pinned `pineforge-engine` tag, in sorted o
 - `selected_window_report.py`
 
 `handle-upstream.yml` syncs those files and regenerates `docker/HARNESS-SHA256SUMS`
-for the engine version it releases. The Dockerfile requires the same ten names
+for the engine version it releases. The Dockerfile requires the same twelve names
 and checks their installed bytes against the sums. It also refuses to build
 when `docker/run_json.py`'s `EXPECTED_PF_ABI` differs from
 `PF_ABI_VERSION` in the bundled engine headers.
+
+The image includes the sink-to-JSON converter beside `pf_sink.py`. Invoke the
+module with Python; `/opt/pineforge/bin` is not added to `PATH`, so no command
+wrappers are installed. Use a retained, completed sink and its captured stdout
+metadata, with a positive `--max-bytes` bound large enough for the sink:
+
+```bash
+docker run --rm --network=none \
+  --mount type=bind,src="$PWD",dst=/in,readonly \
+  --entrypoint python3 <image> \
+  -I -B -S /opt/pineforge/bin/pineforge_sink_to_json.py \
+  --in /in/report.pfsink --stdout-json /in/stdout.json \
+  --out - --max-bytes 67108864 > report.json
+```
+
+Accept `report.json` only when the command exits zero.
+
+On a build host, test a built image with the frozen engine vectors:
+
+```bash
+PINEFORGE_SINK_TEST_IMAGE=<image> \
+  python3 -m unittest discover -s tests -p 'test_release_sink_image.py' -v
+```
+
+The test compares converter stdout byte for byte with the engine's committed
+`valid.expected.to-json.json` and checks a captured C++ writer vector against
+its recorded equity and trade rows. The fixture provenance is documented in
+[`tests/fixtures/sink-vectors/README.md`](tests/fixtures/sink-vectors/README.md).
 
 ## HPO command and bundled licences
 
@@ -376,7 +406,7 @@ The artifact cache is writable by the image's existing user; use `--cache-dir`
 with a writable mount to retain compiled artifacts between containers.
 
 With no first argument `hpo`, the dispatcher passes every argument unchanged
-to the engine's existing `/opt/pineforge/bin/entrypoint.sh`. The ten engine
+to the engine's existing `/opt/pineforge/bin/entrypoint.sh`. The twelve engine
 harness files and their byte and ABI checks remain in place.
 
 For `--target hpo`, `HPO_VERSION` is a required build argument with no default,
