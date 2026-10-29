@@ -290,8 +290,8 @@ other 83 sources are set-02's), set-13 (set-12 with `perl` 5.36.0-7+deb12u4 from
 bookworm-security, first in 1.6.2; its other 83 sources are set-12's), set-14
 (set-13 with `expat` 2.5.0-1+deb12u5 from bookworm-security, first in 1.6.3; its
 other 83 sources are set-13's), set-15 (set-14 with `openssl` 3.0.22-1~deb12u2
-from bookworm-security, first in 1.8.0; its other 83 sources are set-14's) and
-the earliest release holding each bundle.
+from bookworm-security, first in 1.8.0; its other 83 sources are set-14's), set-16 (set-15 with
+`tzdata` 2026e-0+deb12u1 from bookworm-security; its other 83 sources are set-15's) and the earliest release holding each bundle.
 A new source set (an image package set not yet in docker/SOURCE-SETS.tsv) needs
 its bundle attached to an earlier or dedicated release before its first publish,
 because the guard looks up the holding release by tag before the new tag's
