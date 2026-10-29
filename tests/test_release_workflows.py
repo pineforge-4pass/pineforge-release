@@ -2318,7 +2318,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
         job = wf["jobs"]["redeliver"]
         self.assertEqual(job.get("if"), "github.ref == 'refs/heads/main'")
         self.assertNotIn("needs", job)
-        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["runs-on"], "gkp-2cpu-4gb-amd64")
         self.assertEqual(job["environment"], "release-automation")
         self.assertEqual(job["permissions"], {"contents": "write", "issues": "write"})
         self.assertEqual(job["concurrency"], {
@@ -2778,28 +2778,40 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         "release-rollback.yml": {"restore"},
     }
     RUNNER = ["self-hosted", "pf-ci", "pf-ci-release"]
-    # Only the read-only fanout probe uses the protected runner.
+    # Docker-dependent and unbound jobs stay hosted; environment-bound release
+    # jobs that need no Docker use the protected GKE runner.
     HOSTED_JOBS = {
-        ("facts-descriptions.yml", "descriptions"),
-        ("facts-fanout.yml", "web"),
-        ("facts-fanout.yml", "license"),
         ("handle-upstream.yml", "bump"),
         ("publish.yml", "tag-guard"),
         ("publish.yml", "prepare"),
         ("publish.yml", "publish"),
         ("publish.yml", "failure-report"),
         ("release-finalize.yml", "finalize"),
-        ("release-finalize.yml", "release-attempt-cleanup"),
-        ("release-finalize.yml", "notify-consumers"),
         ("release-finalize.yml", "report-compute-configuration-error"),
-        ("release-redeliver.yml", "redeliver"),
         ("release-receipts.yml", "plan"),
-        ("release-receipts.yml", "verify"),
-        ("release-reconcile.yml", "producers"),
         ("release-rollback.yml", "restore"),
     }
     PROTECTED_JOBS = {
+        ("facts-descriptions.yml", "descriptions"): "gkp-2cpu-4gb-amd64",
+        ("facts-fanout.yml", "web"): "gkp-2cpu-4gb-amd64",
+        ("facts-fanout.yml", "license"): "gkp-2cpu-4gb-amd64",
         ("release-fanout-check.yml", "check"): "gkp-2cpu-4gb-amd64",
+        ("release-finalize.yml", "release-attempt-cleanup"): "gkp-2cpu-4gb-amd64",
+        ("release-finalize.yml", "notify-consumers"): "gkp-2cpu-4gb-amd64",
+        ("release-redeliver.yml", "redeliver"): "gkp-2cpu-4gb-amd64",
+        ("release-receipts.yml", "verify"): "gkp-2cpu-4gb-amd64",
+        ("release-reconcile.yml", "producers"): "gkp-2cpu-4gb-amd64",
+    }
+    PROTECTED_ENVIRONMENTS = {
+        ("facts-descriptions.yml", "descriptions"): "descriptions",
+        ("facts-fanout.yml", "web"): "release-automation",
+        ("facts-fanout.yml", "license"): "release-automation",
+        ("release-fanout-check.yml", "check"): "release-automation",
+        ("release-finalize.yml", "release-attempt-cleanup"): "release-automation",
+        ("release-finalize.yml", "notify-consumers"): "release-automation",
+        ("release-redeliver.yml", "redeliver"): "release-automation",
+        ("release-receipts.yml", "verify"): "release-automation",
+        ("release-reconcile.yml", "producers"): "release-automation",
     }
     PROBE_INSTALL_STEP = {
         "name": "Install tools",
@@ -2814,6 +2826,21 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
             self.assertEqual(workflows[name]["jobs"][identity]["runs-on"], "ubuntu-latest",
                              f"{name}:{identity}: runs-on must be ubuntu-latest")
 
+    def assert_protected_job(self, name, identity, job):
+        self.assertEqual(job.get("environment"), self.PROTECTED_ENVIRONMENTS[(name, identity)],
+                         f"{name}:{identity}: environment must remain "
+                         f"{self.PROTECTED_ENVIRONMENTS[(name, identity)]}")
+        self.assertEqual(job.get("runs-on"), self.PROTECTED_JOBS[(name, identity)],
+                         f"{name}:{identity}: runs-on must be "
+                         f"{self.PROTECTED_JOBS[(name, identity)]}")
+
+    def assert_protected_runner_text(self, name, identity, text):
+        block = re.search(rf"(?ms)^  {re.escape(identity)}:\n(.*?)(?=^  [\w-]+:\n|\Z)",
+                          text)
+        self.assertIsNotNone(block, f"{name}:{identity}")
+        expected = f"    runs-on: {self.PROTECTED_JOBS[(name, identity)]}"
+        self.assertEqual(re.findall(r"(?m)^    runs-on:.*$", block[1]), [expected])
+
     def assert_release_runners(self, workflows):
         for name, identities in self.RELEASE_JOBS.items():
             workflow = workflows[name]
@@ -2826,19 +2853,34 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
             expected = identities | ({"notify-consumers"} if name == "publish.yml" else set())
             self.assertEqual(set(workflow["jobs"]), expected, f"{name}: release job inventory")
             for identity in sorted(identities):
-                runner = self.PROTECTED_JOBS.get((name, identity), "ubuntu-latest")
-                self.assertEqual(workflow["jobs"][identity]["runs-on"], runner,
-                                 f"{name}:{identity}: runs-on must be {runner}")
+                if (name, identity) in self.PROTECTED_JOBS:
+                    self.assert_protected_job(name, identity, workflow["jobs"][identity])
+                else:
+                    self.assertEqual(workflow["jobs"][identity]["runs-on"], "ubuntu-latest",
+                                     f"{name}:{identity}: runs-on must be ubuntu-latest")
         self.assert_hosted_runners(workflows)
 
     def test_release_jobs_pin_exact_runners_and_never_accept_pr_events(self):
-        self.assert_release_runners(self.release_workflows())
+        workflows = self.release_workflows()
+        self.assert_release_runners(workflows)
+        for name, identity in sorted(self.PROTECTED_JOBS):
+            self.assert_protected_runner_text(
+                name, identity, (WORKFLOWS / name).read_text(encoding="utf-8"))
 
-    def test_only_the_probe_is_protected_among_eighteen_release_jobs(self):
+    def test_protected_jobs_are_explicit_among_eighteen_release_jobs(self):
         self.assertEqual(self.PROTECTED_JOBS, {
+            ("facts-descriptions.yml", "descriptions"): "gkp-2cpu-4gb-amd64",
+            ("facts-fanout.yml", "web"): "gkp-2cpu-4gb-amd64",
+            ("facts-fanout.yml", "license"): "gkp-2cpu-4gb-amd64",
             ("release-fanout-check.yml", "check"): "gkp-2cpu-4gb-amd64",
+            ("release-finalize.yml", "release-attempt-cleanup"): "gkp-2cpu-4gb-amd64",
+            ("release-finalize.yml", "notify-consumers"): "gkp-2cpu-4gb-amd64",
+            ("release-redeliver.yml", "redeliver"): "gkp-2cpu-4gb-amd64",
+            ("release-receipts.yml", "verify"): "gkp-2cpu-4gb-amd64",
+            ("release-reconcile.yml", "producers"): "gkp-2cpu-4gb-amd64",
         })
-        self.assertEqual(len(self.HOSTED_JOBS), 17)
+        self.assertEqual(len(self.HOSTED_JOBS), 9)
+        self.assertEqual(len(self.PROTECTED_JOBS), 9)
         self.assertTrue(self.HOSTED_JOBS.isdisjoint(self.PROTECTED_JOBS))
         self.assertEqual(self.HOSTED_JOBS | set(self.PROTECTED_JOBS), {
             (name, identity)
@@ -2897,10 +2939,10 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         text = (WORKFLOWS / "release-fanout-check.yml").read_text(encoding="utf-8")
         self.assert_protected_probe_runner_text(text)
 
-    def test_protected_probe_refuses_hosted_general_labels_and_fallbacks(self):
+    def test_protected_jobs_refuse_hosted_general_labels_and_fallbacks(self):
         original = self.release_workflows()
         self.assert_release_runners(original)
-        for runner in (
+        invalid_runners = (
             "ubuntu-latest",
             "gke-2cpu-4gb-amd64",
             "gke-4cpu-8gb-amd64",
@@ -2911,12 +2953,25 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
             {"group": "protected", "labels": "gkp-2cpu-4gb-amd64"},
             "${{ 'gkp-2cpu-4gb-amd64' }}",
             "${{ github.event_name == 'workflow_dispatch' && 'gkp-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
-        ):
-            with self.subTest(runner=runner):
-                mutant = copy.deepcopy(original)
-                mutant["release-fanout-check.yml"]["jobs"]["check"]["runs-on"] = runner
-                with self.assertRaisesRegex(AssertionError, "runs-on must be gkp-2cpu-4gb-amd64"):
-                    self.assert_release_runners(mutant)
+        )
+        for (name, identity), expected in sorted(self.PROTECTED_JOBS.items()):
+            for runner in invalid_runners:
+                with self.subTest(workflow=name, job=identity, runner=runner):
+                    mutant = copy.deepcopy(original)
+                    mutant[name]["jobs"][identity]["runs-on"] = runner
+                    with self.assertRaisesRegex(
+                            AssertionError, re.escape(f"runs-on must be {expected}")):
+                        self.assert_release_runners(mutant)
+
+    def test_protected_jobs_refuse_missing_environment(self):
+        original = self.release_workflows()
+        for (name, identity), expected in sorted(self.PROTECTED_ENVIRONMENTS.items()):
+            mutant = copy.deepcopy(original)
+            mutant[name]["jobs"][identity].pop("environment", None)
+            with self.subTest(workflow=name, job=identity):
+                with self.assertRaisesRegex(
+                        AssertionError, re.escape(f"environment must remain {expected}")):
+                    self.assert_protected_job(name, identity, mutant[name]["jobs"][identity])
 
     def test_protected_probe_refuses_quoted_folded_and_expression_runner_lines(self):
         text = (WORKFLOWS / "release-fanout-check.yml").read_text(encoding="utf-8")
@@ -3015,9 +3070,9 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
 
     def test_release_finalize_stops_the_apt_timers_before_anything_else(self):
         # LB-504: apt-daily-upgrade.timer re-execs systemd 20-25 minutes after
-        # boot and kills the runner, and the finalizer runs hourly on
-        # ubuntu-latest (owner 10-21). Both of its jobs must stop the timers before any
-        # checkout, secret or repository code.
+        # boot and kills the runner. The hosted buildx finalizer and protected
+        # notification job must both stop the timers before any checkout, secret or
+        # repository code.
         jobs = _workflow("release-finalize.yml")["jobs"]
         for identity in ("finalize", "notify-consumers"):
             with self.subTest(job=identity):
@@ -3218,21 +3273,23 @@ class PrTierWorkflowTest(unittest.TestCase):
         (github.event_name != 'pull_request' ||
          (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
         fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}"""
-    # Release routes stay hosted except for the read-only protected probe.
+    # Docker-dependent and unbound release routes stay hosted; environment-bound
+    # routes that need no Docker use the protected GKE label.
     EXEMPT_RUNNERS = {
-        "facts-descriptions.yml": {"descriptions": "ubuntu-latest"},
-        "facts-fanout.yml": {"web": "ubuntu-latest", "license": "ubuntu-latest"},
+        "facts-descriptions.yml": {"descriptions": "gkp-2cpu-4gb-amd64"},
+        "facts-fanout.yml": {"web": "gkp-2cpu-4gb-amd64", "license": "gkp-2cpu-4gb-amd64"},
         "handle-upstream.yml": {"bump": "ubuntu-latest"},
         "publish.yml": {"tag-guard": "ubuntu-latest", "prepare": "ubuntu-latest",
                         "publish": "ubuntu-latest", "notify-consumers": None,
                         "failure-report": "ubuntu-latest"},
-        "release-finalize.yml": {"finalize": "ubuntu-latest", "release-attempt-cleanup": "ubuntu-latest",
-                                 "notify-consumers": "ubuntu-latest",
+        "release-finalize.yml": {"finalize": "ubuntu-latest",
+                                 "release-attempt-cleanup": "gkp-2cpu-4gb-amd64",
+                                 "notify-consumers": "gkp-2cpu-4gb-amd64",
                                  "report-compute-configuration-error": "ubuntu-latest"},
         "release-fanout-check.yml": {"check": "gkp-2cpu-4gb-amd64"},
-        "release-redeliver.yml": {"redeliver": "ubuntu-latest"},
-        "release-receipts.yml": {"plan": "ubuntu-latest", "verify": "ubuntu-latest"},
-        "release-reconcile.yml": {"producers": "ubuntu-latest"},
+        "release-redeliver.yml": {"redeliver": "gkp-2cpu-4gb-amd64"},
+        "release-receipts.yml": {"plan": "ubuntu-latest", "verify": "gkp-2cpu-4gb-amd64"},
+        "release-reconcile.yml": {"producers": "gkp-2cpu-4gb-amd64"},
         "release-rollback.yml": {"restore": "ubuntu-latest"},
     }
     LEGACY_LABEL_JOBS = {
@@ -4695,7 +4752,8 @@ class PrTierWorkflowTest(unittest.TestCase):
                         "${{ github.event_name == 'workflow_dispatch' && 'gkp-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
                     ]
                     invalid_runners.append(
-                        "ubuntu-latest" if (name, identity) == ("release-fanout-check.yml", "check")
+                        "ubuntu-latest"
+                        if expected[identity] == "gkp-2cpu-4gb-amd64"
                         else "gkp-2cpu-4gb-amd64")
                     for runner in invalid_runners:
                         with self.subTest(runner=runner):

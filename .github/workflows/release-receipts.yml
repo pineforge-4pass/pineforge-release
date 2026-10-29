@@ -45,8 +45,8 @@ jobs:
   verify:
     needs: plan
     if: needs.plan.outputs.consumers != '[]'
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
-    runs-on: ubuntu-latest
+    # No Docker needed; runs on the protected GKE runner (runner group gke-protected).
+    runs-on: gkp-2cpu-4gb-amd64
     environment: release-automation
     permissions:
       contents: write

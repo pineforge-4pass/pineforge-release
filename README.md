@@ -194,9 +194,22 @@ non-commit or side-branch tag fails before tagged checkout or publication.
 Later tagged checkouts use its verified SHA with no persisted credentials.
 Pushing a tag alone does not start publication.
 
-The release, facts-automation and PR-CI jobs use GitHub-hosted runners.
-The `authz` jobs use `runs-on: ubuntu-24.04`; the other jobs use
-`runs-on: ubuntu-latest`, including candidate preparation, receipt planning and failure reporting; the PR-CI jobs that also run on pushes to main use the push-triggered runner `runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}`.
+The environment-bound jobs that need no Docker use the protected
+GKE runner `runs-on: gkp-2cpu-4gb-amd64`: `facts-descriptions.yml`'s
+`descriptions`, `facts-fanout.yml`'s `web` and `license`,
+`release-receipts.yml`'s `verify`, `release-reconcile.yml`'s `producers`,
+`release-redeliver.yml`'s `redeliver`, and `release-finalize.yml`'s
+`notify-consumers` and `release-attempt-cleanup`. Their environments remain
+unchanged.
+The four `publish.yml` jobs stay on `runs-on: ubuntu-latest` as one publication
+path; its `publish` job uses Docker, Buildx and QEMU. The same hosted route
+applies to `release-finalize.yml:finalize`, `release-rollback.yml:restore`,
+and `handle-upstream.yml:bump`, which use Docker, Buildx, GHCR or Docker
+manifest inspection; GKE Docker support is unproven. `release-receipts.yml:plan`
+and `release-finalize.yml:report-compute-configuration-error` also stay hosted
+because they have no `environment:`.
+The `authz` jobs use `runs-on: ubuntu-24.04`; the other PR jobs use
+`runs-on: ubuntu-latest`; the PR-CI jobs that also run on pushes to main use the push-triggered runner `runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}`.
 Those other jobs have the standing R6/rule-B exception (owner decision 10-21, msg 1562390657274748981).
 The [release runner policy](docs/release-chain.md#release-runner-isolation) lists
 the jobs and the class boundary.
