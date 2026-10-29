@@ -8,20 +8,39 @@ or deploy consumers.
 
 ## Release runner isolation
 
-Owner decision 10-21 (msg 1562390657274748981) sets these release and facts-automation
-jobs to the literal `runs-on: ubuntu-latest`, a standing R6/rule-B exception
-for pineforge-release:
+Owner decision 10-21 (msg 1562390657274748981) sets the remaining GitHub-hosted
+release and facts-automation jobs to the literal `runs-on: ubuntu-latest`, a
+standing R6/rule-B exception for pineforge-release:
 
-| Workflow | Jobs |
+| Workflow | GitHub-hosted jobs that stay on `ubuntu-latest` |
+|---|---|
+| `handle-upstream.yml` | `bump` |
+| `publish.yml` | `tag-guard`, `prepare`, `publish`, `failure-report` |
+| `release-finalize.yml` | `finalize`, `report-compute-configuration-error` |
+| `release-receipts.yml` | `plan` |
+| `release-rollback.yml` | `restore` |
+
+The protected GKE runner `runs-on: gkp-2cpu-4gb-amd64` carries the
+environment-bound jobs that need no Docker:
+
+| Workflow | Protected GKE jobs |
 |---|---|
 | `facts-descriptions.yml` | `descriptions` |
 | `facts-fanout.yml` | `web`, `license` |
-| `handle-upstream.yml` | `bump` |
-| `publish.yml` | `tag-guard`, `prepare`, `publish`, `failure-report` |
-| `release-finalize.yml` | `finalize`, `notify-consumers` |
-| `release-receipts.yml` | `plan`, `verify` |
+| `release-fanout-check.yml` | `check` |
+| `release-finalize.yml` | `release-attempt-cleanup`, `notify-consumers` |
+| `release-redeliver.yml` | `redeliver` |
+| `release-receipts.yml` | `verify` |
 | `release-reconcile.yml` | `producers` |
-| `release-rollback.yml` | `restore` |
+
+The four `publish.yml` jobs remain hosted as one release path; its `publish`
+job builds and pushes images with QEMU and Buildx. `release-finalize.yml:finalize`
+and `release-rollback.yml:restore` use Buildx and GHCR, while
+`handle-upstream.yml:bump` uses Docker login and `docker manifest inspect`.
+GKE Docker support is unproven, so those jobs stay hosted until a canary proves
+it. `release-receipts.yml:plan` and
+`release-finalize.yml:report-compute-configuration-error` stay hosted because
+they have no `environment:`.
 
 The former release class has its own runner group restricted to selected workflows at protected
 refs, its own no-role service account, and one job per runner, with nothing shared
@@ -53,6 +72,8 @@ finalization; failure reporting first refuses to check out or run repository
 code unless the guard succeeded.
 The reusable `release-finalize.yml` call inherits the caller's main ref.
 Tag pushes, release events and `workflow_run` do not start publication.
+Every moved job's workflow runs on refs/heads/main (push main, schedule, workflow_dispatch, repository_dispatch, or workflow_call from publish.yml which is dispatched from main). A dispatch with `--ref <tag>` would not be admitted (the runner-group entries name `@refs/heads/main` only) and the job would queue forever.
+Dispatch these from main; the tag is an input, never --ref <tag>.
 
 ## Receive, verify and replay
 
@@ -1167,8 +1188,10 @@ cancelled or failed authz blocks merging.
 A member's own fork fails the canonical authz check.
 The existing `merge_group` trigger remains
 configured and passes the canonical authz script. macOS stays hosted
-(no hardware); this repository has no macOS jobs. Credential/release jobs
-use `ubuntu-latest` per owner decision 10-21, including publication workflows.
+(no hardware); this repository has no macOS jobs. Credential/release jobs that
+remain hosted use `ubuntu-latest` per owner decision 10-21. The environment-bound
+jobs listed in the release runner policy use `gkp-2cpu-4gb-amd64`; Docker-dependent
+publication jobs remain hosted while GKE Docker support is unproven.
 
 | Name / setting | Scope | Purpose |
 |---|---|---|
