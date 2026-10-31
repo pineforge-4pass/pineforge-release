@@ -413,6 +413,10 @@ class GuardPolicyPublishTest(unittest.TestCase):
                 "Historical Dockerfile fixtures quote build commands; they do not build images.",
             "tests/test_release_workflows.py":
                 "Workflow and shell assertion fixtures inspect builds without invoking a builder.",
+            "tools/release-dry-run/wfrun.py":
+                "Stubs docker/build-push-action and records every non-empty build-args "
+                "line of the workflow step verbatim; it never names a specific build arg, "
+                "so the arg reaches it from publish.yml (checked above) without a mention here.",
         }
         # Both tools handle workflow build actions indirectly, without spelling
         # the Dockerfile path themselves; include them even if grep misses it.
