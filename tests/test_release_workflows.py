@@ -973,6 +973,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         self.assertIn("${{ steps.toolchain.outputs.args }}\n", build["with"]["build-args"])
         for existing in ("ENGINE_VERSION=${{ steps.pins.outputs.engine }}",
                          "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
+                         "GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}",
                          "${{ steps.pair.outputs.hpo_version_arg }}",
                          "${{ steps.binding.outputs.hpo_wheel_arg }}",
                          "${{ steps.binding.outputs.hpo_sdist_arg }}",
@@ -1025,6 +1026,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                 arguments = self.named[name]["with"]["build-args"].splitlines()
                 for expected in ("ENGINE_VERSION=${{ steps.pins.outputs.engine }}",
                                  "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
+                                 "GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}",
                                  "RELEASE_VERSION=${{ env.RELEASE_TAG }}"):
                     self.assertIn(expected, arguments, name + " must receive " + expected)
 
@@ -1533,6 +1535,8 @@ class HpoWorkflowTest(unittest.TestCase):
     def fixture(self, root):
         (root / "scripts").mkdir()
         shutil.copyfile(REPO / "scripts" / "release_pair.py", root / "scripts" / "release_pair.py")
+        (root / "docker").mkdir()
+        shutil.copyfile(REPO / "docker" / "GUARD-POLICY-SETS.pin", root / "docker" / "GUARD-POLICY-SETS.pin")
         (root / "VERSION").write_text("1.5.9\n", encoding="utf-8")
         (root / "state").mkdir()
         (root / "gitconfig-empty").touch()

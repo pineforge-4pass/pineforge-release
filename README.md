@@ -391,12 +391,12 @@ its recorded equity and trade rows. The fixture provenance is documented in
 backtest image: the last `default` stage aliases the runtime, `release`.
 The default image differs from 1.5.0 only by the source notice, the two source
 labels and the retained Debian package copyright files.
-Only `ENGINE_VERSION` and `CODEGEN_VERSION` are required for that build, and its
-entrypoint remains `/opt/pineforge/bin/entrypoint.sh`.
+`ENGINE_VERSION`, `CODEGEN_VERSION` and `GUARD_POLICY_SETS_SHA256` are required for that build, and its
+entrypoint remains `/opt/pineforge/bin/entrypoint.sh`. The guard policy value is read from `docker/GUARD-POLICY-SETS.pin`, computed privately and never re-derived here; the image records it in the `io.pineforge.guard.policy-sets-sha256` label and in `/opt/pineforge/guard-policy.sha256`.
 
 Use `--target hpo` to build the FULL image with the HPO command. It requires
-`ENGINE_VERSION`, `CODEGEN_VERSION`, `HPO_VERSION` and all six toolchain arguments
-listed below. That image accepts `docker run <image> hpo <subcommand>` for
+`ENGINE_VERSION`, `CODEGEN_VERSION`, `GUARD_POLICY_SETS_SHA256`, `HPO_VERSION` and
+all six toolchain arguments listed below. That image accepts `docker run <image> hpo <subcommand>` for
 `space-info`, `compile`, `run` and `warm-encode`. For example, inspect each
 command's inputs with `docker run --rm <image> hpo compile --help`. The HPO
 command has the C++ compiler, Eigen, engine headers and static library needed

@@ -312,6 +312,28 @@ def _without_stage_alias(stage: DockerStage) -> str:
                   r"\1", stage.text, count=1, flags=re.M | re.I)
 
 
+def _without_guard_policy(text: str) -> str:
+    """Remove exactly the approved guard fragment before checking the historical runtime pin."""
+    argument = "ARG GUARD_POLICY_SETS_SHA256\n"
+    labels = (
+        '      io.pineforge.codegen.version="${CODEGEN_VERSION}" \\\n'
+        '      io.pineforge.guard.policy-sets-sha256="${GUARD_POLICY_SETS_SHA256}"\n'
+    )
+    run = r'''RUN set -eu; \
+    printf '%s' "${GUARD_POLICY_SETS_SHA256}" | grep -Eq '^[0-9a-f]{64}$'; \
+    test "$(printf '%s' "${GUARD_POLICY_SETS_SHA256}")" = "${GUARD_POLICY_SETS_SHA256}"; \
+    [ -d /opt/pineforge ] || mkdir -p /opt/pineforge; \
+    printf '%s\n' "${GUARD_POLICY_SETS_SHA256}" > /opt/pineforge/guard-policy.sha256; \
+    chmod 0644 /opt/pineforge/guard-policy.sha256; \
+    chown 0:0 /opt/pineforge/guard-policy.sha256; \
+    test "$(cat /opt/pineforge/guard-policy.sha256)" = "${GUARD_POLICY_SETS_SHA256}"''' + "\n"
+    if text.count(argument) != 1 or text.count(labels) != 1 or text.count(run + "\n") != 1:
+        raise ValueError("expected exactly one approved guard policy runtime fragment")
+    text = text.replace(argument, "", 1)
+    text = text.replace(labels, '      io.pineforge.codegen.version="${CODEGEN_VERSION}"\n', 1)
+    return text.replace(run + "\n", "", 1)
+
+
 def _without_sources_notice(text: str) -> str:
     begin = "# --- sources notice (begin)\n"
     end = "# --- sources notice (end)\n"
@@ -458,10 +480,11 @@ class DockerfileTargetTest(unittest.TestCase):
     # to the line before the next heading, bytes unchanged. It is pinned here, not read from git history,
     # because a shallow CI checkout and a main reached by a squash merge do not contain that commit.
     # Restore exactly the harness list additions before checking this historical pin.
+    # The approved guard-policy fragment is removed byte for byte by _without_guard_policy.
     ORIGINAL_RUNTIME_STAGE_SHA256 = "a632a13892deaeb350733b8ca8917b9889db69d0894a611498c3ab6da8c333a2"
 
     def test_release_stage_matches_original_runtime_after_notice_and_harness_changes(self):
-        text = _without_sources_notice(_without_stage_alias(self.named["release"]))
+        text = _without_guard_policy(_without_sources_notice(_without_stage_alias(self.named["release"])))
         text = _restore_original_doc_cleanup(text)
         text = _restore_original_harness_manifest(text)
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -509,6 +532,7 @@ class DockerfileTargetTest(unittest.TestCase):
         text = _without_stage_alias(self.named["release"])
         stripped = _without_sources_notice(text)
         self.assertNotEqual(text, stripped)
+        stripped = _without_guard_policy(stripped)
         stripped = _restore_original_doc_cleanup(stripped)
         stripped = _restore_original_harness_manifest(stripped)
         self.assertNotEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -541,7 +565,7 @@ class DockerfileTargetTest(unittest.TestCase):
                                "RUN mkdir -p /opt/pineforge/bin /unexpected\n", 1)
         self.assertNotEqual(altered, text)
         normalized = _restore_original_harness_manifest(
-            _restore_original_doc_cleanup(_without_sources_notice(altered)))
+            _restore_original_doc_cleanup(_without_guard_policy(_without_sources_notice(altered))))
         self.assertNotEqual(hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
 

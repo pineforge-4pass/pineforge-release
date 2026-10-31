@@ -165,6 +165,14 @@ jobs:
           facts="$(python3 scripts/release_pair.py info "$REF")"
           hpo_pairing="$(printf '%s\n' "$facts" | sed -n 's/^hpo_pairing=//p')"
           e=""; c=""; h=""
+          guard_policy_sets="$(cat docker/GUARD-POLICY-SETS.pin)"
+          guard_policy_lines="$(wc -l < docker/GUARD-POLICY-SETS.pin)"
+          guard_policy_bytes="$(wc -c < docker/GUARD-POLICY-SETS.pin)"
+          if [ "$guard_policy_lines" -ne 1 ] || [ "$guard_policy_bytes" -ne 65 ] ||
+             ! printf '%s' "$guard_policy_sets" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::docker/GUARD-POLICY-SETS.pin must contain exactly one line of 64 lowercase hex characters"
+            exit 1
+          fi
           # Trust the tag message ONLY if REF is an ANNOTATED tag — a lightweight
           # tag's %(contents:body) leaks the target commit body, not our keys.
           if [ "$(git cat-file -t "$REF" 2>/dev/null || true)" = tag ]; then
@@ -192,7 +200,7 @@ jobs:
           if [ "$hpo_pairing" = true ]; then
             semver "$h" || { echo "::error::tag ${REF} (engine ${e} + codegen ${c}) requires valid hpo= in its annotated message; got '${h}'"; exit 1; }
           fi
-          { echo "engine=$e"; echo "codegen=$c"; if [ "$hpo_pairing" = true ]; then echo "hpo=$h"; fi; } >> "$GITHUB_OUTPUT"
+          { echo "engine=$e"; echo "codegen=$c"; if [ "$hpo_pairing" = true ]; then echo "hpo=$h"; fi; echo "guard_policy_sets=$guard_policy_sets"; } >> "$GITHUB_OUTPUT"
           echo "pins: engine=$e codegen=$c${h:+ hpo=$h}"
 
       # From 1.0.0 on engine and codegen share one version, prerelease included,
@@ -359,6 +367,7 @@ jobs:
           build-args: |
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
             RELEASE_VERSION=${{ env.RELEASE_TAG }}
             RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: type=gha,scope=release-amd64
@@ -378,6 +387,7 @@ jobs:
           build-args: |
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
             RELEASE_VERSION=${{ env.RELEASE_TAG }}
             RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: type=gha,scope=release-arm64
@@ -398,6 +408,7 @@ jobs:
           build-args: |
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
             ${{ steps.pair.outputs.hpo_version_arg }}
             ${{ steps.binding.outputs.hpo_wheel_arg }}
             ${{ steps.binding.outputs.hpo_sdist_arg }}
@@ -422,6 +433,7 @@ jobs:
           build-args: |
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
             ${{ steps.pair.outputs.hpo_version_arg }}
             ${{ steps.binding.outputs.hpo_wheel_arg }}
             ${{ steps.binding.outputs.hpo_sdist_arg }}
@@ -481,6 +493,7 @@ jobs:
           build-args: |
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
             RELEASE_VERSION=${{ env.RELEASE_TAG }}
             RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: |
@@ -505,6 +518,7 @@ jobs:
           build-args: |
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
+            GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
             ${{ steps.pair.outputs.hpo_version_arg }}
             ${{ steps.binding.outputs.hpo_wheel_arg }}
             ${{ steps.binding.outputs.hpo_sdist_arg }}
