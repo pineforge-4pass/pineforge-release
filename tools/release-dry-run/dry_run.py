@@ -670,8 +670,11 @@ def _triple_order(w, order, version):
                                                 cwd=w.origin, env=w.env))
     p = w.publish(tag)
     builds = p.calls(tool="docker/build-push-action")
+    guard_policy_sets = (w.opts.checkout / "docker" / "GUARD-POLICY-SETS.pin").read_text(
+        encoding="utf-8").rstrip("\n")
     expected = {f"ENGINE_VERSION={version}", f"CODEGEN_VERSION={version}", f"HPO_VERSION={pep440}",
                 f"HPO_WHEEL_SHA256={digest}",
+                f"GUARD_POLICY_SETS_SHA256={guard_policy_sets}",
                 f"RELEASE_VERSION={tag}", f"RELEASE_GIT_SHA={w.rev(tag)}"}
     w.check("publish checks all pins, selects hpo and passes its version and wheel digest",
             p.ok and p.step("pair").get("hpo") == version and p.step("pair").get("hpo_pep440") == pep440
@@ -747,11 +750,11 @@ def triple(w):
         w.record_tag(version)
         p = w.publish(f"v{version}")
         builds = p.calls(tool="docker/build-push-action")
-        w.check(f"landed v{version} without hpo= still publishes with the old build arguments",
+        w.check(f"landed v{version} without hpo= still publishes with the base build arguments",
                 p.ok and w.pins(f"v{version}", include_hpo=True) == (version, version, None)
                 and "hpo" not in p.step("pair") and len(builds) == 1
                 and builds[0].get("target") is None
-                and len(builds[0]["build_args"]) == 4
+                and len(builds[0]["build_args"]) == 5
                 and not any(arg.startswith("HPO_") for arg in builds[0]["build_args"]), (p.failed_step, builds))
     before, main = w.tags(), w.rev("main")
     for version in ("0.13.2", "1.5.0", "1.5.9", "1.6.0-alpha.1", "1.6.0a1", "1.6.0-beta.1", "1.6.0b1"):

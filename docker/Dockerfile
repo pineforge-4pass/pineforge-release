@@ -15,7 +15,8 @@
 # without the build-args is an error (guards below), never a silent empty value:
 #   ENGINE_VERSION   pineforge-engine release whose static-lib tarball is fetched
 #   CODEGEN_VERSION  pineforge-codegen PyPI version baked in
-# The default target needs only ENGINE_VERSION and CODEGEN_VERSION above.
+#   GUARD_POLICY_SETS_SHA256  pinned guard policy set digest from docker/GUARD-POLICY-SETS.pin
+# The default target needs ENGINE_VERSION, CODEGEN_VERSION and GUARD_POLICY_SETS_SHA256 above.
 # --target hpo additionally requires HPO_VERSION (no source default) and the
 # six toolchain package version build-args chosen on the signed box.
 # HPO_WHEEL_SHA256 checks the downloaded wheel when supplied to that target.
@@ -65,6 +66,7 @@ RUN set -eux; \
 FROM debian:bookworm-slim AS release
 ARG ENGINE_VERSION
 ARG CODEGEN_VERSION
+ARG GUARD_POLICY_SETS_SHA256
 ARG RELEASE_VERSION=unknown
 ARG RELEASE_GIT_SHA=unknown
 ARG RELEASE_BUILD_DATE=unknown
@@ -78,7 +80,17 @@ LABEL org.opencontainers.image.title="pineforge-release" \
       org.opencontainers.image.source="https://github.com/pineforge-4pass/pineforge-release" \
       org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-PineForge-Source-License-1.2" \
       io.pineforge.engine.version="${ENGINE_VERSION}" \
-      io.pineforge.codegen.version="${CODEGEN_VERSION}"
+      io.pineforge.codegen.version="${CODEGEN_VERSION}" \
+      io.pineforge.guard.policy-sets-sha256="${GUARD_POLICY_SETS_SHA256}"
+
+RUN set -eu; \
+    printf '%s' "${GUARD_POLICY_SETS_SHA256}" | grep -Eq '^[0-9a-f]{64}$'; \
+    test "$(printf '%s' "${GUARD_POLICY_SETS_SHA256}")" = "${GUARD_POLICY_SETS_SHA256}"; \
+    [ -d /opt/pineforge ] || mkdir -p /opt/pineforge; \
+    printf '%s\n' "${GUARD_POLICY_SETS_SHA256}" > /opt/pineforge/guard-policy.sha256; \
+    chmod 0644 /opt/pineforge/guard-policy.sha256; \
+    chown 0:0 /opt/pineforge/guard-policy.sha256; \
+    test "$(cat /opt/pineforge/guard-policy.sha256)" = "${GUARD_POLICY_SETS_SHA256}"
 
 # g++ + Eigen compile the transpiled generated.cpp against the static lib;
 # python3 runs the transpiler + the JSON harness. No pip, no network at runtime.
