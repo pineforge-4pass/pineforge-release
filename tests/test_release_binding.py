@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import datetime as dt
 import hashlib
 import io
 import json
@@ -1903,6 +1904,10 @@ class ReconciliationTests(unittest.TestCase):
                 super().__init__()
                 self.dispatched = []
                 self.hub_tag = False
+                self.hub_ref = {"type": "tag", "sha": "a" * 40}
+                self.hub_annotation = {"tagger": {"date": "2026-10-16T00:00:00Z"},
+                                       "object": {"type": "commit", "sha": "d" * 40}}
+                self.issues, self.issue_writes = [], []
 
             def tag_commit(self, repo, tag):
                 if repo == contract.HUB:
@@ -1912,12 +1917,22 @@ class ReconciliationTests(unittest.TestCase):
                 return super().tag_commit(repo, tag)
 
             def pages(self, route):
+                if route == f"repos/{contract.HUB}/issues?state=all":
+                    return copy.deepcopy(self.issues)
                 role = next(role for role, repo in artifacts.PRODUCERS.items() if route == f"repos/{repo}/releases")
                 return [self.releases[role], {"tag_name": "v1.5.9", "draft": False, "prerelease": False},
                         {"tag_name": "v9.9.9", "draft": True, "prerelease": False},
                         {"tag_name": "v9.9.9rc1" if role == "hpo" else "v9.9.9-rc.1", "draft": False, "prerelease": True}]
 
             def api(self, route, **kwargs):
+                if route == f"repos/{contract.HUB}/git/ref/tags/v1.6.0":
+                    return {"object": self.hub_ref}
+                if route == f"repos/{contract.HUB}/git/tags/{'a' * 40}":
+                    return self.hub_annotation
+                if route == f"repos/{contract.HUB}/issues" and kwargs.get("method") == "POST":
+                    self.issue_writes.append(copy.deepcopy(kwargs["data"]))
+                    self.issues.append({"number": len(self.issues) + 1, "state": "open", **kwargs["data"]})
+                    return self.issues[-1]
                 if route == f"repos/{contract.HUB}/dispatches":
                     assert kwargs["method"] == "POST"
                     self.dispatched.append(kwargs["data"])
@@ -1954,11 +1969,107 @@ class ReconciliationTests(unittest.TestCase):
     def test_existing_hub_tag_skips_all_producer_downloads_and_redispatches(self):
         client = self.client()
         client.hub_tag = True
+        store = MemoryStore(fixture_manifest())
         with patch.object(pipeline.Path, "read_text", return_value="1.5.9\n"), \
                 patch.object(client, "download", side_effect=AssertionError("handled version must not download artifacts")):
             for _ in range(3):
-                pipeline.reconcile(client, None)
+                pipeline.reconcile(client, store)
         self.assertEqual(client.dispatched, [])
+        self.assertEqual(client.issue_writes, [])
+
+    def tagged_reconcile(self, client, store, registry):
+        with patch.object(pipeline.Path, "read_text", return_value="1.5.9\n"), \
+                patch.object(pipeline, "Registry", return_value=registry):
+            pipeline.reconcile(client, store)
+
+    def test_tag_without_candidate_or_image_reports_only_after_grace_and_deduplicates(self):
+        class Clock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 11, 2, 12, tzinfo=dt.timezone.utc)
+        for offset, expected in ((-1, 0), (0, 0), (1, 1)):
+            client = self.client()
+            client.hub_tag = True
+            stamp = Clock.now() - dt.timedelta(minutes=pipeline.PUBLISH_START_GRACE_MINUTES + offset)
+            client.hub_annotation["tagger"]["date"] = stamp.isoformat()
+            with self.subTest(offset=offset), patch.object(pipeline.dt, "datetime", Clock), \
+                    patch.object(pipeline, "producer", side_effect=AssertionError("tagged release must not verify producers")), \
+                    patch.dict(os.environ, {"RELEASE_REPORT_OWNER": "", "RELEASE_REPORT_TOKEN": "", "GITHUB_RUN_ID": "42"}):
+                for _ in range(2):
+                    self.tagged_reconcile(client, MemoryStore(), MemoryRegistry())
+            self.assertEqual(len(client.issue_writes), expected)
+            self.assertEqual(client.dispatched, [])
+            if expected:
+                issue = client.issue_writes[0]
+                self.assertIn("<!-- pineforge-release-chain:publish-start-v1.6.0 -->", issue["body"])
+                self.assertIn("no candidate draft and no image", issue["body"])
+                self.assertIn("gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=v1.6.0",
+                              issue["body"])
+
+    def test_tag_with_candidate_or_image_never_reports_missing_publication(self):
+        for present in ("candidate", "image"):
+            client = self.client()
+            client.hub_tag = True
+            store = MemoryStore(fixture_manifest()) if present == "candidate" else MemoryStore()
+            registry = MemoryRegistry()
+            if present == "image":
+                registry.tags["1.6.0"] = "sha256:" + "b" * 64
+            with self.subTest(present=present), patch.object(pipeline, "report_issue") as alert:
+                self.tagged_reconcile(client, store, registry)
+                alert.assert_not_called()
+            self.assertEqual(client.dispatched, [])
+
+    def test_published_release_with_a_lightweight_hub_tag_is_left_alone(self):
+        for present in ("candidate", "image"):
+            client = self.client()
+            client.hub_tag = True
+            client.hub_ref["type"] = "commit"  # a lightweight tag: no tagger clock exists
+            store = MemoryStore(fixture_manifest()) if present == "candidate" else MemoryStore()
+            registry = MemoryRegistry()
+            if present == "image":
+                registry.tags["1.6.0"] = "sha256:" + "b" * 64
+            with self.subTest(present=present), patch.object(pipeline, "report_issue") as alert:
+                self.tagged_reconcile(client, store, registry)
+                alert.assert_not_called()
+            self.assertEqual(client.dispatched, [])
+
+    def test_tagged_publication_probe_errors_are_never_absence(self):
+        for boundary in ("releases", "read", "registry", "tag"):
+            for error in (contract.Invalid("HTTP 503"), contract.Pending("unreadable store")):
+                client = self.client()
+                client.hub_tag = True
+                store, registry = MemoryStore(fixture_manifest()), MemoryRegistry()
+                target, method = {"releases": (store, "releases"), "read": (store, "read"),
+                                  "registry": (registry, "digest"), "tag": (client, "api")}[boundary]
+                if boundary in ("registry", "tag"):
+                    store = MemoryStore()  # the tag is read only when neither candidate nor image exists
+                with self.subTest(boundary=boundary, error=type(error).__name__), \
+                        patch.object(target, method, side_effect=error), patch.object(pipeline, "report_issue") as alert:
+                    with self.assertRaises((contract.Invalid, contract.Pending)):
+                        self.tagged_reconcile(client, store, registry)
+                    alert.assert_not_called()
+                self.assertEqual(client.dispatched, [])
+
+    def test_lightweight_tag_and_unusable_tagger_date_fail_closed(self):
+        for mutation in ("lightweight", "missing", "malformed", "timezone"):
+            client = self.client()
+            client.hub_tag = True
+            if mutation == "lightweight":
+                client.hub_ref["type"] = "commit"
+            else:
+                client.hub_annotation["tagger"] = {
+                    "missing": {}, "malformed": {"date": "yesterday"},
+                    "timezone": {"date": "2026-10-16T00:00:00"}}[mutation]
+            with self.subTest(mutation=mutation), patch.object(pipeline, "report_issue") as alert:
+                with self.assertRaises((contract.Invalid, ValueError, KeyError, TypeError)):
+                    self.tagged_reconcile(client, MemoryStore(), MemoryRegistry())
+                alert.assert_not_called()
+            self.assertEqual(client.dispatched, [])
+
+    def test_registry_token_error_is_not_an_absent_manifest(self):
+        with patch.object(pipeline.Client, "request", side_effect=contract.Pending("token endpoint unavailable")), \
+                self.assertRaises(contract.Invalid):
+            pipeline.Registry().digest("1.6.0")
 
     def test_unknown_hub_tag_probe_errors_do_not_authorize_replay(self):
         client = self.client()

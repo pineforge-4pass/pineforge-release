@@ -158,7 +158,7 @@ is the release tag, with its `v`: `v1.0.0`).
 
 ```
 {engine, codegen, HPO} releases → existing producer events → handle-upstream.yml
-  → lockstep VERSION + tag push (App) → operator dispatch on main with tag input
+  → lockstep VERSION + tag push (App) → automatic dispatch on main with tag input
   → publish.yml: guard tag shape, existence and ancestry → build verified SHA
   → release-finalize.yml: packages + measured release facts + immutable manifest
   → pineforge-release → consumer PR → own CI + E2E → merge/deploy → served receipt
@@ -168,7 +168,7 @@ is the release tag, with its `v`: `v1.0.0`).
 - `handle-upstream.yml` — receives `repository_dispatch` from engine / codegen-oss / HPO
   (`{version, prerelease, run_id}`), applies the pairing rule, sets `VERSION`,
   commits + pushes the tag (idempotent, with half-failed-release recovery and a
-  downgrade guard). Publication then needs the operator command below.
+  downgrade guard). Publication dispatches automatically when recovery policy allows.
 - `publish.yml` — only by dispatch on `main` with a required `tag` input:
   first checks the release tag's shape, existence and reachability from main.
   It checks out the verified commit SHA, checks the pair, waits for upstream
@@ -182,10 +182,10 @@ is the release tag, with its `v`: `v1.0.0`).
   this diagram; each consumer gets an App token scoped to its configured target.
   A prerelease reaches the application by hand-off, with no repository dispatch
   and no App token. Stable consumers without verified completion stay pending.
-- `release-reconcile.yml` validates and repairs missed stable producer events;
+- `release-reconcile.yml` repairs missed stable producer events and reports tagged publication gaps after a grace period;
   `release-receipts.yml` validates consumer evidence and repairs dropped callbacks.
 
-After the tag exists on main and `handle-upstream` is green, a user with write access runs publication or replay:
+Bump/retag/republish dispatch publication automatically when allowed; for older-version recovery or a failed dispatch, a user with write access runs:
 `gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=<vX.Y.Z or vX.Y.Z-rc.N>`.
 The first `tag-guard` job requires a main-ref dispatch, validates the complete
 release tag pattern, fetches tags and main with full history, and requires the

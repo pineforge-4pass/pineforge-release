@@ -145,6 +145,135 @@ class HandleUpstreamTest(unittest.TestCase):
         self.assertNotIn("PF_ENGINE_REF", self.text)
 
 
+class HandlerPublicationReplayTest(unittest.TestCase):
+    """Replay the real post-decision steps with local git and external-service fixtures."""
+
+    def replay(self, root, **kwargs):
+        sys.path.insert(0, str(REPO / "tools/release-dry-run"))
+        from dry_run import PublicationReplay
+        return PublicationReplay(REPO, root, **kwargs)
+
+    def dispatches(self, result):
+        return [row for row in result["calls"] if row.get("action") == "workflow run"]
+
+    def mints(self, result):
+        return [row for row in result["calls"] if row.get("tool") == "actions/create-github-app-token"]
+
+    def test_bump_dispatches_the_pushed_output_tag_on_main_for_both_release_lines(self):
+        for version, expected in (("0.1.26", "v0.1.26"), ("1.6.0-rc.1", "v1.6.0-rc.1"), ("1.6.0", "v1.6.0")):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
+                replay = self.replay(Path(tmp), version=version)
+                result = replay.run()
+                self.assertTrue(result["ok"], result["text"])
+                sent = self.dispatches(result)
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0]["workflow"], "publish.yml")
+                self.assertEqual(sent[0]["repo"], "pineforge-4pass/pineforge-release")
+                self.assertEqual(sent[0]["ref"], "main")
+                self.assertEqual(sent[0]["inputs"], {"tag": expected})
+                self.assertTrue(sent[0]["remote_tag"], "the dispatch observed the tag on origin")
+                self.assertEqual(result["steps"]["bump"]["outputs"]["tag"], expected)
+                self.assertEqual(result["executed"][-3:],
+                                 ["Check publication recovery policy", "Mint hub Actions token", "Dispatch publication"])
+                self.assertEqual(len(self.mints(result)), 1)
+                self.assertEqual(self.mints(result)[0]["permissions"], {"permission-actions": "write"})
+                self.assertEqual(self.mints(result)[0]["repositories"], "pineforge-release")
+
+    def test_dispatch_tag_comes_from_the_same_job_even_with_a_different_payload_tag(self):
+        for payload in ("v99.0.0", "v0.1.0", "v1.6.0;$(touch payload-executed)"):
+            for mode, retag in (("bump", False), ("bump", True), ("republish", False)):
+                with self.subTest(payload=payload, mode=mode, retag=retag), tempfile.TemporaryDirectory() as tmp:
+                    replay = self.replay(Path(tmp), payload_tag=payload, mode=mode, retag=retag)
+                    result = replay.run()
+                    self.assertTrue(result["ok"], result["text"])
+                    self.assertEqual([row["inputs"] for row in self.dispatches(result)], [{"tag": "v1.6.0"}])
+                    self.assertFalse((replay.work / "payload-executed").exists())
+
+    def test_noop_and_wait_do_not_mint_or_dispatch_publication(self):
+        for mode in ("noop", "wait"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                result = self.replay(Path(tmp), mode=mode).run()
+                self.assertTrue(result["ok"], result["text"])
+                self.assertEqual(self.dispatches(result), [])
+                self.assertEqual(self.mints(result), [])
+                self.assertNotIn("Check publication recovery policy", result["executed"])
+
+    def test_retag_and_republish_skip_older_recovery_but_allow_equal_and_newer(self):
+        for mode, retag in (("bump", True), ("republish", False)):
+            for latest, allowed in (("1.6.1", False), ("1.6.0", True), ("1.5.9", True)):
+                with self.subTest(mode=mode, latest=latest), tempfile.TemporaryDirectory() as tmp:
+                    result = self.replay(Path(tmp), mode=mode, retag=retag, latest=latest).run()
+                    self.assertTrue(result["ok"], result["text"])
+                    self.assertEqual(len(self.dispatches(result)), 1 if allowed else 0)
+                    self.assertEqual(len(self.mints(result)), 1 if allowed else 0)
+                    if not allowed:
+                        manual = "gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=v1.6.0"
+                        self.assertIn("::notice title=pineforge publish skipped::", result["text"])
+                        self.assertIn("older than latest ready 1.6.1", result["text"])
+                        self.assertIn(manual, result["text"])
+                        self.assertIn(manual, result["summary"])
+
+    def test_failed_dispatch_fails_the_job_keeps_the_tag_and_reports_the_producer_incident(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            replay = self.replay(Path(tmp))
+            (replay.state / "workflow-dispatch.fail").touch()
+            result = replay.run()
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["failed_step"], "Dispatch publication")
+            self.assertEqual(len(self.dispatches(result)), 1)
+            self.assertTrue(self.dispatches(result)[0]["failed"])
+            self.assertTrue(self.dispatches(result)[0]["remote_tag"])
+            manual = "gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=v1.6.0"
+            self.assertIn(manual, result["text"])
+            self.assertIn(manual, result["summary"])
+            self.assertIn("::error title=pineforge publish dispatch failed::", result["text"])
+            self.assertEqual(result["executed"][-1], "Report failed upstream handling")
+            issues = [row for row in result["calls"] if row.get("action") == "issue create"]
+            self.assertEqual(len(issues), 1)
+            self.assertIn("<!-- pineforge-release-chain:producer-failure -->", issues[0]["body"]["body"])
+            (replay.state / "workflow-dispatch.fail").unlink()
+            retried = replay.run(mode="republish")
+            self.assertTrue(retried["ok"], retried["text"])
+            self.assertEqual([row["inputs"] for row in self.dispatches(retried)], [{"tag": "v1.6.0"}])
+
+    def test_tag_push_failure_or_missing_republish_tag_never_authorizes_dispatch(self):
+        for mode, options in (("bump", {"reject_push": True}),
+                              ("republish", {"tag_present": False}),
+                              ("republish", {"reject_push": True})):
+            with self.subTest(mode=mode, options=options), tempfile.TemporaryDirectory() as tmp:
+                result = self.replay(Path(tmp), mode=mode, **options).run()
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["failed_step"], "Bump VERSION, commit, tag" if mode == "bump"
+                                 else "Re-publish (recover a half-failed prior release)")
+                self.assertEqual(self.dispatches(result), [])
+                self.assertEqual(self.mints(result), [])
+                output = result["steps"].get("republish" if mode == "republish" else "bump", {}).get("outputs", {})
+                self.assertNotIn("tag", output)
+                self.assertEqual(result["executed"][-1], "Report failed upstream handling")
+
+    def test_store_error_fails_policy_before_token_mint_or_dispatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            replay = self.replay(Path(tmp))
+            (replay.state / "store-read.fail").touch()
+            result = replay.run()
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["failed_step"], "Check publication recovery policy")
+            self.assertEqual(self.mints(result), [])
+            self.assertEqual(self.dispatches(result), [])
+            self.assertEqual(result["executed"][-1], "Report failed upstream handling")
+
+    def test_dispatch_shim_rejects_other_refs_missing_or_extra_inputs(self):
+        for arguments in (["publish.yml", "--repo", "pineforge-4pass/pineforge-release", "--ref", "topic", "-f", "tag=v1.6.0"],
+                          ["publish.yml", "--repo", "pineforge-4pass/pineforge-release", "--ref", "main"],
+                          ["publish.yml", "--repo", "pineforge-4pass/pineforge-release", "--ref", "main",
+                           "-f", "tag=v1.6.0", "-f", "extra=true"]):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as tmp:
+                replay = self.replay(Path(tmp))
+                done = subprocess.run(["gh", "workflow", "run", *arguments], cwd=replay.work,
+                                      env=replay.env, capture_output=True, text=True)
+                self.assertNotEqual(done.returncode, 0)
+
+
 class PublishTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -281,6 +410,32 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         "(needs.publish.result == 'success' || needs.publish.result == 'skipped') }}"
     )
     OPERATOR_COMMAND = "gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag="
+    TAG_OUTPUTS = "${{ steps.bump.outputs.tag || steps.republish.outputs.tag }}"
+    PUBLICATION_IF = "steps.publish-policy.outputs.allowed == 'true'"
+    POLICY_RUN = textwrap.dedent("""\
+        set -euo pipefail
+        policy="$(python3 scripts/release_pipeline.py publish-policy --tag "$TAG" --recovery "$RECOVERY")"
+        printf '%s\\n' "$policy" >> "$GITHUB_OUTPUT"
+        if printf '%s\\n' "$policy" | grep -qx 'allowed=false'; then
+          latest="$(printf '%s\\n' "$policy" | sed -n 's/^latest_ready=//p')"
+          line="automatic publication skipped for ${TAG}: recovery is older than latest ready ${latest}; manual recovery: gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=${TAG}"
+          echo "::notice title=pineforge publish skipped::${line}"
+          printf '%s\\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+        fi
+    """)
+    DISPATCH_RUN = textwrap.dedent("""\
+        set -euo pipefail
+        if gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag="$TAG"; then
+          line="automatically dispatched publish.yml on main for ${TAG}"
+          echo "::notice title=pineforge publish dispatched::${line}"
+          printf '%s\\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+        else
+          line="automatic publication dispatch failed for ${TAG}; manual recovery: gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=${TAG}"
+          echo "::error title=pineforge publish dispatch failed::${line}"
+          printf '%s\\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
+    """)
     INPUT = (
         '    inputs:\n'
         '      tag:\n'
@@ -438,42 +593,96 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             self.assertNotRegex(code, pattern, "no workflow may dispatch any workflow")
 
     def assert_handler(self, text):
-        self.assert_no_publish_dispatch(text)
         wf = self.parse(text)
-        steps = wf.get("jobs", {}).get("bump", {}).get("steps", [])
+        job = wf.get("jobs", {}).get("bump", {})
+        self.assertEqual(job.get("environment"), "release-automation")
+        steps = job.get("steps", [])
+        self.assertEqual([row.get("name") for row in steps], [
+            "Mint org App token", "Checkout main (App token bypasses the ruleset)",
+            "Validate payload", "Validate producer event JSON types",
+            "Verify the dispatched producer artifacts", "Configure git identity",
+            "Log in to GHCR (read, for the image-exists probe)",
+            "Resolve the landed component pins", "Probe the partner releases (pairing line)",
+            "Decide action (pairing rule + idempotent + recover half-failed release + downgrade guard)",
+            "No-op", "Wait for the partner release (1.0 pair incomplete)",
+            "Re-publish (recover a half-failed prior release)", "Bump VERSION, commit, tag",
+            "Check publication recovery policy", "Mint hub Actions token", "Dispatch publication",
+            "Report failed upstream handling",
+        ], "the narrow mint must immediately precede dispatch; the failure reporter is last")
         app = next((row for row in steps if row.get("id") == "app"), {})
-        self.assertEqual(app.get("with", {}).get("permission-contents"), "write")
-        self.assertNotIn("permission-actions", app.get("with", {}))
-        self.assertNotRegex(_step(text, "Mint org App token"), r"(?m)^\s*permission-actions\s*:")
+        self.assertEqual(app.get("with"), {
+            "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
+            "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
+            "owner": "${{ github.repository_owner }}", "repositories": "pineforge-release",
+            "permission-contents": "write", "github-api-url": "https://api.github.com",
+        })
+        self.assertEqual(steps[-3], {
+            "name": "Mint hub Actions token", "id": "publish-app", "if": self.PUBLICATION_IF,
+            "uses": "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
+            "with": {
+                "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
+                "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
+                "owner": "${{ github.repository_owner }}", "repositories": "pineforge-release",
+                "permission-actions": "write", "github-api-url": "https://api.github.com",
+            },
+        })
+        self.assertEqual(steps[-2], {
+            "name": "Dispatch publication", "if": self.PUBLICATION_IF,
+            "env": {"GH_TOKEN": "${{ steps.publish-app.outputs.token }}", "TAG": self.TAG_OUTPUTS},
+            "run": self.DISPATCH_RUN,
+        })
+        self.assertEqual(steps[-4], {
+            "name": "Check publication recovery policy", "id": "publish-policy",
+            "if": "steps.decide.outputs.mode == 'bump' || steps.decide.outputs.mode == 'republish'",
+            "env": {
+                "GH_TOKEN": "${{ steps.app.outputs.token }}", "TAG": self.TAG_OUTPUTS,
+                "RECOVERY": "${{ steps.decide.outputs.mode == 'republish' || steps.decide.outputs.retag == 'true' }}",
+            },
+            "run": self.POLICY_RUN,
+        })
+        self.assertEqual(steps[-1], {
+            "name": "Report failed upstream handling", "if": "${{ failure() && !cancelled() }}",
+            "env": {"GH_TOKEN": "${{ github.token }}", "RELEASE_REPORT_OWNER": "${{ vars.RELEASE_REPORT_OWNER }}"},
+            "run": "python3 scripts/release_pipeline.py alert --stage producer",
+        })
+        # Only this completely pinned step may dispatch a workflow. Keep the
+        # generic no-dispatch check over every other step and every other file.
+        dispatch_body = _step(text, "Dispatch publication")
+        self.assert_no_publish_dispatch(text.replace(dispatch_body, "", 1))
         replay = next((row for row in steps if row.get("name", "").startswith("Re-publish")), {})
         bump = next((row for row in steps if row.get("name", "").startswith("Bump VERSION")), {})
+        self.assertEqual(replay.get("id"), "republish")
+        self.assertEqual(bump.get("id"), "bump")
         self.assertEqual(replay.get("if"), "steps.decide.outputs.mode == 'republish'")
         self.assertEqual(replay.get("env", {}).get("TAG"), "v${{ steps.decide.outputs.cur_ver }}")
         for step in (replay, bump):
+            self.assertNotIn("continue-on-error", step)
             self.assertNotIn("GH_TOKEN", step.get("env", {}))
         self.assertEqual(bump.get("name"), "Bump VERSION, commit, tag")
         self.assertEqual(bump.get("if"), "steps.decide.outputs.mode == 'bump'")
         summary = 'printf \'%s\\n\' "$line" >> "$GITHUB_STEP_SUMMARY"'
         replay_run = replay.get("run", "")
-        self.assertIn(self.OPERATOR_COMMAND + '${TAG}"', replay_run)
-        self.assertIn('echo "::warning title=pineforge publish needed::${line}"', replay_run)
+        self.assertIn('git push origin "$TAG"\n' + 'echo "tag=$TAG" >> "$GITHUB_OUTPUT"', replay_run)
+        self.assertIn("a missing tag fails this job on purpose", replay_run)
+        self.assertIn("automatically dispatches publish.yml when allowed", replay_run)
+        self.assertIn('echo "::notice title=pineforge publish automatic::${line}"', replay_run)
         self.assertIn(summary, replay_run)
-        self.assertEqual(replay_run.splitlines()[-1], "exit 0")
         run = bump.get("run", "")
         commands = [line.strip() for line in run.splitlines()]
         for variable in ("RELEASE", "next"):
-            # Both paths print the operator command only after the tag push succeeds.
             push = 'git push origin "v${' + variable + '}"'
             self.assertIn(push, commands)
             at = commands.index(push)
-            self.assertLess(at + 3, len(commands))
-            self.assertTrue(commands[at + 1].startswith('line="pushed v${' + variable + '}'))
-            self.assertIn(self.OPERATOR_COMMAND + 'v${' + variable + '}"', commands[at + 1])
-            self.assertEqual(commands[at + 2], 'echo "::notice title=pineforge publish needed::${line}"')
-            self.assertEqual(commands[at + 3], summary)
+            # a mutant that deletes a trailing line must fail as an assertion, not as an IndexError
+            self.assertGreater(len(commands), at + 4, "the output and notice lines must follow the tag push")
+            self.assertEqual(commands[at + 1], 'echo "tag=v${' + variable + '}" >> "$GITHUB_OUTPUT"')
+            self.assertTrue(commands[at + 2].startswith('line="pushed v${' + variable + '}'))
+            self.assertIn("automatically dispatches publish.yml when allowed", commands[at + 2])
+            self.assertEqual(commands[at + 3], 'echo "::notice title=pineforge publish automatic::${line}"')
+            self.assertEqual(commands[at + 4], summary)
             if variable == "RELEASE":
-                self.assertLess(at + 4, len(commands))
-                self.assertEqual(commands[at + 4], "exit 0")
+                self.assertGreater(len(commands), at + 5, "the retag path must end with exit 0")
+                self.assertEqual(commands[at + 5], "exit 0")
 
     def assert_release_triggers(self, text):
         wf = self.parse(text)
@@ -490,23 +699,26 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             self.assertEqual(push.get("branches"), ["main"])
             self.assertLessEqual(set(push), {"branches", "paths", "paths-ignore"}, "no tag or branch-ignore filters")
 
-    def test_publish_uses_operator_dispatch_and_handler_prints_the_next_command(self):
+    def test_publish_keeps_main_dispatch_and_handler_dispatches_after_tagging(self):
         self.assert_publish((WORKFLOWS / "publish.yml").read_text())
         self.assert_handler((WORKFLOWS / "handle-upstream.yml").read_text())
 
-    def test_no_workflow_dispatches_publish(self):
+    def test_only_the_pinned_handler_step_may_dispatch_a_workflow(self):
         found = []
         for path in sorted(WORKFLOWS.iterdir()):
             if path.suffix in {".yml", ".yaml"}:
                 found.append(path.name)
                 with self.subTest(workflow=path.name):
-                    self.assert_no_publish_dispatch(path.read_text())
+                    if path.name == "handle-upstream.yml":
+                        self.assert_handler(path.read_text())
+                    else:
+                        self.assert_no_publish_dispatch(path.read_text())
         self.assertIn("handle-upstream.yml", found)
         self.assertIn("publish.yml", found)
 
-    def test_no_dispatch_pin_refuses_cli_javascript_and_api_steps_on_real_text(self):
+    def test_dispatch_pin_refuses_additional_cli_javascript_and_api_steps_on_real_text(self):
         text = (WORKFLOWS / "handle-upstream.yml").read_text()
-        self.assert_no_publish_dispatch(text)
+        self.assert_handler(text)
         anchor = "      - name: Report failed upstream handling\n"
         steps = (
             "        run: " + self.OPERATOR_COMMAND + "v1.6.2\n",
@@ -532,7 +744,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         for step in steps:
             mutant = self.mutate(text, anchor, "      - name: Forbidden publish dispatch\n" + step + anchor)
             with self.subTest(step=step), self.assertRaises(AssertionError):
-                self.assert_no_publish_dispatch(mutant)
+                self.assert_handler(mutant)
 
     def test_every_release_workflow_has_only_main_ref_trigger_types(self):
         found = []
@@ -649,37 +861,48 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_publish(late_guard)
 
-    def test_handler_pin_refuses_dispatch_permissions_tokens_or_broken_operator_notices(self):
+    def test_handler_pin_refuses_wider_tokens_unsafe_dispatch_and_broken_notices(self):
         text = (WORKFLOWS / "handle-upstream.yml").read_text()
         self.assert_handler(text)
-        for tag in ('${TAG}', 'v${RELEASE}', 'v${next}'):
-            command = self.OPERATOR_COMMAND + tag
-            for replacement in (command.replace("--ref main", '--ref topic'),
-                                command.removesuffix(" -f tag=" + tag), ""):
-                mutant = self.mutate(text, command, replacement)
-                with self.subTest(command=command, replacement=replacement), self.assertRaises(AssertionError):
-                    self.assert_handler(mutant)
         for before, after in (
             ("          permission-contents: write\n",
              "          permission-contents: write\n          permission-actions: write\n"),
+            ("          permission-actions: write\n",
+             "          permission-actions: write\n          permission-contents: write\n"),
+            ("          permission-actions: write", "          permission-actions: read"),
+            ("      - name: Mint hub Actions token\n",
+             "      - name: Mint hub Actions token\n        continue-on-error: true\n"),
+            ("      - name: Dispatch publication\n",
+             "      - name: Dispatch publication\n        continue-on-error: true\n"),
+            ('-f tag="$TAG"; then', '-f tag="${{ github.event.client_payload.tag }}"; then'),
+            ('-f tag="$TAG"; then', '-f tag="$TAG" || true; then'),
+            ('-f tag="$TAG"; then', '-f tag="$TAG" --ref topic; then'),
+            ('-f tag="$TAG"; then', '-f tag="$TAG"; then\n          gh workflow run publish.yml --ref main -f tag="$TAG"'),
             ('        env:\n          TAG: v${{ steps.decide.outputs.cur_ver }}',
              '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          TAG: v${{ steps.decide.outputs.cur_ver }}'),
             ('        env:\n          E:', '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          E:'),
             ("        if: steps.decide.outputs.mode == 'republish'", "        if: always()"),
-            ("        if: steps.decide.outputs.mode == 'bump'", "        if: always()"),
+            # trailing newline: the publish-policy step's own `if:` starts with the same text
+            ("        if: steps.decide.outputs.mode == 'bump'\n", "        if: always()\n"),
             ("          TAG: v${{ steps.decide.outputs.cur_ver }}", "          TAG: v0.0.0"),
             ("      - name: Bump VERSION, commit, tag\n", "      - name: Bump VERSION, commit, tag (fires publish.yml)\n"),
-            ('echo "::warning title=pineforge publish needed::${line}"', 'echo "$line"'),
+            ('          git push origin "$TAG"\n', ""),
         ):
             mutant = self.mutate(text, before, after)
             with self.subTest(anchor=before), self.assertRaises(AssertionError):
                 self.assert_handler(mutant)
-        for name, annotation, notices in (("Re-publish", "warning", 1), ("Bump VERSION", "notice", 2)):
+        for before, after in (
+            ("        if: " + self.PUBLICATION_IF + "\n", "        if: always()\n"),
+            ("TAG: " + self.TAG_OUTPUTS, "TAG: ${{ github.event.client_payload.tag }}"),
+        ):
+            mutant = self.mutate(text, before, after, count=2)
+            with self.subTest(anchor=before), self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
+        for name, notices in (("Re-publish", 1), ("Bump VERSION", 2)):
             body = _step(text, name)
             for command, count in (
                 ('printf \'%s\\n\' "$line" >> "$GITHUB_STEP_SUMMARY"', notices),
-                ('echo "::' + annotation + ' title=pineforge publish needed::${line}"', notices),
-                ("exit 0", 1),
+                ('echo "::notice title=pineforge publish automatic::${line}"', notices),
             ):
                 matches = list(re.finditer(re.escape(command), body))
                 self.assertEqual(len(matches), count, "each notice mutation must have its real anchor")
@@ -688,6 +911,22 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
                     mutant = self.mutate(text, body, changed)
                     with self.subTest(step=name, command=command, occurrence=match.start()), self.assertRaises(AssertionError):
                         self.assert_handler(mutant)
+        for name in ("Check publication recovery policy", "Dispatch publication"):
+            body = _step(text, name)
+            command = self.OPERATOR_COMMAND + "${TAG}"
+            for before in (command, 'printf \'%s\\n\' "$line" >> "$GITHUB_STEP_SUMMARY"'):
+                mutant = self.mutate(text, body, body.replace(before, ""))
+                with self.subTest(step=name, anchor=before), self.assertRaises(AssertionError):
+                    self.assert_handler(mutant)
+        mint = _step(text, "Mint hub Actions token")
+        dispatch = _step(text, "Dispatch publication")
+        without_mint = self.mutate(text, mint, "")
+        for mutant in (self.mutate(without_mint, dispatch, dispatch + "\n      " + mint),
+                       text + "\n      - name: Late step\n        run: true\n",
+                       self.mutate(text, "          repositories: pineforge-release\n",
+                                   "          repositories: pineforge-release,other\n", count=2)):
+            with self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
 
     def test_generic_trigger_pin_refuses_forbidden_events_and_tag_pushes_in_every_real_workflow(self):
         for path in sorted(WORKFLOWS.iterdir()):

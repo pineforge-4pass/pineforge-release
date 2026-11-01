@@ -37,6 +37,7 @@ RECEIPT_FIELDS = ("schema", "consumer", "attempt", "sequence", "state", "timesta
 # Delay after each reserved attempt: two retries, then an acknowledgement grace
 # period before a terminal failure. Unsent reservations are released by cleanup.
 DELIVERY_BACKOFF_MINUTES = (15, 60, 15)
+PUBLISH_START_GRACE_MINUTES = 30
 
 
 def now():
@@ -121,7 +122,12 @@ class Registry:
         # Public pull token, never a GitHub credential. Reading the actual OCI
         # response bytes avoids CLI pretty-printing/newline changes to digests.
         client = Client(token="")
-        token = decode(client.request("https://ghcr.io/token?service=ghcr.io&scope=repository:" + HUB + ":pull"))["token"]
+        try:
+            token = decode(client.request("https://ghcr.io/token?service=ghcr.io&scope=repository:" + HUB + ":pull"))["token"]
+        except Pending:
+            # Only a manifest 404 means absence; an unreadable token endpoint
+            # must not authorize a missing-image incident or an alias write.
+            raise Invalid("registry authentication unavailable") from None
         return client.request("https://ghcr.io/v2/" + HUB + "/manifests/" + ref,
                               accept="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
                               extra_headers={"Authorization": "Bearer " + token})
@@ -196,6 +202,17 @@ def finalized_version(store):
             if store.read(row, "release-rejected.json") is None:
                 ready.append(v)
     return max(ready) if ready else None
+
+
+def publish_policy(store, tag, recovery):
+    """Read the finalizer's ready frontier; storage errors never authorize publication."""
+    require(tag.startswith("v"), "publication needs a release tag")
+    v = version(tag.removeprefix("v"))
+    newest = finalized_version(store)
+    # Equality is allowed: recovery restores the image of the latest ready
+    # version itself. A normal bump is always allowed; only recovery is ordered.
+    allowed = not recovery or newest is None or v >= newest
+    return allowed, newest
 
 
 def release_superseded(event, rows):
@@ -878,7 +895,12 @@ def run_link():
 
 
 def reconcile(client, store):
-    """Replay stable public releases; never execute producer version-bump logic."""
+    """Replay stable producer events; report stalled tagged publication, never dispatch publish.
+
+    Lightweight hub tags raise: only an annotated tagger date can start the
+    publication grace clock. Store, registry and tag metadata errors propagate;
+    they never count as absence. Producer version-bump logic is never executed.
+    """
     floor = version(Path("VERSION").read_text().strip())
     failures, candidates = [], []
     for component, repo in PRODUCERS.items():
@@ -903,8 +925,31 @@ def reconcile(client, store):
     except Pending:
         pass
     else:
-        # A hub tag hands responsibility to publish/finalize, including drafts
-        # awaiting facts. Do not re-download producer artifacts or re-dispatch.
+        tag = "v" + str(desired)
+        rows = [row for row in store.releases() if row["tag_name"] == tag]
+        require(len(rows) <= 1, "ambiguous hub release tag")
+        # Do not use candidate_exists here: it treats Pending as missing,
+        # whereas even an asset read 404 during reconciliation must fail closed.
+        if rows and store.read(rows[0], CANDIDATE) is not None:
+            return
+        if Registry().digest(str(desired)) is not None:
+            return
+        # Only a tag with neither candidate nor image needs its tagger clock, so a
+        # published release whose hub tag is lightweight is never touched here.
+        obj = client.api(f"repos/{HUB}/git/ref/tags/{tag}")["object"]
+        require(obj["type"] == "tag", "publication grace requires an annotated hub tag")
+        match(COMMIT, obj["sha"])
+        annotated = client.api(f"repos/{HUB}/git/tags/{obj['sha']}")
+        timestamp = annotated["tagger"]["date"]
+        tagged_at = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        require(tagged_at.tzinfo is not None, "hub tagger date needs a timezone")
+        if age_minutes(timestamp) > PUBLISH_START_GRACE_MINUTES:
+            report_issue(client, f"publish-start-{tag}", f"Release {tag}: publication has not started",
+                         f"Hub tag {tag} has no candidate draft and no image after the publication start grace period.\n\n"
+                         f"Manual recovery: gh workflow run publish.yml --repo {HUB} --ref main -f tag={tag}\n\n"
+                         + run_link())
+        # Responsibility stays with publish/finalize. No producer downloads or
+        # dispatches for an existing hub tag, including drafts awaiting facts.
         return
     for v, component in sorted(set(candidates), key=lambda item: (item[0], item[1])):
         if v != desired:
@@ -934,6 +979,9 @@ def main():
     p.add_argument("--hpo", default="")
     p = sub.add_parser("candidate-exists")
     p.add_argument("tag")
+    p = sub.add_parser("publish-policy")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--recovery", choices=("true", "false"), required=True)
     p = sub.add_parser("candidate")
     for field in ("file", "tag", "notes-file", "source-tag", "source-list", "amd64", "arm64"):
         p.add_argument("--" + field, required=True)
@@ -971,6 +1019,10 @@ def main():
                                                           args.codegen, args.hpo, args.hub_commit)))
         elif args.cmd == "candidate-exists":
             print("exists=" + ("true" if candidate_exists(store, args.tag) else "false"))
+        elif args.cmd == "publish-policy":
+            allowed, newest = publish_policy(store, args.tag, args.recovery == "true")
+            print("allowed=" + str(allowed).lower())
+            print("latest_ready=" + (str(newest) if newest is not None else ""))
         elif args.cmd == "candidate":
             obj = decode(Path(args.file).read_bytes())
             obj.update(sources={"release_tag": args.source_tag, "list_asset": Path(args.source_list).name,

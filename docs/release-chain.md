@@ -51,6 +51,9 @@ verified commit SHA, with no persisted credentials, so moving a tag between
 jobs cannot change the tree built. A failed or skipped guard prevents
 finalization; failure reporting first refuses to check out or run repository
 code unless the guard succeeded.
+The publication job also requires the tag to equal `v` plus the checked-out
+`VERSION`, reads component pins from the annotated tag message (with the existing
+pair-version or legacy fallback), and applies the pairing rule before building.
 The reusable `release-finalize.yml` call inherits the caller's main ref.
 Tag pushes, release events and `workflow_run` do not start publication.
 
@@ -64,14 +67,17 @@ own published artifacts are verified before the existing partner/pair decision.
 Incomplete lockstep waits. Invalid flags, source mismatches, authentication,
 rate limits and transport failures fail visibly.
 
-`release-reconcile.yml` wakes hourly or manually. It paginates the
+`release-reconcile.yml` is configured to wake hourly or manually. It paginates the
 three fixed producer repositories, excludes drafts/prereleases/non-product tags
 and versions older than hub VERSION. It checks whether the desired stable
 version already has a hub Git tag before downloading any artifacts. Only a
 version without that tag has its artifacts verified and the **same producer
-events** sent back to the existing handler. The handler pushes the hub tag;
-after the tag exists on main and `handle-upstream` is green, a user with write
-access dispatches `publish.yml` on `main` with that tag using the command below.
+events** sent back to the existing handler. After pushing the hub tag successfully,
+the handler automatically dispatches `publish.yml` on `main` in bump (including
+retag) and republish modes when policy allows; noop and wait never dispatch.
+The input tag comes only from the same job's successful tag-step output, never
+the event payload. Republish first idempotently pushes its assumed existing tag;
+a missing tag fails the job and triggers the producer incident.
 Finalization then continues even while the release is a draft awaiting prerequisites.
 Older missed versions are superseded by the newest desired stable version;
 they are never replayed as downgrades after it. Duplicate notifications reuse
@@ -79,16 +85,42 @@ the handler's existing decision. A stored candidate makes an unchanged-version
 decision a no-op even while the fixed image tag is absent. Nothing calls a
 producer's version-bump job.
 
-Recovery of an existing hub tag emits an operator notice and never force-pushes
-or rewrites the tag. Publication and replay use the same operator command,
-run by a user with write access after the tag exists on main and
-`handle-upstream` is green:
+The post-push `publish-policy` check reuses the finalizer's `finalized_version(store)`
+and semver ordering. A normal bump is allowed. Retag/republish recovery older
+than the latest ready release succeeds with a notice and step summary, without
+minting the dispatch token or dispatching. Equal versions are allowed because
+recovery restores the image of the latest ready version; newer versions are
+allowed too. An unreadable release store fails the policy check.
+
+The existing App token keeps Contents write only. A second mint requests
+Actions write only, limited to `pineforge-release`, immediately before dispatch.
+The second token's blast radius is "dispatch, cancel or re-run ANY workflow of this hub"; the control is the pinned step list (the mint is immediately followed by the dispatch step, the failure reporter is last), which `tests/test_release_workflows.py` freezes.
+The job keeps the `release-automation` environment; required reviewers there
+can still pause the chain. The owner must confirm the App's Actions write
+permission on the hub and the environment's reviewers.
+
+A failed dispatch fails the job and fires the existing producer incident;
+the pushed tag remains and a rerun is safe. Older-version recovery and failed
+dispatch notices retain this manual command for a user with write access:
 `gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=<vX.Y.Z or vX.Y.Z-rc.N>`.
 Use the actual existing tag as `tag`. Pushing a tag alone publishes nothing.
-Both a new tag push and retag recovery leave publication to the operator;
-an unchanged version with an image or verified candidate keeps its existing no-op.
+Recovery never force-pushes or rewrites the tag; an unchanged version with an
+image or verified candidate keeps its existing no-op.
 Tags predating this workflow need a reviewed migration; the hub does not invent
 new manifests for historical images without candidate verification.
+
+For an existing hub tag, reconcile reports a deduplicated incident if no
+candidate draft and no fixed version image exist after the grace period in
+`PUBLISH_START_GRACE_MINUTES`. The clock is the annotated tagger date.
+Lightweight tags, unreadable tag metadata, and store or registry errors fail
+closed. This tagged-publication check never dispatches publication.
+
+Live activation caveat: when last read, `release-reconcile`, `release-finalize`,
+`release-receipts`, `facts-fanout` and `facts-descriptions` were
+`disabled_manually`; the reconcile incident safety net and their scheduled/push
+triggers remain inactive until the owner activates them. The reason for those
+settings and whether human stable publication was an intentional public-image
+gate remain owner decisions; this change does not alter live settings.
 
 Exception on record: on 2026-10-25 the `v1.7.0` tag was re-pointed from `73d2a1eed8393d46cae0fa8d1d785ac2919d5a10` to `ab95811bc18dc7a593ce27f864e340bd270fef79` (the licence-sums fix, #121) by the maintainer's decision after a full pre-proof; the published image's revision label is `ab95811bc18dc7a593ce27f864e340bd270fef79`.
 
@@ -239,8 +271,8 @@ The sender reuses the existing App token mint, scoped to one target with
 Contents write. The existing App must be installed on the private compute
 repository with the App's full permission set, to be confirmed in the App's
 settings before the owner decides **O-1**. App permissions apply to every
-repository in the installation: the existing App already holds Actions write
-for the hub, and installing it on compute grants that and every other App
+repository in the installation: the documented App permission set includes Actions write
+for the hub (the owner must confirm it live), and installing it on compute grants that and every other App
 permission there. The mint uses `owner: github.repository_owner`, so compute
 joins the same owner's installation; each mint's requested permissions limit
 that token rather than the App installation.
@@ -1173,7 +1205,7 @@ use `ubuntu-latest` per owner decision 10-21, including publication workflows.
 | Name / setting | Scope | Purpose |
 |---|---|---|
 | `PINEFORGE_APP_ID`, `PINEFORGE_APP_PRIVATE_KEY` (existing) | Hub `release-automation` environment | Short-lived, one-target installation tokens; no PAT fallback. |
-| App installation permissions | The App's full permission set on every installed repository, including the private compute repository | Confirm the full set in the App's settings before the owner decides O-1. The App already holds Actions write for the hub; installing it on compute grants that and every other App permission there. The mint uses `owner: github.repository_owner` and joins the same owner's installation. Hub tag pushes and producer-event reconciliation; consumer dispatch and completion evidence reads. Publication and replay use the write-access operator's login. Each mint asks only for the permissions needed by that job: hub Contents write; receipt consumers Contents read/write, Actions read and Pull requests read; delivery-only compute uses only the existing Contents-write dispatch mint. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
+| App installation permissions | The App's full permission set on every installed repository, including the private compute repository | Confirm the full set in the App's settings before the owner decides O-1, including the documented Actions write for the hub; installing it on compute grants that and every other App permission there. The mint uses `owner: github.repository_owner` and joins the same owner's installation. Hub tag pushes and producer-event reconciliation; consumer dispatch and completion evidence reads. Automatic publication uses a separate hub mint with Actions write only; manual recovery uses a write-access operator's login. Each mint asks only for the permissions needed by that job: hub Contents write or the separate hub Actions write; receipt consumers Contents read/write, Actions read and Pull requests read; delivery-only compute uses only the existing Contents-write dispatch mint. Consumer PR writers in other repos separately need Pull requests write without branch bypass. |
 | `RELEASE_HOSTED_MCP_REPOSITORY`, `RELEASE_APPLICATION_REPOSITORY`, `FACTS_WEB_REPOSITORY` (existing) | Hub `release-automation` environment secrets | Private short repository names for neutral hosted/application/web targets. Public offline/data/license names are fixed in workflows. |
 | `RELEASE_COMPUTE_REPOSITORY` (new secret) | Hub `release-automation` environment secrets | Private short name of the compute target repository; the application target likewise lives in `RELEASE_APPLICATION_REPOSITORY`. Both reuse the existing one-target App mint. No values belong in source or public audit assets. |
 | `RELEASE_RECEIPT_POLICY` (new secret) | Hub repository Actions secret (read by the receipt verify job, which runs in the `release-automation` environment; do not also create it in the environment, it would shadow this one) | JSON map of each enabled receipt role to its trusted receipt workflow/artifact/base and full CI/E2E/deploy job inventories, plus optional application-only `post_merge`. Compute needs no entry. Keep private workflow/job details out of public source. |

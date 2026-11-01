@@ -16,6 +16,7 @@ State files (all optional):
   releases-<repo>.json  REST `repos/<owner>/<repo>/releases` answer
   release-pineforge-hpo-v<version>.json  the hpo release and its asset digests
   gh-release-list.fail  present: `gh release list` fails
+  workflow-dispatch.fail  present: the modeled publication workflow dispatch fails
 """
 from __future__ import annotations
 
@@ -216,6 +217,31 @@ def curl(argv):
 
 # ------------------------------------------------------------------------ gh
 def gh(argv):
+    if argv[:2] == ["workflow", "run"]:
+        try:
+            pos, opts, flags = parse(argv[2:], {"--repo", "--ref", "-f"})
+            body, _ = api_fields(opts)
+            supported = (pos == ["publish.yml"] and not flags
+                         and set(opts) == {"--repo", "--ref", "-f"}
+                         and opts["--repo"] == ["pineforge-4pass/pineforge-release"]
+                         and opts["--ref"] == ["main"] and len(opts["-f"]) == 1
+                         and set(body) == {"tag"} and re.fullmatch("v" + SEMVER, body["tag"]))
+        except (IndexError, ValueError, TypeError):
+            supported = False
+        if not supported:
+            record(tool="gh", unsupported=argv)
+            say("gh", "publication dispatch requires main and exactly one tag input")
+            return 1
+        # Observe the real local origin at the instant of dispatch. The oracle
+        # checks this instead of assuming that an earlier tag command pushed it.
+        remote = subprocess.run(["git", "ls-remote", "--exit-code", "origin", "refs/tags/" + body["tag"]],
+                                capture_output=True, text=True)
+        failed = (STATE / "workflow-dispatch.fail").exists()
+        record(tool="gh", action="workflow run", workflow=pos[0], repo=opts["--repo"][0],
+               ref=opts["--ref"][0], inputs=body, remote_tag=remote.returncode == 0, failed=failed)
+        say("gh", "workflow dispatch failed (state says so)" if failed
+            else f"WOULD DISPATCH publish.yml on main: {json.dumps(body, sort_keys=True)}")
+        return 1 if failed else 0
     if argv[:2] == ["release", "list"]:
         _, opts, flags = parse(argv[2:], {"--limit", "-L", "--json", "-q", "--jq", "-R", "--repo"})
         if (STATE / "gh-release-list.fail").exists():

@@ -73,6 +73,185 @@ def git(*args, cwd=None, env=None, stdin=None):
     return proc.stdout.strip()
 
 
+def publication_fixture_request(self, url, *, method="GET", data=None, **kwargs):
+    """External API boundary for publication replay; unknown routes fail without HTTP."""
+    from release_contract import Invalid, canonical
+    state = Path(os.environ["HARNESS_STATE"])
+    releases = json.loads((state / "publication-releases.json").read_text())
+    route = url.removeprefix("https://api.github.com/")
+    if not url.startswith("https://api.github.com/"):
+        raise AssertionError("unmodeled publication fixture origin")
+    if route == f"repos/{REPO}/releases?per_page=100&page=1":
+        if (state / "store-read.fail").exists():
+            raise Invalid("fixture release store unavailable")
+        return canonical(releases)
+    if re.fullmatch(rf"repos/{REPO}/releases/[0-9]+", route) and method == "GET":
+        return canonical(next(row for row in releases if str(row["id"]) == route.rsplit("/", 1)[1]))
+    issues_path = state / "publication-issues.json"
+    issues = json.loads(issues_path.read_text()) if issues_path.exists() else []
+    if route == f"repos/{REPO}/issues?state=all&per_page=100&page=1" and method == "GET":
+        return canonical(issues)
+    if route == f"repos/{REPO}/issues" and method == "POST":
+        row = {"number": len(issues) + 1, "state": "open", **data}
+        issues.append(row)
+        issues_path.write_bytes(canonical(issues))
+        wfrun.record(state, tool="github-api", action="issue create", body=data)
+        return canonical(row)
+    if re.fullmatch(rf"repos/{REPO}/issues/[0-9]+", route) and method == "PATCH":
+        row = next(row for row in issues if str(row["number"]) == route.rsplit("/", 1)[1])
+        row.update(data)
+        issues_path.write_bytes(canonical(issues))
+        wfrun.record(state, tool="github-api", action="issue update", body=data)
+        return canonical(row)
+    raise AssertionError(f"unmodeled publication fixture request: {method} {route}")
+
+
+class PublicationReplay:
+    """Run the handler's real post-decision steps, including policy CLI and failure reporting.
+
+    The existing decision is an input to this replay (arrival/decision replays
+    cover it separately). Git, tag pushes, harness sync and shell are real;
+    only GitHub API, App mint and engine downloads use external-service fixtures.
+    """
+
+    def __init__(self, checkout, root, *, version="1.6.0", mode="bump", retag=False,
+                 latest=None, payload_tag="v99.0.0", tag_present=True, reject_push=False):
+        self.checkout, self.root = Path(checkout), Path(root)
+        self.version, self.mode, self.retag = version, mode, retag
+        self.state, self.work, self.origin = self.root / "state", self.root / "work", self.root / "origin.git"
+        self.state.mkdir()
+        self.work.mkdir()
+        self.env = wfrun.hermetic_git(wfrun.clean_env(), self.root)
+        self.env.update({
+            "PATH": str(HERE / "shims") + os.pathsep + self.env.get("PATH", os.defpath),
+            "HARNESS_STATE": str(self.state), "PYTHONDONTWRITEBYTECODE": "1",
+            "GITHUB_RUN_ID": "42", "RELEASE_REPORT_OWNER": "", "RELEASE_REPORT_TOKEN": "",
+            "GIT_AUTHOR_NAME": "release-fixture", "GIT_AUTHOR_EMAIL": "release-fixture@localhost",
+            "GIT_COMMITTER_NAME": "release-fixture", "GIT_COMMITTER_EMAIL": "release-fixture@localhost",
+        })
+        # A subprocess-only external-client injection leaves the production
+        # command untouched. It also forbids accidental real socket connections.
+        fixture = self.root / "python-fixture"
+        fixture.mkdir()
+        (fixture / "sitecustomize.py").write_text(
+            "import socket\n"
+            "def no_network(*args, **kwargs):\n"
+            "    raise AssertionError('real networking forbidden in publication replay')\n"
+            "socket.create_connection = no_network\n"
+            "import release_artifacts\n"
+            "from dry_run import publication_fixture_request\n"
+            "release_artifacts.Client.request = publication_fixture_request\n", encoding="utf-8")
+        self.env["PYTHONPATH"] = os.pathsep.join(map(str, (fixture, HERE, self.work / "scripts")))
+        shutil.copytree(self.checkout / "scripts", self.work / "scripts")
+        (self.work / "docker").mkdir()
+        sync = (self.work / "scripts/sync-harness.sh").read_text()
+        manifest = re.search(r"^FILES=\(\n(.*?)^\)$", sync, re.S | re.M)
+        if manifest is None:
+            raise RuntimeError("missing harness manifest")
+        http = {}
+        for name in manifest.group(1).split():
+            shutil.copyfile(self.checkout / "docker" / name, self.work / "docker" / name)
+            shutil.copyfile(self.checkout / "docker" / name, self.state / name)
+            http[f"{ENGINE_RAW}/v{version}/docker/{name}"] = {"status": 200, "file": name}
+        (self.state / "http.json").write_text(json.dumps(http))
+        rows = [] if latest is None else [{"id": 1, "tag_name": "v" + latest, "draft": False,
+                                          "assets": [{"name": "release-manifest.json", "state": "uploaded"}]}]
+        (self.state / "publication-releases.json").write_text(json.dumps(rows))
+        (self.state / "actions.jsonl").touch()
+        current = version if retag or mode == "republish" else ("0.1.25" if rp.parse(version).line == "legacy" else "1.5.9")
+        (self.work / "VERSION").write_text(current + "\n")
+        hpo = version if rp.hpo_pairing(rp.parse(version)) else ""
+        components = f"engine {version} + codegen {version}" + (f" + hpo {hpo}" if hpo else "")
+        git("init", "-q", "--bare", self.origin, env=self.env)
+        git("init", "-q", self.work, env=self.env)
+        git("add", "-A", cwd=self.work, env=self.env)
+        git("commit", "-q", "-m", f"chore(release): v{current} — {components}", cwd=self.work, env=self.env)
+        git("remote", "add", "origin", self.origin, cwd=self.work, env=self.env)
+        if mode == "republish" and tag_present:
+            message = f"pineforge-release v{version}\n\nengine={version}\ncodegen={version}\n" + (f"hpo={hpo}\n" if hpo else "")
+            git("tag", "-a", "v" + version, "-m", message, cwd=self.work, env=self.env)
+        git("push", "-q", "origin", "HEAD:main", *([] if reject_push else ["--tags"]),
+            cwd=self.work, env=self.env)
+        if reject_push:
+            hook = self.origin / "hooks/pre-receive"
+            hook.write_text("#!/bin/sh\nwhile read old new ref; do\n"
+                            "  case \"$ref\" in refs/tags/*) exit 1 ;; esac\n"
+                            "done\n", encoding="utf-8")
+            hook.chmod(0o755)
+        self.context = {
+            "github": {"repository_owner": "pineforge-4pass", "token": "fixture-hub-token",
+                       "event": {"client_payload": {"tag": payload_tag, "version": payload_tag}}},
+            "vars": {"RELEASE_REPORT_OWNER": ""},
+            "secrets": {"PINEFORGE_APP_ID": "fixture-app-id", "PINEFORGE_APP_PRIVATE_KEY": "fixture-key"},
+            "steps": {
+                "app": {"outputs": {"token": "fixture-contents-token"}},
+                "decide": {"outputs": {"mode": mode, "cur_ver": version, "release": version,
+                                      "engine": version, "codegen": version, "hpo": hpo,
+                                      "line": rp.parse(version).line, "retag": str(retag).lower(), "awaiting": "codegen"}},
+                "in": {"outputs": {"component": "engine", "version": version, "hpo_pep440": rp.parse(version).pep440}},
+                "pins": {"outputs": {"eprev": "1.5.9", "cprev": "1.5.9", "hprev": ""}},
+            },
+        }
+
+    def run(self, *, mode=None):
+        import copy
+        from unittest.mock import patch
+        ctx = copy.deepcopy(self.context)
+        if mode is not None:
+            ctx["steps"]["decide"]["outputs"].update(mode=mode, retag="false")
+        workflow = wfrun.yaml.load((self.checkout / ".github/workflows/handle-upstream.yml").read_text(),
+                                  Loader=wfrun.yaml.BaseLoader)
+        steps = workflow["jobs"]["bump"]["steps"]
+        start = next(i for i, row in enumerate(steps) if row.get("name") == "No-op")
+        mark = len((self.state / "actions.jsonl").read_text().splitlines())
+        summary = self.root / "summary"
+        summary.write_text("")
+        executed, transcript, failed = [], [], ""
+        call = wfrun.call
+
+        def status_call(name, args):
+            if name in ("success", "failure", "cancelled", "always"):
+                return {"success": not failed, "failure": bool(failed), "cancelled": False, "always": True}[name]
+            return call(name, args)
+
+        for index, step in enumerate(steps[start:]):
+            condition = step.get("if")
+            explicit_status = re.search(r"\b(?:always|failure|success|cancelled)\s*\(", condition or "")
+            if failed and not explicit_status:
+                continue
+            with patch.object(wfrun, "call", side_effect=status_call):
+                if not wfrun.evaluate_if(condition, ctx):
+                    continue
+            name = step["name"]
+            executed.append(name)
+            sid = step.get("id")
+            if "uses" in step:
+                if not step["uses"].startswith("actions/create-github-app-token@"):
+                    raise AssertionError("unmodeled publication replay action")
+                with_ = {k: wfrun.interpolate(v, ctx) for k, v in step["with"].items()}
+                wfrun.record(self.state, tool="actions/create-github-app-token",
+                             repositories=with_.get("repositories"), owner=with_.get("owner"),
+                             permissions={k: v for k, v in with_.items() if k.startswith("permission-")})
+                ctx["steps"][sid] = {"outputs": {"token": "fixture-actions-token"}}
+                continue
+            output = self.root / f"output-{index}"
+            output.write_text("")
+            env = {**self.env, "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)}
+            env.update({k: wfrun.interpolate(v, ctx) for k, v in step.get("env", {}).items()})
+            done = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c",
+                                   wfrun.interpolate(step["run"], ctx)],
+                                  cwd=self.work, env=env, capture_output=True, text=True)
+            transcript.append(done.stdout + done.stderr)
+            if sid:
+                ctx["steps"][sid] = {"outputs": wfrun.parse_output_file(output),
+                                     "outcome": "success" if done.returncode == 0 else "failure"}
+            if done.returncode and not failed and step.get("continue-on-error") != "true":
+                failed = name
+        calls = [json.loads(line) for line in (self.state / "actions.jsonl").read_text().splitlines()[mark:]]
+        return {"ok": not failed, "failed_step": failed, "steps": ctx["steps"], "executed": executed,
+                "text": "\n".join(transcript), "summary": summary.read_text(), "calls": calls}
+
+
 class Result:
     """A job run: wfrun's JobResult plus the shim calls it made."""
 
