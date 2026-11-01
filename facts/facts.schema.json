@@ -197,6 +197,62 @@
         }
       }
     },
+    "otherMarkets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lanes",
+        "markets",
+        "additionalTimeframes",
+        "hardProbes",
+        "corpusProbes",
+        "closedProbes",
+        "graded",
+        "excellent",
+        "strong",
+        "belowStrong",
+        "engineErrors",
+        "tiers"
+      ],
+      "properties": {
+        "lanes": {
+          "$ref": "#/$defs/count"
+        },
+        "markets": {
+          "$ref": "#/$defs/count"
+        },
+        "additionalTimeframes": {
+          "$ref": "#/$defs/count"
+        },
+        "hardProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "corpusProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "closedProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "graded": {
+          "$ref": "#/$defs/count"
+        },
+        "excellent": {
+          "$ref": "#/$defs/count"
+        },
+        "strong": {
+          "$ref": "#/$defs/count"
+        },
+        "belowStrong": {
+          "$ref": "#/$defs/count"
+        },
+        "engineErrors": {
+          "$ref": "#/$defs/count"
+        },
+        "tiers": {
+          "$ref": "#/$defs/tiers"
+        }
+      }
+    },
     "scoreboard": {
       "type": "object",
       "additionalProperties": false,
@@ -349,6 +405,9 @@
           "items": {
             "$ref": "#/$defs/pair"
           }
+        },
+        "otherMarkets": {
+          "$ref": "#/$defs/otherMarkets"
         },
         "scopes": {
           "type": "object",

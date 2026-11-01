@@ -14,6 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from facts_other_markets import description_facts
+
 ROOT = Path(__file__).resolve().parents[1]
 HUB = "pineforge-4pass/pineforge-release"
 FACTS = ROOT / "facts/facts.json"
@@ -311,6 +313,34 @@ class DescriptionsCLI(unittest.TestCase):
         engine = next(row for row in json.loads(result.stdout)["repositories"] if row["role"] == "engine")
         self.assertIn(f'{facts["scoreboard"]["excellent"]:,} excellent', engine["expected"])
         self.assertEqual(self.patch_count, 0)
+
+    def test_aggregate_source_prepares_and_reconciles_with_complete_totals(self):
+        raw = json.dumps(description_facts()).encode()
+        self.files["facts/facts.json"] = raw
+        source = self.prepare()
+        self.assertEqual(source["facts_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual((self.directory / "source/facts.json").read_bytes(), raw)
+        result = self.reconcile(dry_run="true")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        rows = {row["role"]: row for row in json.loads(result.stdout)["repositories"]}
+        self.assertIn("all 10 graded probes", rows["engine"]["expected"])
+        self.assertIn("6 excellent, 4 strong", rows["engine"]["expected"])
+        self.assertIn("2/3 excellent probes", rows["corpus"]["expected"])
+        self.assertEqual(self.patch_count, 0)
+
+    def test_aggregate_identity_payload_fails_before_snapshot_or_consumer_reads(self):
+        facts = description_facts()
+        facts["scoreboard"]["otherMarkets"]["symbol"] = "PRIVATE:INDEX"
+        self.files["facts/facts.json"] = json.dumps(facts).encode()
+        result = self.invoke("prepare", "--facts", str(FACTS),
+                             "--output-dir", str(self.directory / "source"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "facts-descriptions: invalid input or source unavailable; no receipt emitted\n")
+        self.assertFalse((self.directory / "source").exists())
+        self.assertFalse(any(call[0] != "GET" for call in self.calls))
+        self.assertFalse(any(call[1] == "/repos/" + row["repo"] for call in self.calls
+                             for row in self.expected if row["repo"] != HUB))
 
     def test_remote_invalid_facts_or_blob_digest_fail_before_artifacts_or_consumer_calls(self):
         for malformed in (True, False):

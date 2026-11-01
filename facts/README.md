@@ -12,6 +12,12 @@ private receipts without publishing private infrastructure or probe identities.
 graded on. Tags preserve the file in their tagged tree; advancing main does not
 rewrite a release's numbers or create a product release.
 
+`scoreboard.otherMarkets` is optional: it keeps the counts and tiers of markets
+not listed in `pairs`, and carries no symbol, venue or name. Scoreboard totals
+include both the named pairs and this aggregate; `additionalTimeframes` counts
+timeframes absent from the named pairs. `hardLane` still names only the first
+pair with hard probes, so it can be null while `otherMarkets.hardProbes` is nonzero.
+
 Registry trade-row totals and distinct source/slug counts are private evidence
 only, referenced by `privateEvidenceSha256`; they are not public trade or script
 inventories. Website-only metadata, MCP quotas, endpoints and gallery data stay

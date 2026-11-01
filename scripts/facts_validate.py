@@ -115,27 +115,42 @@ def scoreboard_invariants(score):
     require(score["graded"] + score["engineErrors"] + score["anomaliesExcluded"] == score["population"],
             "population sum differs")
     pairs = score["pairs"]
+    other = score.get("otherMarkets")
+    groups = [*pairs, other] if other is not None else pairs
     require(len({(p["symbol"], p["timeframe"]) for p in pairs}) == len(pairs), "duplicate lane identity")
-    require(score["lanes"] == len(pairs) and score["markets"] == len({p["symbol"] for p in pairs})
-            and score["timeframes"] == len({p["timeframe"] for p in pairs}), "lane dimensions differ")
+    require(score["lanes"] == len(pairs) + (other["lanes"] if other is not None else 0)
+            and score["markets"] == len({p["symbol"] for p in pairs}) + (other["markets"] if other is not None else 0)
+            and score["timeframes"] == len({p["timeframe"] for p in pairs})
+            + (other["additionalTimeframes"] if other is not None else 0), "lane dimensions differ")
     for pair in pairs:
         require(re.fullmatch(r"[1-9][0-9]*[DSWM]?", pair["timeframe"]), "invalid lane timeframe")
         tally(pair)
         require(pair["corpusProbes"] + pair["closedProbes"] == pair["graded"] + pair["engineErrors"],
                 "lane scope sum differs")
         require(pair["hardProbes"] <= pair["graded"] + pair["engineErrors"], "hard probes exceed lane")
+    if other is not None:
+        tally(other)
+        require(other["corpusProbes"] + other["closedProbes"] == other["graded"] + other["engineErrors"],
+                "other markets scope sum differs")
+        require(other["hardProbes"] <= other["graded"] + other["engineErrors"],
+                "hard probes exceed other markets")
+        require(other["markets"] <= other["lanes"], "other markets exceed lanes")
+        require(other["lanes"] <= other["graded"] + other["engineErrors"], "other lanes exceed probes")
+        require(other["additionalTimeframes"] <= other["lanes"], "other timeframes exceed lanes")
+        require((other["markets"] == 0) == (other["lanes"] == 0),
+                "other markets and lanes disagree on emptiness")
     for field in COUNTS:
-        require(sum(p[field] for p in pairs) == score[field], "lane count sum differs")
+        require(sum(p[field] for p in groups) == score[field], "lane count sum differs")
         require(sum(scope[field] for scope in score["scopes"].values()) == score[field],
                 "scope count sum differs")
     for tier in TIERS:
-        require(sum(p["tiers"][tier] for p in pairs) == score["tiers"][tier], "lane tier sum differs")
+        require(sum(p["tiers"][tier] for p in groups) == score["tiers"][tier], "lane tier sum differs")
         require(sum(s["tiers"][tier] for s in score["scopes"].values()) == score["tiers"][tier],
                 "scope tier sum differs")
     for name, scope in score["scopes"].items():
         tally(scope)
         require(score[name + "Probes"] == scope["graded"] + scope["engineErrors"]
-                == sum(p[name + "Probes"] for p in pairs), "scope probes differ")
+                == sum(p[name + "Probes"] for p in groups), "scope probes differ")
     hard_pairs = [pair for pair in pairs if pair["hardProbes"]]
     require(score["hardLane"] == (hard_pairs[0] if hard_pairs else None),
             "hard lane differs from lane evidence")

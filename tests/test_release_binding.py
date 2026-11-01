@@ -35,6 +35,8 @@ import release_receipts as receipts  # noqa: E402
 import release_rollback as rollback  # noqa: E402
 import release_sources as sources  # noqa: E402
 import consumer_receipt_example as receipt_example  # noqa: E402
+from facts_validate import InputError  # noqa: E402
+from facts_other_markets import aggregate_facts, legacy_facts  # noqa: E402
 
 
 def fixture_manifest(v="1.6.0"):
@@ -2536,6 +2538,92 @@ class ReceiptTests(unittest.TestCase):
             receipts.collect(self, Hub(), store, "web")
         self.assertTrue(any(asset["name"].startswith("facts-consumer-web-") for asset in store.facts()["assets"]))
         self.assertNotIn("web", pipeline.receipts(store, row, self.event["event_id"]))
+
+
+class OtherMarketsBindingTests(unittest.TestCase):
+    def test_facts_receipt_validation_accepts_both_shapes_and_rejects_bad_aggregate(self):
+        class Hub:
+            def file(self, repo, commit, path):
+                if (repo, commit, path) != (contract.HUB, "e" * 40, "facts/facts.json"):
+                    raise AssertionError("unexpected facts source")
+                return self.raw
+
+            def api(self, route):
+                if route == f"repos/{contract.HUB}/git/ref/heads/main":
+                    return {"object": {"sha": "e" * 40}}
+                if route == f"repos/{contract.HUB}/compare/{'e' * 40}...{'e' * 40}":
+                    return {"status": "identical"}
+                raise AssertionError("unexpected canonical history request")
+
+        hub = Hub()
+        for factory in (aggregate_facts, legacy_facts):
+            hub.raw = contract.canonical(factory())
+            target = {"commit": "e" * 40, "sha256": hashlib.sha256(hub.raw).hexdigest()}
+            with self.subTest(shape=factory.__name__):
+                self.assertIsNone(receipts.validate_facts_target(hub, target))
+        bad = aggregate_facts()
+        bad["scoreboard"]["otherMarkets"]["symbol"] = "PRIVATE:INDEX"
+        hub.raw = contract.canonical(bad)
+        target["sha256"] = hashlib.sha256(hub.raw).hexdigest()
+        with self.assertRaisesRegex(InputError, r"^facts schema validation failed \(additionalProperties\)$"):
+            receipts.validate_facts_target(hub, target)
+
+    def test_bind_and_retain_accept_both_shapes_and_bind_exact_bytes(self):
+        for factory in (aggregate_facts, legacy_facts):
+            with self.subTest(shape=factory.__name__):
+                facts = factory()
+                score = facts["releases"]["1.0.1"]["scoreboard"]
+                versions = {role: {"commit": score[role + "Commit"]} for role in ("engine", "codegen")}
+                raw = contract.canonical(facts)
+                expected = {"commit": "e" * 40, "path": "facts/facts.json",
+                            "sha256": hashlib.sha256(raw).hexdigest(), "release_key": "1.0.1"}
+                self.assertEqual(contract.bind_facts(raw, "e" * 40, "1.0.1", versions), expected)
+                manifest = {"facts": expected, "prerelease": False}
+                self.assertEqual(contract.retain_facts(manifest, raw, raw), expected["sha256"])
+                newer = copy.deepcopy(facts)
+                newer["scoreboard"]["pairs"][0]["hardProbes"] = 0
+                newer["scoreboard"]["hardLane"] = next(
+                    (copy.deepcopy(p) for p in newer["scoreboard"]["pairs"] if p["hardProbes"]), None)
+                installed = contract.canonical(newer)
+                self.assertEqual(contract.retain_facts(manifest, raw, installed),
+                                 hashlib.sha256(installed).hexdigest())
+
+    def test_binding_refuses_identity_payload_and_inconsistent_aggregate_before_binding(self):
+        facts = aggregate_facts()
+        release = facts["releases"]["1.0.1"]["scoreboard"]
+        versions = {role: {"commit": release[role + "Commit"]} for role in ("engine", "codegen")}
+        original = contract.canonical(facts)
+        manifest = {"prerelease": False, "facts": {
+            "release_key": "1.0.1", "sha256": hashlib.sha256(original).hexdigest()}}
+        for location in ("active", "release"):
+            for identity in (True, False):
+                with self.subTest(location=location, identity=identity):
+                    bad = copy.deepcopy(facts)
+                    score = bad["scoreboard"] if location == "active" else bad["releases"]["1.0.1"]["scoreboard"]
+                    score["otherMarkets"].update({"symbol": "PRIVATE:INDEX"} if identity else {"hardProbes": 6})
+                    raw = contract.canonical(bad)
+                    message = ("facts schema validation failed (additionalProperties)" if identity
+                               else "hard probes exceed other markets")
+                    with self.assertRaisesRegex(InputError, "^" + re.escape(message) + "$"):
+                        contract.bind_facts(raw, "e" * 40, "1.0.1", versions)
+                    # Retention validates the installed document; release-entry
+                    # immutability is a separate earlier contract guard.
+                    pinned = dict(manifest, facts=dict(manifest["facts"], sha256=hashlib.sha256(raw).hexdigest()))
+                    with self.assertRaisesRegex(InputError, "^" + re.escape(message) + "$"):
+                        contract.retain_facts(pinned, raw, raw)
+
+    def test_binding_keeps_source_commit_and_release_entry_guards(self):
+        facts = aggregate_facts()
+        raw = contract.canonical(facts)
+        versions = {role: {"commit": "f" * 40} for role in ("engine", "codegen")}
+        with self.assertRaisesRegex(contract.Invalid, "^release facts source commit differs$"):
+            contract.bind_facts(raw, "e" * 40, "1.0.1", versions)
+        manifest = {"prerelease": False, "facts": {
+            "release_key": "1.0.1", "sha256": hashlib.sha256(raw).hexdigest()}}
+        changed = copy.deepcopy(facts)
+        changed["releases"]["1.0.1"]["scoreboard"]["otherMarkets"]["hardProbes"] = 1
+        with self.assertRaisesRegex(contract.Invalid, "^release facts entry changed$"):
+            contract.retain_facts(manifest, raw, contract.canonical(changed))
 
 
 class ImmutableAssetTests(unittest.TestCase):

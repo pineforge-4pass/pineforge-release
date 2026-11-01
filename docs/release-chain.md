@@ -124,6 +124,11 @@ and on manual replay. It never rebuilds a stored verified candidate. It requires
   measured evidence and engine/codegen commits equal to the candidate's sources.
   The active scoreboard is never substituted for the stable release mapping.
 
+Active and released scoreboards may include optional `otherMarkets`, containing
+only counts and tiers for markets absent from `pairs`, with no symbol, venue or
+name. Totals include this aggregate. `hardLane` still names only the first pair
+with hard probes and may be null while `otherMarkets` holds hard probes.
+
 **Prerelease rule:** prereleases skip the per-release measured facts requirement.
 They bind the SHA-256 and commit of schema/semantically validated `main` facts;
 they do not wait for `facts.releases["X.Y.Z-rc.N"]`. The ready event still carries

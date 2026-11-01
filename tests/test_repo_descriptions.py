@@ -15,6 +15,8 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
+from facts_other_markets import description_facts, tiers
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "repo_descriptions.py"
 FACTS = REPO / "facts" / "facts.json"
@@ -133,6 +135,24 @@ class DescriptionCLI(unittest.TestCase):
                          "Release probes: 7989; current: 7989; date: 2026-10-07; "
                          "engine: 49bb202944c54c9bffdb918e24a7f4fb1a7d838d.")
 
+    def test_aggregate_descriptions_use_full_totals_even_without_named_pairs(self):
+        for named in (True, False):
+            facts = description_facts()
+            if not named:
+                for score in (facts["scoreboard"], facts["releases"]["1.0.1"]["scoreboard"]):
+                    score["pairs"] = []
+                    score["hardLane"] = None
+                    score["otherMarkets"] = dict(
+                        lanes=5, markets=3, additionalTimeframes=3, hardProbes=3,
+                        corpusProbes=4, closedProbes=8, graded=10, excellent=6,
+                        strong=4, belowStrong=0, engineErrors=2, tiers=tiers(6, 4))
+            with self.subTest(named=named):
+                document = self.render(facts=self.document("aggregate.json", facts))
+                rows = {row["role"]: row for row in document["repositories"]}
+                self.assertIn("all 10 graded probes", rows["engine"]["expected"])
+                self.assertIn("6 excellent, 4 strong", rows["engine"]["expected"])
+                self.assertIn("2/3 excellent probes", rows["corpus"]["expected"])
+
     def test_future_main_does_not_relabel_inventory_or_released_metrics(self):
         canonical = json.loads(FACTS.read_text(encoding="utf-8"))
         inventory = canonical["inventory"]
@@ -184,14 +204,17 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(scoreboard["hardLane"], canonical["scoreboard"]["hardLane"])
         self.assertEqual(scoreboard["population"] - scoreboard["anomaliesExcluded"],
                          scoreboard["graded"])
-        for group in [scoreboard, *scoreboard["scopes"].values(), *scoreboard["pairs"]]:
+        lanes = [*scoreboard["pairs"]]
+        if "otherMarkets" in scoreboard:
+            lanes.append(scoreboard["otherMarkets"])
+        for group in [scoreboard, *scoreboard["scopes"].values(), *lanes]:
             self.assertEqual(sum(group["tiers"].values()), group["graded"])
             self.assertEqual(group["excellent"] + group["strong"] + group["belowStrong"],
                              group["graded"])
             self.assertEqual(group["belowStrong"], sum(value for tier, value in group["tiers"].items()
                                                      if tier not in {"excellent", "strong"}))
         for field in ("graded", "excellent", "strong", "belowStrong", "engineErrors"):
-            self.assertEqual(sum(value[field] for value in scoreboard["pairs"]), scoreboard[field])
+            self.assertEqual(sum(value[field] for value in lanes), scoreboard[field])
             self.assertEqual(sum(value[field] for value in scoreboard["scopes"].values()),
                              scoreboard[field])
         future = self.document("future-below-strong.json", facts)
