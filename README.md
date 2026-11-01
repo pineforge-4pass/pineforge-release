@@ -257,6 +257,24 @@ combined image, package identities and measured release facts are ready.
 example `1.0.0-rc.1`) gets `X.Y.Z-rc.N` · `engine<E>-codegen<C>` · `sha-<short>`
 only.
 
+## Offline runtime and TLS
+
+The image is offline by design. The [backtest entrypoint](docker/entrypoint.sh)
+transpiles and compiles locally using bundled code and mounted inputs, with no
+runtime network fetch. The [release smoke](scripts/release_smoke.py) runs the
+image with `--network=none`.
+
+The runtime image carries no system CA bundle
+(`/etc/ssl/certs/ca-certificates.crt`). The [Dockerfile](docker/Dockerfile) installs
+`ca-certificates` only in build stages and does not copy their certificates into
+the runtime. Outbound requests cannot reach remote services under `--network=none`.
+Even with networking enabled, TLS clients that rely on the system CA store
+cannot verify server certificates without supplied trust roots.
+
+Adding `ca-certificates` for TLS inside the container requires a later image
+pair, its own source set registered in `docker/SOURCE-SETS.tsv`, and a renewed
+base-digest proof.
+
 ## Debian source packages
 
 Every release carries or links the exact source packages for the Debian

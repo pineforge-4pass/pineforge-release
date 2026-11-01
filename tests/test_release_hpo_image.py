@@ -955,10 +955,11 @@ class ReadmePairRuleTest(unittest.TestCase):
     PAIR_RULE_SHA256 = "35b72f7f5c7466cfc212a71eaf05df98f45e92411fd34a67bfff761556c61601"
 
     # The converter documentation adds 30 lines to the previous 446-line layout.
+    # The offline runtime and TLS section adds 18 lines after the pair rule, for 494.
     # The pair-rule digest above still covers the unchanged lines 215-244.
-    def test_runner_documentation_keeps_the_476_line_layout(self):
+    def test_runner_documentation_keeps_the_494_line_layout(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
-        self.assertEqual(len(lines), 476)
+        self.assertEqual(len(lines), 494)
 
     def test_lines_215_to_244_are_byte_identical_to_the_published_rule(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
