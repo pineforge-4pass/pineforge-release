@@ -8,6 +8,8 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from facts_other_markets import aggregate_facts, legacy_facts
+
 ROOT = Path(__file__).resolve().parents[1]
 FACTS = ROOT / "facts/facts.json"
 
@@ -58,6 +60,24 @@ class FactsCardsCLI(unittest.TestCase):
                 result = self.invoke(facts=path, format=format)
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, "")
+
+    def test_aggregate_and_legacy_cards_use_complete_totals_in_both_formats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "facts.json"
+            for factory in (aggregate_facts, legacy_facts):
+                path.write_text(json.dumps(factory()))
+                for variant, excellent, graded in (("full", 3, 10), ("corpus", 1, 3)):
+                    with self.subTest(shape=factory.__name__, variant=variant):
+                        result = self.invoke(variant, "json", facts=path)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        data = json.loads(result.stdout)
+                        self.assertTrue(data["message"].startswith(f"{excellent}/{graded} excellent; "))
+                        self.assertEqual(data["factsSha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+                        result = self.invoke(variant, "svg", facts=path)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        svg = ET.fromstring(result.stdout)
+                        text = " ".join(svg.itertext())
+                        self.assertIn(f"{excellent} / {graded} excellent probes", text)
 
 
 if __name__ == "__main__":
