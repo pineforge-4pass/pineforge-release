@@ -1,4 +1,4 @@
-"""Canonical CLI acceptance and exact schema/semantic refusal diagnostics."""
+"""Fixture CLI acceptance and exact schema/semantic refusal diagnostics."""
 import copy
 import hashlib
 import json
@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FACTS = ROOT / "facts/facts.json"
+FACTS = ROOT / "tests/fixtures/repo-descriptions-facts.json"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from facts_validate import InputError, validate_facts
@@ -18,17 +18,30 @@ from facts_other_markets import aggregate_facts, legacy_facts, tiers, zero_aggre
 
 
 class FactsValidationCLI(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        facts = json.loads(FACTS.read_text())
+        facts["scoreboard"].update(
+            tvTradesCompared=1,
+            tvTradesComparedSource=(
+                "Sum over the graded probes of this baseline of the trades compared with TradingView, "
+                "each probe counted once; a position closed in several parts counts once; "
+                "trades still open at the end of TradingView's list are excluded."))
+        self.facts = Path(temporary.name) / "facts.json"
+        self.facts.write_text(json.dumps(facts))
+
     def invoke(self, path):
         return subprocess.run([sys.executable, str(ROOT / "scripts/facts_validate.py"),
                                "--facts", str(path)], capture_output=True, text=True)
 
     def test_current_and_historical_facts_validate(self):
-        result = self.invoke(FACTS)
+        result = self.invoke(self.facts)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["sha256"], hashlib.sha256(FACTS.read_bytes()).hexdigest())
+        self.assertEqual(json.loads(result.stdout)["sha256"], hashlib.sha256(self.facts.read_bytes()).hexdigest())
 
     def test_compared_trade_count_is_one_paired_active_integer_and_optional(self):
-        canonical = json.loads(FACTS.read_text())
+        canonical = json.loads(self.facts.read_text())
         score = canonical["scoreboard"]
         self.assertIsInstance(score["tvTradesCompared"], int)
         self.assertNotIsInstance(score["tvTradesCompared"], bool)
@@ -47,7 +60,7 @@ class FactsValidationCLI(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_complete_schema_and_semantic_negatives_have_no_output(self):
-        canonical = json.loads(FACTS.read_text())
+        canonical = json.loads(self.facts.read_text())
         changes = {
             "root-extra": lambda f: f.update(extra=True),
             "missing": lambda f: f["scoreboard"].pop("pairs"),
@@ -369,6 +382,91 @@ class OtherMarketsValidation(unittest.TestCase):
                     facts = aggregate_facts()
                     change(self.scores(facts)[target])
                     self.assert_invalid(facts, message)
+
+
+class CryptoPairValidation(unittest.TestCase):
+    def scores(self, facts):
+        return (facts["scoreboard"], facts["releases"]["1.0.1"]["scoreboard"])
+
+    def assert_invalid(self, facts, message):
+        with self.assertRaisesRegex(InputError, "^" + re.escape(message) + "$"):
+            validate_facts(facts)
+
+    def test_each_crypto_venue_accepts_pairs_and_hard_lane_with_optional_aggregate(self):
+        venues = (
+            "BINANCE", "BINANCEUS", "BYBIT", "COINBASE", "KRAKEN", "BITSTAMP",
+            "BITFINEX", "OKX", "KUCOIN", "GATEIO", "MEXC", "HUOBI", "HTX", "BITGET",
+        )
+        for factory in (aggregate_facts, legacy_facts):
+            for target in (0, 1):
+                for venue in venues:
+                    with self.subTest(shape=factory.__name__, target=target, venue=venue):
+                        facts = factory()
+                        score = self.scores(facts)[target]
+                        for pair in score["pairs"][:2]:
+                            pair["symbol"] = venue + ":BTCUSDT"
+                        score["hardLane"] = copy.deepcopy(score["pairs"][0])
+                        self.assertIs(validate_facts(facts), facts)
+                        self.assertEqual(score["hardLane"], score["pairs"][0])
+                        self.assertEqual("otherMarkets" in score, factory is aggregate_facts)
+
+    def test_ticker_accepts_digits_underscore_period_and_exclamation(self):
+        for target in (0, 1):
+            with self.subTest(target=target):
+                facts = aggregate_facts()
+                score = self.scores(facts)[target]
+                for pair in score["pairs"]:
+                    pair["symbol"] = "KRAKEN:XBT_USD.P1!"
+                score["hardLane"] = copy.deepcopy(score["pairs"][0])
+                self.assertIs(validate_facts(facts), facts)
+
+    def test_unlisted_venues_and_malformed_pair_symbols_fail_schema(self):
+        symbols = (
+            "NASDAQ:AAPL",
+            "NYSE:IBM",
+            "OANDA:EURUSD",
+            "CME_MINI:ES1!",
+            "NSE:NIFTY",
+            "FOO:BTCUSDT",
+            "binance:BTCUSDT",
+            "BTCUSDT",
+            "BINANCEX:BTCUSDT",
+            "BINANCE:BTC-USDT",
+            "BINANCE:BTCUSDT:PERP",
+            "BINANCEBTCUSDT",
+            "BINANCE:",
+            "XBINANCE:BTCUSDT",
+            "BINANCE:BTCUSDT?",
+        )
+        for factory in (aggregate_facts, legacy_facts):
+            for target in (0, 1):
+                for symbol in symbols:
+                    with self.subTest(shape=factory.__name__, target=target, symbol=symbol):
+                        facts = factory()
+                        score = self.scores(facts)[target]
+                        # Only the non-hard pair changes, adding one distinct named market.
+                        score["pairs"][1]["symbol"] = symbol
+                        score["markets"] += 1
+                        self.assert_invalid(facts, "facts schema validation failed (pattern)")
+
+    def test_non_crypto_hard_lane_fails_its_schema_branch(self):
+        for factory in (aggregate_facts, legacy_facts):
+            for target in (0, 1):
+                with self.subTest(shape=factory.__name__, target=target):
+                    facts = factory()
+                    self.scores(facts)[target]["hardLane"]["symbol"] = "NASDAQ:AAPL"
+                    self.assert_invalid(facts, "facts schema validation failed (anyOf)")
+
+    def test_crypto_hard_lane_still_requires_first_hard_pair_evidence(self):
+        for factory in (aggregate_facts, legacy_facts):
+            for target in (0, 1):
+                with self.subTest(shape=factory.__name__, target=target):
+                    facts = factory()
+                    score = self.scores(facts)[target]
+                    self.assertEqual(score["hardLane"], score["pairs"][0])
+                    self.assertIs(validate_facts(facts), facts)
+                    score["hardLane"]["symbol"] = "COINBASE:BTCUSD"
+                    self.assert_invalid(facts, "hard lane differs from lane evidence")
 
 
 if __name__ == "__main__":

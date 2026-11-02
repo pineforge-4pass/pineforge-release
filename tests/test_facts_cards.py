@@ -11,7 +11,7 @@ from pathlib import Path
 from facts_other_markets import aggregate_facts, legacy_facts
 
 ROOT = Path(__file__).resolve().parents[1]
-FACTS = ROOT / "facts/facts.json"
+FACTS = ROOT / "tests/fixtures/repo-descriptions-facts.json"
 
 
 class FactsCardsCLI(unittest.TestCase):
