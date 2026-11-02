@@ -18,7 +18,7 @@ from facts_other_markets import description_facts
 
 ROOT = Path(__file__).resolve().parents[1]
 HUB = "pineforge-4pass/pineforge-release"
-FACTS = ROOT / "facts/facts.json"
+FACTS = ROOT / "tests/fixtures/repo-descriptions-facts.json"
 POLICY = ROOT / "facts/repo-descriptions.json"
 
 
@@ -29,8 +29,11 @@ class DescriptionsCLI(unittest.TestCase):
         self.directory = Path(self.temp.name)
         self.calls = []
         self.commit = "a" * 40
-        self.files = {name: (ROOT / name).read_bytes() for name in
-                      ("facts/facts.json", "facts/repo-descriptions.json", "facts/facts.schema.json")}
+        self.files = {
+            "facts/facts.json": FACTS.read_bytes(),
+            "facts/repo-descriptions.json": POLICY.read_bytes(),
+            "facts/facts.schema.json": (ROOT / "facts/facts.schema.json").read_bytes(),
+        }
         rendered = subprocess.run([sys.executable, str(ROOT / "scripts/repo_descriptions.py"),
                                    "render", "--facts", str(FACTS)], capture_output=True, text=True)
         self.assertEqual(rendered.returncode, 0, rendered.stderr)

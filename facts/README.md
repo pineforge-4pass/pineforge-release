@@ -18,6 +18,13 @@ include both the named pairs and this aggregate; `additionalTimeframes` counts
 timeframes absent from the named pairs. `hardLane` still names only the first
 pair with hard probes, so it can be null while `otherMarkets.hardProbes` is nonzero.
 
+Listed `pairs` and a non-null `hardLane` on active and release scoreboards must
+name crypto lanes as `VENUE:TICKER`, using the schema's crypto venue allow-list
+and ticker characters `[A-Z0-9_!.]+`. The venue list is hand-maintained and
+duplicated by hand in the venue list of the facts exporter; the two lists must
+stay identical. A crypto venue can list non-crypto products, which is a known
+limit of this venue check.
+
 Registry trade-row totals and distinct source/slug counts are private evidence
 only, referenced by `privateEvidenceSha256`; they are not public trade or script
 inventories. Website-only metadata, MCP quotas, endpoints and gallery data stay

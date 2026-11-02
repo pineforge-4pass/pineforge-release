@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -335,6 +336,11 @@ class FanoutCLI(unittest.TestCase):
 
     def test_actual_workflow_prepare_and_dispatch_shells(self):
         text = WORKFLOW.read_text()
+        checkout = self.directory / "checkout"
+        shutil.copytree(ROOT / "scripts", checkout / "scripts")
+        (checkout / "facts").mkdir()
+        for name, raw in self.github.files.items():
+            (checkout / name).write_bytes(raw)
         env = dict(self.env, RUNNER_TEMP=str(self.directory),
                    GITHUB_OUTPUT=str(self.directory / "outputs"), DRY_RUN="true",
                    FACTS_WEB_DISPATCH_ENABLED="false", FACTS_READ_TOKEN="test-read",
@@ -348,7 +354,7 @@ class FanoutCLI(unittest.TestCase):
             if enabled:
                 env.update(FACTS_WEB_DISPATCH_ENABLED="true", MINT_OUTCOME="success")
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
-                                    cwd=ROOT, env=dict(env, TEST_API=self.github.api),
+                                    cwd=checkout, env=dict(env, TEST_API=self.github.api),
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assert_redacted(result)

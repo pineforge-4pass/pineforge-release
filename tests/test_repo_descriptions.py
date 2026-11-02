@@ -19,8 +19,8 @@ from facts_other_markets import description_facts, tiers
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "repo_descriptions.py"
-FACTS = REPO / "facts" / "facts.json"
 FROZEN_FACTS = REPO / "tests" / "fixtures" / "repo-descriptions-facts.json"
+FACTS = FROZEN_FACTS
 POLICY = REPO / "facts" / "repo-descriptions.json"
 
 

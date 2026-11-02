@@ -162,7 +162,7 @@
       "properties": {
         "symbol": {
           "type": "string",
-          "pattern": "^[A-Z0-9_:!.]+$"
+          "pattern": "^(BINANCE|BINANCEUS|BYBIT|COINBASE|KRAKEN|BITSTAMP|BITFINEX|OKX|KUCOIN|GATEIO|MEXC|HUOBI|HTX|BITGET):[A-Z0-9_!.]+$"
         },
         "timeframe": {
           "type": "string",
