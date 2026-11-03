@@ -197,6 +197,47 @@
         }
       }
     },
+    "otherMarketTimeframe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timeframe",
+        "lanes",
+        "graded",
+        "excellent",
+        "strong",
+        "belowStrong",
+        "engineErrors",
+        "tiers"
+      ],
+      "properties": {
+        "timeframe": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*[DSWM]?$"
+        },
+        "lanes": {
+          "$ref": "#/$defs/count"
+        },
+        "graded": {
+          "$ref": "#/$defs/count"
+        },
+        "excellent": {
+          "$ref": "#/$defs/count"
+        },
+        "strong": {
+          "$ref": "#/$defs/count"
+        },
+        "belowStrong": {
+          "$ref": "#/$defs/count"
+        },
+        "engineErrors": {
+          "$ref": "#/$defs/count"
+        },
+        "tiers": {
+          "$ref": "#/$defs/tiers"
+        }
+      }
+    },
     "otherMarkets": {
       "type": "object",
       "additionalProperties": false,
@@ -223,6 +264,12 @@
         },
         "additionalTimeframes": {
           "$ref": "#/$defs/count"
+        },
+        "timeframes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/otherMarketTimeframe"
+          }
         },
         "hardProbes": {
           "$ref": "#/$defs/count"
