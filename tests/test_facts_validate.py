@@ -15,6 +15,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from facts_validate import InputError, validate_facts
 from facts_other_markets import aggregate_facts, legacy_facts, tiers, zero_aggregate
+from facts_other_markets import (
+    all_tier_timeframe_facts, other_market_timeframe_rows,
+    shared_other_market_timeframe_rows, timeframe_facts,
+)
 
 
 class FactsValidationCLI(unittest.TestCase):
@@ -467,6 +471,447 @@ class CryptoPairValidation(unittest.TestCase):
                     self.assertIs(validate_facts(facts), facts)
                     score["hardLane"]["symbol"] = "COINBASE:BTCUSD"
                     self.assert_invalid(facts, "hard lane differs from lane evidence")
+
+
+class OtherMarketsTimeframesValidation(unittest.TestCase):
+    """Exercise the real schema and validator with independent input oracles."""
+
+    SCALARS = ("lanes", "graded", "excellent", "strong", "belowStrong", "engineErrors")
+    TIER_NAMES = ("excellent", "strong", "moderate", "weak", "minimal", "no-trades")
+    TARGETS = ((0,), (1,), (0, 1))
+
+    def scores(self, facts):
+        return (facts["scoreboard"], facts["releases"]["1.0.1"]["scoreboard"])
+
+    def assert_valid(self, facts):
+        try:
+            actual = validate_facts(facts)
+        except InputError as error:
+            self.fail(f"expected valid timeframe facts; validate_facts rejected them: {error}")
+        self.assertIs(actual, facts)
+
+    def assert_invalid(self, facts):
+        with self.assertRaises(InputError):
+            validate_facts(facts)
+
+    def validated_case(self, target, factory=timeframe_facts):
+        facts = factory(targets=(target,))
+        # A negative only counts after this exact unmutated input validates.
+        self.assert_valid(facts)
+        return facts, self.scores(facts)[target]["otherMarkets"]["timeframes"]
+
+    def assert_partition_totals(self, rows, counts=(3, 4, 1, 1, 2, 1),
+                                tier_counts=(1, 1, 0, 0, 1, 1)):
+        # Expected tuples are handwritten, never obtained from production.
+        self.assertEqual(tuple(sum(row[field] for row in rows) for field in self.SCALARS),
+                         counts)
+        self.assertEqual(tuple(sum(row["tiers"][tier] for row in rows)
+                               for tier in self.TIER_NAMES), tier_counts)
+
+    def assert_row_tallies(self, rows):
+        # Check isolation preconditions without invoking the production tally.
+        for row in rows:
+            self.assertEqual(row["excellent"] + row["strong"] + row["belowStrong"],
+                             row["graded"])
+            self.assertEqual(sum(row["tiers"].values()), row["graded"])
+            self.assertEqual(
+                (row["excellent"], row["strong"], row["belowStrong"]),
+                (row["tiers"]["excellent"], row["tiers"]["strong"],
+                 sum(row["tiers"][tier] for tier in self.TIER_NAMES[2:])))
+
+    def test_legacy_documents_without_timeframe_arrays_remain_valid(self):
+        for factory in (aggregate_facts, legacy_facts):
+            with self.subTest(shape=factory.__name__):
+                facts = factory()
+                for score in self.scores(facts):
+                    self.assertNotIn("timeframes", score.get("otherMarkets", {}))
+                self.assert_valid(facts)
+
+    def test_three_and_shared_frame_oracles_accept_active_archive_and_both(self):
+        for row_factory in (other_market_timeframe_rows, shared_other_market_timeframe_rows):
+            for targets in self.TARGETS:
+                with self.subTest(rows=row_factory.__name__, targets=targets):
+                    facts = timeframe_facts(row_factory, targets)
+                    control = aggregate_facts()
+                    self.assert_valid(control)
+                    self.assert_valid(facts)
+                    for target, score in enumerate(self.scores(facts)):
+                        other = copy.deepcopy(score["otherMarkets"])
+                        if target in targets:
+                            rows = other.pop("timeframes")
+                            self.assert_partition_totals(rows)
+                            self.assert_row_tallies(rows)
+                        else:
+                            self.assertNotIn("timeframes", other)
+                        self.assertEqual(other, self.scores(control)[target]["otherMarkets"])
+                        self.assertEqual(score["timeframes"], 3)
+                        self.assertEqual(other["additionalTimeframes"], 1)
+                        unchanged = copy.deepcopy(score)
+                        unchanged["otherMarkets"] = other
+                        self.assertEqual(unchanged, self.scores(control)[target])
+
+    def test_all_six_tiers_accept_active_archive_and_both(self):
+        for targets in self.TARGETS:
+            with self.subTest(targets=targets):
+                facts = all_tier_timeframe_facts(targets)
+                control = all_tier_timeframe_facts(targets=())
+                self.assert_valid(control)
+                self.assert_valid(facts)
+                for target in targets:
+                    score = self.scores(facts)[target]
+                    self.assertEqual(score["graded"], 10)
+                    self.assertEqual(score["tiers"], tiers(3, 3, 1, 1, 1, 1))
+                    rows = score["otherMarkets"]["timeframes"]
+                    self.assert_partition_totals(rows, (3, 6, 1, 1, 4, 1),
+                                                 (1, 1, 1, 1, 1, 1))
+                    self.assert_row_tallies(rows)
+
+    def test_canonical_labels_use_string_order_without_renumbering_dimensions(self):
+        # 10 precedes 2 in string order; every allowed suffix is exercised.
+        labels = (("1", "2"), ("10", "2"), ("1D", "1M"), ("1S", "1W"),
+                  ("15", "999999999999999999999999999999"))
+        for target in (0, 1):
+            for first, second in labels:
+                with self.subTest(target=target, labels=(first, second)):
+                    facts = timeframe_facts(shared_other_market_timeframe_rows, (target,))
+                    rows = self.scores(facts)[target]["otherMarkets"]["timeframes"]
+                    rows[0]["timeframe"], rows[1]["timeframe"] = first, second
+                    self.assert_partition_totals(rows)
+                    self.assert_valid(facts)
+                    self.assertEqual(self.scores(facts)[target]["timeframes"], 3)
+                    self.assertEqual(
+                        self.scores(facts)[target]["otherMarkets"]["additionalTimeframes"], 1)
+
+    def test_every_release_independently_accepts_or_omits_timeframes(self):
+        selections = (
+            (), ("active",), ("1.0.1",), ("1.0.2",),
+            ("active", "1.0.1"), ("active", "1.0.2"), ("1.0.1", "1.0.2"),
+            ("active", "1.0.1", "1.0.2"),
+        )
+        for selected in selections:
+            with self.subTest(selected=selected):
+                facts = aggregate_facts()
+                later = copy.deepcopy(facts["releases"]["1.0.1"])
+                later["source"] = (
+                    "https://github.com/pineforge-4pass/pineforge-engine/"
+                    "blob/v1.0.2/README.md#validation-scoreboard")
+                facts["releases"]["1.0.2"] = later
+                self.assert_valid(facts)
+                scores = {"active": facts["scoreboard"],
+                          "1.0.1": facts["releases"]["1.0.1"]["scoreboard"],
+                          "1.0.2": later["scoreboard"]}
+                for name in selected:
+                    rows = (shared_other_market_timeframe_rows() if name == "1.0.2"
+                            else other_market_timeframe_rows())
+                    scores[name]["otherMarkets"]["timeframes"] = copy.deepcopy(rows)
+                self.assert_valid(facts)
+
+    def test_later_release_timeframes_are_always_validated(self):
+        facts = aggregate_facts()
+        later = copy.deepcopy(facts["releases"]["1.0.1"])
+        later["source"] = (
+            "https://github.com/pineforge-4pass/pineforge-engine/"
+            "blob/v1.0.2/README.md#validation-scoreboard")
+        later["scoreboard"]["otherMarkets"]["timeframes"] = other_market_timeframe_rows()
+        facts["releases"]["1.0.2"] = later
+        self.assert_valid(facts)
+        later["scoreboard"]["otherMarkets"]["timeframes"][0]["engineErrors"] = 0
+        self.assert_invalid(facts)
+
+    def test_zero_aggregate_accepts_empty_arrays_independently(self):
+        for targets in self.TARGETS:
+            with self.subTest(targets=targets):
+                facts = legacy_facts()
+                for target, score in enumerate(self.scores(facts)):
+                    score["otherMarkets"] = zero_aggregate()
+                    if target in targets:
+                        score["otherMarkets"]["timeframes"] = []
+                self.assert_valid(facts)
+
+    def test_nonzero_aggregate_rejects_empty_arrays(self):
+        for target in (0, 1):
+            with self.subTest(target=target):
+                facts, rows = self.validated_case(target)
+                rows.clear()
+                self.assert_invalid(facts)
+
+    def test_error_only_rows_accept_safe_maximum_and_reject_empty_arrays(self):
+        # Synthetic boundary oracle: zero grades and exactly count error probes.
+        # No graded count can mask a missing engineErrors sum check on empty [].
+        for count in (1, 2**53 - 1):
+            with self.subTest(engine_errors=count):
+                facts = aggregate_facts()
+                for score in self.scores(facts):
+                    other = zero_aggregate()
+                    other.update(lanes=1, markets=1, additionalTimeframes=1,
+                                 closedProbes=count, engineErrors=count)
+                    other["timeframes"] = [
+                        dict(timeframe="1S", lanes=1, graded=0, excellent=0, strong=0,
+                             belowStrong=0, engineErrors=count, tiers=tiers()),
+                    ]
+                    score.update(
+                        population=count, anomaliesExcluded=0, graded=0, excellent=0,
+                        strong=0, belowStrong=0, engineErrors=count, tiers=tiers(),
+                        excellentPct=0, strongPct=0, excellentOrStrongPct=0,
+                        lanes=1, markets=1, timeframes=1, corpusProbes=0,
+                        closedProbes=count, pairs=[], hardLane=None, otherMarkets=other,
+                        scopes={
+                            "corpus": dict(graded=0, excellent=0, strong=0, belowStrong=0,
+                                           engineErrors=0, tiers=tiers()),
+                            "closed": dict(graded=0, excellent=0, strong=0, belowStrong=0,
+                                           engineErrors=count, tiers=tiers()),
+                        })
+                facts["inventory"].update(corpusScripts=0, closedProbes=count,
+                                          communityProbes=count, probeScriptProbes=0)
+                self.assert_valid(facts)
+                for target in (0, 1):
+                    with self.subTest(target=target):
+                        changed = copy.deepcopy(facts)
+                        self.scores(changed)[target]["otherMarkets"]["timeframes"] = []
+                        self.assert_invalid(changed)
+
+    def test_duplicate_only_split_preserves_totals_but_is_rejected(self):
+        for target in (0, 1):
+            with self.subTest(target=target):
+                facts = timeframe_facts(shared_other_market_timeframe_rows, (target,))
+                self.assert_valid(facts)
+                # Split shared 15 back into its two original hand-counted lanes.
+                # Only the second label changes; no scalar or tier total changes.
+                rows = other_market_timeframe_rows()
+                rows[1]["timeframe"] = "15"
+                self.assertEqual([row["timeframe"] for row in rows], ["15", "15", "60"])
+                self.assert_partition_totals(rows)
+                self.assert_row_tallies(rows)
+                self.scores(facts)[target]["otherMarkets"]["timeframes"] = rows
+                self.assert_invalid(facts)
+
+    def test_order_only_reversal_preserves_totals_but_is_rejected(self):
+        for row_factory in (other_market_timeframe_rows, shared_other_market_timeframe_rows):
+            for target in (0, 1):
+                with self.subTest(rows=row_factory.__name__, target=target):
+                    facts = timeframe_facts(row_factory, (target,))
+                    self.assert_valid(facts)
+                    rows = self.scores(facts)[target]["otherMarkets"]["timeframes"]
+                    rows.reverse()
+                    self.assert_partition_totals(rows)
+                    self.assert_row_tallies(rows)
+                    self.assert_invalid(facts)
+
+    def test_each_row_requires_exactly_eight_fields(self):
+        fields = ("timeframe", *self.SCALARS, "tiers")
+        for target in (0, 1):
+            control, _ = self.validated_case(target)
+            for field in fields:
+                with self.subTest(target=target, missing=field):
+                    facts = copy.deepcopy(control)
+                    self.scores(facts)[target]["otherMarkets"]["timeframes"][0].pop(field)
+                    self.assert_invalid(facts)
+            for field in ("extra", "hardProbes", "corpusProbes", "closedProbes"):
+                with self.subTest(target=target, extra=field):
+                    facts = copy.deepcopy(control)
+                    self.scores(facts)[target]["otherMarkets"]["timeframes"][0][field] = 0
+                    self.assert_invalid(facts)
+
+    def test_forbidden_identity_provenance_and_trade_payloads_are_rejected(self):
+        forbidden = (
+            "symbol", "market", "venue", "assetClass", "asset-class", "id", "slug",
+            "provenance", "privateProvenance", "privateEvidenceSha256",
+            "trades", "tradeBreakdown", "tvTradesCompared", "tvTradeRows",
+        )
+        payloads = ("WITHHELD", {"symbol": "WITHHELD"}, [{"assetClass": "WITHHELD"}])
+        for target in (0, 1):
+            control, _ = self.validated_case(target)
+            for field in forbidden:
+                for location in ("row", "tiers"):
+                    for payload in payloads:
+                        with self.subTest(target=target, field=field, location=location,
+                                          payload=type(payload).__name__):
+                            facts = copy.deepcopy(control)
+                            row = self.scores(facts)[target]["otherMarkets"]["timeframes"][0]
+                            destination = row if location == "row" else row["tiers"]
+                            destination[field] = copy.deepcopy(payload)
+                            self.assert_invalid(facts)
+
+    def test_timeframes_and_rows_require_array_and_object_types(self):
+        nonarrays = (None, {}, "15", 15, 1.5, True)
+        bad_rows = (None, [], "15", 15, 1.5, True)
+        for target in (0, 1):
+            control, _ = self.validated_case(target)
+            for value in nonarrays:
+                with self.subTest(target=target, array_type=type(value).__name__):
+                    facts = copy.deepcopy(control)
+                    self.scores(facts)[target]["otherMarkets"]["timeframes"] = copy.deepcopy(value)
+                    self.assert_invalid(facts)
+            for value in bad_rows:
+                with self.subTest(target=target, row_type=type(value).__name__):
+                    facts = copy.deepcopy(control)
+                    self.scores(facts)[target]["otherMarkets"]["timeframes"][0] = copy.deepcopy(value)
+                    self.assert_invalid(facts)
+
+    def test_invalid_blank_and_noncanonical_timeframe_labels_are_rejected(self):
+        labels = (
+            "", " ", "0", "00", "0D", "00S", "01", "01D", "01W", "1d", "1s", "1w", "1m",
+            "D", "-1", "+1", "1.0", "1H", "1DD", "1 D", " 1", "1 ", "1\n", "1D\n",
+            "\u0661", "\uff11", None, True, 15, 15.0, [], {"symbol": "WITHHELD"},
+        )
+        for target in (0, 1):
+            control, _ = self.validated_case(target)
+            for value in labels:
+                with self.subTest(target=target, label=value):
+                    facts = copy.deepcopy(control)
+                    self.scores(facts)[target]["otherMarkets"]["timeframes"][0]["timeframe"] = (
+                        copy.deepcopy(value))
+                    self.assert_invalid(facts)
+
+    def test_all_scalar_and_tier_counts_require_safe_json_integers(self):
+        values = (True, False, 0.0, 0.5, 1.0, -1, 2**53, "1", None,
+                  {"symbol": "WITHHELD"}, [{"market": "WITHHELD"}])
+        for target in (0, 1):
+            control, _ = self.validated_case(target)
+            for location, fields in (("row", self.SCALARS), ("tiers", self.TIER_NAMES)):
+                for field in fields:
+                    for value in values:
+                        with self.subTest(target=target, location=location, field=field,
+                                          value=value):
+                            facts = copy.deepcopy(control)
+                            row = self.scores(facts)[target]["otherMarkets"]["timeframes"][0]
+                            destination = row if location == "row" else row["tiers"]
+                            destination[field] = copy.deepcopy(value)
+                            self.assert_invalid(facts)
+
+    def test_tiers_require_the_existing_exact_six_keys(self):
+        for target in (0, 1):
+            control, _ = self.validated_case(target)
+            for tier in self.TIER_NAMES:
+                with self.subTest(target=target, missing_tier=tier):
+                    facts = copy.deepcopy(control)
+                    self.scores(facts)[target]["otherMarkets"]["timeframes"][0]["tiers"].pop(tier)
+                    self.assert_invalid(facts)
+            for value in (None, [], "tiers", True, 0, {"excellent": 1},
+                          dict(tiers(excellent=1), extra=0)):
+                with self.subTest(target=target, tiers=value):
+                    facts = copy.deepcopy(control)
+                    self.scores(facts)[target]["otherMarkets"]["timeframes"][0]["tiers"] = (
+                        copy.deepcopy(value))
+                    self.assert_invalid(facts)
+
+    def test_each_scalar_sum_must_match_its_other_markets_aggregate(self):
+        # Dependent grade/summary fields move together so every row still tallies.
+        cases = (
+            ("lanes", 0, dict(lanes=2), (4, 4, 1, 1, 2, 1), (1, 1, 0, 0, 1, 1)),
+            ("graded", 0, dict(graded=2, excellent=2, tiers=tiers(excellent=2)),
+             (3, 5, 2, 1, 2, 1), (2, 1, 0, 0, 1, 1)),
+            ("excellent", 0, dict(excellent=0, strong=1, tiers=tiers(strong=1)),
+             (3, 4, 0, 2, 2, 1), (0, 2, 0, 0, 1, 1)),
+            ("strong", 1, dict(strong=0, belowStrong=1, tiers=tiers(weak=1)),
+             (3, 4, 1, 0, 3, 1), (1, 0, 0, 1, 1, 1)),
+            ("belowStrong", 2, dict(excellent=1, belowStrong=1,
+                                   tiers=tiers(excellent=1, no_trades=1)),
+             (3, 4, 2, 1, 1, 1), (2, 1, 0, 0, 0, 1)),
+            ("engineErrors", 0, dict(engineErrors=0),
+             (3, 4, 1, 1, 2, 0), (1, 1, 0, 0, 1, 1)),
+        )
+        for target in (0, 1):
+            for field, index, change, counts, tier_counts in cases:
+                with self.subTest(target=target, field=field):
+                    facts, rows = self.validated_case(target)
+                    rows[index].update(copy.deepcopy(change))
+                    self.assert_row_tallies(rows)
+                    self.assert_partition_totals(rows, counts, tier_counts)
+                    self.assert_invalid(facts)
+
+    def test_each_tier_sum_must_match_its_other_markets_aggregate(self):
+        # Lower-tier exchanges keep all six scalar sums correct; excellent and
+        # strong necessarily move their corresponding scalar summaries as well.
+        cases = (
+            ("excellent", 0, dict(excellent=0, strong=1,
+                                 tiers=tiers(strong=1, moderate=1)),
+             (3, 6, 0, 2, 4, 1), (0, 2, 1, 1, 1, 1)),
+            ("strong", 1, dict(excellent=1, strong=0, tiers=tiers(excellent=1, weak=1)),
+             (3, 6, 2, 0, 4, 1), (2, 0, 1, 1, 1, 1)),
+            ("moderate", 0, dict(tiers=tiers(excellent=1, weak=1)),
+             (3, 6, 1, 1, 4, 1), (1, 1, 0, 2, 1, 1)),
+            ("weak", 1, dict(tiers=tiers(strong=1, minimal=1)),
+             (3, 6, 1, 1, 4, 1), (1, 1, 1, 0, 2, 1)),
+            ("minimal", 2, dict(tiers=tiers(no_trades=2)),
+             (3, 6, 1, 1, 4, 1), (1, 1, 1, 1, 0, 2)),
+            ("no-trades", 2, dict(tiers=tiers(minimal=2)),
+             (3, 6, 1, 1, 4, 1), (1, 1, 1, 1, 2, 0)),
+        )
+        for target in (0, 1):
+            for tier, index, change, counts, tier_counts in cases:
+                with self.subTest(target=target, tier=tier):
+                    facts, rows = self.validated_case(target, all_tier_timeframe_facts)
+                    rows[index].update(copy.deepcopy(change))
+                    self.assert_row_tallies(rows)
+                    self.assert_partition_totals(rows, counts, tier_counts)
+                    self.assert_invalid(facts)
+
+    def test_each_row_tallies_even_when_cross_row_totals_match(self):
+        cases = (
+            ("all-graded", {0: dict(graded=2), 2: dict(graded=1)}),
+            ("tier-sum", {0: dict(tiers=tiers()),
+                          2: dict(tiers=tiers(excellent=1, minimal=1, no_trades=1))}),
+            ("excellent-summary", {0: dict(tiers=tiers(minimal=1)),
+                                   2: dict(tiers=tiers(excellent=1, no_trades=1))}),
+            ("strong-summary", {1: dict(tiers=tiers(no_trades=1)),
+                                2: dict(tiers=tiers(strong=1, minimal=1))}),
+            ("below-summary", {0: dict(tiers=tiers(no_trades=1)),
+                               2: dict(tiers=tiers(excellent=1, minimal=1))}),
+        )
+        for target in (0, 1):
+            for name, changes in cases:
+                with self.subTest(target=target, equation=name):
+                    facts, rows = self.validated_case(target)
+                    for index, change in changes.items():
+                        rows[index].update(copy.deepcopy(change))
+                    self.assert_partition_totals(rows)
+                    self.assert_invalid(facts)
+
+    def test_changed_input_cannot_reuse_a_constant_or_cached_success(self):
+        for factory in (timeframe_facts, all_tier_timeframe_facts):
+            for target in (0, 1):
+                with self.subTest(shape=factory.__name__, target=target):
+                    facts = factory()
+                    self.assert_valid(facts)
+                    rows = self.scores(facts)[target]["otherMarkets"]["timeframes"]
+                    untouched = self.scores(facts)[1 - target]["otherMarkets"]["timeframes"]
+                    self.assertIsNot(rows, untouched)
+                    self.assertIsNot(rows[0], untouched[0])
+                    self.assertIsNot(rows[0]["tiers"], untouched[0]["tiers"])
+                    saved_rows, saved_untouched = copy.deepcopy(rows), copy.deepcopy(untouched)
+                    # Mutate the same document after successful validation.
+                    rows[0]["lanes"] = 2
+                    self.assert_invalid(facts)
+                    self.assertEqual(untouched, saved_untouched)
+                    rows[:] = copy.deepcopy(saved_rows)
+                    self.assert_valid(facts)
+                    rows[0]["tiers"]["weak"] = True
+                    self.assert_invalid(facts)
+                    rows[:] = copy.deepcopy(saved_rows)
+                    self.assert_valid(facts)
+
+    def test_valid_timeframes_preserve_existing_scoreboard_guards(self):
+        def exceed_other_markets(score):
+            # Keep the old dimension equation valid to isolate the bound.
+            score["markets"] = 5
+            score["otherMarkets"]["markets"] = 4
+
+        cases = (
+            ("provenance", lambda s: s["provenance"].update(engineCommit="a" * 40)),
+            ("scope", lambda s: s["scopes"]["closed"].update(engineErrors=2)),
+            ("aggregate-scope", lambda s: s["otherMarkets"].update(closedProbes=5)),
+            ("aggregate-bound", exceed_other_markets),
+            ("dimensions", lambda s: s.update(timeframes=4)),
+            ("percentage", lambda s: s.update(excellentPct=31)),
+            ("named-timeframe", lambda s: s["pairs"][1].update(timeframe="0")),
+        )
+        for target in (0, 1):
+            for name, change in cases:
+                with self.subTest(target=target, guard=name):
+                    facts, _ = self.validated_case(target)
+                    change(self.scores(facts)[target])
+                    self.assert_invalid(facts)
 
 
 if __name__ == "__main__":
