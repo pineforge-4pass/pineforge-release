@@ -109,6 +109,9 @@ def other_market_timeframe_invariants(other):
         require(previous is None or previous < timeframe,
                 "other markets timeframes must be sorted and unique")
         tally(row)
+        require(row["lanes"] >= 1, "other markets timeframe lanes must be positive")
+        require(row["lanes"] <= row["graded"] + row["engineErrors"],
+                "other markets timeframe lanes exceed probes")
         previous = timeframe
     for field in ("lanes", *COUNTS):
         require(sum(row[field] for row in rows) == other[field],

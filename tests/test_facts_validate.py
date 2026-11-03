@@ -670,6 +670,48 @@ class OtherMarketsTimeframesValidation(unittest.TestCase):
                         self.scores(changed)[target]["otherMarkets"]["timeframes"] = []
                         self.assert_invalid(changed)
 
+    def test_zero_row_lanes_preserve_totals_but_are_rejected(self):
+        for target in (0, 1):
+            with self.subTest(target=target):
+                facts, rows = self.validated_case(target)
+                self.assert_partition_totals(rows)
+                self.assert_row_tallies(rows)
+                for row in rows:
+                    self.assertGreaterEqual(row["lanes"], 1)
+                    self.assertLessEqual(row["lanes"], row["graded"] + row["engineErrors"])
+                rows[0]["lanes"] = 0
+                rows[2]["lanes"] = 2
+                self.assert_partition_totals(rows)
+                self.assert_row_tallies(rows)
+                for row in rows:
+                    self.assertLessEqual(row["lanes"], row["graded"] + row["engineErrors"])
+                self.assert_invalid(facts)
+
+    def test_row_lanes_exceeding_probes_preserve_totals_but_are_rejected(self):
+        for target in (0, 1):
+            with self.subTest(target=target):
+                facts = timeframe_facts(shared_other_market_timeframe_rows, (target,))
+                rows = self.scores(facts)[target]["otherMarkets"]["timeframes"]
+                # Hand-counted regrouping leaves a spare lane on the first row.
+                rows[0].update(lanes=2, graded=3, excellent=1, strong=0,
+                               belowStrong=2, engineErrors=1,
+                               tiers=tiers(excellent=1, minimal=1, no_trades=1))
+                rows[1].update(lanes=1, graded=1, excellent=0, strong=1,
+                               belowStrong=0, engineErrors=0, tiers=tiers(strong=1))
+                self.assert_partition_totals(rows)
+                self.assert_row_tallies(rows)
+                for row in rows:
+                    self.assertGreaterEqual(row["lanes"], 1)
+                    self.assertLessEqual(row["lanes"], row["graded"] + row["engineErrors"])
+                self.assert_valid(facts)
+                rows[0]["lanes"] = 1
+                rows[1]["lanes"] = 2
+                self.assert_partition_totals(rows)
+                self.assert_row_tallies(rows)
+                for row in rows:
+                    self.assertGreaterEqual(row["lanes"], 1)
+                self.assert_invalid(facts)
+
     def test_duplicate_only_split_preserves_totals_but_is_rejected(self):
         for target in (0, 1):
             with self.subTest(target=target):
