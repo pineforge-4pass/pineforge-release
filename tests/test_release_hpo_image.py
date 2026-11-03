@@ -358,19 +358,23 @@ def _restore_original_doc_cleanup(text: str) -> str:
 def _restore_original_harness_manifest(text: str) -> str:
     """Undo exactly the harness list additions for the original runtime pin."""
     changes = (
-        ("# The harness is the engine's runtime files for the pinned engine tag, all twelve and nothing\n",
+        ("# The harness is the engine's runtime files for the pinned engine tag, all sixteen and nothing\n",
          "# The harness is the engine's runtime files for the pinned engine tag, all eight and nothing\n"),
         ("# bind_compiled_inventory.py; Python helpers import modules from this directory.\n",
          "# bind_compiled_inventory.py; run_json.py imports the other modules from its own directory.\n"),
         ("COPY docker/pf_bars.py                  /opt/pineforge/bin/pf_bars.py\n", ""),
         ("COPY docker/pf_sink.py                  /opt/pineforge/bin/pf_sink.py\n", ""),
+        ("COPY docker/pineforge_report_deadlines.py /opt/pineforge/bin/pineforge_report_deadlines.py\n", ""),
+        ("COPY docker/pineforge_report_supervise.py /opt/pineforge/bin/pineforge_report_supervise.py\n", ""),
         ("COPY docker/pineforge_sink_finalize.py  /opt/pineforge/bin/pineforge_sink_finalize.py\n", ""),
         ("COPY docker/pineforge_sink_to_json.py   /opt/pineforge/bin/pineforge_sink_to_json.py\n", ""),
-        ("# must name exactly the twelve files above, in sorted order, and nothing else may sit in bin/;\n",
+        ("COPY docker/quota_columns.py           /opt/pineforge/bin/quota_columns.py\n", ""),
+        ("COPY docker/run_quota.py               /opt/pineforge/bin/run_quota.py\n", ""),
+        ("# must name exactly the sixteen files above, in sorted order, and nothing else may sit in bin/;\n",
          "# must name exactly the eight files above, in this order, and nothing else may sit in bin/;\n"),
-        ('    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_sink_finalize.py pineforge_sink_to_json.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \\\n',
+        ('    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_report_deadlines.py pineforge_report_supervise.py pineforge_sink_finalize.py pineforge_sink_to_json.py quota_columns.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py run_quota.py selected_window_plan.py selected_window_report.py"; \\\n',
          '    want="bind_compiled_inventory.py entrypoint.sh request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \\\n'),
-        ('    echo "harness: the twelve files match HARNESS-SHA256SUMS"\n',
+        ('    echo "harness: the sixteen files match HARNESS-SHA256SUMS"\n',
          '    echo "harness: the eight files match HARNESS-SHA256SUMS"\n'),
     )
     for current, original in changes:
@@ -498,8 +502,12 @@ class DockerfileTargetTest(unittest.TestCase):
         for name, copy_line in (
                 ("pf_bars.py", "COPY docker/pf_bars.py                  /opt/pineforge/bin/pf_bars.py\n"),
                 ("pf_sink.py", "COPY docker/pf_sink.py                  /opt/pineforge/bin/pf_sink.py\n"),
+                ("pineforge_report_deadlines.py", "COPY docker/pineforge_report_deadlines.py /opt/pineforge/bin/pineforge_report_deadlines.py\n"),
+                ("pineforge_report_supervise.py", "COPY docker/pineforge_report_supervise.py /opt/pineforge/bin/pineforge_report_supervise.py\n"),
                 ("pineforge_sink_finalize.py", "COPY docker/pineforge_sink_finalize.py  /opt/pineforge/bin/pineforge_sink_finalize.py\n"),
-                ("pineforge_sink_to_json.py", "COPY docker/pineforge_sink_to_json.py   /opt/pineforge/bin/pineforge_sink_to_json.py\n")):
+                ("pineforge_sink_to_json.py", "COPY docker/pineforge_sink_to_json.py   /opt/pineforge/bin/pineforge_sink_to_json.py\n"),
+                ("quota_columns.py", "COPY docker/quota_columns.py           /opt/pineforge/bin/quota_columns.py\n"),
+                ("run_quota.py", "COPY docker/run_quota.py               /opt/pineforge/bin/run_quota.py\n")):
             self.assertEqual(text.count(copy_line), 1)
             self.assertEqual(text.count(" " + name + " "), 1)
             for scenario, altered in (
@@ -787,21 +795,23 @@ source "$dispatch"
 
 class DockerfileHarnessTest(unittest.TestCase):
     HARNESS = ("bind_compiled_inventory.py", "entrypoint.sh", "pf_bars.py", "pf_sink.py",
-               "pineforge_sink_finalize.py", "pineforge_sink_to_json.py", "request_feed_inventory.py",
-               "run_execution_observer.py", "run_json.py", "run_phase_transport.py",
+               "pineforge_report_deadlines.py", "pineforge_report_supervise.py",
+               "pineforge_sink_finalize.py", "pineforge_sink_to_json.py", "quota_columns.py",
+               "request_feed_inventory.py", "run_execution_observer.py", "run_json.py",
+               "run_phase_transport.py", "run_quota.py",
                "selected_window_plan.py", "selected_window_report.py")
-    # The complete byte-check RUN is the contract, including all twelve names
+    # The complete byte-check RUN is the contract, including all sixteen names
     # and the check for an extra bin/ file.
     CHECK = r'''RUN set -eu; \
     cd /opt/pineforge/bin; \
-    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_sink_finalize.py pineforge_sink_to_json.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \
+    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_report_deadlines.py pineforge_report_supervise.py pineforge_sink_finalize.py pineforge_sink_to_json.py quota_columns.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py run_quota.py selected_window_plan.py selected_window_report.py"; \
     listed="$(sed 's/^[0-9a-f]\{64\}  //' HARNESS-SHA256SUMS | tr '\n' ' ' | sed 's/ $//')"; \
     present="$(LC_ALL=C ls -A | grep -v '^HARNESS-SHA256SUMS$' | tr '\n' ' ' | sed 's/ $//')"; \
     if [ "$listed" != "$want" ] || [ "$present" != "$want" ]; then \
       echo "ERROR: HARNESS-SHA256SUMS lists [${listed}] and bin/ holds [${present}]; both must be exactly [${want}]" >&2; exit 1; \
     fi; \
     sha256sum -c --strict HARNESS-SHA256SUMS; \
-    echo "harness: the twelve files match HARNESS-SHA256SUMS"'''
+    echo "harness: the sixteen files match HARNESS-SHA256SUMS"'''
 
     def test_harness_copy_list_and_full_build_check_are_unchanged(self):
         dockerfile = (REPO / "docker" / "Dockerfile").read_text(encoding="utf-8")
