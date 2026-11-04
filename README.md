@@ -327,6 +327,9 @@ Those inventories established equal amd64/arm64 source/version sets. Every exact
 source archive was mirrored, with a verified published list and asset mirror
 before adding the registry row. The published 1.10.0 image passed `publish.yml`'s
 source coverage checks and runtime smoke on both architectures.
+See the [`publish` job in run 41858128823](https://github.com/pineforge-4pass/pineforge-release/actions/runs/41858128823/job/126672415990)
+for that evidence. The publication job succeeded; the workflow later failed
+during a notification step.
 The six toolchain pins map to `gcc-defaults` 1.220, `gcc-14` 14.2.0-19,
 `binutils` 2.44-3, `eigen3` 3.4.0-5, `cmake` 3.31.6-2 and `make-dfsg` 4.4.1-2.
 CMake and make remain build-only; the final inventories determine the complete
