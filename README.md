@@ -259,6 +259,12 @@ only.
 
 ## Offline runtime and TLS
 
+The 1.10.0 image uses Debian 13 (trixie), with the glibc 2.41 family and GCC 14.
+This runtime floor supplies `__isoc23_strtol`, required by the immutable amd64
+engine library; bookworm's glibc 2.36 cannot load that library. Engine, codegen
+and HPO remain at 1.10.0, with unchanged producer artifact SHA-256 pins.
+The engine asset triples remain `linux-x86_64` and `linux-aarch64`.
+
 The image is offline by design. The [backtest entrypoint](docker/entrypoint.sh)
 transpiles and compiles locally using bundled code and mounted inputs, with no
 runtime network fetch. The [release smoke](scripts/release_smoke.py) runs the
@@ -315,6 +321,16 @@ its bundle attached to an earlier or dedicated release before its first publish,
 because the guard looks up the holding release by tag before the new tag's
 GitHub Release exists.
 
+Set-17 mirrors the trixie image's 72 source/version pairs at `v1.4.0` with `set-17.SOURCES.list` (set-id `76b31d334dc701427d36bbd034b463bdd69101b3bb34e67aa9569bd892d6994a`).
+The trixie image needs a new source set derived from both native image inventories.
+The existing bookworm sets do not establish its source coverage. Publication
+still requires equal amd64/arm64 source/version sets, every exact source archive,
+and a verified published list and asset mirror before adding a registry row.
+The six toolchain pins map to `gcc-defaults` 1.220, `gcc-14` 14.2.0-19,
+`binutils` 2.44-3, `eigen3` 3.4.0-5, `cmake` 3.31.6-2 and `make-dfsg` 4.4.1-2.
+CMake and make remain build-only; the final inventories determine the complete
+runtime source set, including glibc and all other base and dependency packages.
+
 ## License
 
 The files in this repository (Dockerfile, entrypoint, scripts, workflows, tests)
@@ -353,24 +369,28 @@ to 1.0.0 carry `Apache-2.0`.
 
 ## Harness / engine ABI
 
-`scripts/sync-harness.sh <engine-version>` vendors exactly twelve engine runtime
+`scripts/sync-harness.sh <engine-version>` vendors exactly sixteen engine runtime
 harness files into `docker/` from the pinned `pineforge-engine` tag, in sorted order:
 
 - `bind_compiled_inventory.py`
 - `entrypoint.sh`
 - `pf_bars.py`
 - `pf_sink.py`
+- `pineforge_report_deadlines.py`
+- `pineforge_report_supervise.py`
 - `pineforge_sink_finalize.py`
 - `pineforge_sink_to_json.py`
+- `quota_columns.py`
 - `request_feed_inventory.py`
 - `run_execution_observer.py`
 - `run_json.py`
 - `run_phase_transport.py`
+- `run_quota.py`
 - `selected_window_plan.py`
 - `selected_window_report.py`
 
 `handle-upstream.yml` syncs those files and regenerates `docker/HARNESS-SHA256SUMS`
-for the engine version it releases. The Dockerfile requires the same twelve names
+for the engine version it releases. The Dockerfile requires the same sixteen names
 and checks their installed bytes against the sums. It also refuses to build
 when `docker/run_json.py`'s `EXPECTED_PF_ABI` differs from
 `PF_ABI_VERSION` in the bundled engine headers.
@@ -407,8 +427,8 @@ its recorded equity and trade rows. The fixture provenance is documented in
 
 `docker build` without `--target`, using `docker/Dockerfile`, builds the
 backtest image: the last `default` stage aliases the runtime, `release`.
-The default image differs from 1.5.0 only by the source notice, the two source
-labels and the retained Debian package copyright files.
+The 1.10.0 packaging refresh moves every Debian-based stage to trixie and replaces
+bookworm's GCC 12 pins with GCC 14; the checked harness and entrypoint stay unchanged.
 `ENGINE_VERSION`, `CODEGEN_VERSION` and `GUARD_POLICY_SETS_SHA256` are required for that build, and its
 entrypoint remains `/opt/pineforge/bin/entrypoint.sh`. The guard policy value is read from `docker/GUARD-POLICY-SETS.pin`, computed privately and never re-derived here; the image records it in the `io.pineforge.guard.policy-sets-sha256` label and in `/opt/pineforge/guard-policy.sha256`.
 
@@ -424,7 +444,7 @@ The artifact cache is writable by the image's existing user; use `--cache-dir`
 with a writable mount to retain compiled artifacts between containers.
 
 With no first argument `hpo`, the dispatcher passes every argument unchanged
-to the engine's existing `/opt/pineforge/bin/entrypoint.sh`. The twelve engine
+to the engine's existing `/opt/pineforge/bin/entrypoint.sh`. The sixteen engine
 harness files and their byte and ABI checks remain in place.
 
 For `--target hpo`, `HPO_VERSION` is a required build argument with no default,
@@ -440,8 +460,8 @@ Publishing validates both bound artifact digests before passing
 is checked against the sdist digest before extraction and compilation. These
 per-release artifact pins are declared in `scripts/release_sources.py`, separate
 from the six Debian toolchain versions below.
-This change merges without a release; the first publish carrying HPO is the
-1.6.0 lockstep. HPO 0.15.0 is the fixture for the signed box proof.
+The 1.10.0 engine/codegen/HPO producer triple and both HPO artifact pins stay
+unchanged by the Debian packaging refresh.
 
 The box must supply exact Debian package versions through these required
 build arguments; no toolchain version has been guessed:
@@ -449,18 +469,18 @@ build arguments; no toolchain version has been guessed:
 | Build argument | Packages |
 |---|---|
 | `HPO_GCC_DEFAULTS_VERSION` | `gcc`, `g++`, `cpp` |
-| `HPO_GCC_VERSION` | `gcc-12`, `g++-12`, `cpp-12`, `libgcc-12-dev`, `libstdc++-12-dev`, `libgcc-s1`, `libstdc++6` |
+| `HPO_GCC_VERSION` | `gcc-14`, `g++-14`, `cpp-14`, `libgcc-14-dev`, `libstdc++-14-dev`, `libgcc-s1`, `libstdc++6` |
 | `HPO_BINUTILS_VERSION` | `binutils` |
 | `HPO_EIGEN_VERSION` | `libeigen3-dev` |
 | `HPO_CMAKE_VERSION` | `cmake` (native build only) |
 | `HPO_MAKE_VERSION` | `make` (native build only) |
 
 `docker/hpo-toolchain.args` records those six pins as plain `NAME=VALUE` lines,
-with comments and blank lines allowed, and no shell syntax. The values were
-recorded by a signed box run (and a value left empty is reported by the tests as
-an unfilled skip); the publish workflow reads the file and passes the
-values as build arguments for `--target hpo`. The Dockerfile uses build
-arguments only. The default target does not need this file or its arguments.
+with comments and blank lines allowed, and no shell syntax. The trixie values
+come from public Debian metadata for both amd64 and arm64; native validation
+is pending. The publish parser rejects empty values; the historical test helper
+discloses an empty value as an unfilled skip, which is never proof. Publishing
+passes all six arguments to `--target hpo`; the default target does not need them.
 
 The installed wheels' own `*.dist-info/licenses/` files are also copied to
 `/opt/pineforge/licenses/pineforge-hpo/` (`LICENSE`, `NOTICE` and
@@ -486,9 +506,10 @@ wheel for an offline run; otherwise the test fetches it from PyPI and verifies
 PyPI's digest. The same build helper must reject 0.13.2 because its real
 `pineforge-codegen<1.4,>=1.1.0` bound excludes 1.5.0, then resolve 0.15.0 without
 changing codegen. The tests also compute each target's stage dependencies,
-compare `release` with the original runtime at `989a0fd9~1`, and check dispatcher
+compare `release` with the historical runtime digest, allowing the exact trixie
+base change, and check dispatcher
 argv and exit status, the unchanged harness check, a forced licence mutation
-and the README pair-rule bytes against `origin/main`. The args-file tests
+and the pinned README pair-rule bytes. The args-file tests
 compare its names with the real Dockerfile's toolchain declarations and
 required guards, reject malformed or duplicate entries, and report empty
 values as a named `unfilled toolchain versions` skip until the box fills them.

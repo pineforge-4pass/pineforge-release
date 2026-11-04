@@ -28,7 +28,7 @@ ARG ENGINE_VERSION
 ARG CODEGEN_VERSION
 
 # --- Stage 1: stage the pure-Python transpiler (final image carries no pip) ---
-FROM debian:bookworm-slim AS codegen
+FROM debian:trixie-slim AS codegen
 ARG CODEGEN_VERSION
 RUN test -n "${CODEGEN_VERSION}" || { echo "ERROR: CODEGEN_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -38,7 +38,7 @@ RUN pip3 install --break-system-packages --no-cache-dir -U \
         --target /opt/codegen "pineforge-codegen==${CODEGEN_VERSION}"
 
 # --- Stage 2: fetch + verify the engine static-lib tarball (per build arch) ---
-FROM debian:bookworm-slim AS engine
+FROM debian:trixie-slim AS engine
 ARG ENGINE_VERSION
 ARG TARGETARCH
 RUN test -n "${ENGINE_VERSION}" || { echo "ERROR: ENGINE_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
@@ -63,7 +63,7 @@ RUN set -eux; \
     cp -r "/tmp/${base}/include" /opt/pineforge/include
 
 # --- Stage 3: final = toolchain + engine lib + codegen + harness --------------
-FROM debian:bookworm-slim AS release
+FROM debian:trixie-slim AS release
 ARG ENGINE_VERSION
 ARG CODEGEN_VERSION
 ARG GUARD_POLICY_SETS_SHA256
@@ -221,10 +221,10 @@ RUN set -eu; \
     cp -r "$1/." /opt/hpo-licenses/pineforge-codegen/
 
 # --- HPO toolchain: shared by the native build and the FULL runtime -----------
-# No guessed package versions: the box supplies these exact Debian pins for
-# both architectures. gcc/g++/cpp are the bookworm GCC-12 defaults; the compiler
+# Exact Debian trixie pins for both architectures come from public package
+# metadata in hpo-toolchain.args. gcc/g++/cpp are the GCC-14 defaults; the compiler
 # and libstdc++ packages share HPO_GCC_VERSION. CMake/make stay build-only.
-FROM debian:bookworm-slim AS hpo-toolchain
+FROM debian:trixie-slim AS hpo-toolchain
 ARG HPO_GCC_DEFAULTS_VERSION
 ARG HPO_GCC_VERSION
 ARG HPO_BINUTILS_VERSION
@@ -237,11 +237,11 @@ RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
       "gcc=${HPO_GCC_DEFAULTS_VERSION}" "g++=${HPO_GCC_DEFAULTS_VERSION}" "cpp=${HPO_GCC_DEFAULTS_VERSION}" \
-      "gcc-12=${HPO_GCC_VERSION}" "g++-12=${HPO_GCC_VERSION}" "cpp-12=${HPO_GCC_VERSION}" \
-      "libgcc-12-dev=${HPO_GCC_VERSION}" "libstdc++-12-dev=${HPO_GCC_VERSION}" \
+      "gcc-14=${HPO_GCC_VERSION}" "g++-14=${HPO_GCC_VERSION}" "cpp-14=${HPO_GCC_VERSION}" \
+      "libgcc-14-dev=${HPO_GCC_VERSION}" "libstdc++-14-dev=${HPO_GCC_VERSION}" \
       "libgcc-s1=${HPO_GCC_VERSION}" "libstdc++6=${HPO_GCC_VERSION}" \
       "binutils=${HPO_BINUTILS_VERSION}" "libeigen3-dev=${HPO_EIGEN_VERSION}" python3; \
-    for pkg in gcc g++ cpp gcc-12 g++-12 cpp-12 libgcc-12-dev libstdc++-12-dev libgcc-s1 libstdc++6 binutils libeigen3-dev; do \
+    for pkg in gcc g++ cpp gcc-14 g++-14 cpp-14 libgcc-14-dev libstdc++-14-dev libgcc-s1 libstdc++6 binutils libeigen3-dev; do \
       mkdir -p "/opt/pineforge/licenses/${pkg}"; \
       cp -L "/usr/share/doc/${pkg}/copyright" "/opt/pineforge/licenses/${pkg}/copyright"; \
     done; \
@@ -300,8 +300,8 @@ LABEL org.opencontainers.image.description="Full PineScript v6 -> deterministic 
 # CMake, make, pip and the native build tree stay in the build stages.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       "gcc=${HPO_GCC_DEFAULTS_VERSION}" "g++=${HPO_GCC_DEFAULTS_VERSION}" "cpp=${HPO_GCC_DEFAULTS_VERSION}" \
-      "gcc-12=${HPO_GCC_VERSION}" "g++-12=${HPO_GCC_VERSION}" "cpp-12=${HPO_GCC_VERSION}" \
-      "libgcc-12-dev=${HPO_GCC_VERSION}" "libstdc++-12-dev=${HPO_GCC_VERSION}" \
+      "gcc-14=${HPO_GCC_VERSION}" "g++-14=${HPO_GCC_VERSION}" "cpp-14=${HPO_GCC_VERSION}" \
+      "libgcc-14-dev=${HPO_GCC_VERSION}" "libstdc++-14-dev=${HPO_GCC_VERSION}" \
       "libgcc-s1=${HPO_GCC_VERSION}" "libstdc++6=${HPO_GCC_VERSION}" \
       "binutils=${HPO_BINUTILS_VERSION}" "libeigen3-dev=${HPO_EIGEN_VERSION}" \
     && rm -rf /var/lib/apt/lists/* /usr/share/man /usr/share/locale /usr/share/info

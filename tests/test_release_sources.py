@@ -135,6 +135,19 @@ class SourceGuardTest(unittest.TestCase):
         self.registry.write_text(REGISTRY_HEADER + "# no mirrors yet\n", encoding="utf-8")
         self.refused(self.check(), f"source set {_set_id(self.pairs)} is not in registry")
 
+    def test_trixie_defaults_source_version_cannot_reuse_a_bookworm_registry_row(self):
+        # The source is gcc-defaults 1.220, not the defaults binaries' epoch version.
+        updated = [(source, "1.220" if source == "gcc-defaults" else version)
+                   for source, version in self.pairs]
+        self.assertNotEqual(updated, self.pairs)
+        for path, arch in ((self.amd64, "amd64"), (self.arm64, "arm64")):
+            data = _inventory(updated, arch).replace("4:12.2.0-3", "4:14.2.0-1")
+            path.write_text(data, encoding="utf-8")
+            pairs = sources.inventory_pairs(path)
+            self.assertIn(("gcc-defaults", "1.220"), pairs)
+            self.assertNotIn(("gcc-defaults", "4:14.2.0-1"), pairs)
+        self.refused(self.check(), f"source set {_set_id(updated)} is not in registry")
+
     def test_02_registered_set_without_list_asset_is_refused(self):
         assets = [item for item in self.assets if item["name"] != self.sources_list.name]
         self.refused(self.check(assets), "missing release asset: set-02.SOURCES.list")
@@ -318,10 +331,11 @@ class SourceGuardTest(unittest.TestCase):
         self.assertTrue(data, "the registry must retain its documented header")
         self.assertEqual(data[0], REGISTRY_HEADER.rstrip("\n"))
         rows = [line.split("\t") for line in data[1:]]
-        self.assertEqual(len(rows), 16, "the registry must contain the 16 real source sets")
+        self.assertEqual(len(rows), 17, "the registry must contain the 17 real source sets")
         expected_tags = ("v0.1.0", "v1.4.0", "v0.1.21", "v0.1.15", "v1.0.1", "v0.1.11",
                          "v0.1.13", "v1.0.0-rc.1", "v0.1.19", "v0.1.25", "v1.3.0", "v1.4.0", "v1.4.0", "v1.4.0",
-                         "v1.4.0", "v1.4.0")
+                         "v1.4.0", "v1.4.0", "v1.4.0")
+        expected_counts = ("84",) * 16 + ("72",)
         identities = []
         for number, columns in enumerate(rows, 1):
             with self.subTest(source_set=f"set-{number:02d}"):
@@ -332,10 +346,10 @@ class SourceGuardTest(unittest.TestCase):
                 self.assertTrue(tag.startswith("v"), "holding releases must use v-prefixed tags")
                 self.assertIn(tag, expected_tags)
                 self.assertEqual(tag, expected_tags[number - 1], "each set must use its confirmed release")
-                self.assertEqual(count, "84")
+                self.assertEqual(count, expected_counts[number - 1])
                 self.assertEqual(asset, f"set-{number:02d}.SOURCES.list")
                 identities.append(identity)
-        self.assertEqual(len(set(identities)), 16, "source set-ids must be unique")
+        self.assertEqual(len(set(identities)), 17, "source set-ids must be unique")
 
     def test_96_multiple_assets_for_one_source_pair_keep_the_same_set_id(self):
         source, version = next(pair for pair in self.pairs if ":" in pair[1])
@@ -472,7 +486,7 @@ class SourceNoticeTest(unittest.TestCase):
         cls.template = (REPO / "docker" / "SOURCES.txt.in").read_text(encoding="utf-8")
 
     def test_template_preserves_biz_notice_verbatim_except_version_token(self):
-        approved = (FIXTURES / "GPL-NOTICE-v1.txt").read_text(encoding="utf-8")
+        approved = (FIXTURES / "GPL-NOTICE-v2.txt").read_text(encoding="utf-8")
         self.assertEqual(self.template, approved.replace("<this version>", "@RELEASE_VERSION@"))
         self.assertEqual(re.findall(r"@[A-Za-z0-9_]+@", self.template), ["@RELEASE_VERSION@"])
         self.assertNotIn("<this version>", self.template)
@@ -763,10 +777,10 @@ class SourceRetentionTest(unittest.TestCase):
             "README must explain how to make a new source set available before its first publish",
         )
         self.assertIn(
-            "The default image differs from 1.5.0 only by the source notice, the two source "
-            "labels and the retained Debian package copyright files.",
+            "The 1.10.0 packaging refresh moves every Debian-based stage to trixie and replaces "
+            "bookworm's GCC 12 pins with GCC 14; the checked harness and entrypoint stay unchanged.",
             readme,
-            "README must state the notice and copyright differences from the 1.5.0 default image",
+            "README must state the bounded Debian base/compiler refresh",
         )
 
 
