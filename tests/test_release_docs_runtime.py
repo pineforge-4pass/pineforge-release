@@ -101,5 +101,41 @@ class RuntimeScratchDocumentationTest(unittest.TestCase):
             self.assert_scratch_guidance(without_cache_sentence)
 
 
+class TrixieRuntimeDocumentationTest(unittest.TestCase):
+    def setUp(self):
+        self.readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    def assert_trixie_guidance(self, text):
+        prose = " ".join(text.split())
+        for required in (
+            "Debian 13 (trixie), with the glibc 2.41 family and GCC 14",
+            "`__isoc23_strtol`",
+            "bookworm's glibc 2.36 cannot load that library",
+            "Engine, codegen and HPO remain at 1.10.0, with unchanged producer artifact SHA-256 pins",
+            "`linux-x86_64` and `linux-aarch64`",
+            "trixie image needs a new source set derived from both native image inventories",
+            "equal amd64/arm64 source/version sets",
+            "verified published list and asset mirror before adding a registry row",
+            "CMake and make remain build-only",
+            "native validation is pending",
+            "unfilled skip, which is never proof",
+        ):
+            self.assertIn(required, prose)
+
+    def test_runtime_floor_unchanged_producers_and_pending_mirror_are_documented(self):
+        self.assert_trixie_guidance(self.readme)
+
+    def test_wrong_runtime_floor_or_missing_producer_or_mirror_disclosure_is_rejected(self):
+        for fragment in ("Debian 13 (trixie)", "glibc 2.41", "remain at 1.10.0",
+                         "unchanged producer artifact SHA-256 pins",
+                         "verified published list and asset mirror",
+                         "native validation\nis pending", "unfilled skip, which is never proof"):
+            with self.subTest(fragment=fragment):
+                mutated = self.readme.replace(fragment, "omitted", 1)
+                self.assertNotEqual(mutated, self.readme)
+                with self.assertRaises(AssertionError):
+                    self.assert_trixie_guidance(mutated)
+
+
 if __name__ == "__main__":
     unittest.main()

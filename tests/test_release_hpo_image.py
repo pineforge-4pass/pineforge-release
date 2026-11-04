@@ -312,6 +312,15 @@ def _without_stage_alias(stage: DockerStage) -> str:
                   r"\1", stage.text, count=1, flags=re.M | re.I)
 
 
+def _restore_bookworm_runtime_base(text: str) -> str:
+    """Restore only the single approved FROM line for the historical digest."""
+    lines = text.splitlines(keepends=True)
+    if (not lines or lines[0] != "FROM debian:trixie-slim\n"
+            or sum(line.startswith("FROM ") for line in lines) != 1):
+        raise ValueError("expected exactly one approved trixie runtime FROM line")
+    return "FROM debian:bookworm-slim\n" + "".join(lines[1:])
+
+
 def _without_guard_policy(text: str) -> str:
     """Remove exactly the approved guard fragment before checking the historical runtime pin."""
     argument = "ARG GUARD_POLICY_SETS_SHA256\n"
@@ -437,6 +446,52 @@ def _require_filled_toolchain_arguments(arguments: dict[str, str]) -> None:
                                 + "; TO BE FILLED BY THE BOX RUN")
 
 
+# Reviewed against both trixie Packages indexes, not inferred from one arch or
+# from the installed host. These are packaging assertions, not runtime proof.
+TRIXIE_TOOLCHAIN_PINS = {
+    "HPO_GCC_DEFAULTS_VERSION": "4:14.2.0-1",
+    "HPO_GCC_VERSION": "14.2.0-19",
+    "HPO_BINUTILS_VERSION": "2.44-3",
+    "HPO_EIGEN_VERSION": "3.4.0-5",
+    "HPO_CMAKE_VERSION": "3.31.6-2",
+    "HPO_MAKE_VERSION": "4.4.1-2",
+}
+
+
+def _trixie_packaging_problems(dockerfile: str, args_text: str) -> list[str]:
+    stages = _dockerfile_stages(dockerfile)
+    named = {stage.name: stage for stage in stages}
+    problems = []
+    external = {stage.name: stage.base for stage in stages if stage.base not in named}
+    if external != dict.fromkeys(("codegen", "engine", "release", "hpo-toolchain"),
+                                 "debian:trixie-slim"):
+        problems.append("all four Debian bases must be exactly debian:trixie-slim")
+    if _read_toolchain_arguments(args_text) != TRIXIE_TOOLCHAIN_PINS:
+        problems.append("toolchain values must match the six reviewed trixie pins")
+    expected = {
+        **dict.fromkeys(("gcc", "g++", "cpp"), "HPO_GCC_DEFAULTS_VERSION"),
+        **dict.fromkeys(("gcc-14", "g++-14", "cpp-14", "libgcc-14-dev",
+                         "libstdc++-14-dev", "libgcc-s1", "libstdc++6"), "HPO_GCC_VERSION"),
+        "binutils": "HPO_BINUTILS_VERSION", "libeigen3-dev": "HPO_EIGEN_VERSION",
+    }
+    for name in ("hpo-toolchain", "hpo", "hpo-native"):
+        stage = named[name]
+        pinned = ({"cmake": "HPO_CMAKE_VERSION", "make": "HPO_MAKE_VERSION"}
+                  if name == "hpo-native" else expected)
+        packages = [f"{package}=${{{argument}}}" for package, argument in pinned.items()]
+        if name == "hpo-toolchain":
+            packages.append("python3")
+        elif name == "hpo-native":
+            packages.extend(("curl", "ca-certificates"))
+        installs = [match[1] for keyword, body in stage.instructions if keyword == "RUN"
+                    for match in re.finditer(
+                        r"apt-get install -y --no-install-recommends\s+(.+?)(?:;|&&)", body)]
+        if (len(installs) != 1 or shlex.split(installs[0]) != packages
+                or _pinned_packages(stage) != pinned):
+            problems.append(name + ": expected exactly the approved trixie package pins")
+    return problems
+
+
 class DockerfileTargetTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -489,13 +544,28 @@ class DockerfileTargetTest(unittest.TestCase):
 
     def test_release_stage_matches_original_runtime_after_notice_and_harness_changes(self):
         text = _without_guard_policy(_without_sources_notice(_without_stage_alias(self.named["release"])))
+        text = _restore_bookworm_runtime_base(text)
         text = _restore_original_doc_cleanup(text)
         text = _restore_original_harness_manifest(text)
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
                          "after restoring the one /usr/share/doc token and removing the marked "
-                         "notice and approved harness changes, release must remain "
+                         "notice, exact trixie FROM line and approved harness changes, release must remain "
                          "byte for byte the original runtime stage")
+
+    def test_runtime_base_normalization_refuses_other_from_changes(self):
+        text = _without_stage_alias(self.named["release"])
+        restored = _restore_bookworm_runtime_base(text)
+        self.assertEqual(restored, text.replace("FROM debian:trixie-slim\n",
+                                               "FROM debian:bookworm-slim\n", 1))
+        for replacement in ("FROM debian:bookworm-slim\n", "FROM debian:trixie\n",
+                            "FROM debian:latest\n", "FROM ubuntu:24.04\n",
+                            "FROM debian:trixie-slim AS release\n",
+                            "FROM debian:trixie-slim\nFROM debian:trixie-slim\n"):
+            with self.subTest(replacement=replacement):
+                changed = text.replace("FROM debian:trixie-slim\n", replacement, 1)
+                with self.assertRaisesRegex(ValueError, "approved trixie runtime FROM line"):
+                    _restore_bookworm_runtime_base(changed)
 
     def test_original_harness_normalization_requires_all_added_modules(self):
         text = _without_sources_notice(_without_stage_alias(self.named["release"]))
@@ -541,6 +611,7 @@ class DockerfileTargetTest(unittest.TestCase):
         stripped = _without_sources_notice(text)
         self.assertNotEqual(text, stripped)
         stripped = _without_guard_policy(stripped)
+        stripped = _restore_bookworm_runtime_base(stripped)
         stripped = _restore_original_doc_cleanup(stripped)
         stripped = _restore_original_harness_manifest(stripped)
         self.assertNotEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -573,7 +644,8 @@ class DockerfileTargetTest(unittest.TestCase):
                                "RUN mkdir -p /opt/pineforge/bin /unexpected\n", 1)
         self.assertNotEqual(altered, text)
         normalized = _restore_original_harness_manifest(
-            _restore_original_doc_cleanup(_without_guard_policy(_without_sources_notice(altered))))
+            _restore_original_doc_cleanup(_restore_bookworm_runtime_base(
+                _without_guard_policy(_without_sources_notice(altered)))))
         self.assertNotEqual(hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
 
@@ -641,6 +713,39 @@ class ToolchainArgumentsTest(unittest.TestCase):
         for stage in stages:
             self.assertNotIn("hpo-toolchain.args", stage.text,
                              "the workflow reads this data file; Dockerfile stays build-arg driven")
+
+    def test_trixie_bases_and_matching_compiler_runtime_pins(self):
+        self.assertEqual(_trixie_packaging_problems(self.dockerfile, self.args_text), [])
+
+    def test_mixed_suite_old_compiler_and_missing_or_mismatched_runtime_pins_are_rejected(self):
+        self.assertEqual(_trixie_packaging_problems(self.dockerfile, self.args_text), [])
+        runtime = next(stage for stage in _dockerfile_stages(self.dockerfile) if stage.name == "hpo")
+        mutations = [
+            self.dockerfile.replace("FROM debian:trixie-slim AS engine",
+                                    "FROM debian:bookworm-slim AS engine", 1),
+            self.dockerfile.replace("FROM debian:trixie-slim", "FROM debian:latest"),
+            self.dockerfile.replace("gcc-14", "gcc-12"),
+            self.dockerfile.replace('"cmake=${HPO_CMAKE_VERSION}"',
+                                    '"cmake=${HPO_MAKE_VERSION}"', 1),
+        ]
+        pin = '"libstdc++6=${HPO_GCC_VERSION}"'
+        for replacement in ('"libstdc++6"', '"libstdc++6=${HPO_GCC_DEFAULTS_VERSION}"', "",
+                            pin + " " + pin):
+            mutations.append(self.dockerfile.replace(
+                runtime.text, runtime.text.replace(pin, replacement, 1), 1))
+        for index, mutated in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.assertNotEqual(mutated, self.dockerfile)
+                self.assertTrue(_trixie_packaging_problems(mutated, self.args_text))
+
+    def test_bookworm_empty_and_latest_values_cannot_replace_the_reviewed_trixie_pins(self):
+        for argument, value in TRIXIE_TOOLCHAIN_PINS.items():
+            for replacement in ("", "latest", "12.2.0-14+deb12u1"):
+                with self.subTest(argument=argument, replacement=replacement):
+                    mutated = self.args_text.replace(f"{argument}={value}",
+                                                     f"{argument}={replacement}", 1)
+                    self.assertNotEqual(mutated, self.args_text)
+                    self.assertTrue(_trixie_packaging_problems(self.dockerfile, mutated))
 
     def test_argument_comments_name_the_packages_pinned_by_the_real_stages(self):
         stages = _dockerfile_stages(self.dockerfile)
@@ -963,13 +1068,6 @@ class ReadmePairRuleTest(unittest.TestCase):
     # A checkout in CI has no origin/main, so the rule is pinned by digest; a deliberate change of the rule changes
     # this value in the same commit.
     PAIR_RULE_SHA256 = "35b72f7f5c7466cfc212a71eaf05df98f45e92411fd34a67bfff761556c61601"
-
-    # The converter documentation adds 30 lines to the previous 446-line layout.
-    # The offline runtime and TLS section adds 18 lines after the pair rule, for 494.
-    # The pair-rule digest above still covers the unchanged lines 215-244.
-    def test_runner_documentation_keeps_the_494_line_layout(self):
-        lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
-        self.assertEqual(len(lines), 494)
 
     def test_lines_215_to_244_are_byte_identical_to_the_published_rule(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)

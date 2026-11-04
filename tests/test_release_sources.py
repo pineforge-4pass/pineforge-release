@@ -135,6 +135,19 @@ class SourceGuardTest(unittest.TestCase):
         self.registry.write_text(REGISTRY_HEADER + "# no mirrors yet\n", encoding="utf-8")
         self.refused(self.check(), f"source set {_set_id(self.pairs)} is not in registry")
 
+    def test_trixie_defaults_source_version_cannot_reuse_a_bookworm_registry_row(self):
+        # The source is gcc-defaults 1.220, not the defaults binaries' epoch version.
+        updated = [(source, "1.220" if source == "gcc-defaults" else version)
+                   for source, version in self.pairs]
+        self.assertNotEqual(updated, self.pairs)
+        for path, arch in ((self.amd64, "amd64"), (self.arm64, "arm64")):
+            data = _inventory(updated, arch).replace("4:12.2.0-3", "4:14.2.0-1")
+            path.write_text(data, encoding="utf-8")
+            pairs = sources.inventory_pairs(path)
+            self.assertIn(("gcc-defaults", "1.220"), pairs)
+            self.assertNotIn(("gcc-defaults", "4:14.2.0-1"), pairs)
+        self.refused(self.check(), f"source set {_set_id(updated)} is not in registry")
+
     def test_02_registered_set_without_list_asset_is_refused(self):
         assets = [item for item in self.assets if item["name"] != self.sources_list.name]
         self.refused(self.check(assets), "missing release asset: set-02.SOURCES.list")
@@ -763,10 +776,10 @@ class SourceRetentionTest(unittest.TestCase):
             "README must explain how to make a new source set available before its first publish",
         )
         self.assertIn(
-            "The default image differs from 1.5.0 only by the source notice, the two source "
-            "labels and the retained Debian package copyright files.",
+            "The 1.10.0 packaging refresh moves every Debian-based stage to trixie and replaces "
+            "bookworm's GCC 12 pins with GCC 14; the checked harness and entrypoint stay unchanged.",
             readme,
-            "README must state the notice and copyright differences from the 1.5.0 default image",
+            "README must state the bounded Debian base/compiler refresh",
         )
 
 

@@ -1,24 +1,26 @@
 # The build for --target hpo must pass these exact toolchain build arguments.
 # The default target does not need them.
 # This file is read as plain NAME=VALUE lines (no shell syntax).
-# Values recorded by the signed box run of 2026-10-13 (apt-cache policy candidates in
-# debian:bookworm-slim, uniform inside each package group; the installed versions in the built
-# hpo image equal them).
+# Values from Debian trixie main Packages metadata for amd64 and arm64, retrieved
+# 2026-11-04; both indexes match the Debian 13.7 Release SHA256 entries.
+# These replace bookworm's GCC-12 family; native build/runtime validation is pending.
+# https://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.xz
+# https://deb.debian.org/debian/dists/trixie/main/binary-arm64/Packages.xz
 
 # Debian packages gcc, g++, cpp
-HPO_GCC_DEFAULTS_VERSION=4:12.2.0-3
+HPO_GCC_DEFAULTS_VERSION=4:14.2.0-1
 
-# Debian packages gcc-12, g++-12, cpp-12, libgcc-12-dev, libstdc++-12-dev, libgcc-s1, libstdc++6
-HPO_GCC_VERSION=12.2.0-14+deb12u1
+# Debian packages gcc-14, g++-14, cpp-14, libgcc-14-dev, libstdc++-14-dev, libgcc-s1, libstdc++6
+HPO_GCC_VERSION=14.2.0-19
 
 # Debian packages binutils
-HPO_BINUTILS_VERSION=2.40-2
+HPO_BINUTILS_VERSION=2.44-3
 
 # Debian packages libeigen3-dev
-HPO_EIGEN_VERSION=3.4.0-4
+HPO_EIGEN_VERSION=3.4.0-5
 
 # Debian packages cmake
-HPO_CMAKE_VERSION=3.25.1-1
+HPO_CMAKE_VERSION=3.31.6-2
 
 # Debian packages make
-HPO_MAKE_VERSION=4.3-4.1
+HPO_MAKE_VERSION=4.4.1-2
