@@ -92,3 +92,63 @@ def description_facts():
         score["scopes"]["corpus"].update(excellent=2, strong=1, belowStrong=0, tiers=tiers(2, 1))
         score["scopes"]["closed"].update(excellent=4, strong=3, belowStrong=0, tiers=tiers(4, 3))
     return facts
+
+
+def other_market_timeframe_rows():
+    """Three hand-counted frames; string order is 15, 1D, 60."""
+    return [
+        dict(timeframe="15", lanes=1, graded=1, excellent=1, strong=0,
+             belowStrong=0, engineErrors=1, tiers=tiers(excellent=1)),
+        dict(timeframe="1D", lanes=1, graded=1, excellent=0, strong=1,
+             belowStrong=0, engineErrors=0, tiers=tiers(strong=1)),
+        dict(timeframe="60", lanes=1, graded=2, excellent=0, strong=0,
+             belowStrong=2, engineErrors=0, tiers=tiers(minimal=1, no_trades=1)),
+    ]
+
+
+def shared_other_market_timeframe_rows():
+    """The same four grades and three lanes, with two lanes sharing 15."""
+    return [
+        dict(timeframe="15", lanes=2, graded=2, excellent=1, strong=1,
+             belowStrong=0, engineErrors=1, tiers=tiers(excellent=1, strong=1)),
+        dict(timeframe="60", lanes=1, graded=2, excellent=0, strong=0,
+             belowStrong=2, engineErrors=0, tiers=tiers(minimal=1, no_trades=1)),
+    ]
+
+
+def timeframe_facts(row_factory=other_market_timeframe_rows, targets=(0, 1)):
+    """Add independently owned rows without changing any parent totals."""
+    facts = aggregate_facts()
+    scores = (facts["scoreboard"], facts["releases"]["1.0.1"]["scoreboard"])
+    rows = row_factory()
+    for target in targets:
+        scores[target]["otherMarkets"]["timeframes"] = copy.deepcopy(rows)
+    return facts
+
+
+def all_tier_timeframe_facts(targets=(0, 1)):
+    """Regroup two named below-strong grades into the anonymous aggregate.
+
+    The ten overall grades stay 3 excellent, 3 strong and 1 in each lower
+    tier. Each named pair now contributes 1 excellent and 1 strong; the
+    anonymous six grades contribute exactly 1 in each of the six tiers.
+    """
+    facts = aggregate_facts()
+    rows = [
+        dict(timeframe="15", lanes=1, graded=2, excellent=1, strong=0,
+             belowStrong=1, engineErrors=1, tiers=tiers(excellent=1, moderate=1)),
+        dict(timeframe="1D", lanes=1, graded=2, excellent=0, strong=1,
+             belowStrong=1, engineErrors=0, tiers=tiers(strong=1, weak=1)),
+        dict(timeframe="60", lanes=1, graded=2, excellent=0, strong=0,
+             belowStrong=2, engineErrors=0, tiers=tiers(minimal=1, no_trades=1)),
+    ]
+    scores = (facts["scoreboard"], facts["releases"]["1.0.1"]["scoreboard"])
+    for target, score in enumerate(scores):
+        for pair in score["pairs"]:
+            pair.update(graded=2, belowStrong=0, closedProbes=1, tiers=tiers(1, 1))
+        score["hardLane"] = copy.deepcopy(score["pairs"][0])
+        score["otherMarkets"].update(
+            graded=6, belowStrong=4, closedProbes=6, tiers=tiers(1, 1, 1, 1, 1, 1))
+        if target in targets:
+            score["otherMarkets"]["timeframes"] = copy.deepcopy(rows)
+    return facts

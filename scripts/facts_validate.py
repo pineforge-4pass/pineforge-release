@@ -100,6 +100,27 @@ def tally(group):
             "tier summaries differ")
 
 
+def other_market_timeframe_invariants(other):
+    rows = other["timeframes"]
+    previous = None
+    for row in rows:
+        timeframe = row["timeframe"]
+        require(re.fullmatch(r"[1-9][0-9]*[DSWM]?", timeframe), "invalid other markets timeframe")
+        require(previous is None or previous < timeframe,
+                "other markets timeframes must be sorted and unique")
+        tally(row)
+        require(row["lanes"] >= 1, "other markets timeframe lanes must be positive")
+        require(row["lanes"] <= row["graded"] + row["engineErrors"],
+                "other markets timeframe lanes exceed probes")
+        previous = timeframe
+    for field in ("lanes", *COUNTS):
+        require(sum(row[field] for row in rows) == other[field],
+                "other markets timeframe count sum differs")
+    for tier in TIERS:
+        require(sum(row["tiers"][tier] for row in rows) == other["tiers"][tier],
+                "other markets timeframe tier sum differs")
+
+
 def scoreboard_invariants(score):
     provenance = score["provenance"]
     for field in ("engineCommit", "codegenCommit", "snapshotSha256", "populationSha256"):
@@ -139,6 +160,8 @@ def scoreboard_invariants(score):
         require(other["additionalTimeframes"] <= other["lanes"], "other timeframes exceed lanes")
         require((other["markets"] == 0) == (other["lanes"] == 0),
                 "other markets and lanes disagree on emptiness")
+        if "timeframes" in other:
+            other_market_timeframe_invariants(other)
     for field in COUNTS:
         require(sum(p[field] for p in groups) == score[field], "lane count sum differs")
         require(sum(scope[field] for scope in score["scopes"].values()) == score[field],
