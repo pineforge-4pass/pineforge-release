@@ -321,6 +321,7 @@ its bundle attached to an earlier or dedicated release before its first publish,
 because the guard looks up the holding release by tag before the new tag's
 GitHub Release exists.
 
+Set-17 mirrors the trixie image's 72 source/version pairs at `v1.4.0` with `set-17.SOURCES.list` (set-id `76b31d334dc701427d36bbd034b463bdd69101b3bb34e67aa9569bd892d6994a`).
 The trixie image needs a new source set derived from both native image inventories.
 The existing bookworm sets do not establish its source coverage. Publication
 still requires equal amd64/arm64 source/version sets, every exact source archive,
