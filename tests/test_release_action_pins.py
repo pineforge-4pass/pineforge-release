@@ -10,7 +10,7 @@ import yaml
 from yaml.tokens import KeyToken, ScalarToken, ValueToken
 
 ROOT = Path(__file__).resolve().parents[1]
-MIN_USES = 67  # 66 remote actions plus one local reusable workflow at e84cd8c.
+MIN_USES = 63  # 62 remote actions plus one local reusable workflow after retirement.
 VALID_SHA = "0123456789abcdef" * 2 + "01234567"
 VALID_DIGEST = "0123456789abcdef" * 4
 
