@@ -113,23 +113,26 @@ class TrixieRuntimeDocumentationTest(unittest.TestCase):
             "bookworm's glibc 2.36 cannot load that library",
             "Engine, codegen and HPO remain at 1.10.0, with unchanged producer artifact SHA-256 pins",
             "`linux-x86_64` and `linux-aarch64`",
-            "trixie image needs a new source set derived from both native image inventories",
+            "trixie image's new source set was derived from both native image inventories",
             "equal amd64/arm64 source/version sets",
-            "verified published list and asset mirror before adding a registry row",
+            "verified published list and asset mirror before adding the registry row",
+            "published 1.10.0 image passed `publish.yml`'s source coverage checks and runtime smoke on both architectures",
             "CMake and make remain build-only",
-            "native validation is pending",
+            "Both native image builds completed, and `publish.yml` verified the published image's runtime on amd64 and arm64",
             "unfilled skip, which is never proof",
         ):
             self.assertIn(required, prose)
 
-    def test_runtime_floor_unchanged_producers_and_pending_mirror_are_documented(self):
+    def test_runtime_floor_unchanged_producers_and_published_mirror_are_documented(self):
         self.assert_trixie_guidance(self.readme)
 
     def test_wrong_runtime_floor_or_missing_producer_or_mirror_disclosure_is_rejected(self):
         for fragment in ("Debian 13 (trixie)", "glibc 2.41", "remain at 1.10.0",
                          "unchanged producer artifact SHA-256 pins",
                          "verified published list and asset mirror",
-                         "native validation\nis pending", "unfilled skip, which is never proof"):
+                         "Both native image\nbuilds completed",
+                         "source coverage checks and runtime smoke on both architectures",
+                         "unfilled skip, which is never proof"):
             with self.subTest(fragment=fragment):
                 mutated = self.readme.replace(fragment, "omitted", 1)
                 self.assertNotEqual(mutated, self.readme)

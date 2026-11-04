@@ -3,7 +3,8 @@
 # This file is read as plain NAME=VALUE lines (no shell syntax).
 # Values from Debian trixie main Packages metadata for amd64 and arm64, retrieved
 # 2026-11-04; both indexes match the Debian 13.7 Release SHA256 entries.
-# These replace bookworm's GCC-12 family; native build/runtime validation is pending.
+# These replace bookworm's GCC-12 family; both native image builds completed.
+# publish.yml verified the published 1.10.0 image's runtime on amd64 and arm64.
 # https://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.xz
 # https://deb.debian.org/debian/dists/trixie/main/binary-arm64/Packages.xz
 

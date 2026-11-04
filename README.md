@@ -322,10 +322,11 @@ because the guard looks up the holding release by tag before the new tag's
 GitHub Release exists.
 
 Set-17 mirrors the trixie image's 72 source/version pairs at `v1.4.0` with `set-17.SOURCES.list` (set-id `76b31d334dc701427d36bbd034b463bdd69101b3bb34e67aa9569bd892d6994a`).
-The trixie image needs a new source set derived from both native image inventories.
-The existing bookworm sets do not establish its source coverage. Publication
-still requires equal amd64/arm64 source/version sets, every exact source archive,
-and a verified published list and asset mirror before adding a registry row.
+The trixie image's new source set was derived from both native image inventories.
+Those inventories established equal amd64/arm64 source/version sets. Every exact
+source archive was mirrored, with a verified published list and asset mirror
+before adding the registry row. The published 1.10.0 image passed `publish.yml`'s
+source coverage checks and runtime smoke on both architectures.
 The six toolchain pins map to `gcc-defaults` 1.220, `gcc-14` 14.2.0-19,
 `binutils` 2.44-3, `eigen3` 3.4.0-5, `cmake` 3.31.6-2 and `make-dfsg` 4.4.1-2.
 CMake and make remain build-only; the final inventories determine the complete
@@ -477,8 +478,9 @@ build arguments; no toolchain version has been guessed:
 
 `docker/hpo-toolchain.args` records those six pins as plain `NAME=VALUE` lines,
 with comments and blank lines allowed, and no shell syntax. The trixie values
-come from public Debian metadata for both amd64 and arm64; native validation
-is pending. The publish parser rejects empty values; the historical test helper
+come from public Debian metadata for both amd64 and arm64. Both native image
+builds completed, and `publish.yml` verified the published image's runtime on
+amd64 and arm64. The publish parser rejects empty values; the historical test helper
 discloses an empty value as an unfilled skip, which is never proof. Publishing
 passes all six arguments to `--target hpo`; the default target does not need them.
 

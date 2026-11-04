@@ -24,7 +24,7 @@ def _name(value: str) -> str:
 
 
 def check(args) -> None:
-    # Debian bookworm installs pip in the codegen stage. Use its own PEP 440
+    # Debian trixie installs pip in the codegen stage. Use its own PEP 440
     # parser; never compare a prerelease's PyPI spelling as a raw string.
     from pip._vendor.packaging.requirements import Requirement
     from pip._vendor.packaging.version import Version
@@ -67,7 +67,7 @@ def check(args) -> None:
         "PIP_NO_INPUT": "1",
     }
     pip = [sys.executable, "-m", "pip", "install"]
-    # Check the flags of the pip actually provided by bookworm instead of
+    # Check the flags of the pip actually provided by trixie instead of
     # assuming that another host's pip supports them. Unsupported pip is a
     # setup failure, never the red test's expected dependency failure.
     help_result = subprocess.run(pip + ["--help"], cwd=wheel.parent, env=env,
