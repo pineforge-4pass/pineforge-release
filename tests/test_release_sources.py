@@ -485,7 +485,7 @@ class SourceNoticeTest(unittest.TestCase):
         cls.template = (REPO / "docker" / "SOURCES.txt.in").read_text(encoding="utf-8")
 
     def test_template_preserves_biz_notice_verbatim_except_version_token(self):
-        approved = (FIXTURES / "GPL-NOTICE-v1.txt").read_text(encoding="utf-8")
+        approved = (FIXTURES / "GPL-NOTICE-v2.txt").read_text(encoding="utf-8")
         self.assertEqual(self.template, approved.replace("<this version>", "@RELEASE_VERSION@"))
         self.assertEqual(re.findall(r"@[A-Za-z0-9_]+@", self.template), ["@RELEASE_VERSION@"])
         self.assertNotIn("<this version>", self.template)
