@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   check:
-    runs-on: gkp-2cpu-4gb-amd64
+    runs-on: gkp-od-4cpu-8gb-amd64
     environment: release-automation
     env:
       GH_TOKEN: ${{ github.token }}

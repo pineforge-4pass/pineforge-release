@@ -2811,7 +2811,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         ("release-rollback.yml", "restore"),
     }
     PROTECTED_JOBS = {
-        ("release-fanout-check.yml", "check"): "gkp-2cpu-4gb-amd64",
+        ("release-fanout-check.yml", "check"): "gkp-od-4cpu-8gb-amd64",
     }
     PROBE_INSTALL_STEP = {
         "name": "Install tools",
@@ -2848,7 +2848,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
 
     def test_only_the_probe_is_protected_among_eighteen_release_jobs(self):
         self.assertEqual(self.PROTECTED_JOBS, {
-            ("release-fanout-check.yml", "check"): "gkp-2cpu-4gb-amd64",
+            ("release-fanout-check.yml", "check"): "gkp-od-4cpu-8gb-amd64",
         })
         self.assertEqual(len(self.HOSTED_JOBS), 17)
         self.assertTrue(self.HOSTED_JOBS.isdisjoint(self.PROTECTED_JOBS))
@@ -2869,7 +2869,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         })
         self.assertEqual(workflow["permissions"], {"contents": "read", "actions": "read"})
         job = workflow["jobs"]["check"]
-        self.assertEqual(job["runs-on"], "gkp-2cpu-4gb-amd64")
+        self.assertEqual(job["runs-on"], "gkp-od-4cpu-8gb-amd64")
         self.assertEqual(job["environment"], "release-automation")
         self.assertNotIn("container", job)
         self.assertNotIn("if", job)
@@ -2902,7 +2902,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         block = re.search(r"(?ms)^  check:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
         self.assertIsNotNone(block)
         self.assertEqual(re.findall(r"(?m)^    runs-on:.*$", block[1]),
-                         ["    runs-on: gkp-2cpu-4gb-amd64"])
+                         ["    runs-on: gkp-od-4cpu-8gb-amd64"])
 
     def test_protected_probe_installs_tools_before_checkout_and_credentials(self):
         self.assert_protected_probe(_workflow("release-fanout-check.yml"))
@@ -2916,6 +2916,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
             "ubuntu-latest",
             "gke-2cpu-4gb-amd64",
             "gke-4cpu-8gb-amd64",
+            "gkp-2cpu-4gb-amd64",
             "gkp-4cpu-8gb-amd64",
             "gkp-2cpu-4gb-arm64",
             ["gkp-2cpu-4gb-amd64"],
@@ -2923,23 +2924,28 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
             {"group": "protected", "labels": "gkp-2cpu-4gb-amd64"},
             "${{ 'gkp-2cpu-4gb-amd64' }}",
             "${{ github.event_name == 'workflow_dispatch' && 'gkp-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
+            ["gkp-od-4cpu-8gb-amd64"],
+            ["gkp-od-4cpu-8gb-amd64", "ubuntu-latest"],
+            {"group": "protected", "labels": "gkp-od-4cpu-8gb-amd64"},
+            "${{ 'gkp-od-4cpu-8gb-amd64' }}",
+            "${{ github.event_name == 'workflow_dispatch' && 'gkp-od-4cpu-8gb-amd64' || 'ubuntu-latest' }}",
         ):
             with self.subTest(runner=runner):
                 mutant = copy.deepcopy(original)
                 mutant["release-fanout-check.yml"]["jobs"]["check"]["runs-on"] = runner
-                with self.assertRaisesRegex(AssertionError, "runs-on must be gkp-2cpu-4gb-amd64"):
+                with self.assertRaisesRegex(AssertionError, "runs-on must be gkp-od-4cpu-8gb-amd64"):
                     self.assert_release_runners(mutant)
 
     def test_protected_probe_refuses_quoted_folded_and_expression_runner_lines(self):
         text = (WORKFLOWS / "release-fanout-check.yml").read_text(encoding="utf-8")
         self.assert_protected_probe_runner_text(text)
-        original = "    runs-on: gkp-2cpu-4gb-amd64"
+        original = "    runs-on: gkp-od-4cpu-8gb-amd64"
         self.assertEqual(text.count(original + "\n"), 1)
         for replacement in (
-            "    runs-on: 'gkp-2cpu-4gb-amd64'",
-            '    runs-on: "gkp-2cpu-4gb-amd64"',
-            "    runs-on: >\n      gkp-2cpu-4gb-amd64",
-            "    runs-on: ${{ 'gkp-2cpu-4gb-amd64' }}",
+            "    runs-on: 'gkp-od-4cpu-8gb-amd64'",
+            '    runs-on: "gkp-od-4cpu-8gb-amd64"',
+            "    runs-on: >\n      gkp-od-4cpu-8gb-amd64",
+            "    runs-on: ${{ 'gkp-od-4cpu-8gb-amd64' }}",
         ):
             with self.subTest(source=replacement):
                 mutant = text.replace(original, replacement, 1)
@@ -3241,7 +3247,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         "release-finalize.yml": {"finalize": "ubuntu-latest", "release-attempt-cleanup": "ubuntu-latest",
                                  "notify-consumers": "ubuntu-latest",
                                  "report-compute-configuration-error": "ubuntu-latest"},
-        "release-fanout-check.yml": {"check": "gkp-2cpu-4gb-amd64"},
+        "release-fanout-check.yml": {"check": "gkp-od-4cpu-8gb-amd64"},
         "release-redeliver.yml": {"redeliver": "ubuntu-latest"},
         "release-receipts.yml": {"plan": "ubuntu-latest", "verify": "ubuntu-latest"},
         "release-reconcile.yml": {"producers": "ubuntu-latest"},
@@ -4709,6 +4715,8 @@ class PrTierWorkflowTest(unittest.TestCase):
                     invalid_runners.append(
                         "ubuntu-latest" if (name, identity) == ("release-fanout-check.yml", "check")
                         else "gkp-2cpu-4gb-amd64")
+                    if (name, identity) == ("release-fanout-check.yml", "check"):
+                        invalid_runners.append("gkp-2cpu-4gb-amd64")
                     for runner in invalid_runners:
                         with self.subTest(runner=runner):
                             mutant = copy.deepcopy(job)
