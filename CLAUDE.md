@@ -29,7 +29,7 @@ docker run --rm -v "$PWD/strategy.pine:/in/strategy.pine:ro" -v "$PWD/ohlcv.csv:
 - `scripts/` — the logic the workflows run: `release_pair.py` (version order, pairing), `release_pipeline.py` (candidate, finalize, dispatch, reconcile), `release_receipts.py`, `release_sources.py`, `release_smoke.py`, `facts_*.py`, `sync-harness.sh`.
 - `tests/` — `unittest` modules `test_*.py` and `fixtures/`, except `test_fingerprint_canonical.py`, a standalone script (`python3 tests/test_fingerprint_canonical.py`); `facts_other_markets.py` is a fixture helper, not a test.
 - `tools/release-dry-run/` — offline replay of the release graph (`dry_run.py`, `wfrun.py`, shims); its README.md has the options.
-- `.github/workflows/` — PR gates (`python-test.yml`, `facts-validate.yml`), release automation (`handle-upstream`, `publish`, `release-*`), `facts-*` automation, `diag-gke-python.yml`; `.github/dependabot.yml` bumps actions weekly.
+- `.github/workflows/` — PR gates (`python-test.yml`, `facts-validate.yml`), release automation (`handle-upstream`, `publish`, `release-*`), `facts-*` automation; `.github/dependabot.yml` bumps actions weekly.
 
 ## Testing
 ### a. What CI runs, per trigger
@@ -58,7 +58,7 @@ A check's name is the job `name:` when set, else the job key. **REQUIRED** check
 | dispatch, cron `11 * * * *` | `release-reconcile.yml`: `producers` | replays missed stable producer events |
 | push to `main` on `facts/facts.json`, dispatch (`dry_run`), cron `7 3 * * *` | `facts-fanout.yml`: `web`, `license` | validates facts, signals consumers (dry run unless enabled) |
 | push to `main` on `facts/**`, `scripts/repo_descriptions.py`, `scripts/facts_*.py`, `tests/test_repo_descriptions.py`, `tests/test_facts_*.py`, `.github/workflows/facts-descriptions.yml`; dispatch (`dry_run`); cron `17 3 * * *` | `facts-descriptions.yml`: `descriptions` | reconciles public repository descriptions (dry run unless enabled) |
-| dispatch only | `release-rollback.yml` `restore`; `release-redeliver.yml` `redeliver`; `release-fanout-check.yml` `check`; `diag-gke-python.yml` `inspect` | restore aliases of a rejected release; repair one consumer's delivery; read-only delivery check; Python/pip diagnostic |
+| dispatch only | `release-rollback.yml` `restore`; `release-redeliver.yml` `redeliver` | restore aliases of a rejected release; repair one consumer's delivery |
 
 ### b. Local-only checks (not run by CI)
 - `PINEFORGE_SINK_TEST_IMAGE=<image> python3 -m unittest discover -s tests -p 'test_release_sink_image.py' -v` — sink converter in an already built image (needs docker; `PINEFORGE_SINK_TEST_PLATFORM` picks `linux/amd64` or `linux/arm64`). CI runs only its fixture-integrity class; the image class skips. Run it when you change `docker/pineforge_sink_to_json.py`, `docker/pf_sink.py` or `tests/fixtures/sink-vectors/`.

@@ -335,9 +335,9 @@ role; excluded roles are visible and do not require a delivery.
 An unavailable receiver API (including a 404) produces a failing role row
 while the check continues reporting the other roles.
 Set `RELEASE_TARGET_<ROLE>_REPOSITORY` to the configured short repository names.
-The optional workflow uses the hub token for public release assets and a
-scoped Actions-read App token for receiver repositories. The
-`release-fanout-check` workflow accepts the same tag for manual inspection.
+Run the CLI directly for manual inspection, using `GH_HUB_TOKEN` for public
+release assets and `GH_RECEIVER_TOKEN` with Actions-read access to the receiver
+repositories.
 
 Prerelease application/web/data/license roles, if configured, are explicitly
 `skipped_by_policy`; offline/hosted must enforce their dev/next policy.
