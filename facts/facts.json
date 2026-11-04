@@ -193,7 +193,43 @@
         "weak": 0,
         "minimal": 0,
         "no-trades": 0
-      }
+      },
+      "timeframes": [
+        {
+          "timeframe": "15",
+          "lanes": 7,
+          "graded": 3081,
+          "excellent": 3077,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 3077,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        {
+          "timeframe": "1D",
+          "lanes": 7,
+          "graded": 2175,
+          "excellent": 2175,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 2175,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        }
+      ]
     },
     "tvTradesCompared": 4692951,
     "tvTradesComparedSource": "Sum over the graded probes of this baseline of the trades compared with TradingView, each probe counted once; a position closed in several parts counts once; trades still open at the end of TradingView's list are excluded."
@@ -394,7 +430,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3032,
+              "strong": 49,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3032,
+                "strong": 49,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2165,
+              "strong": 10,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2165,
+                "strong": 10,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -593,7 +665,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3060,
+              "strong": 21,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3060,
+                "strong": 21,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2172,
+              "strong": 3,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2172,
+                "strong": 3,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -792,7 +900,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3069,
+              "strong": 12,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3069,
+                "strong": 12,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2174,
+              "strong": 1,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2174,
+                "strong": 1,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -991,7 +1135,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3076,
+              "strong": 5,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3076,
+                "strong": 5,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -1190,7 +1370,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -1389,7 +1605,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -1588,7 +1840,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -1787,7 +2075,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -1986,7 +2310,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -2185,7 +2545,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -2384,7 +2780,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -2583,7 +3015,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -2782,7 +3250,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     },
@@ -2981,7 +3485,43 @@
             "weak": 0,
             "minimal": 0,
             "no-trades": 0
-          }
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
         }
       }
     }
