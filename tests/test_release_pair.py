@@ -9,18 +9,22 @@ check. Stdlib only: `python3 -m unittest discover -s tests -p 'test_release_*.py
 """
 from __future__ import annotations
 
+import io
 import re
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from itertools import permutations
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "release_pair.py"
 sys.path.insert(0, str(SCRIPT.parent))
 
 import release_pair as rp  # noqa: E402
+import release_pipeline as pipeline  # noqa: E402
 
 
 def run(*args: str, stdin: str = "") -> subprocess.CompletedProcess:
@@ -48,6 +52,69 @@ def decide(component: str, version: str, prev: tuple, *, current: str = "0.1.25"
 def check(release: str, engine: str, codegen: str, newest: str = "") -> subprocess.CompletedProcess:
     return run("check", "--release", release, "--engine", engine, "--codegen", codegen,
                "--newest-stable", newest)
+
+
+class PublishPolicyTest(unittest.TestCase):
+    """Exercise the CLI and the real ready-frontier selector, with external storage fixtures."""
+
+    class Store:
+        def __init__(self):
+            self.rows = [
+                {"tag_name": "v1.9.2", "draft": False, "assets": [{"name": "release-manifest.json"}]},
+                {"tag_name": "v1.10.0", "draft": False, "assets": [{"name": "release-manifest.json"}]},
+                {"tag_name": "v3.0.0", "draft": True, "assets": [{"name": "release-manifest.json"}]},
+                {"tag_name": "v4.0.0-rc.1", "draft": False, "assets": [{"name": "release-manifest.json"}]},
+                {"tag_name": "v5.0.0", "draft": False, "assets": []},
+                {"tag_name": "v6.0.0", "draft": False, "assets": [{"name": "release-manifest.json"}]},
+            ]
+            self.assets = {("v6.0.0", "release-rejected.json"): b'{"rejected":true}\n'}
+
+        def releases(self):
+            return self.rows
+
+        def read(self, row, name):
+            return self.assets.get((row["tag_name"], name))
+
+    def cli(self, tag, recovery, store):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(sys, "argv", ["release_pipeline.py", "publish-policy", "--tag", tag,
+                                      "--recovery", recovery]), \
+                patch.object(pipeline, "Client"), patch.object(pipeline, "Store", return_value=store), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            result = pipeline.main()
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def test_recovery_order_uses_semver_and_the_existing_ready_frontier(self):
+        for tag, allowed in (("v1.9.2", "false"), ("v1.10.0-rc.12", "false"),
+                             ("v1.10.0", "true"), ("v1.10.1-rc.1", "true"), ("v1.11.0", "true")):
+            with self.subTest(tag=tag):
+                result, stdout, stderr = self.cli(tag, "true", self.Store())
+                self.assertEqual(result, 0, stderr)
+                self.assertEqual(stdout, f"allowed={allowed}\nlatest_ready=1.10.0\n")
+                self.assertEqual(stderr, "")
+
+    def test_normal_bump_is_allowed_even_below_the_frontier(self):
+        result, stdout, stderr = self.cli("v1.9.2", "false", self.Store())
+        self.assertEqual(result, 0, stderr)
+        self.assertEqual(stdout, "allowed=true\nlatest_ready=1.10.0\n")
+
+    def test_empty_ready_frontier_allows_recovery(self):
+        store = self.Store()
+        store.rows = []
+        result, stdout, stderr = self.cli("v0.1.26", "true", store)
+        self.assertEqual(result, 0, stderr)
+        self.assertEqual(stdout, "allowed=true\nlatest_ready=\n")
+
+    def test_unreadable_store_never_authorizes_a_bump_or_recovery(self):
+        for recovery in ("true", "false"):
+            for failure in (pipeline.Invalid("HTTP 403"), pipeline.Pending("store unavailable")):
+                for operation in ("releases", "read"):
+                    with self.subTest(recovery=recovery, operation=operation, failure=type(failure).__name__), \
+                            patch.object(self.Store, operation, side_effect=failure):
+                        result, stdout, stderr = self.cli("v1.10.0", recovery, self.Store())
+                        self.assertNotEqual(result, 0)
+                        self.assertNotIn("allowed=", stdout)
+                        self.assertTrue(stderr)
 
 
 class VersionTest(unittest.TestCase):

@@ -14,8 +14,8 @@ name: handle-upstream
 # artifacts, and the release version becomes the pair version.
 # Hpo joins at the single cutoff in scripts/release_pair.py: then an event
 # probes both partners and the tag records all three versions.
-# The handler pushes the tag with the App token. Publication is a separate
-# operator dispatch of publish.yml on main with that tag as input (build the
+# The handler pushes the tag with the App token, then automatically dispatches
+# publish.yml on main with its own tag output when policy allows (build the
 # combined image -> fan out to the MCPs and the app). Idempotent, with
 # half-failed-release recovery, a downgrade guard, and serialized concurrency.
 
@@ -314,17 +314,22 @@ jobs:
           printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Re-publish (recover a half-failed prior release)
+        id: republish
         if: steps.decide.outputs.mode == 'republish'
         env:
           TAG: v${{ steps.decide.outputs.cur_ver }}
         run: |
           set -euo pipefail
-          line="versions unchanged but image missing for ${TAG}; after the tag exists on main and handle-upstream is green, a user with write access must run: gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=${TAG}"
-          echo "::warning title=pineforge publish needed::${line}"
+          # Republish assumes the tag: a missing tag fails this job on purpose
+          # at this idempotent push, so the existing producer alert fires.
+          git push origin "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          line="versions unchanged but image missing for ${TAG}; handle-upstream automatically dispatches publish.yml when allowed by recovery policy"
+          echo "::notice title=pineforge publish automatic::${line}"
           printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
-          exit 0
 
       - name: Bump VERSION, commit, tag
+        id: bump
         if: steps.decide.outputs.mode == 'bump'
         env:
           E:       ${{ steps.decide.outputs.engine }}
@@ -348,8 +353,9 @@ jobs:
             [ -n "$commit" ] || { echo "::error::VERSION is ${RELEASE} but main has no release commit for it; refusing to tag"; exit 1; }
             git tag -a "v${RELEASE}" "$commit" -m "$(tag_message "$RELEASE")"
             git push origin "v${RELEASE}"
-            line="pushed v${RELEASE} at ${commit} (${components}); after the tag exists on main and handle-upstream is green, a user with write access must run: gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=v${RELEASE}"
-            echo "::notice title=pineforge publish needed::${line}"
+            echo "tag=v${RELEASE}" >> "$GITHUB_OUTPUT"
+            line="pushed v${RELEASE} at ${commit} (${components}); handle-upstream automatically dispatches publish.yml when allowed by recovery policy"
+            echo "::notice title=pineforge publish automatic::${line}"
             printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -387,9 +393,58 @@ jobs:
           git tag -a "v${next}" -m "$(tag_message "$next")"
           git push origin HEAD:main
           git push origin "v${next}"
-          line="pushed v${next} (${components}); after the tag exists on main and handle-upstream is green, a user with write access must run: gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=v${next}"
-          echo "::notice title=pineforge publish needed::${line}"
+          echo "tag=v${next}" >> "$GITHUB_OUTPUT"
+          line="pushed v${next} (${components}); handle-upstream automatically dispatches publish.yml when allowed by recovery policy"
+          echo "::notice title=pineforge publish automatic::${line}"
           printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check publication recovery policy
+        id: publish-policy
+        if: steps.decide.outputs.mode == 'bump' || steps.decide.outputs.mode == 'republish'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ steps.bump.outputs.tag || steps.republish.outputs.tag }}
+          RECOVERY: ${{ steps.decide.outputs.mode == 'republish' || steps.decide.outputs.retag == 'true' }}
+        run: |
+          set -euo pipefail
+          policy="$(python3 scripts/release_pipeline.py publish-policy --tag "$TAG" --recovery "$RECOVERY")"
+          printf '%s\n' "$policy" >> "$GITHUB_OUTPUT"
+          if printf '%s\n' "$policy" | grep -qx 'allowed=false'; then
+            latest="$(printf '%s\n' "$policy" | sed -n 's/^latest_ready=//p')"
+            line="automatic publication skipped for ${TAG}: recovery is older than latest ready ${latest}; manual recovery: gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=${TAG}"
+            echo "::notice title=pineforge publish skipped::${line}"
+            printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Mint hub Actions token
+        id: publish-app
+        if: steps.publish-policy.outputs.allowed == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.PINEFORGE_APP_ID }}
+          private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: pineforge-release
+          permission-actions: write
+          github-api-url: https://api.github.com
+
+      - name: Dispatch publication
+        if: steps.publish-policy.outputs.allowed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.publish-app.outputs.token }}
+          TAG: ${{ steps.bump.outputs.tag || steps.republish.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag="$TAG"; then
+            line="automatically dispatched publish.yml on main for ${TAG}"
+            echo "::notice title=pineforge publish dispatched::${line}"
+            printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+          else
+            line="automatic publication dispatch failed for ${TAG}; manual recovery: gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=${TAG}"
+            echo "::error title=pineforge publish dispatch failed::${line}"
+            printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
       - name: Report failed upstream handling
         if: ${{ failure() && !cancelled() }}

@@ -20,6 +20,23 @@ must detect removal of the runtime gate, early latest tags and bypassed finalize
 dependencies. The CI aggregate `release/ready` requires this replay as well as
 the existing release/source/harness and fingerprint jobs.
 
+The default `--ready` suite also runs the handler's real post-decision shell,
+tag pushes to a local origin, the `publish-policy` CLI and failure reporter.
+It checks automatic `publish.yml` dispatch on `main` with exactly one `tag`
+input from the bump/republish output, including conflicting payload tags,
+noop/wait, older/equal/newer recovery, missing tags, rejected pushes, unreadable
+storage, and dispatch failure followed by a safe rerun. `PublicationReplay`
+injects only external API responses into subprocesses; production commands have
+no fixture-success branch. The shim records whether the tag was already on
+origin at dispatch time. A `workflow-dispatch.fail` file in a replay's state
+directory makes `gh workflow run` fail.
+
+Tagged-publication reconcile cases use a frozen clock and the production
+`PUBLISH_START_GRACE_MINUTES` constant: before/at/after grace, candidate/image
+presence, deduplicated incidents, lightweight tags and store/registry errors.
+The default suite includes the workflow pin mutations for widened tokens,
+changed order/conditions, error suppression, payload tags and extra dispatches.
+
 No token is minted, no registry is written and no real HTTP is allowed. This
 replay does not claim a real image passed E2E: `publish.yml` separately runs
 `release_smoke.py` on both pushed child digests in CI before storing a verified

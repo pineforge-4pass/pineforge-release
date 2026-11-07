@@ -25,7 +25,10 @@ def main(argv=None):
     if args.k:
         loader.testNamePatterns = ["*" + args.k + "*"]
     suite = unittest.TestSuite(loader.loadTestsFromName(name) for name in
-                               ("test_release_binding", "test_release_binding_workflows", "test_release_runtime_smoke"))
+                               ("test_release_binding", "test_release_binding_workflows", "test_release_runtime_smoke",
+                                "test_release_pair.PublishPolicyTest",
+                                "test_release_workflows.HandlerPublicationReplayTest",
+                                "test_release_workflows.ReleaseTriggerWorkflowTest"))
     if not suite.countTestCases():
         parser.error("no replay cases selected")
     stream = sys.stderr

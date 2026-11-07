@@ -33,7 +33,7 @@ jobs:
           repositories: pineforge-release
           permission-contents: write
           github-api-url: https://api.github.com
-      - name: Verify artifacts and replay missed stable producer events
+      - name: Replay missed stable producer events and report stalled tagged publication
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           RELEASE_REPORT_OWNER: ${{ vars.RELEASE_REPORT_OWNER }}
