@@ -2704,9 +2704,7 @@ class PrTierWorkflowTest(unittest.TestCase):
     }
     # Old pool labels remain negative-control fixtures.
     RUNNER = ["self-hosted", "pf-ci", "pf-ci-x64"]
-    PUSH_RUNNER = "${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}"
-    RUNNER_LINE = "    runs-on: " + PUSH_RUNNER
-    RUNNER_COUNTS = {"python-test.yml": 5, "facts-validate.yml": 1}
+    LEGACY_PUSH_RUNNER = "${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}"
     PUSH_PACKAGES = {
         "validate": "ca-certificates diffutils git python3",
         "changes": "python3",
@@ -2840,7 +2838,7 @@ class PrTierWorkflowTest(unittest.TestCase):
     }
 
     def expected_runner(self, identity):
-        return self.HOSTED_ONLY_RUNNERS.get(identity, self.PUSH_RUNNER)
+        return self.HOSTED_ONLY_RUNNERS.get(identity, "ubuntu-24.04")
 
     def assert_runner(self, runner, identity):
         expected = self.expected_runner(identity)
@@ -3087,13 +3085,14 @@ class PrTierWorkflowTest(unittest.TestCase):
     def test_each_runner_pin_refuses_pool_arrays_fragments_unavailable_labels_and_labels_env(self):
         for name in self.ROUTED_JOBS:
             text = (WORKFLOWS / name).read_text()
-            self.assertEqual(text.count(self.RUNNER_LINE + "\n"), self.RUNNER_COUNTS[name])
-            for identity, job in _workflow(name)["jobs"].items():
+            jobs = _workflow(name)["jobs"]
+            self.assert_literal_routes(text, jobs)
+            for identity, job in jobs.items():
                 self.assert_hosted_job(job, identity)
                 for runner in (
                     self.RUNNER.copy(),
-                    "ubuntu-latest" if identity == "authz" else "ubuntu-24.04",
-                    self.PUSH_RUNNER if identity == "release-rules" else "ubuntu-latest",
+                    "ubuntu-24.04" if identity == "release-rules" else "ubuntu-latest",
+                    self.LEGACY_PUSH_RUNNER,
                     "gke-2cpu-4gb-amd64",
                     "${{ github.event_name == 'pull_request' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
                     "${{ github.event_name == 'merge_group' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
@@ -3116,18 +3115,21 @@ class PrTierWorkflowTest(unittest.TestCase):
                 mutant = copy.deepcopy(job)
                 mutant.setdefault("env", {})["PF_CI_LABELS"] = json.dumps(self.RUNNER)
                 with self.subTest(workflow=name, job=identity, mutation="labels env"):
+                    self.assertNotEqual(mutant, job)
                     with self.assertRaises(AssertionError):
                         self.assert_hosted_job(mutant, identity)
                 block = re.search(rf"(?ms)^  {re.escape(identity)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
                 self.assertIsNotNone(block)
                 original = "    runs-on: " + self.expected_runner(identity)
-                replacement = self.AUTHZ_POOL_RUNNER_LINE if identity == "authz" else self.POOL_RUNNER_LINE
                 self.assertEqual(block[0].count(original + "\n"), 1, identity)
-                altered = block[0].replace(original, replacement, 1)
-                mutant_text = text[:block.start()] + altered + text[block.end():]
-                self.assertNotEqual(mutant_text, text)
-                with self.assertRaises(AssertionError):
-                    self.assert_literal_routes(mutant_text, {identity})
+                pool = self.AUTHZ_POOL_RUNNER_LINE if identity == "authz" else self.POOL_RUNNER_LINE
+                for replacement in (pool, "    runs-on: " + self.LEGACY_PUSH_RUNNER):
+                    altered = block[0].replace(original, replacement, 1)
+                    mutant_text = text[:block.start()] + altered + text[block.end():]
+                    with self.subTest(workflow=name, job=identity, replacement=replacement):
+                        self.assertNotEqual(mutant_text, text)
+                        with self.assertRaises(AssertionError):
+                            self.assert_literal_routes(mutant_text, {identity})
 
     def test_push_tools_refuse_missing_late_unguarded_or_changed_installation(self):
         for name in self.ROUTED_JOBS:
@@ -4018,6 +4020,10 @@ class PrTierWorkflowTest(unittest.TestCase):
                     with self.assertRaises(AssertionError):
                         self.assert_authz_decision(mutant, inputs, accepted, **options)
 
+    JOB_RUNNER_DOCUMENTATION = re.compile(
+        r"`([^`]+\.yml)` jobs? ((?:`[^`]+`(?:, | and )?)+) uses? `runs-on: ([^`]+)`"
+    )
+
     def assert_authz_runner_documentation(self, chain, readme, workflows):
         introduction, supervisor = chain.split("## Supervisor configuration\n", 1)
         canonical_descriptions = re.findall(
@@ -4044,18 +4050,26 @@ class PrTierWorkflowTest(unittest.TestCase):
                 r"`authz`(?: jobs)? uses? `runs-on: ([^`]+)`; "
                 r"the other (?:PR )?jobs use `runs-on: ([^`]+)`", normalized)
             self.assertTrue(runner_pairs, f"{label}: distinguish authz from the other hosted jobs")
-            # The jobs that run on pushes to main use the documented push-triggered runner; every other
-            # non-authz job uses the documented hosted runner.
-            push_runners = set(re.findall(r"push-triggered runner `runs-on: ([^`]+)`", normalized))
-            self.assertTrue(push_runners, f"{label}: document the push-triggered runner of the PR-CI jobs")
+            self.assertNotIn("push-triggered runner", normalized,
+                             f"{label}: document literal hosted routes for every configured event")
+            documented_jobs = {}
+            for name, identities, runner in self.JOB_RUNNER_DOCUMENTATION.findall(normalized):
+                self.assertIn(name, workflows, f"{label}: documented workflow")
+                for identity in re.findall(r"`([^`]+)`", identities):
+                    self.assertIn(identity, workflows[name]["jobs"], f"{label}: documented job")
+                    self.assertEqual(runner, workflows[name]["jobs"][identity]["runs-on"],
+                                     f"{label}: {name}:{identity}: documented runner")
+                    self.assertNotIn((name, identity), documented_jobs,
+                                     f"{label}: duplicate runner assignment")
+                    documented_jobs[name, identity] = runner
             for runners in runner_pairs:
                 for name, workflow in workflows.items():
                     for identity, job in workflow["jobs"].items():
                         if identity == "authz":
                             self.assertEqual(runners[0], job["runs-on"], f"{label}: {name}:{identity}")
                         else:
-                            self.assertIn(job["runs-on"], {runners[1], *push_runners},
-                                          f"{label}: {name}:{identity}")
+                            self.assertEqual(job["runs-on"], documented_jobs.get((name, identity), runners[1]),
+                                             f"{label}: {name}:{identity}: documented runner")
 
     def test_authz_runner_documentation_matches_workflows_and_refuses_stale_runners(self):
         documents = {"chain": (REPO / "docs/release-chain.md").read_text(),
@@ -4077,6 +4091,25 @@ class PrTierWorkflowTest(unittest.TestCase):
                 self.assertNotEqual(mutant, documents)
                 with self.assertRaises(AssertionError):
                     self.assert_authz_runner_documentation(mutant["chain"], mutant["readme"], workflows)
+        for document, text in documents.items():
+            for match in self.JOB_RUNNER_DOCUMENTATION.finditer(text.replace("\n", " ")):
+                # Match offsets use the same length-preserving newline normalization.
+                original = text[match.start():match.end()]
+                runner = match[3]
+                wrong_runner = "ubuntu-latest" if runner == "ubuntu-24.04" else "ubuntu-24.04"
+                replacements = [
+                    "",
+                    original.replace("`runs-on: " + runner + "`", "`runs-on: " + wrong_runner + "`", 1),
+                ]
+                replacements.extend(original.replace("`" + identity + "`", "`unknown-job`", 1)
+                                    for identity in re.findall(r"`([^`]+)`", match[2]))
+                for replacement in replacements:
+                    mutant = dict(documents)
+                    mutant[document] = text[:match.start()] + replacement + text[match.end():]
+                    with self.subTest(document=document, mutation=original, replacement=replacement):
+                        self.assertNotEqual(mutant, documents)
+                        with self.assertRaises(AssertionError):
+                            self.assert_authz_runner_documentation(mutant["chain"], mutant["readme"], workflows)
 
     def test_authz_runner_documentation_refuses_the_reported_exception_clause(self):
         chain = (REPO / "docs/release-chain.md").read_text()
