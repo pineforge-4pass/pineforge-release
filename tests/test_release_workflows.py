@@ -4359,11 +4359,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         facts = _workflow("facts-validate.yml")
         self.assertEqual(set(facts["on"]), {"pull_request", "push"})
         self.assertEqual(facts["on"]["push"]["branches"], ["main"])
-        self.assertEqual(facts["on"]["push"]["paths"], [
-            "facts/**", "scripts/repo_descriptions.py", "scripts/facts_*.py",
-            "tests/test_repo_descriptions.py", "tests/test_facts_*.py",
-            "tests/test_release_workflows.py", ".github/workflows/**",
-        ])
+        self.assertEqual(facts["on"]["push"], {"branches": ["main"]})
         validate = facts["jobs"]["validate"]
         self.assert_job_condition("validate", validate)
         self.assertEqual(validate["needs"], "authz")
