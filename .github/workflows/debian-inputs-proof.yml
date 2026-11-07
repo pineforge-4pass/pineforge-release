@@ -1,0 +1,108 @@
+name: Frozen Debian inputs native AMD64 diagnostic
+
+# Source diagnostic only. Activation is a reviewed push to this branch.
+on:
+  push:
+    branches: [diag/debian-inputs-proof]
+
+permissions:
+  contents: read
+
+jobs:
+  native-amd64:
+    name: Frozen Debian inputs native AMD64
+    if: >-
+      github.event_name == 'push' &&
+      github.repository == 'pineforge-4pass/pineforge-release' &&
+      github.ref == 'refs/heads/diag/debian-inputs-proof'
+    runs-on: ubuntu-24.04
+    env:
+      PF_BUILD_CPUS: '2'
+      PF_BUILD_MEMORY_GIB: '6'
+    steps:
+      - name: Initialize incomplete diagnostic and guard execution
+        id: guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/debian-inputs-proof"
+          printf '%s\n' '{"schema":1,"status":"INCOMPLETE","scope":"frozen-product native AMD64 diagnostic"}' > "$RUNNER_TEMP/debian-inputs-proof/status.json.initial"
+          mv "$RUNNER_TEMP/debian-inputs-proof/status.json.initial" "$RUNNER_TEMP/debian-inputs-proof/status.json"
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REPOSITORY" = pineforge-4pass/pineforge-release
+          test "$GITHUB_REF" = refs/heads/diag/debian-inputs-proof
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -m)" = x86_64
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout controller
+        id: controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: pineforge-4pass/pineforge-release
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+
+      - name: Checkout frozen product
+        id: product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: pineforge-4pass/pineforge-release
+          ref: 54d13b3809c4f321dfe94a58e46bee8c16f2fdfa
+          path: product
+          persist-credentials: false
+
+      - name: Collect actual native AMD64 image execution
+        id: collect
+        shell: bash
+        env:
+          PF_CONTROLLER_CHECKOUT: ${{ steps.controller.outcome }}
+          PF_PRODUCT_CHECKOUT: ${{ steps.product.outcome }}
+        run: bash control/scripts/debian_inputs_image_proof.sh "$GITHUB_WORKSPACE/product" "$RUNNER_TEMP/debian-inputs-proof"
+
+      - name: Validate collected files
+        id: results
+        shell: bash
+        # The job's real completed_at is only available after the job finishes.
+        # The operator supplies that API JSON to the same helper with --job-json.
+        # Until then the validated execution still has status INCOMPLETE.
+        run: python3 -I control/scripts/debian_inputs_image_results.py verify "$RUNNER_TEMP/debian-inputs-proof" "$GITHUB_WORKSPACE/product"
+
+      - name: Preserve curated diagnostic files
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: debian-inputs-amd64-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/debian-inputs-proof/status.json
+            ${{ runner.temp }}/debian-inputs-proof/resources.json
+            ${{ runner.temp }}/debian-inputs-proof/*.started
+            ${{ runner.temp }}/debian-inputs-proof/*.ended
+            ${{ runner.temp }}/debian-inputs-proof/*.exit
+            ${{ runner.temp }}/debian-inputs-proof/*.log
+            ${{ runner.temp }}/debian-inputs-proof/*.stderr
+            ${{ runner.temp }}/debian-inputs-proof/*.sha
+            ${{ runner.temp }}/debian-inputs-proof/*.tree
+            ${{ runner.temp }}/debian-inputs-proof/*.iid
+            ${{ runner.temp }}/debian-inputs-proof/*.id
+            ${{ runner.temp }}/debian-inputs-proof/*.sha256
+            ${{ runner.temp }}/debian-inputs-proof/*.tsv
+            ${{ runner.temp }}/debian-inputs-proof/*-source-pairs.txt
+            ${{ runner.temp }}/debian-inputs-proof/*.labels.json
+            ${{ runner.temp }}/debian-inputs-proof/*.platform
+            ${{ runner.temp }}/debian-inputs-proof/*.guard
+            ${{ runner.temp }}/debian-inputs-proof/*-backtest.json
+            ${{ runner.temp }}/debian-inputs-proof/hpo-study.json
+            ${{ runner.temp }}/debian-inputs-proof/study.json
+            ${{ runner.temp }}/debian-inputs-proof/debian.args
+            ${{ runner.temp }}/debian-inputs-proof/hpo.args
+            ${{ runner.temp }}/debian-inputs-proof/buildkit.toml
+            ${{ runner.temp }}/debian-inputs-proof/builder-resources.txt
+            ${{ runner.temp }}/debian-inputs-proof/builder-cpu.txt
+            ${{ runner.temp }}/debian-inputs-proof/builder-cpuset.txt
+            ${{ runner.temp }}/debian-inputs-proof/builder-memory.txt
+            ${{ runner.temp }}/debian-inputs-proof/missing-ca.rc
