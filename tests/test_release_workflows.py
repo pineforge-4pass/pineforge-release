@@ -4368,18 +4368,28 @@ class PrTierWorkflowTest(unittest.TestCase):
                          "${{ github.event_name == 'pull_request' && '0' || '1' }}")
         for step in validate["steps"][3:]:
             self.assertEqual(step["if"], "steps.paths.outputs.docs-only == 'false'")
+        discovery_steps = [
+            step for step in validate["steps"]
+            if "unittest discover" in step.get("run", "")
+        ]
+        self.assertTrue(discovery_steps, "validate must run unittest discover")
+        for step in discovery_steps:
+            self.assertEqual(step.get("if"), "steps.paths.outputs.docs-only == 'false'")
 
     def detector(self, workflow):
         jobs = _workflow(workflow)["jobs"]
         job = jobs["changes" if workflow == "python-test.yml" else "validate"]
         return next(step for step in job["steps"] if step.get("id") == "paths")["run"]
 
-    def detect(self, workflow, paths, event="pull_request", *, fail=False, script=None):
+    def detector_program(self, workflow, script=None):
         if script is None:
             script = self.detector(workflow)
         self.assertTrue(script.startswith("python3 - <<'PY'\n"))
         self.assertTrue(script.endswith("PY\n"))
-        program = script.removeprefix("python3 - <<'PY'\n").removesuffix("PY\n")
+        return script.removeprefix("python3 - <<'PY'\n").removesuffix("PY\n")
+
+    def detect(self, workflow, paths, event="pull_request", *, fail=False, script=None):
+        program = self.detector_program(workflow, script)
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "outputs"
             env = {"EVENT_NAME": event, "BASE_SHA": "base", "HEAD_SHA": "head",
@@ -4400,6 +4410,24 @@ class PrTierWorkflowTest(unittest.TestCase):
                 else:
                     diff.assert_not_called()
             return output.read_text() if output.exists() else None
+
+    def detect_subprocess(self, workflow, event):
+        program_text = self.detector_program(workflow)
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            program = directory / "detector.py"
+            output = directory / "outputs"
+            program.write_text(program_text, encoding="utf-8")
+            env = os.environ.copy()
+            env.update(
+                EVENT_NAME=event, BASE_SHA="", HEAD_SHA="", GITHUB_OUTPUT=str(output),
+            )
+            result = subprocess.run(
+                ["python3", "-I", str(program)],
+                cwd=directory, env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return output.read_text(encoding="utf-8")
 
     def test_docs_detection_executes_actual_scripts_on_docs_mixed_and_unknown_paths(self):
         self.assertEqual(self.detector("python-test.yml"), self.detector("facts-validate.yml"))
@@ -4434,6 +4462,8 @@ class PrTierWorkflowTest(unittest.TestCase):
             for event in ("push", "merge_group", "schedule", "workflow_dispatch", "release"):
                 with self.subTest(workflow=workflow, event=event):
                     self.assertEqual(self.detect(workflow, ["README.md"], event), "docs-only=false\n")
+                    if event == "push":
+                        self.assertEqual(self.detect_subprocess(workflow, event), "docs-only=false\n")
 
     def test_test_input_exclusions_are_exact_and_each_is_needed(self):
         rules = (
