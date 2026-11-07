@@ -106,10 +106,12 @@ printf 'cpus\t%s\nmemory_gib\t%s\ncpuset\t%s\nhost_cpus\t%s\ndaemon_cpus\t%s\nho
     "$((available_kib * 1024))" "$daemon_memory" "$allowed" > "$out/resource-request.tsv"
 uname -m > "$out/host.platform"
 docker info --format '{{.OSType}}/{{.Architecture}}' > "$out/daemon.platform"
-git --version > "$out/versions.log"
-python3 --version >> "$out/versions.log"
-docker version --format 'client={{.Client.Version}} server={{.Server.Version}}' >> "$out/versions.log"
-docker buildx version >> "$out/versions.log"
+{
+    git --version
+    python3 --version
+    docker version --format 'client={{.Client.Version}} server={{.Server.Version}}'
+    docker buildx version
+} > "$out/versions.log"
 end_stage
 
 begin_stage inputs
