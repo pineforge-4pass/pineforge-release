@@ -16,12 +16,14 @@ from pathlib import Path
 from urllib.parse import quote
 
 import release_pair as pair
+import release_artifacts as artifacts
+from parity_bundle import DESCRIPTOR_SCHEMA, PARITY_CAPABILITY_FROM
 from release_artifacts import Client, PRODUCERS, SafeRedirect, command, npm, producer
 from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYPES,
                               HUB, IMAGE, RECEIPT_ROLES, ROLES, SCHEMA, SHA, Invalid,
                               Pending, bind_facts, canonical, decode, keys, match,
                               pair_payload, payload, positive, require, sha256,
-                              validate, validate_candidate, version)
+                              validate, validate_candidate, validate_parity, version)
 
 FACTS_RECEIPTS_TAG = "facts-receipts"
 COMPLETE_STATES = ("verified", "skipped_by_policy", "superseded", "delivered")
@@ -153,7 +155,12 @@ def bindings(client, release_version, engine, codegen, hpo, hub_commit):
     for role, pin in (("engine", engine), ("codegen", codegen), ("hpo", hpo)):
         if pin:
             versions[role], inventory = producer(client, role, pin)
-            if inventory:
+            if role == "engine" and version(release_version) >= version(PARITY_CAPABILITY_FROM):
+                proof = artifacts.parity_source_proof(client, pin, artifacts.PARITY_BUNDLE_ROOT)
+                versions[role]["parity"] = {"schema": DESCRIPTOR_SCHEMA, **proof}
+                inventories["parity"] = inventory
+                validate_parity(versions[role], inventories)
+            elif inventory:
                 inventories[role] = inventory
         else:
             versions[role] = None
@@ -236,9 +243,16 @@ def finalize(client, store, registry, row):
     event = payload(raw)
     require(event["image"] == candidate["image"] and event["hub_commit"] == candidate["hub_commit"],
             "manifest does not bind this candidate")
+    capable = v >= version(PARITY_CAPABILITY_FROM)
+    if capable:
+        require(event["versions"]["engine"]["parity"] == candidate["versions"]["engine"]["parity"],
+                "parity identity differs from manifest")
     for role in ("engine", "codegen", "hpo"):
         expected = candidate["versions"][role]
         actual = event["versions"][role]
+        if role == "engine" and capable:
+            actual = {key: value for key, value in actual.items() if key != "parity"}
+            expected = {key: value for key, value in expected.items() if key != "parity"}
         if role == "codegen":
             actual = {key: value for key, value in actual.items() if key not in ("npm_version", "npm_integrity")}
         require(actual == expected, "manifest producer identity differs from candidate")

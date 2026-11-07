@@ -527,9 +527,32 @@ class FinalizerTests(unittest.TestCase):
         return ",".join(role for role in contract.ROLES if role not in selected)
 
     def plan(self, release="1.6.0", *, enabled="compute", first="1.6.0"):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+
         manifest = fixture_manifest(release)
-        client, store, registry = FinalizeClient(manifest), MemoryStore(manifest), MemoryRegistry()
-        row = store.get("v" + release)
+        capable = pair.parse(release) >= pair.parse(PARITY_CAPABILITY_FROM)
+        if capable:
+            # Use actual fixture byte hashes so parity validation does not mask
+            # the independent compute first-pair comparison under test.
+            from test_parity_source_proof import write_bundle
+            from test_release_parity_wire import finalization_case, fixture_identity
+
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "parity"
+                write_bundle(root, descriptor_commit=manifest["versions"]["engine"]["commit"])
+                identity, inventory = fixture_identity(root)
+            manifest["versions"]["engine"]["parity"] = copy.deepcopy(identity)
+            built = candidate(manifest)
+            built["inventories"]["parity"] = copy.deepcopy(inventory)
+            for arch, record in built["verification"].items():
+                record["parity"] = {
+                    "image_digest": built["image"][arch + "_digest"],
+                    "identity": copy.deepcopy(identity), "inventory": copy.deepcopy(inventory),
+                }
+            client, store, registry, row = finalization_case(manifest, built)
+        else:
+            client, store, registry = FinalizeClient(manifest), MemoryStore(manifest), MemoryRegistry()
+            row = store.get("v" + release)
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
                 "RELEASE_READY_CONSUMERS": enabled, "RELEASE_READY_EXCLUDE": self.exclude(enabled),
                 "RELEASE_COMPUTE_FIRST_PAIR": first,
@@ -540,6 +563,11 @@ class FinalizerTests(unittest.TestCase):
             pipeline.finalize_all(client, store, registry, row["tag_name"], output)
             deliveries = json.loads(output.read_bytes())
         status = json.loads(store.read(row, "release-status-100-1.json"))
+        if capable:
+            self.assertEqual(json.loads(store.read(row, contract.ASSET))["versions"]["engine"]["parity"],
+                             identity)
+            self.assertEqual(json.loads(store.read(row, contract.CANDIDATE))["inventories"]["parity"],
+                             inventory)
         return deliveries, status, store
 
     def test_draft_is_invisible_by_tag_but_found_by_real_store_and_candidate_probe(self):
@@ -1708,17 +1736,31 @@ class ProducerFixture:
 
 class ProducerTests(unittest.TestCase):
     def test_engine_from_1_8_0_requires_only_linux_archives(self):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+        from test_parity_source_proof import TaggedEngineFixture, expected_inventory, write_bundle
+
         for v in ("1.8.0", "1.8.0-rc.1", "1.8.1", "2.0.0"):
             with self.subTest(version=v):
-                client = ProducerFixture(v)
+                capable = pair.parse(v) >= pair.parse(PARITY_CAPABILITY_FROM)
+                client = TaggedEngineFixture(v) if capable else ProducerFixture(v)
                 names = {f"pineforge-v{v}-{triple}.tar.gz"
                          for triple in ("linux-x86_64", "linux-aarch64")}
                 self.assertEqual({a["name"] for a in client.releases["engine"]["assets"]},
                                  names | {name + ".sha256" for name in names})
                 self.assertFalse(any("macos" in url for url in client.downloads))
-                pin, inventory = artifacts.producer(client, "engine", v)
+                if capable:
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary) / "parity"
+                        write_bundle(root, descriptor_commit=client.source_commit)
+                        expected = expected_inventory(root)
+                        self.assertEqual(len(expected), 8)
+                        with patch.object(artifacts, "PARITY_BUNDLE_ROOT", root):
+                            pin, inventory = artifacts.producer(client, "engine", v)
+                        self.assertEqual(inventory, expected)
+                else:
+                    pin, inventory = artifacts.producer(client, "engine", v)
+                    self.assertEqual(inventory, {})
                 self.assertEqual(pin, {"version": v, "commit": "a" * 40, "tag": "v" + v})
-                self.assertEqual(inventory, {})
 
     def test_engine_from_1_8_0_refuses_missing_or_corrupt_linux_assets(self):
         for triple in ("linux-x86_64", "linux-aarch64"):
