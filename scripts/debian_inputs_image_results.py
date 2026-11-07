@@ -66,6 +66,13 @@ def line(path):
     return value[:-1]
 
 
+def iid(path):
+    """Read a Buildx IID digest with EOF or exactly one terminal LF."""
+    match = re.fullmatch(rb"(sha256:[0-9a-f]{64})\n?", raw(path))
+    require(match is not None, f"invalid IID file: {path.name}")
+    return match.group(1).decode("ascii")
+
+
 def sha(value):
     return hashlib.sha256(value).hexdigest()
 
@@ -318,7 +325,7 @@ def verify(root, product, job_path):
     require(plan["execution"]["workers"] == 2 and type(plan["execution"]["workers"]) is int, "fixture worker bound differs")
     images = {}
     for target in ("default", "hpo"):
-        built, observed = line(root / (target + ".iid")), line(root / (target + ".id"))
+        built, observed = iid(root / (target + ".iid")), line(root / (target + ".id"))
         require(re.fullmatch(r"sha256:[0-9a-f]{64}", built) and built == observed, "built/inspected image identities differ")
         require(line(root / (target + ".platform")) == "linux/amd64", "image platform differs")
         labels = load(root / (target + ".labels.json"))
