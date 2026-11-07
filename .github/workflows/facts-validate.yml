@@ -2,16 +2,9 @@ name: facts-validate
 
 on:
   pull_request:
+  # Every push to main runs the facts tests, so there is no path filter.
   push:
     branches: [main]
-    paths:
-      - 'facts/**'
-      - 'scripts/repo_descriptions.py'
-      - 'scripts/facts_*.py'
-      - 'tests/test_repo_descriptions.py'
-      - 'tests/test_facts_*.py'
-      - 'tests/test_release_workflows.py'
-      - '.github/workflows/**'
 
 permissions:
   contents: read

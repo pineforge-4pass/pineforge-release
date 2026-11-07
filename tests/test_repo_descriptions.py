@@ -569,8 +569,7 @@ class DescriptionWorkflows(unittest.TestCase):
             for forbidden in ("secrets.", "create-github-app-token", ": write"):
                 self.assertNotIn(forbidden, text)
         text = (workflows / "facts-validate.yml").read_text()
-        for needed in ("facts/**", "scripts/facts_*.py", "tests/test_facts_*.py", ".github/workflows/**",
-                       "scripts/facts_validate.py", "scripts/repo_descriptions.py render",
+        for needed in ("scripts/facts_validate.py", "scripts/repo_descriptions.py render",
                        "scripts/facts_cards.py", "--format json", "--theme", "cmp ", "test_facts_*.py"):
             self.assertIn(needed, text)
         self.assertIn("test_repo_descriptions.py", (workflows / "python-test.yml").read_text())
