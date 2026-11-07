@@ -17,7 +17,7 @@ import zipfile
 
 import release_pair as pair
 from release_contract import (COMMIT, Invalid, Pending, canonical, decode,
-                              match, require, sha256)
+                              match, require, sha256, validate_assets)
 
 PRODUCERS = {"engine": "pineforge-4pass/pineforge-engine",
              "codegen": "pineforge-4pass/pineforge-codegen-oss",
@@ -219,7 +219,13 @@ def source_matches(client, component, commit, sources, native=None):
         require(expected_native == {name: git_blob(raw) for name, raw in native.items()}, "HPO native sdist differs from tagged source")
 
 
-def producer(client, component, version):
+def attachment(raw, source):
+    """Describe the original compressed bytes, only after producer verification."""
+    return ({"name": urllib.parse.urlsplit(source).path.rsplit("/", 1)[-1],
+             "size": len(raw), "sha256": sha256(raw), "source": source}, raw)
+
+
+def producer(client, component, version, *, attachments=None):
     """Return manifest pin + byte inventory, after checking even the event's own artifacts."""
     v = pair.parse(pair.hpo_version(version, to_semver=True) if component == "hpo" else version)
     obj, commit = release(client, component, str(v))
@@ -235,9 +241,15 @@ def producer(client, component, version):
         for triple in triples:
             name = f"pineforge-v{v}-{triple}.tar.gz"
             raw = asset(client, obj, name, repo)
-            checksum = asset(client, obj, name + ".sha256", repo).decode("ascii").split()
-            require(len(checksum) == 2 and checksum[0] == sha256(raw) and checksum[1].lstrip("*") == name,
+            checksum_raw = asset(client, obj, name + ".sha256", repo)
+            try:
+                checksum = checksum_raw.decode("ascii").split()
+            except UnicodeError:
+                raise Invalid("engine tarball checksum differs") from None
+            require(len(checksum) == 2 and checksum[0] == sha256(raw) and checksum[1] in (name, "*" + name),
                     "engine tarball checksum differs")
+            if attachments is not None and triple.startswith("linux-"):
+                attachments.append(attachment(raw, f"https://github.com/{repo}/releases/download/{obj['tag_name']}/{name}"))
         return pin, inventory
     if component == "codegen":
         meta = decode(client.download(f"https://pypi.org/pypi/pineforge-codegen/{v.pep440}/json", {"pypi.org"}))
@@ -276,10 +288,12 @@ def producer(client, component, version):
         pin.update(wheel_sha256=sha256(wheel), sdist_sha256=sha256(sdist))
     source_matches(client, component, commit, sources, native)
     inventory.update({name: sha256(raw) for name, raw in sources.items()})
+    if component == "codegen" and attachments is not None:
+        attachments.append(attachment(sdist, sdists[0]["url"]))
     return pin, inventory
 
 
-def npm(client, pin, inventory):
+def npm(client, pin, inventory, *, attachments=None):
     v = pin["version"]
     obj = decode(client.download("https://registry.npmjs.org/@pineforge%2fcodegen-pyodide/" + v, {"registry.npmjs.org"}))
     require(obj["name"] == "@pineforge/codegen-pyodide" and obj["version"] == v, "unexpected npm identity")
@@ -299,7 +313,23 @@ def npm(client, pin, inventory):
     require({name: sha256(data) for name, data in sources.items()} == inventory, "npm and PyPI codegen sources differ")
     if obj.get("gitHead"):
         require(obj["gitHead"] == pin["commit"], "npm git commit differs")
+    if attachments is not None:
+        attachments.append(attachment(raw, obj["dist"]["tarball"]))
     return {**pin, "npm_version": v, "npm_integrity": integrity}
+
+
+def verified_assets(client, pins, inventory):
+    """Stage every mirror from candidate pins; never upload or resolve latest."""
+    staged = []
+    for role in ("engine", "codegen"):
+        resolved, _ = producer(client, role, pins[role]["version"], attachments=staged)
+        # Codegen includes the original candidate's sdist digest. A newly
+        # published API digest cannot authorize replacement of the built bytes.
+        require(resolved == pins[role], role + " producer identity differs from candidate")
+    ready = {**pins, "codegen": npm(client, pins["codegen"], inventory, attachments=staged)}
+    staged.sort(key=lambda item: item[0]["name"])
+    validate_assets([descriptor for descriptor, _ in staged], ready)
+    return ready, staged
 
 
 def command(*args, input=None):

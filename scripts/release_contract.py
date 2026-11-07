@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import re
+from urllib.parse import urlsplit
 
 import release_pair as pair
 from release_sources import RELEASE_TAG
@@ -95,8 +96,61 @@ def version(value):
     return v
 
 
+def asset_descriptor(obj, versions):
+    """Validate one producer filename and its provenance; return its required kind."""
+    keys(obj, ("name", "size", "sha256", "source"))
+    name = match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", obj["name"])
+    require(not name.startswith(("release-", "consumer-", "facts-", "delivery-")),
+            "reserved attachment name")
+    positive(obj["size"])
+    match(SHA, obj["sha256"])
+    source = obj["source"]
+    require(isinstance(source, str) and source.isascii()
+            and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in source),
+            "unsafe attachment source")
+    try:
+        parsed = urlsplit(source)
+    except ValueError:
+        raise Invalid("unsafe attachment source") from None
+    require(parsed.scheme == "https" and parsed.netloc in
+            ("github.com", "registry.npmjs.org", "files.pythonhosted.org")
+            and not parsed.query and not parsed.fragment
+            and source == "https://" + parsed.netloc + parsed.path,
+            "unexpected attachment origin")
+    parts = parsed.path.split("/")
+    require(parts[0] == "" and all(part not in ("", ".", "..") for part in parts[1:])
+            and re.fullmatch(r"/[A-Za-z0-9_@./-]+", parsed.path) is not None
+            and parts[-1] == name, "unsafe attachment path")
+    if parsed.netloc == "registry.npmjs.org":
+        require(parsed.path == "/@pineforge/codegen-pyodide/-/" + name
+                and name.endswith((".tgz", ".tar.gz")), "unexpected npm attachment")
+        return "npm"
+    if parsed.netloc == "files.pythonhosted.org":
+        require(name.endswith(".tar.gz"), "unexpected sdist attachment")
+        return "sdist"
+    engine = versions["engine"]
+    for arch in ("x86_64", "aarch64"):
+        expected = f"pineforge-v{engine['version']}-linux-{arch}.tar.gz"
+        if name == expected:
+            require(source == f"https://github.com/pineforge-4pass/pineforge-engine/releases/download/{engine['tag']}/{name}",
+                    "unexpected engine attachment source")
+            return arch
+    raise Invalid("unexpected engine attachment")
+
+
+def validate_assets(assets, versions):
+    require(type(assets) is list and len(assets) == 4, "incomplete attachment inventory")
+    kinds = [asset_descriptor(obj, versions) for obj in assets]
+    names = [obj["name"] for obj in assets]
+    require(len(set(names)) == len(names) and names == sorted(names),
+            "attachment names must be unique and sorted")
+    require(set(kinds) == {"npm", "sdist", "x86_64", "aarch64"}, "unexpected attachment inventory")
+    return assets
+
+
 def validate(manifest):
-    keys(manifest, MANIFEST_KEYS)
+    require(type(manifest) is dict and set(manifest) in (MANIFEST_KEYS, MANIFEST_KEYS | {"assets"}),
+            "unexpected object fields")
     require(manifest["schema"] == SCHEMA, "unsupported release schema")
     v = version(manifest["release_version"])
     require(type(manifest["prerelease"]) is bool and manifest["prerelease"] == v.prerelease,
@@ -142,6 +196,8 @@ def validate(manifest):
     match(COMMIT, facts["commit"])
     match(SHA, facts["sha256"])
     require(facts["path"] == "facts/facts.json" and facts["release_key"] == str(v), "unexpected facts identity")
+    if "assets" in manifest:
+        validate_assets(manifest["assets"], versions)
     return manifest
 
 
@@ -149,7 +205,8 @@ def payload(raw):
     manifest = validate(decode(raw))
     require(canonical(manifest) == raw, "noncanonical manifest bytes")
     digest = sha256(raw)
-    return {**manifest, "event_id": "sha256:" + digest, "manifest": {"asset": ASSET, "sha256": digest}}
+    return {**{key: manifest[key] for key in MANIFEST_KEYS},
+            "event_id": "sha256:" + digest, "manifest": {"asset": ASSET, "sha256": digest}}
 
 
 def validate_candidate(obj):
