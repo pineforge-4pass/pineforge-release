@@ -161,8 +161,9 @@ builder="debian-inputs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 builder_container="buildx_buildkit_${builder}0"
 printf '[worker.oci]\n  max-parallelism = 1\n  gc = false\n' > "$out/buildkit.toml"
 # No --use, global builder selection, imported cache or shared cache.
+# Quote the whole CSV field so commas in the CPU set remain part of its value.
 docker buildx create --name "$builder" --driver docker-container \
-    --driver-opt "cpuset-cpus=$cpuset" --driver-opt cpu-period=100000 \
+    --driver-opt "\"cpuset-cpus=$cpuset\"" --driver-opt cpu-period=100000 \
     --driver-opt "cpu-quota=$quota" --driver-opt "memory=${memory_gib}g" \
     --buildkitd-config "$out/buildkit.toml" > "$out/builder-create.log" 2>&1
 docker buildx inspect --bootstrap "$builder" > "$out/builder-bootstrap.log" 2>&1
