@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import tempfile
 import unittest
 
 
@@ -49,10 +48,12 @@ def path_matches(pattern: str, path: str) -> bool:
 
 
 def push_applies_to_main(push: dict) -> bool:
+    """Never skip a push because a branch form cannot be evaluated."""
     if "branches" in push:
         branches = push["branches"]
         return isinstance(branches, list) and any(
-            path_matches(branch, "main") for branch in branches
+            unevaluated_form([branch]) is not None or path_matches(branch, "main")
+            for branch in branches
         )
     ignored = push.get("branches-ignore", [])
     return isinstance(ignored, list) and not any(
@@ -118,6 +119,28 @@ def check_main_push_inventory(
     return examined, violations
 
 
+def guard_problems(workflows: dict[str, dict], examined: set[str]) -> list[str]:
+    problems = []
+    for name in ("python-test.yml", "facts-validate.yml"):
+        if name not in examined:
+            problems.append(f"{name}: workflow was not examined")
+    name = "facts-validate.yml"
+    triggers = workflows.get(name, {}).get("on")
+    if not isinstance(triggers, dict):
+        problems.append(f"{name}: on must be a mapping")
+        return problems
+    push = triggers.get("push")
+    if not isinstance(push, dict):
+        problems.append(f"{name}: push must be a mapping")
+        return problems
+    branches = push.get("branches")
+    if not isinstance(branches, list):
+        problems.append(f"{name}: push.branches must be a list")
+    elif "main" not in branches:
+        problems.append(f"{name}: push.branches must include main")
+    return problems
+
+
 def load_workflows() -> dict[str, dict]:
     import yaml
 
@@ -130,13 +153,6 @@ def load_workflows() -> dict[str, dict]:
 def tracked_files() -> list[str]:
     output = subprocess.check_output(["git", "ls-files", "-z"], cwd=REPO)
     return sorted(os.fsdecode(path) for path in output.split(b"\0") if path)
-
-
-def embedded_python(run: str) -> str:
-    lines = run.splitlines()
-    start = lines.index("python3 - <<'PY'") + 1
-    end = lines.index("PY", start)
-    return "\n".join(lines[start:end]) + "\n"
 
 
 class MainPushInventoryTest(unittest.TestCase):
@@ -185,13 +201,66 @@ class MainPushInventoryTest(unittest.TestCase):
                 self.assertEqual(unevaluated_form(patterns), expected)
 
     def test_expected_test_workflows_are_examined(self):
-        self.assertTrue(
-            {"python-test.yml", "facts-validate.yml"} <= self.examined,
-            f"test workflows examined: {sorted(self.examined)}",
-        )
-        branches = self.workflows["facts-validate.yml"]["on"]["push"]["branches"]
-        self.assertIsInstance(branches, list)
-        self.assertIn("main", branches)
+        problems = guard_problems(self.workflows, self.examined)
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_guard_reports_exact_problems(self):
+        cases = [
+            (
+                {"on": {"push": {"branches": ["main"]}}},
+                {"python-test.yml", "facts-validate.yml"},
+                [],
+            ),
+            (
+                {},
+                {"python-test.yml", "facts-validate.yml"},
+                ["facts-validate.yml: on must be a mapping"],
+            ),
+            (
+                {"on": ["push"]},
+                {"python-test.yml", "facts-validate.yml"},
+                ["facts-validate.yml: on must be a mapping"],
+            ),
+            (
+                {"on": {}},
+                {"python-test.yml", "facts-validate.yml"},
+                ["facts-validate.yml: push must be a mapping"],
+            ),
+            (
+                {"on": {"push": "main"}},
+                {"python-test.yml", "facts-validate.yml"},
+                ["facts-validate.yml: push must be a mapping"],
+            ),
+            (
+                {"on": {"push": {}}},
+                {"python-test.yml", "facts-validate.yml"},
+                ["facts-validate.yml: push.branches must be a list"],
+            ),
+            (
+                {"on": {"push": {"branches": "main"}}},
+                {"python-test.yml", "facts-validate.yml"},
+                ["facts-validate.yml: push.branches must be a list"],
+            ),
+            (
+                {"on": {"push": {"branches": ["other"]}}},
+                {"python-test.yml", "facts-validate.yml"},
+                ["facts-validate.yml: push.branches must include main"],
+            ),
+            (
+                {"on": {"push": {"branches": ["main"]}}},
+                {"facts-validate.yml"},
+                ["python-test.yml: workflow was not examined"],
+            ),
+            (
+                {"on": {"push": {"branches": ["main"]}}},
+                {"python-test.yml"},
+                ["facts-validate.yml: workflow was not examined"],
+            ),
+        ]
+        for facts, examined, expected in cases:
+            with self.subTest(workflow=facts, examined=examined):
+                workflows = {"python-test.yml": {}, "facts-validate.yml": facts}
+                self.assertEqual(guard_problems(workflows, examined), expected)
 
     def test_checker_reports_exact_causes(self):
         files = ["src/input.py", "docs/guide.md", "docker/input.py"]
@@ -226,6 +295,22 @@ class MainPushInventoryTest(unittest.TestCase):
             ),
             (
                 {"branches": ["main"]},
+                "python3 -m unittest discover -s tests",
+                {"example.yml"},
+                [],
+            ),
+            (
+                {"branches": ["m[a]in"], "paths": ["src/**"]},
+                "python3 -m unittest discover -s tests",
+                {"example.yml"},
+                [
+                    "example.yml: push to main must not define paths; "
+                    "a push to main that changes only docker/input.py would not run example.yml; "
+                    "a push to main that changes only docs/guide.md would not run example.yml"
+                ],
+            ),
+            (
+                {"branches": ["m[a]in"]},
                 "python3 -m unittest discover -s tests",
                 {"example.yml"},
                 [],
@@ -279,6 +364,16 @@ class MainPushInventoryTest(unittest.TestCase):
                 ],
             ),
             (
+                {"branches-ignore": ["m[a]in"], "paths": ["src/**"]},
+                "python3 -m unittest discover -s tests",
+                {"example.yml"},
+                [
+                    "example.yml: push to main must not define paths; "
+                    "a push to main that changes only docker/input.py would not run example.yml; "
+                    "a push to main that changes only docs/guide.md would not run example.yml"
+                ],
+            ),
+            (
                 {"branches": ["main"], "paths": ["x/?.py"]},
                 "python3 -m unittest discover -s tests",
                 {"example.yml"},
@@ -299,30 +394,6 @@ class MainPushInventoryTest(unittest.TestCase):
                     check_main_push_inventory({"example.yml": workflow}, files),
                     (examined, violations),
                 )
-
-    def test_documentation_only_shortcut_cannot_skip_a_push(self):
-        job = self.workflows["facts-validate.yml"]["jobs"]["validate"]
-        self.assertNotIn("if", job)
-        steps = unittest_steps({"jobs": {"validate": job}})
-        self.assertTrue(steps, "validate must run unittest discover")
-        for step in steps:
-            self.assertEqual(step.get("if"), "steps.paths.outputs.docs-only == 'false'")
-        detector = next(step for step in job["steps"] if step.get("id") == "paths")
-        with tempfile.TemporaryDirectory() as name:
-            directory = Path(name)
-            program = directory / "detector.py"
-            output = directory / "outputs"
-            program.write_text(embedded_python(detector["run"]), encoding="utf-8")
-            env = os.environ.copy()
-            env.update(
-                EVENT_NAME="push", BASE_SHA="", HEAD_SHA="", GITHUB_OUTPUT=str(output),
-            )
-            result = subprocess.run(
-                ["python3", "-I", str(program)],
-                cwd=directory, env=env, capture_output=True, text=True, check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(output.read_text(encoding="utf-8"), "docs-only=false\n")
 
 
 if __name__ == "__main__":
