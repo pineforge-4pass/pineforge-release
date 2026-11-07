@@ -369,6 +369,113 @@ class SourceGuardTest(unittest.TestCase):
         self.assertEqual(result.stdout, f"set-id={_set_id(self.pairs)}\n")
 
 
+class DebianCliTest(unittest.TestCase):
+    # Independent reviewed identities, checked against file bytes and CLI output.
+    PINS = {
+        "DEBIAN_BASE_IMAGE": "debian:trixie-slim@sha256:"
+                             "a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2",
+        "DEBIAN_SNAPSHOT": "20261104T140106Z",
+        "DEBIAN_SECURITY_SNAPSHOT": "20261104T140106Z",
+    }
+
+    def test_real_file_emits_the_three_reviewed_inputs_and_preserves_input_order(self):
+        path = REPO / "docker" / "debian-inputs.args"
+        expected = [line for line in path.read_text().splitlines()
+                    if line and not line.startswith("#")]
+        self.assertEqual(dict(line.split("=", 1) for line in expected), self.PINS)
+        self.assertEqual(len(expected), 3)
+        result = _cli("debian-args", str(path))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "\n".join(expected) + "\n")
+        self.assertEqual(result.stderr, "")
+        # A parser that ignores the input file and prints a constant cannot
+        # satisfy this positive control.
+        with tempfile.TemporaryDirectory() as tmp:
+            reordered = Path(tmp) / "debian.args"
+            reordered.write_text("# reordered real inputs\n\n" + "\n".join(reversed(expected)) + "\n",
+                                 encoding="utf-8")
+            result = _cli("debian-args", str(reordered))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "\n".join(reversed(expected)) + "\n")
+
+    def test_real_argument_mutations_refuse_missing_extra_duplicate_and_unsafe_values_with_lines(self):
+        original = (REPO / "docker" / "debian-inputs.args").read_text()
+        lines = original.splitlines()
+        cases = [("", "missing Debian arguments", 1),
+                 ("# no inputs\n", "missing Debian arguments", 2),
+                 (original + "DEBIAN_EXTRA=1\n", "unknown Debian argument", len(lines) + 1),
+                 (original + "HPO_GCC_VERSION=14.2.0-19\n",
+                  "unknown Debian argument", len(lines) + 1)]
+        for number, line in enumerate(lines, 1):
+            if not line.startswith("DEBIAN_"):
+                continue
+            name = line.split("=", 1)[0]
+            cases += [
+                ("\n".join(ln for ln in lines if ln != line) + "\n",
+                 "missing Debian arguments", len(lines)),
+                (original.replace(line, name + "=", 1), "empty value", number),
+                (original + line + "\n", "duplicate Debian argument", len(lines) + 1),
+            ]
+            for invalid in ("value;command", "value other", '"value"', "'value'",
+                            "$value", "$(command)", "`command`", "value\tother", "value=other"):
+                cases.append((original.replace(line, name + "=" + invalid, 1),
+                              "plain NAME=VALUE", number))
+            for invalid in ("export " + line, " " + line, name + " =value", name):
+                cases.append((original.replace(line, invalid, 1), "plain NAME=VALUE", number))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "debian.args"
+            for text, message, number in cases:
+                with self.subTest(message=message, text=text):
+                    path.write_text(text, encoding="utf-8")
+                    result = _cli("debian-args", str(path))
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(message, result.stderr)
+                    self.assertIn(f"Debian args line {number}:", result.stderr)
+
+    def test_missing_or_wrong_digest_and_live_or_different_snapshots_are_refused(self):
+        original = (REPO / "docker" / "debian-inputs.args").read_text()
+        base = self.PINS["DEBIAN_BASE_IMAGE"]
+        replacements = {
+            "DEBIAN_BASE_IMAGE": (
+                "debian:trixie-slim", "debian:latest",
+                base[:-1] + ("0" if base[-1] != "0" else "1"),
+                base[:-1], base.replace("sha256:", "sha512:"),
+                base.replace("trixie", "bookworm"), base.upper(),
+            ),
+            "DEBIAN_SNAPSHOT": ("latest", "live", "20261103T140106Z", "20261104T140106"),
+            "DEBIAN_SECURITY_SNAPSHOT": ("latest", "live", "20261103T140106Z", "20261104T140106"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "debian.args"
+            for name, values in replacements.items():
+                line = name + "=" + self.PINS[name]
+                number = original.splitlines().index(line) + 1
+                for value in values:
+                    with self.subTest(name=name, value=value):
+                        text = original.replace(line, name + "=" + value, 1)
+                        self.assertNotEqual(text, original)
+                        path.write_text(text, encoding="utf-8")
+                        result = _cli("debian-args", str(path))
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertEqual(result.stdout, "")
+                        self.assertIn(f"Debian args line {number}:", result.stderr)
+                        self.assertIn("differs from the reviewed Debian input", result.stderr)
+            # Matching alternative dates are still outside the measured closure.
+            path.write_text(original.replace("20261104T140106Z", "20261103T140106Z"), encoding="utf-8")
+            self.assertEqual(_cli("debian-args", str(path)).returncode, 1)
+
+    def test_debian_and_six_entry_hpo_formats_remain_independent(self):
+        for command, filename, message in (
+                ("debian-args", "hpo-toolchain.args", "unknown Debian argument"),
+                ("toolchain-args", "debian-inputs.args", "plain NAME=VALUE")):
+            with self.subTest(command=command):
+                result = _cli(command, str(REPO / "docker" / filename))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(message, result.stderr)
+
+
 class ToolchainCliTest(unittest.TestCase):
     def test_real_file_output_exactly_matches_real_hpo_declarations_and_guards(self):
         path = REPO / "docker" / "hpo-toolchain.args"

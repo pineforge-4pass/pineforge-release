@@ -312,13 +312,39 @@ def _without_stage_alias(stage: DockerStage) -> str:
                   r"\1", stage.text, count=1, flags=re.M | re.I)
 
 
+# Exact reviewed input plumbing only. These fragments are matched against the
+# real Dockerfile, including by the historical runtime normalizer below.
+DEBIAN_SNAPSHOT_SETUP = r'''ARG DEBIAN_SNAPSHOT
+ARG DEBIAN_SECURITY_SNAPSHOT
+RUN test -n "${DEBIAN_SNAPSHOT}" && test -n "${DEBIAN_SECURITY_SNAPSHOT}" \
+    && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
+    && printf '%s\n' \
+      "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SECURITY_SNAPSHOT}/ trixie-security main" \
+      > /etc/apt/sources.list
+'''
+DEBIAN_APT_PREFIX = r'''RUN --mount=type=secret,id=debian_ca,target=/run/secrets/debian_ca,required=true,mode=0444 \
+    set -eu; \
+    printf '%s\n' \
+      'Acquire::https::CaInfo "/run/secrets/debian_ca";' \
+      'Acquire::https::Verify-Peer "true";' \
+      'Acquire::https::Verify-Host "true";' \
+      > /etc/apt/apt.conf.d/99pineforge-https; \
+    '''
+
+
 def _restore_bookworm_runtime_base(text: str) -> str:
-    """Restore only the single approved FROM line for the historical digest."""
+    """Undo only the exact reviewed Debian input plumbing for the old pin."""
     lines = text.splitlines(keepends=True)
-    if (not lines or lines[0] != "FROM debian:trixie-slim\n"
+    if (not lines or lines[0] != "FROM ${DEBIAN_BASE_IMAGE}\n"
             or sum(line.startswith("FROM ") for line in lines) != 1):
         raise ValueError("expected exactly one approved trixie runtime FROM line")
-    return "FROM debian:bookworm-slim\n" + "".join(lines[1:])
+    if (text.count(DEBIAN_SNAPSHOT_SETUP) != 1
+            or text.count(DEBIAN_APT_PREFIX) != 1
+            or text.count(DEBIAN_APT_PREFIX + "apt-get update") != 1):
+        raise ValueError("expected exactly one approved Debian input plumbing fragment")
+    text = "FROM debian:bookworm-slim\n" + "".join(lines[1:])
+    return text.replace(DEBIAN_SNAPSHOT_SETUP, "", 1).replace(DEBIAN_APT_PREFIX, "RUN ", 1)
 
 
 def _without_guard_policy(text: str) -> str:
@@ -458,14 +484,58 @@ TRIXIE_TOOLCHAIN_PINS = {
 }
 
 
-def _trixie_packaging_problems(dockerfile: str, args_text: str) -> list[str]:
+def _debian_input_problems(dockerfile: str) -> list[str]:
     stages = _dockerfile_stages(dockerfile)
     named = {stage.name: stage for stage in stages}
     problems = []
     external = {stage.name: stage.base for stage in stages if stage.base not in named}
     if external != dict.fromkeys(("codegen", "engine", "release", "hpo-toolchain"),
-                                 "debian:trixie-slim"):
-        problems.append("all four Debian bases must be exactly debian:trixie-slim")
+                                 "${DEBIAN_BASE_IMAGE}"):
+        problems.append("all four external bases must use DEBIAN_BASE_IMAGE")
+    global_text = dockerfile.split("\nFROM ", 1)[0]
+    base_args = [body for keyword, body in _dockerfile_instructions(global_text)
+                 if keyword == "ARG" and body.split("=", 1)[0] == "DEBIAN_BASE_IMAGE"]
+    if base_args != ["DEBIAN_BASE_IMAGE"]:
+        problems.append("the global Debian base argument must be required with no default")
+    apt_stages = []
+    setup_run = _dockerfile_instructions(DEBIAN_SNAPSHOT_SETUP)[-1]
+    apt_prefix = _dockerfile_instructions(DEBIAN_APT_PREFIX + "apt-get update\n")[0][1]
+    for stage in stages:
+        apt_runs = [(index, body) for index, (keyword, body) in enumerate(stage.instructions)
+                    if keyword == "RUN" and re.search(r"\bapt-get\s+(?:update|install)\b", body)]
+        if stage.name in external:
+            snapshot_args = [body for keyword, body in stage.instructions
+                             if keyword == "ARG" and body.startswith("DEBIAN_")]
+            if (stage.text.count(DEBIAN_SNAPSHOT_SETUP) != 1
+                    or snapshot_args != ["DEBIAN_SNAPSHOT", "DEBIAN_SECURITY_SNAPSHOT"]):
+                problems.append(stage.name + ": requires exactly the two signed snapshot sources")
+            elif apt_runs and stage.instructions.index(setup_run) >= apt_runs[0][0]:
+                problems.append(stage.name + ": snapshot configuration must precede APT")
+        for _, body in apt_runs:
+            apt_stages.append(stage.name)
+            if not body.startswith(apt_prefix):
+                problems.append(stage.name + ": APT requires the public CA mount and verified HTTPS")
+            if body.count("apt-get update") != 1 or body.count("apt-get install") != 1:
+                problems.append(stage.name + ": expected one APT update/install operation")
+        # No other source/config writes, TLS options or insecure bootstrap may
+        # hide beside the exact approved setup/prefix, even after a valid one.
+        remaining = stage.text.replace(DEBIAN_SNAPSHOT_SETUP, "").replace(DEBIAN_APT_PREFIX, "")
+        if re.search(r"/etc/apt/|sources\.list|Acquire::|APT_CONFIG|"
+                     r"--allow-unauthenticated|AllowUnauthenticated|AllowInsecure|"
+                     r"AllowDowngradeToInsecure|trusted\s*=|http://|"
+                     r"/etc/ssl/certs/ca-certificates\.crt|/run/secrets/debian_ca", remaining,
+                     re.I):
+            problems.append(stage.name + ": unexpected APT source, trust or CA plumbing")
+    if apt_stages != ["codegen", "engine", "release", "hpo-wheel",
+                       "hpo-toolchain", "hpo-native", "hpo"]:
+        problems.append("all seven APT stages must retain their update/install operation")
+    return problems
+
+
+def _trixie_packaging_problems(dockerfile: str, args_text: str) -> list[str]:
+    stages = _dockerfile_stages(dockerfile)
+    named = {stage.name: stage for stage in stages}
+    problems = _debian_input_problems(dockerfile)
     if _read_toolchain_arguments(args_text) != TRIXIE_TOOLCHAIN_PINS:
         problems.append("toolchain values must match the six reviewed trixie pins")
     expected = {
@@ -550,22 +620,39 @@ class DockerfileTargetTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
                          "after restoring the one /usr/share/doc token and removing the marked "
-                         "notice, exact trixie FROM line and approved harness changes, release must remain "
+                         "notice, exact Debian input plumbing and approved harness changes, release must remain "
                          "byte for byte the original runtime stage")
 
     def test_runtime_base_normalization_refuses_other_from_changes(self):
         text = _without_stage_alias(self.named["release"])
         restored = _restore_bookworm_runtime_base(text)
-        self.assertEqual(restored, text.replace("FROM debian:trixie-slim\n",
-                                               "FROM debian:bookworm-slim\n", 1))
+        self.assertEqual(restored, text.replace("FROM ${DEBIAN_BASE_IMAGE}\n",
+                                               "FROM debian:bookworm-slim\n", 1)
+                         .replace(DEBIAN_SNAPSHOT_SETUP, "", 1)
+                         .replace(DEBIAN_APT_PREFIX, "RUN ", 1))
         for replacement in ("FROM debian:bookworm-slim\n", "FROM debian:trixie\n",
                             "FROM debian:latest\n", "FROM ubuntu:24.04\n",
+                            "FROM debian:trixie-slim\n",
                             "FROM debian:trixie-slim AS release\n",
-                            "FROM debian:trixie-slim\nFROM debian:trixie-slim\n"):
+                            "FROM debian:trixie-slim\nFROM debian:trixie-slim\n",
+                            "FROM ${DEBIAN_BASE_IMAGE} AS release\n",
+                            "FROM ${DEBIAN_BASE_IMAGE}\nFROM ${DEBIAN_BASE_IMAGE}\n"):
             with self.subTest(replacement=replacement):
-                changed = text.replace("FROM debian:trixie-slim\n", replacement, 1)
+                changed = text.replace("FROM ${DEBIAN_BASE_IMAGE}\n", replacement, 1)
                 with self.assertRaisesRegex(ValueError, "approved trixie runtime FROM line"):
                     _restore_bookworm_runtime_base(changed)
+
+    def test_runtime_input_normalization_requires_each_exact_reviewed_fragment(self):
+        text = _without_stage_alias(self.named["release"])
+        for fragment in (DEBIAN_SNAPSHOT_SETUP, DEBIAN_APT_PREFIX):
+            for scenario, altered in (
+                    ("missing", text.replace(fragment, "", 1)),
+                    ("duplicate", text.replace(fragment, fragment + fragment, 1)),
+                    ("changed", text.replace(fragment, fragment.replace("    ", "     ", 1), 1))):
+                with self.subTest(fragment=fragment, scenario=scenario):
+                    self.assertNotEqual(altered, text)
+                    with self.assertRaisesRegex(ValueError, "approved Debian input plumbing"):
+                        _restore_bookworm_runtime_base(altered)
 
     def test_original_harness_normalization_requires_all_added_modules(self):
         text = _without_sources_notice(_without_stage_alias(self.named["release"]))
@@ -721,13 +808,21 @@ class ToolchainArgumentsTest(unittest.TestCase):
         self.assertEqual(_trixie_packaging_problems(self.dockerfile, self.args_text), [])
         runtime = next(stage for stage in _dockerfile_stages(self.dockerfile) if stage.name == "hpo")
         mutations = [
-            self.dockerfile.replace("FROM debian:trixie-slim AS engine",
+            self.dockerfile.replace("FROM ${DEBIAN_BASE_IMAGE} AS engine",
                                     "FROM debian:bookworm-slim AS engine", 1),
-            self.dockerfile.replace("FROM debian:trixie-slim", "FROM debian:latest"),
+            self.dockerfile.replace("FROM ${DEBIAN_BASE_IMAGE}", "FROM debian:latest"),
             self.dockerfile.replace("gcc-14", "gcc-12"),
             self.dockerfile.replace('"cmake=${HPO_CMAKE_VERSION}"',
                                     '"cmake=${HPO_MAKE_VERSION}"', 1),
+            self.dockerfile.replace("ARG DEBIAN_BASE_IMAGE\n", "", 1),
+            self.dockerfile.replace("ARG DEBIAN_BASE_IMAGE\n",
+                                    "ARG DEBIAN_BASE_IMAGE=debian:latest\n", 1),
         ]
+        for stage in _dockerfile_stages(self.dockerfile):
+            if stage.base == "${DEBIAN_BASE_IMAGE}":
+                mutations.append(self.dockerfile.replace(
+                    "FROM ${DEBIAN_BASE_IMAGE} AS " + stage.name,
+                    "FROM debian:trixie-slim AS " + stage.name, 1))
         pin = '"libstdc++6=${HPO_GCC_VERSION}"'
         for replacement in ('"libstdc++6"', '"libstdc++6=${HPO_GCC_DEFAULTS_VERSION}"', "",
                             pin + " " + pin):
@@ -737,6 +832,56 @@ class ToolchainArgumentsTest(unittest.TestCase):
             with self.subTest(mutation=index):
                 self.assertNotEqual(mutated, self.dockerfile)
                 self.assertTrue(_trixie_packaging_problems(mutated, self.args_text))
+
+    def test_each_snapshot_setup_rejects_live_missing_different_or_extra_sources(self):
+        self.assertEqual(_debian_input_problems(self.dockerfile), [])
+        stages = [stage for stage in _dockerfile_stages(self.dockerfile)
+                  if DEBIAN_SNAPSHOT_SETUP in stage.text]
+        self.assertEqual(len(stages), 4, "mutate every real external stage's snapshot setup")
+        for stage in stages:
+            for old, new in (
+                    ("ARG DEBIAN_SNAPSHOT\n", ""),
+                    ("ARG DEBIAN_SECURITY_SNAPSHOT\n", "ARG DEBIAN_SECURITY_SNAPSHOT=latest\n"),
+                    ('test -n "${DEBIAN_SNAPSHOT}"', "true"),
+                    ("https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/",
+                     "https://deb.debian.org/debian/"),
+                    ("${DEBIAN_SNAPSHOT}/ trixie main", "20261103T140106Z/ trixie main"),
+                    ("${DEBIAN_SECURITY_SNAPSHOT}/ trixie-security main",
+                     "${DEBIAN_SNAPSHOT}/ trixie-security main"),
+                    (" trixie-security main", " trixie-updates main"),
+                    (" trixie main", " trixie main contrib"),
+                    ("https://snapshot.debian.org/", "http://snapshot.debian.org/"),
+                    ("signed-by=/usr/share/keyrings/debian-archive-keyring.gpg", "trusted=yes"),
+                    ("check-valid-until=no signed-by=", "trusted=yes signed-by="),
+                    ("    && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \\\n", "")):
+                with self.subTest(stage=stage.name, old=old):
+                    changed = stage.text.replace(old, new, 1)
+                    self.assertNotEqual(changed, stage.text)
+                    mutated = self.dockerfile.replace(stage.text, changed, 1)
+                    self.assertTrue(_debian_input_problems(mutated))
+
+    def test_each_apt_run_rejects_missing_ca_mount_and_unsafe_tls_or_signature_options(self):
+        self.assertEqual(_debian_input_problems(self.dockerfile), [])
+        stages = [stage for stage in _dockerfile_stages(self.dockerfile)
+                  if DEBIAN_APT_PREFIX in stage.text]
+        self.assertEqual(len(stages), 7, "mutate every real APT RUN")
+        for stage in stages:
+            for old, new in (
+                    ("--mount=type=secret,id=debian_ca,target=/run/secrets/debian_ca,required=true,mode=0444 ",
+                     ""),
+                    ("required=true", "required=false"),
+                    ("mode=0444", "mode=0644"),
+                    ('Acquire::https::CaInfo "/run/secrets/debian_ca";',
+                     'Acquire::https::CaInfo "/etc/ssl/certs/ca-certificates.crt";'),
+                    ('Acquire::https::Verify-Peer "true";', 'Acquire::https::Verify-Peer "false";'),
+                    ('Acquire::https::Verify-Host "true";', 'Acquire::https::Verify-Host "false";'),
+                    ("apt-get update", "apt-get update -o Acquire::https::Verify-Peer=false"),
+                    ("apt-get install", "apt-get install --allow-unauthenticated")):
+                with self.subTest(stage=stage.name, old=old):
+                    changed = stage.text.replace(old, new, 1)
+                    self.assertNotEqual(changed, stage.text)
+                    mutated = self.dockerfile.replace(stage.text, changed, 1)
+                    self.assertTrue(_debian_input_problems(mutated))
 
     def test_bookworm_empty_and_latest_values_cannot_replace_the_reviewed_trixie_pins(self):
         for argument, value in TRIXIE_TOOLCHAIN_PINS.items():

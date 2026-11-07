@@ -949,12 +949,139 @@ class ReleaseTagGuardFailureReportTest(unittest.TestCase):
 
 
 class SourceMirrorWorkflowTest(unittest.TestCase):
+    DEBIAN_READER_RUN = (
+        'set -euo pipefail\n'
+        'args="$(python3 scripts/release_sources.py debian-args docker/debian-inputs.args)"\n'
+        "{\n"
+        "  echo 'args<<DEBIAN_INPUT_ARGS'\n"
+        '  printf \'%s\\n\' "$args"\n'
+        "  echo 'DEBIAN_INPUT_ARGS'\n"
+        '} >> "$GITHUB_OUTPUT"\n'
+    )
+
     @classmethod
     def setUpClass(cls):
         cls.workflow = _workflow("publish.yml")
         cls.job = cls.workflow["jobs"]["publish"]
         cls.steps = cls.job["steps"]
         cls.named = {step["name"]: step for step in cls.steps if "name" in step}
+
+    def assert_debian_build_inputs(self, workflow):
+        steps = workflow["jobs"]["publish"]["steps"]
+        readers = [step for step in steps if step.get("id") == "debian"]
+        self.assertEqual(len(readers), 1, "one unconditional Debian input reader is required")
+        reader = readers[0]
+        self.assertEqual(reader, {
+            "name": "Read Debian input arguments", "id": "debian", "run": self.DEBIAN_READER_RUN,
+        })
+        builds = [step for step in steps
+                  if step.get("uses", "").startswith("docker/build-push-action@")]
+        self.assertEqual({step.get("name") for step in builds}, {
+            "Inspect release amd64", "Inspect release arm64", "Inspect hpo amd64", "Inspect hpo arm64",
+            "Build + push (multi-arch)", "Build + push hpo (multi-arch)",
+        })
+        self.assertEqual(len(builds), 6)
+        for build in builds:
+            name = build["name"]
+            config = build.get("with", {})
+            arguments = config.get("build-args", "").splitlines()
+            self.assertEqual(arguments.count("${{ steps.debian.outputs.args }}"), 1, name)
+            self.assertFalse(any(line.lstrip().startswith("DEBIAN_") for line in arguments),
+                             name + ": no literal override of the validated inputs")
+            self.assertEqual(config.get("secret-files"),
+                             "debian_ca=/etc/ssl/certs/ca-certificates.crt\n", name)
+            self.assertNotIn("secrets", config, name + ": public CA data must use secret-files")
+            self.assertLess(steps.index(reader), steps.index(build), name)
+            self.assertNotIn("continue-on-error", build, name)
+
+    def test_debian_file_and_public_ca_are_mandatory_for_all_six_builds(self):
+        self.assert_debian_build_inputs(self.workflow)
+
+    def test_each_build_refuses_omitted_or_overridden_debian_inputs_and_public_ca(self):
+        self.assert_debian_build_inputs(self.workflow)
+        builds = [step for step in self.steps
+                  if step.get("uses", "").startswith("docker/build-push-action@")]
+        for build in builds:
+            for scenario in ("missing args", "wrong reader", "literal snapshot override",
+                             "missing CA", "wrong CA id", "wrong CA file", "credential CA"):
+                with self.subTest(build=build["name"], scenario=scenario):
+                    mutated = copy.deepcopy(self.workflow)
+                    changed = mutated["jobs"]["publish"]["steps"][self.steps.index(build)]["with"]
+                    if scenario == "missing args":
+                        changed["build-args"] = changed["build-args"].replace(
+                            "${{ steps.debian.outputs.args }}\n", "", 1)
+                    elif scenario == "wrong reader":
+                        changed["build-args"] = changed["build-args"].replace(
+                            "${{ steps.debian.outputs.args }}", "${{ steps.toolchain.outputs.args }}", 1)
+                    elif scenario == "literal snapshot override":
+                        changed["build-args"] += "DEBIAN_SNAPSHOT=live\n"
+                    elif scenario == "missing CA":
+                        del changed["secret-files"]
+                    elif scenario == "wrong CA id":
+                        changed["secret-files"] = changed["secret-files"].replace("debian_ca=", "other_ca=")
+                    elif scenario == "wrong CA file":
+                        changed["secret-files"] = "debian_ca=/tmp/unreviewed-ca.crt\n"
+                    else:
+                        changed["secrets"] = changed.pop("secret-files")
+                    self.assertNotEqual(mutated, self.workflow)
+                    with self.assertRaises(AssertionError):
+                        self.assert_debian_build_inputs(mutated)
+
+    def test_debian_reader_cannot_be_conditional_missing_late_or_ignore_parser_failure(self):
+        self.assert_debian_build_inputs(self.workflow)
+        reader = self.named["Read Debian input arguments"]
+        index = self.steps.index(reader)
+        for scenario in ("missing", "HPO only", "default only", "late", "ignore failure"):
+            with self.subTest(scenario=scenario):
+                mutated = copy.deepcopy(self.workflow)
+                steps = mutated["jobs"]["publish"]["steps"]
+                if scenario == "missing":
+                    del steps[index]
+                elif scenario == "late":
+                    steps.append(steps.pop(index))
+                elif scenario == "ignore failure":
+                    steps[index]["run"] = steps[index]["run"].replace(
+                        'docker/debian-inputs.args)"', 'docker/debian-inputs.args || true)"', 1)
+                else:
+                    steps[index]["if"] = ("steps.pair.outputs.target == 'hpo'" if scenario == "HPO only"
+                                          else "steps.pair.outputs.target != 'hpo'")
+                self.assertNotEqual(mutated, self.workflow)
+                with self.assertRaises(AssertionError):
+                    self.assert_debian_build_inputs(mutated)
+
+    def test_real_debian_reader_exports_parsed_file_bytes_and_stops_before_output_on_refusal(self):
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash, "bash is required to exercise the real workflow input reader")
+        original = (REPO / "docker" / "debian-inputs.args").read_text(encoding="utf-8")
+        data = [line for line in original.splitlines() if line and not line.startswith("#")]
+        cases = (
+            ("real", original, data, True),
+            ("reordered", "\n".join(reversed(data)) + "\n", list(reversed(data)), True),
+            ("different snapshot", original.replace("20261104T140106Z", "20261103T140106Z"), [], False),
+        )
+        for scenario, text, arguments, accepted in cases:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "scripts").mkdir()
+                (root / "scripts" / "release_sources.py").write_bytes(
+                    (REPO / "scripts" / "release_sources.py").read_bytes())
+                (root / "docker").mkdir()
+                (root / "docker" / "debian-inputs.args").write_text(text, encoding="utf-8")
+                output = root / "output"
+                done = subprocess.run(
+                    [bash, "-c", self.named["Read Debian input arguments"]["run"]], cwd=root,
+                    env={"PATH": os.environ.get("PATH", os.defpath), "GITHUB_OUTPUT": str(output)},
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+                )
+                if accepted:
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertEqual(output.read_text(encoding="utf-8"),
+                                     "args<<DEBIAN_INPUT_ARGS\n" + "\n".join(arguments)
+                                     + "\nDEBIAN_INPUT_ARGS\n")
+                else:
+                    self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertIn("Debian args line", done.stderr)
+                    self.assertFalse(output.exists(), "a refused parser must export no build inputs")
 
     def test_toolchain_file_is_validated_and_exported_to_the_hpo_build(self):
         reader = self.named["Read hpo toolchain arguments"]
@@ -1003,7 +1130,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                     self.assertEqual(config["load"], "true")
                     self.assertEqual(config["push"], "false")
                     self.assertEqual(config["tags"], f"pineforge-source-inspect:{arch}")
-                    for key in ("context", "file", "target", "build-args", "labels"):
+                    for key in ("context", "file", "target", "build-args", "labels", "secret-files"):
                         self.assertEqual(config.get(key), real["with"].get(key), key)
                     scope = f"type=gha,scope={target}-{arch}"
                     self.assertEqual(config["cache-from"], scope,
