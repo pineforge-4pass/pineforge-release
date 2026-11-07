@@ -1394,7 +1394,7 @@ production inventory. The `hosted` entry is the exact policy from hosted
 `receipt.mjs` at `0a1c82c8`, following the 2026-10-21 post-merge change.
 Merge that hosted entry into the existing
 `RELEASE_RECEIPT_POLICY` only after installing this hub adapter, preserving every
-other consumer entry. The supervisor applies the live policy; this change does
+other consumer entry. The release operator applies the live policy; this change does
 not alter GitHub settings.
 
 The `application` entry uses the supplied base `dev`, literal artifact name,
