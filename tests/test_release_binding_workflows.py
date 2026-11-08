@@ -264,7 +264,7 @@ class PublishParityGlueTests(unittest.TestCase):
         done = subprocess.run(
             ["bash", "--noprofile", "--norc", "-euc", wrapper + script],
             cwd=root, capture_output=True, text=True,
-            env={"PATH": os.environ.get("PATH", os.defpath), "PYTHONDONTWRITEBYTECODE": "1",
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
                  "PRODUCER_FIXTURE_ROOT": str(root), "TAG": tag or "v" + str(client.v),
                  "E": str(client.v), "C": str(client.v), "H": str(client.v),
                  "HUB_COMMIT": "d" * 40, "RUNNER_TEMP": str(root),
