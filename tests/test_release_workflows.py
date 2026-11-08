@@ -304,6 +304,17 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         '        required: true\n'
         '        type: string\n'
     )
+    PUBLISH_RELEASE_INPUTS = (
+        ("Assert tag matches VERSION", "TAG"),
+        ("Read pins (from the annotated tag message; fallback = the pair version, or resolve latest on 0.x)", "REF"),
+        ("Pairing rule + release channel", "REF"),
+        ("Sync parity from the immutable engine tag", "TAG"),
+        ("Bind producer source and package bytes", "TAG"),
+        ("Read hpo wheel digest", "REF"),
+        ("GitHub Release", "TAG"),
+    )
+    COMPLETING_ENGINE = "Verify the completing engine before tagging"
+    BUMP = "Bump VERSION, commit, tag"
 
     def parse(self, text):
         import yaml
@@ -314,6 +325,21 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         mutant = text.replace(before, after)
         self.assertNotEqual(mutant, text, "mutation must change the real workflow")
         return mutant
+
+    def step_text(self, text, job, name):
+        jobs = list(re.finditer(
+            r"(?ms)^  " + re.escape(job) + r":\n.*?(?=^  \S|\Z)", text,
+        ))
+        self.assertEqual(len(jobs), 1, "mutation requires exactly one job: " + job)
+        steps = list(re.finditer(
+            r"(?ms)^      - name: " + re.escape(name) + r"\n.*?(?=^      - |\Z)", jobs[0][0],
+        ))
+        self.assertEqual(len(steps), 1, "mutation requires exactly one step: " + job + "/" + name)
+        return steps[0][0]
+
+    def mutate_step(self, text, job, name, before, after):
+        body = self.step_text(text, job, name)
+        return self.mutate(text, body, self.mutate(body, before, after))
 
     def assert_publish(self, text):
         wf = self.parse(text)
@@ -381,10 +407,14 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
                 self.assertEqual((checkouts[0].get("with") or {}).get("fetch-depth"), "0")
         candidate = next((row for row in steps if row.get("id") == "candidate"), {})
         self.assertEqual((candidate.get("env") or {}).get("TAG"), "${{ needs.tag-guard.outputs.tag }}")
-        named = {row.get("name"): row for row in jobs["publish"].get("steps", [])}
-        for name, variable in (("Assert tag matches VERSION", "TAG"), ("Read pins (from the annotated tag message; fallback = the pair version, or resolve latest on 0.x)", "REF"),
-                               ("Pairing rule + release channel", "REF"), ("Bind producer source and package bytes", "TAG"),
-                               ("Read hpo wheel digest", "REF"), ("GitHub Release", "TAG")):
+        publish_steps = jobs["publish"].get("steps", [])
+        named = {row.get("name"): row for row in publish_steps}
+        self.assertCountEqual(
+            [(row.get("name"), variable) for row in publish_steps
+             for variable in (row.get("env") or {}) if variable in {"TAG", "REF"}],
+            self.PUBLISH_RELEASE_INPUTS, "require every intended release input consumer",
+        )
+        for name, variable in self.PUBLISH_RELEASE_INPUTS:
             self.assertEqual(named.get(name, {}).get("env", {}).get(variable), "${{ env.RELEASE_TAG }}", name)
         labels = named.get("Image metadata", {}).get("with", {}).get("labels", "")
         self.assertIn("org.opencontainers.image.version=${{ env.RELEASE_TAG }}\n", labels)
@@ -394,6 +424,19 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
                          "${{ github.run_id }}-${{ github.run_attempt }}\n")
         binding = named.get("Bind producer source and package bytes", {})
         self.assertEqual((binding.get("env") or {}).get("HUB_COMMIT"), "${{ needs.tag-guard.outputs.sha }}")
+        parity = named.get("Sync parity from the immutable engine tag", {})
+        self.assertEqual(parity.get("env"), {
+            "GH_TOKEN": "${{ github.token }}", "TAG": "${{ env.RELEASE_TAG }}",
+            "E": "${{ steps.pins.outputs.engine }}",
+        })
+        self.assertNotIn("if", parity)
+        self.assertNotIn("continue-on-error", parity)
+        self.assertIn(
+            "if parity_capable(os.environ['TAG'].removeprefix('v')):\n"
+            "    sync_parity_bundle(Client(), 'v' + os.environ['E'], Path('docker/parity'))\n",
+            parity.get("run", ""),
+        )
+        self.assertLess(publish_steps.index(parity), publish_steps.index(binding))
         for name in ("Inspect release amd64", "Inspect release arm64", "Inspect hpo amd64", "Inspect hpo arm64",
                      "Build + push (multi-arch)", "Build + push hpo (multi-arch)"):
             self.assertIn("RELEASE_VERSION=${{ env.RELEASE_TAG }}\n",
@@ -463,6 +506,22 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         self.assertNotRegex(_step(text, "Mint org App token"), r"(?m)^\s*permission-actions\s*:")
         replay = next((row for row in steps if row.get("name", "").startswith("Re-publish")), {})
         bump = next((row for row in steps if row.get("name", "").startswith("Bump VERSION")), {})
+        self.assertCountEqual(
+            [row.get("name") for row in steps if "E" in (row.get("env") or {})],
+            [self.COMPLETING_ENGINE, self.BUMP], "require both decided-engine consumers",
+        )
+        completing = next((row for row in steps if row.get("name") == self.COMPLETING_ENGINE), {})
+        self.assertEqual(completing.get("if"),
+                         "steps.decide.outputs.mode == 'bump' && steps.in.outputs.component != 'engine'")
+        self.assertEqual(completing.get("env"), {
+            "GH_TOKEN": "${{ github.token }}", "E": "${{ steps.decide.outputs.engine }}",
+        })
+        self.assertEqual(completing.get("run"), 'python3 scripts/release_pipeline.py producer engine "$E"')
+        self.assertNotIn("continue-on-error", completing)
+        decide = next((row for row in steps if row.get("id") == "decide"), {})
+        self.assertLess(steps.index(decide), steps.index(completing))
+        self.assertLess(steps.index(completing), steps.index(bump))
+        self.assertEqual(bump.get("env", {}).get("E"), "${{ steps.decide.outputs.engine }}")
         self.assertEqual(replay.get("if"), "steps.decide.outputs.mode == 'republish'")
         self.assertEqual(replay.get("env", {}).get("TAG"), "v${{ steps.decide.outputs.cur_ver }}")
         for step in (replay, bump):
@@ -627,11 +686,38 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         for label, mutant in self.guard_check_mutations(text):
             with self.subTest(check=label), self.assertRaises(AssertionError):
                 self.assert_publish(mutant)
+        # Require the semantic consumer set in assert_publish, then break each
+        # step independently. Missing anchors fail before assertRaises.
+        for name, variable in self.PUBLISH_RELEASE_INPUTS:
+            before = "          " + variable + ": ${{ env.RELEASE_TAG }}\n"
+            for after in ("", "          " + variable + ": v0.0.0\n"):
+                mutant = self.mutate_step(text, "publish", name, before, after)
+                with self.subTest(step=name, variable=variable, replacement=after), self.assertRaises(AssertionError):
+                    self.assert_publish(mutant)
+        parity_name = "Sync parity from the immutable engine tag"
+        for before, after in (
+            ("          E: ${{ steps.pins.outputs.engine }}\n", ""),
+            ("          E: ${{ steps.pins.outputs.engine }}", "          E: v0.0.0"),
+            ("          GH_TOKEN: ${{ github.token }}\n", ""),
+            ("          GH_TOKEN: ${{ github.token }}", "          GH_TOKEN: ${{ steps.app.outputs.token }}"),
+            ("        env:\n", "        if: false\n        env:\n"),
+            ("        env:\n", "        continue-on-error: true\n        env:\n"),
+            ("if parity_capable(os.environ['TAG'].removeprefix('v')):", "if True:"),
+            ("'v' + os.environ['E']", "'v0.0.0'"),
+            ("sync_parity_bundle(Client(),", "print(Client(),"),
+        ):
+            mutant = self.mutate_step(text, "publish", parity_name, before, after)
+            with self.subTest(step=parity_name, anchor=before, replacement=after), self.assertRaises(AssertionError):
+                self.assert_publish(mutant)
+        parity_body = self.step_text(text, "publish", parity_name)
+        binding_body = self.step_text(text, "publish", "Bind producer source and package bytes")
+        late_parity = self.mutate(text, parity_body, "")
+        late_parity = self.mutate(late_parity, binding_body, binding_body + parity_body)
+        with self.subTest(step=parity_name, boundary="before binding"), self.assertRaises(AssertionError):
+            self.assert_publish(late_parity)
         # These anchors repeat: mutate each occurrence independently rather
         # than letting the first checkout/build pin hide a later missing pin.
         for before, after, count in (
-            ("          TAG: ${{ env.RELEASE_TAG }}", "          TAG: v0.0.0", 3),
-            ("          REF: ${{ env.RELEASE_TAG }}", "          REF: v0.0.0", 3),
             ("RELEASE_VERSION=${{ env.RELEASE_TAG }}", "RELEASE_VERSION=v0.0.0", 6),
             ("RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}", "RELEASE_GIT_SHA=${{ github.sha }}", 6),
             ("          ref: ${{ needs.tag-guard.outputs.sha }}\n", "", 2),
@@ -678,18 +764,59 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         for before, after in (
             ("          permission-contents: write\n",
              "          permission-contents: write\n          permission-actions: write\n"),
-            ('        env:\n          TAG: v${{ steps.decide.outputs.cur_ver }}',
-             '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          TAG: v${{ steps.decide.outputs.cur_ver }}'),
-            ('        env:\n          E:', '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          E:'),
-            ("        if: steps.decide.outputs.mode == 'republish'", "        if: always()"),
-            ("        if: steps.decide.outputs.mode == 'bump'", "        if: always()"),
-            ("          TAG: v${{ steps.decide.outputs.cur_ver }}", "          TAG: v0.0.0"),
             ("      - name: Bump VERSION, commit, tag\n", "      - name: Bump VERSION, commit, tag (fires publish.yml)\n"),
             ('echo "::warning title=pineforge publish needed::${line}"', 'echo "$line"'),
         ):
             mutant = self.mutate(text, before, after)
             with self.subTest(anchor=before), self.assertRaises(AssertionError):
                 self.assert_handler(mutant)
+        replay_name = "Re-publish (recover a half-failed prior release)"
+        for name in (replay_name, self.BUMP):
+            mutant = self.mutate_step(
+                text, "bump", name, "        env:\n",
+                "        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n",
+            )
+            with self.subTest(step=name, boundary="no publish token"), self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
+        for name, mode in ((replay_name, "republish"), (self.BUMP, "bump")):
+            before = "        if: steps.decide.outputs.mode == '" + mode + "'\n"
+            mutant = self.mutate_step(text, "bump", name, before, "        if: always()\n")
+            with self.subTest(step=name, boundary="decision gate"), self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
+        mutant = self.mutate_step(
+            text, "bump", replay_name, "          TAG: v${{ steps.decide.outputs.cur_ver }}",
+            "          TAG: v0.0.0",
+        )
+        with self.subTest(step=replay_name, boundary="release tag"), self.assertRaises(AssertionError):
+            self.assert_handler(mutant)
+        for name, before in (
+            (self.COMPLETING_ENGINE, "          E: ${{ steps.decide.outputs.engine }}\n"),
+            (self.BUMP, "          E:       ${{ steps.decide.outputs.engine }}\n"),
+        ):
+            for after in ("", "          E: v0.0.0\n"):
+                mutant = self.mutate_step(text, "bump", name, before, after)
+                with self.subTest(step=name, boundary="engine input", replacement=after), self.assertRaises(AssertionError):
+                    self.assert_handler(mutant)
+        completing_if = "        if: steps.decide.outputs.mode == 'bump' && steps.in.outputs.component != 'engine'\n"
+        for before, after in (
+            (completing_if, ""),
+            (completing_if, "        if: always()\n"),
+            (completing_if, "        if: steps.decide.outputs.mode == 'bump'\n"),
+            ("          GH_TOKEN: ${{ github.token }}\n", ""),
+            ("          GH_TOKEN: ${{ github.token }}", "          GH_TOKEN: ${{ steps.app.outputs.token }}"),
+            ("        env:\n", "        continue-on-error: true\n        env:\n"),
+            ('        run: python3 scripts/release_pipeline.py producer engine "$E"\n', "        run: echo skipped verification\n"),
+            ('producer engine "$E"', 'producer engine "0.0.0"'),
+        ):
+            mutant = self.mutate_step(text, "bump", self.COMPLETING_ENGINE, before, after)
+            with self.subTest(step=self.COMPLETING_ENGINE, anchor=before, replacement=after), self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
+        completing_body = self.step_text(text, "bump", self.COMPLETING_ENGINE)
+        bump_body = self.step_text(text, "bump", self.BUMP)
+        late_engine = self.mutate(text, completing_body, "")
+        late_engine = self.mutate(late_engine, bump_body, bump_body + completing_body)
+        with self.subTest(step=self.COMPLETING_ENGINE, boundary="before tagging"), self.assertRaises(AssertionError):
+            self.assert_handler(late_engine)
         for name, annotation, notices in (("Re-publish", "warning", 1), ("Bump VERSION", "notice", 2)):
             body = _step(text, name)
             for command, count in (
