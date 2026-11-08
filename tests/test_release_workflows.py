@@ -1135,7 +1135,8 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                              name + ": no literal override of the validated inputs")
             self.assertEqual(config.get("secret-files"),
                              "debian_ca=/etc/ssl/certs/ca-certificates.crt\n", name)
-            self.assertNotIn("secrets", config, name + ": public CA data must use secret-files")
+            self.assertEqual(config.get("secrets"),
+                             "github_token=${{ steps.asset_token.outputs.token }}\n", name)
             self.assertLess(steps.index(reader), steps.index(build), name)
             self.assertNotIn("continue-on-error", build, name)
 
@@ -1148,7 +1149,8 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                   if step.get("uses", "").startswith("docker/build-push-action@")]
         for build in builds:
             for scenario in ("missing args", "wrong reader", "literal snapshot override",
-                             "missing CA", "wrong CA id", "wrong CA file", "credential CA"):
+                             "missing CA", "wrong CA id", "wrong CA file", "credential CA",
+                             "CA in token field"):
                 with self.subTest(build=build["name"], scenario=scenario):
                     mutated = copy.deepcopy(self.workflow)
                     changed = mutated["jobs"]["publish"]["steps"][self.steps.index(build)]["with"]
@@ -1166,6 +1168,8 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                         changed["secret-files"] = changed["secret-files"].replace("debian_ca=", "other_ca=")
                     elif scenario == "wrong CA file":
                         changed["secret-files"] = "debian_ca=/tmp/unreviewed-ca.crt\n"
+                    elif scenario == "CA in token field":
+                        changed["secrets"] = changed["secret-files"]
                     else:
                         changed["secrets"] = changed.pop("secret-files")
                     self.assertNotEqual(mutated, self.workflow)
@@ -1228,6 +1232,130 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                     self.assertIn("Debian args line", done.stderr)
                     self.assertFalse(output.exists(), "a refused parser must export no build inputs")
 
+    ASSET_BUILDS = (
+        "Inspect release amd64", "Inspect release arm64",
+        "Inspect hpo amd64", "Inspect hpo arm64",
+        "Build + push (multi-arch)", "Build + push hpo (multi-arch)",
+    )
+
+    def assert_asset_read_token_wiring(self, workflow):
+        self.assertEqual(workflow.get("permissions"), {"contents": "read"})
+        job = workflow["jobs"]["publish"]
+        self.assertEqual(job.get("environment"), "release-automation")
+        self.assertEqual(job.get("permissions"), {"contents": "write", "packages": "write"})
+        steps = job["steps"]
+        mints = [step for step in steps
+                 if step.get("uses", "").startswith("actions/create-github-app-token@")]
+        self.assertEqual(mints, [{
+            "name": "Mint producer asset read token",
+            "id": "asset_token",
+            "uses": "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
+            "with": {
+                "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
+                "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
+                "owner": "${{ github.repository_owner }}",
+                "repositories": "pineforge-engine\npineforge-hpo\n",
+                "permission-contents": "read",
+                "github-api-url": "https://api.github.com",
+            },
+        }])
+        mint_index = steps.index(mints[0])
+        checkout = next(index for index, step in enumerate(steps)
+                        if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertLess(checkout, mint_index)
+        builds = [(index, step) for index, step in enumerate(steps)
+                  if step.get("uses", "").startswith("docker/build-push-action@")]
+        self.assertEqual([step.get("name") for _, step in builds], list(self.ASSET_BUILDS))
+        for index, step in builds:
+            self.assertLess(mint_index, index)
+            self.assertEqual(step["with"].get("secrets"),
+                             "github_token=${{ steps.asset_token.outputs.token }}\n")
+            self.assertNotIn("secret-envs", step["with"])
+            self.assertEqual(step["with"].get("secret-files"),
+                             "debian_ca=/etc/ssl/certs/ca-certificates.crt\n")
+
+        def reference_paths(node, needle, path=()):
+            if isinstance(node, dict):
+                return [found for key, value in node.items()
+                        for found in reference_paths(value, needle, (*path, key))]
+            if isinstance(node, list):
+                return [found for index, value in enumerate(node)
+                        for found in reference_paths(value, needle, (*path, index))]
+            return [path] if isinstance(node, str) and needle in node else []
+
+        # Token output is confined to the six BuildKit inputs, never a job
+        # output, environment, build ARG, script, label or other action input.
+        self.assertCountEqual(
+            reference_paths(workflow, "steps.asset_token.outputs.token"),
+            [("jobs", "publish", "steps", index, "with", "secrets") for index, _ in builds],
+        )
+        for secret, field in (("PINEFORGE_APP_ID", "app-id"),
+                              ("PINEFORGE_APP_PRIVATE_KEY", "private-key")):
+            self.assertEqual(reference_paths(workflow, "secrets." + secret),
+                             [("jobs", "publish", "steps", mint_index, "with", field)])
+
+    def test_producer_read_token_is_scoped_and_only_enters_buildkit_with_mutation_controls(self):
+        self.assert_asset_read_token_wiring(self.workflow)
+        mint_index = next(index for index, step in enumerate(self.steps)
+                          if step.get("id") == "asset_token")
+        for field, value in (
+                ("permission-contents", "write"),
+                ("permission-actions", "read"),
+                ("repositories", ""),
+                ("repositories", "pineforge-engine\npineforge-hpo\npineforge-release\n"),
+                ("owner", "unapproved-owner"),
+                ("app-id", "${{ secrets.NEW_APP_ID }}"),
+                ("private-key", "${{ secrets.NEW_APP_KEY }}"),
+                ("github-api-url", "https://unapproved.invalid")):
+            mutant = copy.deepcopy(self.workflow)
+            mutant["jobs"]["publish"]["steps"][mint_index]["with"][field] = value
+            with self.subTest(mint_field=field, value=value), self.assertRaises(AssertionError):
+                self.assert_asset_read_token_wiring(mutant)
+        for mode in ("missing", "late", "conditional", "softened"):
+            mutant = copy.deepcopy(self.workflow)
+            steps = mutant["jobs"]["publish"]["steps"]
+            if mode in {"missing", "late"}:
+                mint = steps.pop(mint_index)
+                if mode == "late":
+                    steps.append(mint)
+            elif mode == "conditional":
+                steps[mint_index]["if"] = "steps.pair.outputs.target == 'hpo'"
+            else:
+                steps[mint_index]["continue-on-error"] = "true"
+            with self.subTest(mint=mode), self.assertRaises(AssertionError):
+                self.assert_asset_read_token_wiring(mutant)
+        for name in self.ASSET_BUILDS:
+            for mode in ("missing", "write-token", "build-arg", "environment", "secret-file"):
+                mutant = copy.deepcopy(self.workflow)
+                step = next(row for row in mutant["jobs"]["publish"]["steps"]
+                            if row.get("name") == name)
+                secret = step["with"].pop("secrets")
+                if mode == "write-token":
+                    step["with"]["secrets"] = "github_token=${{ github.token }}\n"
+                elif mode == "build-arg":
+                    step["with"]["secrets"] = secret
+                    step["with"]["build-args"] += secret
+                elif mode == "environment":
+                    step["with"]["secrets"] = secret
+                    step["env"] = {"GH_TOKEN": "${{ steps.asset_token.outputs.token }}"}
+                elif mode == "secret-file":
+                    step["with"]["secrets"] = secret
+                    step["with"]["secret-files"] = secret
+                self.assertNotEqual(mutant, self.workflow)
+                with self.subTest(build=name, mutation=mode), self.assertRaises(AssertionError):
+                    self.assert_asset_read_token_wiring(mutant)
+        for mode in ("unprotected", "permissions", "job-output"):
+            mutant = copy.deepcopy(self.workflow)
+            job = mutant["jobs"]["publish"]
+            if mode == "unprotected":
+                job.pop("environment")
+            elif mode == "permissions":
+                job["permissions"]["actions"] = "write"
+            else:
+                job["outputs"]["asset_token"] = "${{ steps.asset_token.outputs.token }}"
+            with self.subTest(job=mode), self.assertRaises(AssertionError):
+                self.assert_asset_read_token_wiring(mutant)
+
     def test_toolchain_file_is_validated_and_exported_to_the_hpo_build(self):
         reader = self.named["Read hpo toolchain arguments"]
         self.assertEqual(reader["id"], "toolchain")
@@ -1275,7 +1403,8 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                     self.assertEqual(config["load"], "true")
                     self.assertEqual(config["push"], "false")
                     self.assertEqual(config["tags"], f"pineforge-source-inspect:{arch}")
-                    for key in ("context", "file", "target", "build-args", "labels", "secret-files"):
+                    for key in ("context", "file", "target", "build-args", "labels",
+                                "secret-files", "secrets"):
                         self.assertEqual(config.get(key), real["with"].get(key), key)
                     scope = f"type=gha,scope={target}-{arch}"
                     self.assertEqual(config["cache-from"], scope,

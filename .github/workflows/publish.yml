@@ -392,6 +392,19 @@ jobs:
             org.opencontainers.image.version=${{ env.RELEASE_TAG }}
             org.opencontainers.image.revision=${{ needs.tag-guard.outputs.sha }}
 
+      - name: Mint producer asset read token
+        id: asset_token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.PINEFORGE_APP_ID }}
+          private-key: ${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            pineforge-engine
+            pineforge-hpo
+          permission-contents: read
+          github-api-url: https://api.github.com
+
       # Inspect the selected target on both architectures before any publish.
       # Keep target and arguments identical to the push steps; the cache scope is per architecture and shared with them.
       - name: Inspect release amd64
@@ -408,6 +421,8 @@ jobs:
           # Public CA data from the hosted runner, supplied only as a build mount.
           secret-files: |
             debian_ca=/etc/ssl/certs/ca-certificates.crt
+          secrets: |
+            github_token=${{ steps.asset_token.outputs.token }}
           build-args: |
             ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
@@ -433,6 +448,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           secret-files: |
             debian_ca=/etc/ssl/certs/ca-certificates.crt
+          secrets: |
+            github_token=${{ steps.asset_token.outputs.token }}
           build-args: |
             ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
@@ -459,6 +476,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           secret-files: |
             debian_ca=/etc/ssl/certs/ca-certificates.crt
+          secrets: |
+            github_token=${{ steps.asset_token.outputs.token }}
           build-args: |
             ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
@@ -489,6 +508,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           secret-files: |
             debian_ca=/etc/ssl/certs/ca-certificates.crt
+          secrets: |
+            github_token=${{ steps.asset_token.outputs.token }}
           build-args: |
             ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
@@ -554,6 +575,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           secret-files: |
             debian_ca=/etc/ssl/certs/ca-certificates.crt
+          secrets: |
+            github_token=${{ steps.asset_token.outputs.token }}
           build-args: |
             ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
@@ -584,6 +607,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           secret-files: |
             debian_ca=/etc/ssl/certs/ca-certificates.crt
+          secrets: |
+            github_token=${{ steps.asset_token.outputs.token }}
           build-args: |
             ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
