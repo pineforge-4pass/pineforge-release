@@ -324,6 +324,16 @@ jobs:
           printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
+      # Engine events already prepare/prove their source before the decision.
+      # A codegen/HPO event that completes the pair must prove the pinned
+      # engine too, before either the normal bump or retag recovery can write.
+      - name: Verify the completing engine before tagging
+        if: steps.decide.outputs.mode == 'bump' && steps.in.outputs.component != 'engine'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          E: ${{ steps.decide.outputs.engine }}
+        run: python3 scripts/release_pipeline.py producer engine "$E"
+
       - name: Bump VERSION, commit, tag
         if: steps.decide.outputs.mode == 'bump'
         env:

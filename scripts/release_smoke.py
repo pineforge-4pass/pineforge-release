@@ -3,14 +3,83 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 from release_artifacts import command
-from release_contract import IMAGE, decode, require, sha256
+from release_contract import (IMAGE, Invalid, canonical, decode, parity_capable,
+                              parity_child_digests, require, sha256, validate_parity)
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/release-smoke"
+RUNTIME_ROOTS = {
+    "codegen": "/opt/pineforge/pycodegen",
+    "hpo": "/opt/pineforge/hpo",
+    "parity": "/opt/pineforge/parity",
+}
+
+
+def runtime_inventory_script():
+    """Run inside each child; report observed bytes or an explicit refusal."""
+    return "ROOTS = " + repr(RUNTIME_ROOTS) + "\n" + r'''import hashlib,json,pathlib,sys
+class Refusal(Exception):
+ pass
+def refuse(message):
+ raise Refusal(message)
+def digest(raw):
+ return hashlib.sha256(raw).hexdigest()
+def canonical(value):
+ return (json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False,allow_nan=False)+'\n').encode('utf-8')
+def verify():
+ request=json.load(sys.stdin)
+ expected=request['inventories']
+ if set(expected)-set(ROOTS): refuse('unknown runtime inventory role')
+ observed={}
+ for role,files in expected.items():
+  root=pathlib.Path(ROOTS[role])
+  if role=='parity':
+   if not root.is_dir() or root.is_symlink(): refuse('parity root is missing')
+   try:
+    entries={p.name:p for p in root.iterdir()}
+    if set(entries)!=set(files) or any(p.is_symlink() or not p.is_file() for p in entries.values()):
+     refuse('parity installed file inventory differs')
+    data={name:p.read_bytes() for name,p in entries.items()}
+   except OSError:
+    refuse('parity installed file inventory differs')
+   identity=request['parity']
+   if not isinstance(identity,dict): refuse('parity child proof missing')
+   descriptor={key:identity[key] for key in ('schema','source_manifest_sha256','engine_commit','payload_sha256')}
+   descriptor_raw=data['PARITY-MANIFEST.json']
+   descriptor_sha256=digest(descriptor_raw)
+   if descriptor_raw!=canonical(descriptor) or descriptor_sha256!=identity['descriptor_sha256']:
+    refuse('parity descriptor identity differs')
+   payload={name:digest(data[name]) for name in identity['payload_sha256']}
+   if payload!=identity['payload_sha256'] or any(not data[name] for name in payload):
+    refuse('parity payload hash differs')
+   rows=[('PARITY-MANIFEST.json',descriptor_sha256),*sorted(payload.items())]
+   sums_raw=data['PARITY-SHA256SUMS']
+   sums_sha256=digest(sums_raw)
+   sums_expected=''.join(value+'  '+name+'\n' for name,value in rows).encode('ascii')
+   if sums_raw!=sums_expected or sums_sha256!=identity['sums_sha256']:
+    refuse('parity SUMS verification failed')
+   inventory={name:digest(raw) for name,raw in data.items()}
+   if inventory!=files: refuse('parity installed file inventory differs')
+   observed['parity']={'identity':{**json.loads(descriptor_raw),
+                                  'descriptor_sha256':descriptor_sha256,'sums_sha256':sums_sha256},
+                       'inventory':inventory}
+  else:
+   actual={str(p.relative_to(root)):digest(p.read_bytes())
+           for package in {name.split('/')[0] for name in files}
+           for p in (root/package).rglob('*') if p.is_file() and (p.suffix=='.py' or p.name.startswith('hpo_failure_codes'))}
+   if actual!=files: refuse('installed package bytes differ')
+ return observed
+# command() captures stderr and exposes only a generic failure. Return explicit
+# refusals as data, which the parent rejects before authorizing smoke commands.
+try:
+ result=verify()
+except Refusal as error:
+ result={'error':str(error)}
+print(json.dumps(result,sort_keys=True,separators=(',',':')))
+'''
 
 
 def inspect_index(digest):
@@ -30,7 +99,13 @@ def inspect_index(digest):
 
 def verify_runtime(image, versions, hub_commit, release_version, inventories):
     """Every command must exit zero and each JSON output must have nonempty real results."""
+    require(type(inventories) is dict and not (set(inventories) - set(RUNTIME_ROOTS)),
+            "unknown runtime inventory role")
+    capable = parity_capable(release_version)
+    identity = validate_parity(versions["engine"], inventories) if capable else None
+    children = parity_child_digests(image) if capable else None
     proof = {}
+    checked = []
     for arch in ("amd64", "arm64"):
         ref = IMAGE + "@" + image[arch + "_digest"]
         command("docker", "pull", "--platform", "linux/" + arch, ref)
@@ -44,32 +119,43 @@ def verify_runtime(image, versions, hub_commit, release_version, inventories):
         if hpo:
             require(labels.get("io.pineforge.hpo.version") == hpo["package_version"], "HPO label differs")
         base = ["docker", "run", "--rm", "--network=none", "--platform", "linux/" + arch,
+                "-e", "PYTHONDONTWRITEBYTECODE=1",
                 "-v", str(FIXTURE) + ":/in:ro"]
         # Byte inventories bind the installed Python delivery paths to the
         # checked PyPI sdist/HPO wheel, rather than trusting version labels.
-        script = '''import hashlib,json,pathlib,sys
-expected=json.load(sys.stdin)
-for role,files in expected.items():
- root=pathlib.Path('/opt/pineforge/pycodegen' if role=='codegen' else '/opt/pineforge/hpo')
- actual={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
-         for package in {name.split('/')[0] for name in files}
-         for p in (root/package).rglob('*') if p.is_file() and (p.suffix=='.py' or p.name.startswith('hpo_failure_codes'))}
- if actual!=files: raise SystemExit('installed package bytes differ')
-'''
-        command(*base, "-i", "--entrypoint", "python3", ref, "-c", script,
-                input=json.dumps(inventories).encode())
+        inventory_raw = command(*base, "-i", "--entrypoint", "python3", ref, "-c", runtime_inventory_script(),
+                                input=canonical({"inventories": inventories, "parity": identity}))
+        observed = None
+        if inventory_raw:
+            try:
+                observed = decode(inventory_raw)
+            except Invalid as error:
+                raise Invalid("parity child proof missing" if capable else "installed package bytes differ") from error
+            require(type(observed) is dict, "parity child proof missing" if capable else "installed package bytes differ")
+            require("error" not in observed, str(observed.get("error")))
+        if capable:
+            require(type(observed) is dict and set(observed) == {"parity"}
+                    and type(observed["parity"]) is dict
+                    and set(observed["parity"]) == {"identity", "inventory"}, "parity child proof missing")
+            require(observed["parity"]["identity"] == identity, "parity descriptor identity differs")
+            require(observed["parity"]["inventory"] == inventories["parity"], "parity installed file inventory differs")
         # The Dockerfile's build checks bind the harness, ABI and licenses;
         # recheck installed harness/license bytes on the pushed digest too.
         check = "cd /opt/pineforge/bin && sha256sum -c --strict HARNESS-SHA256SUMS"
         if hpo:
             check += " && cd /opt/pineforge/licenses && sha256sum -c --strict LICENSE-SHA256SUMS"
         command(*base, "--entrypoint", "bash", ref, "-euc", check)
+        checked.append((arch, base, ref, hpo, observed))
+    # Both installed child inventories must verify before either smoke starts.
+    for arch, base, ref, hpo, observed in checked:
         report_raw = command(*base, ref)
         report = decode(report_raw)
         require(report.get("engine") == "pineforge" and not report.get("error"), "backtest failed")
         require(len(report.get("trades", [])) > 0 and report["metrics"]["all"]["num_trades"] > 0,
                 "backtest fixture produced no trades")
         record = {"backtest_sha256": sha256(report_raw), "trades": len(report["trades"])}
+        if capable:
+            record["parity"] = {"image_digest": children[arch], **observed["parity"]}
         if hpo:
             hpo_raw = command(*base, ref, "hpo", "run", "/in/study.json", "--engine-root", "/opt/pineforge")
             result = decode(hpo_raw)
@@ -92,7 +178,6 @@ def main():
     bound = decode(Path(args.bindings).read_bytes())
     image = inspect_index(args.digest)
     proof = verify_runtime(image, bound["versions"], bound["hub_commit"], bound["release_version"], bound["inventories"])
-    from release_contract import canonical
     Path(args.output).write_bytes(canonical({**bound, "image": image, "verification": proof}))
 
 

@@ -343,6 +343,76 @@ def _without_guard_policy(text: str) -> str:
     return text.replace(run + "\n", "", 1)
 
 
+def _without_parity_carrier(text: str) -> str:
+    """Remove only the exact carrier additions before checking the old pin."""
+    declaration = json.loads(
+        (REPO / "tests/fixtures/parity-bundle.json").read_text(encoding="utf-8"))
+    names = ["PARITY-MANIFEST.json",
+             *sorted(row["destination"] for row in declaration["files"])]
+    # Match complete instructions: added commands must not disappear when the
+    # historical runtime is normalized, even inside the parity section.
+    carrier = r'''# The parity carrier is separate from the engine harness. SUMS checks exactly
+# the descriptor and six reviewed payloads; it is excluded from its own list.
+# Runtime inventory reads these files; no image entrypoint executes them.
+# This root RUN creates root-owned files without the stage's private metadata.
+RUN --mount=type=bind,source=.,target=/tmp/pineforge-context,ro \
+    set -eu; \
+    if [ "${PARITY_CARRIER:-0}" = 1 ]; then \
+      if [ -L /tmp/pineforge-context/docker/parity ]; then echo "parity directory contains a symlink" >&2; exit 1; fi; \
+      if [ ! -d /tmp/pineforge-context/docker/parity ]; then echo "parity directory is missing required file" >&2; exit 1; fi; \
+      mkdir -p /opt/pineforge/parity; \
+      cp -R --no-preserve=mode,ownership,timestamps /tmp/pineforge-context/docker/parity/. /opt/pineforge/parity/; \
+      chmod 0755 /opt/pineforge/parity; \
+      find /opt/pineforge/parity -type f -exec chmod 0644 {} +; \
+    fi
+ENV PYTHONDONTWRITEBYTECODE=1
+RUN set -eu; \
+    case "${PARITY_CARRIER-0}" in \
+      0) if [ -n "${PARITY_DESCRIPTOR_SHA256:-}" ]; then echo "parity descriptor requires the carrier" >&2; exit 1; fi ;; \
+      1) ;; \
+      *) echo "parity carrier must be 0 or 1" >&2; exit 1 ;; \
+    esac; \
+    if [ "${PARITY_CARRIER:-0}" = 1 ]; then \
+      descriptor_sha256="${PARITY_DESCRIPTOR_SHA256:-}"; \
+      if [ "${#descriptor_sha256}" -ne 64 ] || ! printf '%s' "$descriptor_sha256" | grep -Eq '^[0-9a-f]{64}$'; then \
+        echo "parity descriptor hash differs from binding" >&2; exit 1; \
+      fi; \
+      if [ -L /opt/pineforge/parity ]; then echo "parity directory contains a symlink" >&2; exit 1; fi; \
+      if [ ! -d /opt/pineforge/parity ]; then echo "parity directory is missing required file" >&2; exit 1; fi; \
+      cd /opt/pineforge/parity; \
+      want="@NAMES@"; \
+      for path in ./* ./.[!.]* ./..?*; do \
+        [ -e "$path" ] || [ -L "$path" ] || continue; \
+        if [ -L "$path" ]; then echo "parity directory contains a symlink" >&2; exit 1; fi; \
+        case "${path#./}" in \
+          @FILES@) ;; \
+          *) echo "parity directory contains unexpected files" >&2; exit 1 ;; \
+        esac; \
+      done; \
+      for name in $want PARITY-SHA256SUMS; do \
+        if [ ! -f "$name" ]; then echo "parity directory is missing required file" >&2; exit 1; fi; \
+        if [ ! -s "$name" ]; then echo "parity payload is empty" >&2; exit 1; fi; \
+      done; \
+      actual="$(sha256sum PARITY-MANIFEST.json)"; \
+      if [ "${actual%% *}" != "${descriptor_sha256}" ]; then \
+        echo "parity descriptor hash differs from binding" >&2; exit 1; \
+      fi; \
+      listed="$(sed 's/^[0-9a-f]\{64\}  //' PARITY-SHA256SUMS | tr '\n' ' ' | sed 's/ $//')"; \
+      if [ "$listed" != "$want" ] || [ "$(wc -l < PARITY-SHA256SUMS)" -ne @COUNT@ ]; then echo "parity SUMS verification failed" >&2; exit 1; fi; \
+      if ! sha256sum -c --strict PARITY-SHA256SUMS; then echo "parity SUMS verification failed" >&2; exit 1; fi; \
+      echo "parity: seven files match PARITY-SHA256SUMS"; \
+    fi''' + "\n\n"
+    carrier = (carrier.replace("@NAMES@", " ".join(names))
+               .replace("@FILES@", "|".join(sorted([*names, "PARITY-SHA256SUMS"])))
+               .replace("@COUNT@", str(len(names))))
+    for fragment in ("ARG PARITY_DESCRIPTOR_SHA256\n",
+                     "ARG PARITY_CARRIER=0\n", carrier):
+        if text.count(fragment) != 1:
+            raise ValueError("expected exactly one approved parity runtime fragment")
+        text = text.replace(fragment, "", 1)
+    return text
+
+
 def _without_sources_notice(text: str) -> str:
     begin = "# --- sources notice (begin)\n"
     end = "# --- sources notice (end)\n"
@@ -544,13 +614,14 @@ class DockerfileTargetTest(unittest.TestCase):
 
     def test_release_stage_matches_original_runtime_after_notice_and_harness_changes(self):
         text = _without_guard_policy(_without_sources_notice(_without_stage_alias(self.named["release"])))
+        text = _without_parity_carrier(text)
         text = _restore_bookworm_runtime_base(text)
         text = _restore_original_doc_cleanup(text)
         text = _restore_original_harness_manifest(text)
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
                          "after restoring the one /usr/share/doc token and removing the marked "
-                         "notice, exact trixie FROM line and approved harness changes, release must remain "
+                         "notice, exact trixie FROM line and approved harness and parity changes, release must remain "
                          "byte for byte the original runtime stage")
 
     def test_runtime_base_normalization_refuses_other_from_changes(self):
@@ -611,6 +682,7 @@ class DockerfileTargetTest(unittest.TestCase):
         stripped = _without_sources_notice(text)
         self.assertNotEqual(text, stripped)
         stripped = _without_guard_policy(stripped)
+        stripped = _without_parity_carrier(stripped)
         stripped = _restore_bookworm_runtime_base(stripped)
         stripped = _restore_original_doc_cleanup(stripped)
         stripped = _restore_original_harness_manifest(stripped)
@@ -645,9 +717,75 @@ class DockerfileTargetTest(unittest.TestCase):
         self.assertNotEqual(altered, text)
         normalized = _restore_original_harness_manifest(
             _restore_original_doc_cleanup(_restore_bookworm_runtime_base(
-                _without_guard_policy(_without_sources_notice(altered)))))
+                _without_parity_carrier(_without_guard_policy(_without_sources_notice(altered))))))
         self.assertNotEqual(hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
+        # Extra commands or instructions inside the carrier must be refused,
+        # rather than stripped along with the approved carrier additions.
+        for anchor, replacement in (
+                ("ENV PYTHONDONTWRITEBYTECODE=1\n",
+                 "ENV PYTHONDONTWRITEBYTECODE=1\nRUN mkdir -p /unexpected\n"),
+                ("      cd /opt/pineforge/parity; \\\n",
+                 "      cd /opt/pineforge/parity; mkdir -p /unexpected; \\\n"),
+                ("cp -R --no-preserve=mode,ownership,timestamps /tmp/pineforge-context/docker/parity/.",
+                 "cp -R --no-preserve=mode,ownership,timestamps /tmp/pineforge-context/docker/unreviewed/."),
+                ("chmod 0755 /opt/pineforge/parity;",
+                 "chmod 0700 /opt/pineforge/parity;"),
+                ("-type f -exec chmod 0644 {} +;",
+                 "-type f -exec chmod 0600 {} +;"),
+                ('if [ "${actual%% *}" != "${descriptor_sha256}" ]; then',
+                 'if [ "${actual%% *}" != "${descriptor_sha256}" ]; then true;'),
+                ("if ! sha256sum -c --strict PARITY-SHA256SUMS;",
+                 "if ! true;"),
+                ("ARG PARITY_DESCRIPTOR_SHA256\n", ""),
+                ("ARG PARITY_DESCRIPTOR_SHA256\n",
+                 "ARG PARITY_DESCRIPTOR_SHA256\nARG PARITY_DESCRIPTOR_SHA256\n"),
+                ("ARG PARITY_CARRIER=0\n", ""),
+                ("ARG PARITY_CARRIER=0\n", "ARG PARITY_CARRIER=0\nARG PARITY_CARRIER=0\n")):
+            with self.subTest(parity_instruction=replacement):
+                self.assertEqual(text.count(anchor), 1)
+                altered = text.replace(anchor, replacement, 1)
+                self.assertNotEqual(altered, text)
+                with self.assertRaisesRegex(ValueError, "approved parity runtime fragment"):
+                    _without_parity_carrier(altered)
+
+    def test_parity_carrier_arguments_refuse_invalid_or_ignored_bindings(self):
+        block = _run_block(self.named["release"].text, "sha256sum -c --strict PARITY-SHA256SUMS")
+        script = block[len("RUN "):].replace("\\\n", "")
+        self.assertNotIn("\n", script, "exercise the complete logical parity RUN")
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash, "bash is required to exercise the actual parity RUN")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertIn("/opt/pineforge/parity", script)
+            script = script.replace("/opt/pineforge/parity", shlex.quote(str(root / "absent-parity")))
+
+            def replay(carrier, binding):
+                environment = {"PATH": os.environ.get("PATH", os.defpath)}
+                if carrier is not None:
+                    environment["PARITY_CARRIER"] = carrier
+                if binding is not None:
+                    environment["PARITY_DESCRIPTOR_SHA256"] = binding
+                return subprocess.run(
+                    [bash, "--noprofile", "--norc", "-c", script], cwd=root,
+                    env=environment, stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, timeout=60)
+
+            rows = [(value, None, "parity carrier must be 0 or 1")
+                    for value in ("", "2", "-1", "true", "01", "1\n")]
+            rows += [("0", "a" * 64, "parity descriptor requires the carrier"),
+                     (None, "a" * 64, "parity descriptor requires the carrier")]
+            rows += [("1", value, "parity descriptor hash differs from binding")
+                     for value in ("A" * 64, "a" * 63, "a" * 64 + "\n")]
+            for carrier, binding, message in rows:
+                with self.subTest(carrier=carrier, binding=binding):
+                    control = replay("0", None)
+                    self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
+                    done = replay(carrier, binding)
+                    self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertEqual(done.stderr.splitlines(), [message])
+                    self.assertEqual(done.stdout, "")
+            self.assertFalse((root / "absent-parity").exists())
 
     def test_hpo_inherits_release_and_retains_its_runtime_contract(self):
         hpo = self.named["hpo"]
