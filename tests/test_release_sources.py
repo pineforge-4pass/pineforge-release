@@ -453,7 +453,41 @@ class HpoArtifactArgumentsTest(unittest.TestCase):
                 end = text.index("fi;", start) + len("fi;")
                 guard = text[start:end]
                 self.assertIn("sha256sum -c --strict", guard)
-                self.assertLess(text.index("curl -fsSL"), start)
+                # Docker's logical-line parser removes continuation indentation;
+                # identify the guard's RUN by its unique declared argument.
+                runs = [body for keyword, body in stages[stage].instructions
+                        if keyword == "RUN"
+                        and 'if [ -n "${' + argument + '}" ]; then' in body]
+                self.assertEqual(len(runs), 1)
+                lexer = shlex.shlex(runs[0], posix=True, punctuation_chars=";&|")
+                lexer.whitespace_split = True
+                commands = [[]]
+                for word in lexer:
+                    if word in {";", "&&", "||"}:
+                        commands.append([])
+                    else:
+                        commands[-1].append(word)
+                acquisitions = [(index, command) for index, command in enumerate(commands)
+                                if command[:3] == [
+                                    "python3", "-I", "/tmp/fetch_release_asset.py",
+                                ]]
+                name = ("pineforge_hpo-${HPO_VERSION}-py3-none-any.whl"
+                        if stage == "hpo-wheel" else "pineforge_hpo-${HPO_VERSION}.tar.gz")
+                output = "$wheel" if stage == "hpo-wheel" else "/tmp/hpo-source.tar.gz"
+                self.assertEqual([command for _, command in acquisitions], [[
+                    "python3", "-I", "/tmp/fetch_release_asset.py",
+                    "--repo", "pineforge-4pass/pineforge-hpo", "--tag", "v${HPO_VERSION}",
+                    "--name", name, "--output", output,
+                    "--retries", "${ASSET_FETCH_RETRIES}",
+                    "--retry-delay", "${ASSET_FETCH_RETRY_DELAY}",
+                    "--api-root", "https://api.github.com",
+                    "--browser-root", "https://github.com",
+                    "--token-file", "/run/secrets/github_token",
+                ]])
+                guard_positions = [index for index, command in enumerate(commands)
+                                   if command[:4] == ["if", "[", "-n", "${" + argument + "}"]]
+                self.assertEqual(len(guard_positions), 1)
+                self.assertLess(acquisitions[0][0], guard_positions[0])
                 self.assertLess(end, text.index(consume))
                 # Run only the real checksum guard, on explicit fixture bytes;
                 # downloads, extraction and installation remain outside it.

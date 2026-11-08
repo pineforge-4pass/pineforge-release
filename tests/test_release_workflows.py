@@ -1101,6 +1101,125 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         cls.steps = cls.job["steps"]
         cls.named = {step["name"]: step for step in cls.steps if "name" in step}
 
+    ASSET_BUILDS = (
+        "Inspect release amd64", "Inspect release arm64",
+        "Inspect hpo amd64", "Inspect hpo arm64",
+        "Build + push (multi-arch)", "Build + push hpo (multi-arch)",
+    )
+
+    def assert_asset_read_token_wiring(self, workflow):
+        self.assertEqual(workflow.get("permissions"), {"contents": "read"})
+        job = workflow["jobs"]["publish"]
+        self.assertEqual(job.get("environment"), "release-automation")
+        self.assertEqual(job.get("permissions"), {"contents": "write", "packages": "write"})
+        steps = job["steps"]
+        mints = [step for step in steps
+                 if step.get("uses", "").startswith("actions/create-github-app-token@")]
+        self.assertEqual(mints, [{
+            "name": "Mint producer asset read token",
+            "id": "asset_token",
+            "uses": "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
+            "with": {
+                "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
+                "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
+                "owner": "${{ github.repository_owner }}",
+                "repositories": "pineforge-engine\npineforge-hpo\n",
+                "permission-contents": "read",
+                "github-api-url": "https://api.github.com",
+            },
+        }])
+        mint_index = steps.index(mints[0])
+        checkout = next(index for index, step in enumerate(steps)
+                        if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertLess(checkout, mint_index)
+        builds = [(index, step) for index, step in enumerate(steps)
+                  if step.get("uses", "").startswith("docker/build-push-action@")]
+        self.assertEqual([step.get("name") for _, step in builds], list(self.ASSET_BUILDS))
+        for index, step in builds:
+            self.assertLess(mint_index, index)
+            self.assertEqual(step["with"].get("secrets"),
+                             "github_token=${{ steps.asset_token.outputs.token }}\n")
+            self.assertNotIn("secret-envs", step["with"])
+            self.assertNotIn("secret-files", step["with"])
+
+        def reference_paths(node, needle, path=()):
+            if isinstance(node, dict):
+                return [found for key, value in node.items()
+                        for found in reference_paths(value, needle, (*path, key))]
+            if isinstance(node, list):
+                return [found for index, value in enumerate(node)
+                        for found in reference_paths(value, needle, (*path, index))]
+            return [path] if isinstance(node, str) and needle in node else []
+
+        # Token output is confined to the six BuildKit inputs, never a job
+        # output, environment, build ARG, script, label or other action input.
+        self.assertCountEqual(
+            reference_paths(workflow, "steps.asset_token.outputs.token"),
+            [("jobs", "publish", "steps", index, "with", "secrets") for index, _ in builds],
+        )
+        for secret, field in (("PINEFORGE_APP_ID", "app-id"),
+                              ("PINEFORGE_APP_PRIVATE_KEY", "private-key")):
+            self.assertEqual(reference_paths(workflow, "secrets." + secret),
+                             [("jobs", "publish", "steps", mint_index, "with", field)])
+
+    def test_producer_read_token_is_scoped_and_only_enters_buildkit_with_mutation_controls(self):
+        self.assert_asset_read_token_wiring(self.workflow)
+        mint_index = next(index for index, step in enumerate(self.steps)
+                          if step.get("id") == "asset_token")
+        for field, value in (
+                ("permission-contents", "write"),
+                ("permission-actions", "read"),
+                ("repositories", ""),
+                ("repositories", "pineforge-engine\npineforge-hpo\npineforge-release\n"),
+                ("owner", "unapproved-owner"),
+                ("app-id", "${{ secrets.NEW_APP_ID }}"),
+                ("private-key", "${{ secrets.NEW_APP_KEY }}"),
+                ("github-api-url", "https://unapproved.invalid")):
+            mutant = copy.deepcopy(self.workflow)
+            mutant["jobs"]["publish"]["steps"][mint_index]["with"][field] = value
+            with self.subTest(mint_field=field, value=value), self.assertRaises(AssertionError):
+                self.assert_asset_read_token_wiring(mutant)
+        for mode in ("missing", "late", "conditional", "softened"):
+            mutant = copy.deepcopy(self.workflow)
+            steps = mutant["jobs"]["publish"]["steps"]
+            if mode in {"missing", "late"}:
+                mint = steps.pop(mint_index)
+                if mode == "late":
+                    steps.append(mint)
+            elif mode == "conditional":
+                steps[mint_index]["if"] = "steps.pair.outputs.target == 'hpo'"
+            else:
+                steps[mint_index]["continue-on-error"] = "true"
+            with self.subTest(mint=mode), self.assertRaises(AssertionError):
+                self.assert_asset_read_token_wiring(mutant)
+        for name in self.ASSET_BUILDS:
+            for mode in ("missing", "write-token", "build-arg", "environment"):
+                mutant = copy.deepcopy(self.workflow)
+                step = next(row for row in mutant["jobs"]["publish"]["steps"]
+                            if row.get("name") == name)
+                secret = step["with"].pop("secrets")
+                if mode == "write-token":
+                    step["with"]["secrets"] = "github_token=${{ github.token }}\n"
+                elif mode == "build-arg":
+                    step["with"]["secrets"] = secret
+                    step["with"]["build-args"] += secret
+                elif mode == "environment":
+                    step["with"]["secrets"] = secret
+                    step["env"] = {"GH_TOKEN": "${{ steps.asset_token.outputs.token }}"}
+                with self.subTest(build=name, mutation=mode), self.assertRaises(AssertionError):
+                    self.assert_asset_read_token_wiring(mutant)
+        for mode in ("unprotected", "permissions", "job-output"):
+            mutant = copy.deepcopy(self.workflow)
+            job = mutant["jobs"]["publish"]
+            if mode == "unprotected":
+                job.pop("environment")
+            elif mode == "permissions":
+                job["permissions"]["actions"] = "write"
+            else:
+                job["outputs"]["asset_token"] = "${{ steps.asset_token.outputs.token }}"
+            with self.subTest(job=mode), self.assertRaises(AssertionError):
+                self.assert_asset_read_token_wiring(mutant)
+
     def test_toolchain_file_is_validated_and_exported_to_the_hpo_build(self):
         reader = self.named["Read hpo toolchain arguments"]
         self.assertEqual(reader["id"], "toolchain")
@@ -1148,7 +1267,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                     self.assertEqual(config["load"], "true")
                     self.assertEqual(config["push"], "false")
                     self.assertEqual(config["tags"], f"pineforge-source-inspect:{arch}")
-                    for key in ("context", "file", "target", "build-args", "labels"):
+                    for key in ("context", "file", "target", "build-args", "labels", "secrets"):
                         self.assertEqual(config.get(key), real["with"].get(key), key)
                     scope = f"type=gha,scope={target}-{arch}"
                     self.assertEqual(config["cache-from"], scope,

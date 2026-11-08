@@ -2,9 +2,11 @@
 
 Extraction is deliberately mechanical: find the RUN containing the engine's
 ``sha256sum -c "${base}.tar.gz.sha256"``, keep all its physical continuation
-lines, remove only ``RUN `` and Docker's backslash-newline continuations, and
+lines, remove only ``RUN ``, the explicit BuildKit secret mount, and Docker's
+backslash-newline continuations, and
 execute the ENTIRE instruction, including its real tar/mkdir/cp consumers.
 There is no replacement download program, verifier, curl shim, or helper import.
+The copied helper is executed as a real subprocess from its repository path.
 
 The only shell substitutions are URL/destination roots:
 
@@ -12,15 +14,16 @@ The only shell substitutions are URL/destination roots:
 * https://api.github.com -> its /api root, if present in the actual RUN;
 * cd /tmp and the quoted /tmp/ sources -> CR918_FIXTURE_TMP;
 * /opt/pineforge -> CR918_FIXTURE_INSTALL.
+* /tmp/fetch_release_asset.py -> the actual COPY source in this repository;
+* /run/secrets/github_token -> a file containing only synthetic read-token bytes.
 
 At the Phase A baseline the instruction contains two real browser curl calls,
 then the real sha256sum, then extraction/copy. The API fixture is available but
 the harness never calls it on the product's behalf. The proposed public retry
 inputs are ASSET_FETCH_RETRIES (N additional attempts) and
-ASSET_FETCH_RETRY_DELAY (D seconds); the baseline ignores them. GH_TOKEN contains
-only a synthetic fixture read token. Phase B must map its actual copied helper
-and reviewed secret input if it changes the Dockerfile wiring; this module does
-not invent or import that future helper.
+ASSET_FETCH_RETRY_DELAY (D seconds); the baseline ignores them. The candidate's
+secret file contains only a synthetic fixture read token. This maps the actual
+helper and secret paths without changing the helper's behavior.
 
 The server accepts only enumerated release/asset routes, validates API auth and
 octet-stream Accept, and serves nonempty fixture bytes. Expected hashes come
@@ -54,6 +57,8 @@ from urllib.parse import urlsplit
 REPO = Path(__file__).resolve().parent.parent
 ENGINE_CHECK = 'sha256sum -c "${base}.tar.gz.sha256"'
 ACQUISITION_REASON = "ASSET_FETCH_FAILED"
+HELPER_COPY = "COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py"
+SECRET_MOUNT = "--mount=type=secret,id=github_token "
 
 
 @dataclass(frozen=True)
@@ -251,6 +256,9 @@ def _engine_instruction(dockerfile: str) -> str:
     if len(matches) != 1:
         raise RuntimeError("fixture setup: expected one actual engine checksum RUN")
     script = matches[0][len("RUN "):].replace("\\\n", "").rstrip("\n")
+    if not script.startswith(SECRET_MOUNT):
+        raise RuntimeError("fixture setup: expected the actual optional secret mount")
+    script = script[len(SECRET_MOUNT):]
     if "\n" in script:
         raise RuntimeError("fixture setup: engine RUN is not one logical instruction")
     return script
@@ -289,12 +297,22 @@ class _Observation:
 class ReleaseAssetFetchTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.script = _engine_instruction(
-            (REPO / "docker" / "Dockerfile").read_text(encoding="utf-8"),
-        )
+        dockerfile = (REPO / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        engine = dockerfile.split("FROM debian:trixie-slim AS engine\n", 1)[1].split(
+            "\nFROM ", 1,
+        )[0]
+        if engine.splitlines().count(HELPER_COPY) != 1:
+            raise RuntimeError("fixture setup: expected the explicit engine helper COPY")
+        cls.helper = REPO / "scripts" / "fetch_release_asset.py"
+        if not cls.helper.is_file():
+            raise RuntimeError("fixture setup: actual copied helper is missing")
+        cls.script = _engine_instruction(dockerfile)
+        if (cls.script.count("python3 -I /tmp/fetch_release_asset.py ") != 2
+                or cls.script.count("--token-file /run/secrets/github_token") != 2):
+            raise RuntimeError("fixture setup: expected both real helper/secret invocations")
         # Use system binaries, not any test or lane PATH shims.
         binaries = {name: shutil.which(name, path=os.defpath)
-                    for name in ("bash", "curl", "sha256sum", "tar", "gzip", "mkdir", "cp")}
+                    for name in ("bash", "python3", "curl", "sha256sum", "tar", "gzip", "mkdir", "cp")}
         missing = [name for name, path in binaries.items() if path is None]
         if missing:
             raise RuntimeError("fixture setup: missing real tools: " + ", ".join(missing))
@@ -305,6 +323,7 @@ class ReleaseAssetFetchTest(unittest.TestCase):
         # An explicit empty curl config and a whitelist environment prevent
         # inherited credentials, proxies, startup scripts, or curl configuration.
         (root / ".curlrc").write_text("", encoding="utf-8")
+        (root / "github_token").write_text(payload.token, encoding="ascii")
         return {
             "PATH": os.defpath,
             "LC_ALL": "C",
@@ -312,9 +331,10 @@ class ReleaseAssetFetchTest(unittest.TestCase):
             "NO_PROXY": "127.0.0.1",
             "ENGINE_VERSION": payload.version,
             "TARGETARCH": payload.arch,
-            "GH_TOKEN": payload.token,
             "ASSET_FETCH_RETRIES": str(retries),
             "ASSET_FETCH_RETRY_DELAY": str(delay),
+            "CR918_FIXTURE_HELPER": str(self.helper),
+            "CR918_FIXTURE_TOKEN_FILE": str(root / "github_token"),
             "CR918_FIXTURE_TMP": str(root / "download"),
             "CR918_FIXTURE_INSTALL": str(root / "installed"),
         }
@@ -326,6 +346,8 @@ class ReleaseAssetFetchTest(unittest.TestCase):
         script = self.script.replace(
             "https://github.com", release.origin + "/browser",
         ).replace("https://api.github.com", release.origin + "/api")
+        script = script.replace("/tmp/fetch_release_asset.py", '"${CR918_FIXTURE_HELPER}"')
+        script = script.replace("/run/secrets/github_token", '"${CR918_FIXTURE_TOKEN_FILE}"')
         script = script.replace("cd /tmp;", 'cd "${CR918_FIXTURE_TMP}";')
         script = script.replace('"/tmp/', '"${CR918_FIXTURE_TMP}/')
         script = script.replace("/opt/pineforge", '"${CR918_FIXTURE_INSTALL}"')
@@ -343,6 +365,8 @@ class ReleaseAssetFetchTest(unittest.TestCase):
             stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=30,
         )
+        self.assertNotIn(release.payload.token, completed.stdout)
+        self.assertNotIn(release.payload.token, completed.stderr)
         observed = _Observation(completed, release.requests(after))
         print("CR918 " + json.dumps({"case": label, **observed.proof()}, sort_keys=True),
               flush=True)
@@ -351,6 +375,10 @@ class ReleaseAssetFetchTest(unittest.TestCase):
     def _assert_known_routes(self, observed: _Observation):
         self.assertNotIn("unknown", [request.route for request in observed.requests],
                          "product requested an unconfigured fixture route")
+        for request in observed.requests:
+            if request.route.startswith("browser-"):
+                self.assertFalse(request.authenticated,
+                                 "the read token reached the public browser fallback")
 
     def _assert_bytes_and_consumed(self, root: Path, payload: _Payload,
                                    observed: _Observation):
