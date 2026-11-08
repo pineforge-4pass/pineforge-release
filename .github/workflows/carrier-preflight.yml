@@ -1,0 +1,47 @@
+name: Carrier amd64 preflight
+
+on:
+  pull_request:
+    types: [opened]
+    paths:
+      - .github/workflows/carrier-preflight.yml
+
+permissions:
+  contents: read
+
+jobs:
+  carrier-amd64:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout preflight
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: control
+          persist-credentials: false
+      - name: Checkout build source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 83580ac78ec5e3ea17ee7032ca08469549193db9
+          path: source
+          persist-credentials: false
+      - name: Build carrier and read it as default user
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(uname -m)" = x86_64
+          mkdir -p "$RUNNER_TEMP/carrier-proof"
+          python3 ../control/scripts/carrier_preflight.py "$RUNNER_TEMP/carrier-proof"
+      - name: Preserve carrier logs in the workflow log
+        if: always()
+        run: |
+          for name in harness-sync.log build.log default-user-listing.log default-user-inventory.log image-proof.json; do
+            if [ -f "$RUNNER_TEMP/carrier-proof/$name" ]; then
+              cat "$RUNNER_TEMP/carrier-proof/$name"
+            fi
+          done
