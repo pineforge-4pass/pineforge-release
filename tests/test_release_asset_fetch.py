@@ -1,4 +1,4 @@
-"""CR-918 acquisition regressions, replaying the real engine Dockerfile RUN.
+"""Release asset acquisition regressions, replaying the real engine Dockerfile RUN.
 
 Extraction is deliberately mechanical: find the RUN containing the engine's
 ``sha256sum -c "${base}.tar.gz.sha256"``, keep all its physical continuation
@@ -12,8 +12,8 @@ The only shell substitutions are URL/destination roots:
 
 * https://github.com -> the loopback server's /browser root;
 * https://api.github.com -> its /api root, if present in the actual RUN;
-* cd /tmp and the quoted /tmp/ sources -> CR918_FIXTURE_TMP;
-* /opt/pineforge -> CR918_FIXTURE_INSTALL.
+* cd /tmp and the quoted /tmp/ sources -> ASSET_FIXTURE_TMP;
+* /opt/pineforge -> ASSET_FIXTURE_INSTALL.
 * /tmp/fetch_release_asset.py -> the actual COPY source in this repository;
 * /run/secrets/github_token -> a file containing only synthetic read-token bytes.
 
@@ -322,7 +322,7 @@ class ReleaseAssetFetchTest(unittest.TestCase):
         if (cls.script.count("python3 -I /tmp/fetch_release_asset.py ") != 2
                 or cls.script.count("--token-file /run/secrets/github_token") != 2):
             raise RuntimeError("fixture setup: expected both real helper/secret invocations")
-        # Use system binaries, not any test or lane PATH shims.
+        # Use system binaries, not any test PATH shims.
         binaries = {name: shutil.which(name, path=os.defpath)
                     for name in ("bash", "python3", "curl", "sha256sum", "tar", "gzip", "mkdir", "cp")}
         missing = [name for name, path in binaries.items() if path is None]
@@ -346,10 +346,10 @@ class ReleaseAssetFetchTest(unittest.TestCase):
             "TARGETARCH": payload.arch,
             "ASSET_FETCH_RETRIES": str(retries),
             "ASSET_FETCH_RETRY_DELAY": str(delay),
-            "CR918_FIXTURE_HELPER": str(self.helper),
-            "CR918_FIXTURE_TOKEN_FILE": str(root / "github_token"),
-            "CR918_FIXTURE_TMP": str(root / "download"),
-            "CR918_FIXTURE_INSTALL": str(root / "installed"),
+            "ASSET_FIXTURE_HELPER": str(self.helper),
+            "ASSET_FIXTURE_TOKEN_FILE": str(root / "github_token"),
+            "ASSET_FIXTURE_TMP": str(root / "download"),
+            "ASSET_FIXTURE_INSTALL": str(root / "installed"),
         }
 
     def _run(self, label: str, root: Path, release: _LocalRelease, *,
@@ -359,11 +359,11 @@ class ReleaseAssetFetchTest(unittest.TestCase):
         script = self.script.replace(
             "https://github.com", release.origin + "/browser",
         ).replace("https://api.github.com", release.origin + "/api")
-        script = script.replace("/tmp/fetch_release_asset.py", '"${CR918_FIXTURE_HELPER}"')
-        script = script.replace("/run/secrets/github_token", '"${CR918_FIXTURE_TOKEN_FILE}"')
-        script = script.replace("cd /tmp;", 'cd "${CR918_FIXTURE_TMP}";')
-        script = script.replace('"/tmp/', '"${CR918_FIXTURE_TMP}/')
-        script = script.replace("/opt/pineforge", '"${CR918_FIXTURE_INSTALL}"')
+        script = script.replace("/tmp/fetch_release_asset.py", '"${ASSET_FIXTURE_HELPER}"')
+        script = script.replace("/run/secrets/github_token", '"${ASSET_FIXTURE_TOKEN_FILE}"')
+        script = script.replace("cd /tmp;", 'cd "${ASSET_FIXTURE_TMP}";')
+        script = script.replace('"/tmp/', '"${ASSET_FIXTURE_TMP}/')
+        script = script.replace("/opt/pineforge", '"${ASSET_FIXTURE_INSTALL}"')
         if "/tmp" in script or "/opt/pineforge" in script:
             raise RuntimeError("fixture setup: unredirected engine destination")
         urls = re.findall(r'https?://[^\s"\']+', script)
@@ -385,7 +385,7 @@ class ReleaseAssetFetchTest(unittest.TestCase):
         self.assertNotIn(release.payload.token, completed.stdout)
         self.assertNotIn(release.payload.token, completed.stderr)
         observed = _Observation(completed, release.requests(after))
-        print("CR918 " + json.dumps({"case": label, **observed.proof()}, sort_keys=True),
+        print("ASSET_FETCH_PROOF " + json.dumps({"case": label, **observed.proof()}, sort_keys=True),
               flush=True)
         return observed
 
@@ -417,7 +417,7 @@ class ReleaseAssetFetchTest(unittest.TestCase):
             "synthetic token appeared in helper output",
         )
         observed = _Observation(completed, release.requests(after))
-        print("CR918 " + json.dumps({"case": label, **observed.proof()}, sort_keys=True),
+        print("ASSET_FETCH_PROOF " + json.dumps({"case": label, **observed.proof()}, sort_keys=True),
               flush=True)
         return observed
 
@@ -541,7 +541,7 @@ class ReleaseAssetFetchTest(unittest.TestCase):
                         capture_output=True, text=True, timeout=10,
                     )
                     probe_observed = _Observation(probe, release.requests())
-                    print("CR918 " + json.dumps(
+                    print("ASSET_FETCH_PROOF " + json.dumps(
                         {"case": "independent-browser-rejection", **probe_observed.proof()},
                         sort_keys=True,
                     ), flush=True)
@@ -685,7 +685,7 @@ class ReleaseAssetFetchTest(unittest.TestCase):
                 observed = self._run("cross-host-redirect", Path(tmp), release,
                                      retries=0, delay=1)
             received = receiver.requests()
-            print("CR918 " + json.dumps(
+            print("ASSET_FETCH_PROOF " + json.dumps(
                 {"case": "cross-host-redirect-receiver",
                  **_Observation(observed.completed, received).proof()}, sort_keys=True,
             ), flush=True)

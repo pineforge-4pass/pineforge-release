@@ -472,6 +472,17 @@ def _pinned_packages(stage: DockerStage) -> dict[str, str]:
     return packages
 
 
+def _apt_packages(stage: DockerStage) -> set[str]:
+    """Read exact package names from the stage's actual apt install commands."""
+    return {
+        token.split("=", 1)[0]
+        for keyword, body in stage.instructions if keyword == "RUN"
+        for match in re.finditer(
+            r"apt-get install -y --no-install-recommends\s+(.+?)(?:;|&&)", body)
+        for token in shlex.split(match[1])
+    }
+
+
 def _read_toolchain_arguments(text: str) -> dict[str, str]:
     """Plain NAME=VALUE data only; never evaluate this file as shell code."""
     arguments = {}
@@ -699,6 +710,38 @@ RUN --mount=type=secret,id=github_token set -eu; \
                     mutant = self.dockerfile.replace(stage, altered, 1)
                     with self.assertRaises(AssertionError):
                         self.assert_asset_fetch_wiring(mutant)
+
+    def assert_asset_fetch_python_dependencies(self, dockerfile):
+        named = {stage.name: stage for stage in _dockerfile_stages(dockerfile)}
+        for target, provider in (("engine", "engine"),
+                                 ("hpo-wheel", "codegen"),
+                                 ("hpo-native", "hpo-toolchain")):
+            if target != provider:
+                self.assertEqual(named[target].base, provider,
+                                 target + ": Python must come from its FROM ancestor")
+            self.assertIn("python3", _apt_packages(named[provider]),
+                          target + ": " + provider + " must explicitly install python3")
+
+    def test_asset_fetch_python_dependencies_and_mutation_controls(self):
+        self.assert_asset_fetch_python_dependencies(self.dockerfile)
+        for name, original, replacement in (
+                ("codegen", "python3 python3-pip", "python3-pip"),
+                ("hpo-toolchain", " python3;", ";")):
+            with self.subTest(provider=name):
+                stage = self.named[name].text
+                self.assertEqual(stage.count(original), 1)
+                altered = stage.replace(original, replacement, 1)
+                self.assertNotEqual(altered, stage)
+                mutant = self.dockerfile.replace(stage, altered, 1)
+                self.assertNotEqual(mutant, self.dockerfile)
+                named = {stage.name: stage for stage in _dockerfile_stages(mutant)}
+                self.assertEqual(named["hpo-wheel"].base, "codegen")
+                self.assertEqual(named["hpo-native"].base, "hpo-toolchain")
+                self.assertNotIn("python3", _apt_packages(named[name]))
+                if name == "codegen":
+                    self.assertIn("python3-pip", _apt_packages(named[name]))
+                with self.assertRaisesRegex(AssertionError, "explicitly install python3"):
+                    self.assert_asset_fetch_python_dependencies(mutant)
 
     def test_last_stage_is_a_no_op_release_alias_with_the_original_entrypoint(self):
         last = self.stages[-1]

@@ -36,7 +36,7 @@ FROM debian:trixie-slim AS codegen
 ARG CODEGEN_VERSION
 RUN test -n "${CODEGEN_VERSION}" || { echo "ERROR: CODEGEN_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3-pip ca-certificates \
+        python3 python3-pip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN pip3 install --break-system-packages --no-cache-dir -U \
         --target /opt/codegen "pineforge-codegen==${CODEGEN_VERSION}"
