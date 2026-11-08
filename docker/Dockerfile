@@ -179,13 +179,17 @@ RUN set -eu; \
 
 # The parity carrier is separate from the engine harness. SUMS checks exactly
 # the descriptor and six reviewed payloads; it is excluded from its own list.
+# Runtime inventory reads these files; no image entrypoint executes them.
+# This root RUN creates root-owned files without the stage's private metadata.
 RUN --mount=type=bind,source=.,target=/tmp/pineforge-context,ro \
     set -eu; \
     if [ "${PARITY_CARRIER:-0}" = 1 ]; then \
       if [ -L /tmp/pineforge-context/docker/parity ]; then echo "parity directory contains a symlink" >&2; exit 1; fi; \
       if [ ! -d /tmp/pineforge-context/docker/parity ]; then echo "parity directory is missing required file" >&2; exit 1; fi; \
       mkdir -p /opt/pineforge/parity; \
-      cp -a /tmp/pineforge-context/docker/parity/. /opt/pineforge/parity/; \
+      cp -R --no-preserve=mode,ownership,timestamps /tmp/pineforge-context/docker/parity/. /opt/pineforge/parity/; \
+      chmod 0755 /opt/pineforge/parity; \
+      find /opt/pineforge/parity -type f -exec chmod 0644 {} +; \
     fi
 ENV PYTHONDONTWRITEBYTECODE=1
 RUN set -eu; \
