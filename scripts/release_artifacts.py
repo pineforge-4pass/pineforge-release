@@ -255,14 +255,8 @@ def producer(client, component, version):
             checksum = asset(client, obj, name + ".sha256", repo).decode("ascii").split()
             require(len(checksum) == 2 and checksum[0] == sha256(raw) and checksum[1].lstrip("*") == name,
                     "engine tarball checksum differs")
-        if v >= pair.parse(parity.PARITY_CAPABILITY_FROM):
-            identity = parity_source_proof(client, str(v), PARITY_BUNDLE_ROOT)
-            require(identity["engine_commit"] == commit, "parity descriptor commit differs from engine tag")
-            inventory = {
-                **identity["payload_sha256"],
-                parity.DESCRIPTOR_NAME: identity["descriptor_sha256"],
-                parity.SUMS_NAME: identity["sums_sha256"],
-            }
+        # Pre-tag/reconcile callers prepare their source proof separately.
+        # Publish bindings independently prove and inventory their local bundle.
         return pin, inventory
     if component == "codegen":
         meta = decode(client.download(f"https://pypi.org/pypi/pineforge-codegen/{v.pep440}/json", {"pypi.org"}))

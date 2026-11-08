@@ -129,6 +129,24 @@ class HandleUpstreamTest(unittest.TestCase):
         self.assertIn('if [ "$RETAG" = true ]; then', body)
         self.assertLess(body.index('if [ "$RETAG" = true ]; then'), body.index('printf \'%s\\n\' "$next" > VERSION'))
 
+    def test_engine_verification_covers_every_completing_event_before_tagging(self):
+        steps = _workflow("handle-upstream.yml")["jobs"]["bump"]["steps"]
+        named = {row.get("name"): row for row in steps}
+        dispatched = named["Verify the dispatched producer artifacts"]
+        completing = named.get("Verify the completing engine before tagging")
+        self.assertIsNotNone(completing)
+        self.assertEqual(dispatched["run"],
+                         'python3 scripts/release_pipeline.py producer "$COMPONENT" "$VER"')
+        self.assertEqual(completing["if"],
+                         "steps.decide.outputs.mode == 'bump' && steps.in.outputs.component != 'engine'")
+        self.assertEqual(completing["run"], 'python3 scripts/release_pipeline.py producer engine "$E"')
+        self.assertEqual(completing["env"]["E"], "${{ steps.decide.outputs.engine }}")
+        decide = next(row for row in steps if row.get("id") == "decide")
+        self.assertLess(steps.index(dispatched), steps.index(decide))
+        self.assertLess(steps.index(completing), steps.index(named["Bump VERSION, commit, tag"]))
+        for step in (dispatched, completing, named["Bump VERSION, commit, tag"]):
+            self.assertNotIn("continue-on-error", step)
+
     def test_the_harness_is_synced_by_the_script_from_the_pinned_tag(self):
         body = _step(self.text, "Bump VERSION")
         sync = 'bash scripts/sync-harness.sh "${E}"'

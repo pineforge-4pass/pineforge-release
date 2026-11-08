@@ -61,8 +61,8 @@ def alternate_identity(identity):
     return {**descriptor, "descriptor_sha256": digest(raw), "sums_sha256": digest(sums)}
 
 
-def wire_case(root):
-    manifest = fixture_manifest(PARITY_CAPABILITY_FROM)
+def wire_case(root, *, release=PARITY_CAPABILITY_FROM):
+    manifest = fixture_manifest(release)
     write_bundle(root, descriptor_commit=manifest["versions"]["engine"]["commit"])
     identity, inventory = fixture_identity(root)
     manifest["versions"]["engine"]["parity"] = copy.deepcopy(identity)
@@ -130,6 +130,45 @@ class ParityWireTests(unittest.TestCase):
         self.assertEqual(registry.operations, [])
         self.assertTrue(row["draft"])
         self.assertIsNone(store.read(row, contract.ASSET))
+
+    def test_canonical_cutoff_controls_release_capability_and_wire_acceptance(self):
+        for cutoff, cases in (
+                ("1.11.0", (("1.10.1", False), ("1.11.0-rc.1", False),
+                            ("1.11.0", True), ("1.11.1", True))),
+                ("1.11.1", (("1.11.0", False), ("1.11.1-rc.1", False),
+                            ("1.11.1", True), ("1.11.2", True)))):
+            with patch("parity_bundle.PARITY_CAPABILITY_FROM", cutoff):
+                for release, capable in cases:
+                    with self.subTest(cutoff=cutoff, release=release), \
+                            tempfile.TemporaryDirectory() as temporary:
+                        self.assertIs(contract.parity_capable(release), capable)
+                        legacy = fixture_manifest(release)
+                        legacy_built = candidate(legacy)
+                        manifest, built, _, _ = wire_case(
+                            Path(temporary) / "parity", release=release)
+                        if capable:
+                            accepted, accepted_built = manifest, built
+                            with self.assertRaisesRegex(
+                                    contract.Invalid, "^legacy manifest predates parity capability$"):
+                                contract.validate(legacy)
+                            with self.assertRaisesRegex(
+                                    contract.Invalid, "^parity capability missing for release$"):
+                                contract.validate_candidate(legacy_built)
+                            with self.assertRaisesRegex(
+                                    contract.Invalid, "^legacy manifest predates parity capability$"):
+                                contract.pair_payload(canonical(legacy), canonical(legacy_built))
+                        else:
+                            accepted, accepted_built = legacy, legacy_built
+                            with self.assertRaisesRegex(contract.Invalid, "^unexpected object fields$"):
+                                contract.validate(manifest)
+                            with self.assertRaisesRegex(contract.Invalid, "^unexpected object fields$"):
+                                contract.pair_payload(canonical(manifest), canonical(built))
+                        self.assertEqual(contract.validate(copy.deepcopy(accepted)), accepted)
+                        self.assertEqual(
+                            contract.validate_candidate(copy.deepcopy(accepted_built)), accepted_built)
+                        raw, candidate_raw = canonical(accepted), canonical(accepted_built)
+                        self.assertEqual(contract.pair_payload(raw, candidate_raw),
+                                         expected_pair_payload(raw, candidate_raw))
 
     def test_bindings_carry_tagged_proof_and_eight_entry_parity_inventory(self):
         with tempfile.TemporaryDirectory() as temporary:

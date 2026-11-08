@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regressions for the engine producer's independent parity source proof."""
+"""Regressions for publish bindings' independent engine parity source proof."""
 from __future__ import annotations
 
 import copy
@@ -18,6 +18,7 @@ from release_artifacts import parity_source_proof  # noqa: E402
 from parity_bundle import PARITY_CAPABILITY_FROM, sync_parity_bundle  # noqa: E402
 import release_artifacts as artifacts  # noqa: E402
 import release_contract as contract  # noqa: E402
+import release_pipeline as pipeline  # noqa: E402
 from test_parity_bundle import (  # noqa: E402
     ENGINE_REPO, ENGINE_TAG, MANIFEST, MANIFEST_RAW, PAYLOAD_BYTES, ROWS,
     TaggedEngineFixture, canonical, digest,
@@ -63,9 +64,10 @@ def expected_inventory(root):
             for path in sorted(root.iterdir(), key=lambda item: item.name)}
 
 
-def produce(client, root):
+def bind(client, root):
+    version = str(client.v)
     with patch.object(artifacts, "PARITY_BUNDLE_ROOT", root):
-        return artifacts.producer(client, "engine", PARITY_CAPABILITY_FROM)
+        return pipeline.bindings(client, version, version, version, version, "d" * 40)
 
 
 def tag_source_mismatch(client, root):
@@ -132,14 +134,24 @@ NEGATIVE_ROWS = (
 
 
 class ParitySourceProofTests(unittest.TestCase):
-    def assert_positive_producer(self, client, root):
+    def assert_positive_bindings(self, client, root):
         write_bundle(root)
-        pin, inventory = produce(client, root)
-        self.assertEqual(pin, {
-            "version": PARITY_CAPABILITY_FROM, "commit": "a" * 40, "tag": ENGINE_TAG,
+        bound = bind(client, root)
+        inventory = bound["inventories"]["parity"]
+        identity = {
+            **json.loads((root / "PARITY-MANIFEST.json").read_bytes()),
+            "descriptor_sha256": digest((root / "PARITY-MANIFEST.json").read_bytes()),
+            "sums_sha256": digest((root / "PARITY-SHA256SUMS").read_bytes()),
+        }
+        self.assertEqual(bound["versions"]["engine"], {
+            "version": str(client.v), "commit": "a" * 40, "tag": "v" + str(client.v),
+            "parity": identity,
         })
         self.assertEqual(inventory, expected_inventory(root))
         self.assertEqual(len(inventory), len(ROWS) + 2)
+        self.assertNotIn("engine", bound["inventories"])
+        self.assertEqual(client.content_calls, len(ROWS) + 1)
+        return bound
 
     def test_proof_returns_independent_tagged_source_identity_and_inventory(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -168,18 +180,52 @@ class ParitySourceProofTests(unittest.TestCase):
             client.api_data[f"repos/{ENGINE_REPO}/git/trees/{moved}?recursive=1"] = (
                 copy.deepcopy(client.source_tree))
             client.commits["engine"] = moved
-            with self.assertRaisesRegex(
-                    contract.Invalid, "^parity descriptor commit differs from engine tag$"):
+            # Keep the direct proof's commit assertion observable independently
+            # of bindings' additional descriptor and inventory validation.
+            with self.subTest(row="wrong_source_commit"), self.assertRaisesRegex(
+                    contract.Invalid, "^parity descriptor commit differs from engine tag$",
+                    msg="wrong_source_commit"):
                 parity_source_proof(client, PARITY_CAPABILITY_FROM, root)
 
     def test_existing_engine_archives_and_checksums_stay_green_with_nonempty_proof(self):
         with tempfile.TemporaryDirectory() as temporary:
-            self.assert_positive_producer(TaggedEngineFixture(), Path(temporary) / "parity")
+            client = TaggedEngineFixture("2.0.0")
+            names = {f"pineforge-v{client.v}-{triple}.tar.gz"
+                     for triple in ("linux-x86_64", "linux-aarch64")}
+            self.assertEqual({a["name"] for a in client.releases["engine"]["assets"]},
+                             names | {name + ".sha256" for name in names})
+            self.assertFalse(any("macos" in url for url in client.downloads))
+            bound = self.assert_positive_bindings(client, Path(temporary) / "parity")
+            self.assertEqual(len(bound["inventories"]["parity"]), 8)
+
+    def test_bindings_refuse_a_proof_from_a_different_engine_tag_resolution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            self.assert_positive_bindings(TaggedEngineFixture(), base / "positive")
+            client = TaggedEngineFixture()
+            moved = "b" * 40
+            root = base / "negative"
+            write_bundle(root, descriptor_commit=moved)
+            for path in ("scripts/parity-bundle.json", *(row["source"] for row in ROWS)):
+                route = f"repos/{ENGINE_REPO}/contents/{path}?ref={moved}"
+                client.api_data[route] = copy.deepcopy(client.api_data[client.route(path)])
+            client.api_data[f"repos/{ENGINE_REPO}/git/trees/{moved}?recursive=1"] = (
+                copy.deepcopy(client.source_tree))
+            # The bundle agrees with the second resolution, so the independent
+            # proof succeeds; it must still agree with the producer's first pin.
+            with patch.object(client, "tag_commit", side_effect=[client.source_commit, moved]) as resolve:
+                with self.assertRaisesRegex(
+                        contract.Invalid, "^parity descriptor commit differs from engine tag$"):
+                    bind(client, root)
+            self.assertEqual(resolve.call_count, 2)
+            self.assertTrue(all(call.args == (ENGINE_REPO, ENGINE_TAG)
+                                for call in resolve.call_args_list))
+            self.assertEqual(client.content_calls, len(ROWS) + 1)
 
     def test_negative_rows_have_a_green_control_and_refuse(self):
         for label, mutate, message in NEGATIVE_ROWS:
             with self.subTest(row=label), tempfile.TemporaryDirectory() as temporary:
-                self.assert_positive_producer(TaggedEngineFixture(), Path(temporary) / "positive")
+                self.assert_positive_bindings(TaggedEngineFixture(), Path(temporary) / "positive")
                 negative_root = Path(temporary) / "negative"
                 client = TaggedEngineFixture()
                 write_bundle(negative_root)
@@ -196,7 +242,7 @@ class ParitySourceProofTests(unittest.TestCase):
                         "PARITY-MANIFEST.json": digest(descriptor_raw), **expected_payload_hashes(),
                     })
                 with self.assertRaisesRegex(contract.Invalid, "^" + message + "$", msg=label):
-                    produce(client, negative_root)
+                    bind(client, negative_root)
 
     def test_mutation_rows_name_a_matching_negative_control(self):
         from run_parity_mutations import MUTANTS

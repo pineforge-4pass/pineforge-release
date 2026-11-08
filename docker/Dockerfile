@@ -67,6 +67,8 @@ FROM debian:trixie-slim AS release
 ARG ENGINE_VERSION
 ARG CODEGEN_VERSION
 ARG GUARD_POLICY_SETS_SHA256
+ARG PARITY_DESCRIPTOR_SHA256
+ARG PARITY_CARRIER=0
 ARG RELEASE_VERSION=unknown
 ARG RELEASE_GIT_SHA=unknown
 ARG RELEASE_BUILD_DATE=unknown
@@ -174,6 +176,54 @@ RUN set -eu; \
       echo "ERROR: harness EXPECTED_PF_ABI=${have:-?} != engine PF_ABI_VERSION=${want:-?} for engine ${ENGINE_VERSION}; run scripts/sync-harness.sh ${ENGINE_VERSION}" >&2; exit 1; \
     fi; \
     echo "harness ABI ${have} matches engine ${ENGINE_VERSION}"
+
+# The parity carrier is separate from the engine harness. SUMS checks exactly
+# the descriptor and six reviewed payloads; it is excluded from its own list.
+RUN --mount=type=bind,source=.,target=/tmp/pineforge-context,ro \
+    set -eu; \
+    if [ "${PARITY_CARRIER:-0}" = 1 ]; then \
+      if [ -L /tmp/pineforge-context/docker/parity ]; then echo "parity directory contains a symlink" >&2; exit 1; fi; \
+      if [ ! -d /tmp/pineforge-context/docker/parity ]; then echo "parity directory is missing required file" >&2; exit 1; fi; \
+      mkdir -p /opt/pineforge/parity; \
+      cp -a /tmp/pineforge-context/docker/parity/. /opt/pineforge/parity/; \
+    fi
+ENV PYTHONDONTWRITEBYTECODE=1
+RUN set -eu; \
+    case "${PARITY_CARRIER-0}" in \
+      0) if [ -n "${PARITY_DESCRIPTOR_SHA256:-}" ]; then echo "parity descriptor requires the carrier" >&2; exit 1; fi ;; \
+      1) ;; \
+      *) echo "parity carrier must be 0 or 1" >&2; exit 1 ;; \
+    esac; \
+    if [ "${PARITY_CARRIER:-0}" = 1 ]; then \
+      descriptor_sha256="${PARITY_DESCRIPTOR_SHA256:-}"; \
+      if [ "${#descriptor_sha256}" -ne 64 ] || ! printf '%s' "$descriptor_sha256" | grep -Eq '^[0-9a-f]{64}$'; then \
+        echo "parity descriptor hash differs from binding" >&2; exit 1; \
+      fi; \
+      if [ -L /opt/pineforge/parity ]; then echo "parity directory contains a symlink" >&2; exit 1; fi; \
+      if [ ! -d /opt/pineforge/parity ]; then echo "parity directory is missing required file" >&2; exit 1; fi; \
+      cd /opt/pineforge/parity; \
+      want="PARITY-MANIFEST.json derive_corpus_feeds.py parity_paths.py pf_release_run.py run_parity_jailed.py run_strategy.py verify_corpus.py"; \
+      for path in ./* ./.[!.]* ./..?*; do \
+        [ -e "$path" ] || [ -L "$path" ] || continue; \
+        if [ -L "$path" ]; then echo "parity directory contains a symlink" >&2; exit 1; fi; \
+        case "${path#./}" in \
+          PARITY-MANIFEST.json|PARITY-SHA256SUMS|derive_corpus_feeds.py|parity_paths.py|pf_release_run.py|run_parity_jailed.py|run_strategy.py|verify_corpus.py) ;; \
+          *) echo "parity directory contains unexpected files" >&2; exit 1 ;; \
+        esac; \
+      done; \
+      for name in $want PARITY-SHA256SUMS; do \
+        if [ ! -f "$name" ]; then echo "parity directory is missing required file" >&2; exit 1; fi; \
+        if [ ! -s "$name" ]; then echo "parity payload is empty" >&2; exit 1; fi; \
+      done; \
+      actual="$(sha256sum PARITY-MANIFEST.json)"; \
+      if [ "${actual%% *}" != "${descriptor_sha256}" ]; then \
+        echo "parity descriptor hash differs from binding" >&2; exit 1; \
+      fi; \
+      listed="$(sed 's/^[0-9a-f]\{64\}  //' PARITY-SHA256SUMS | tr '\n' ' ' | sed 's/ $//')"; \
+      if [ "$listed" != "$want" ] || [ "$(wc -l < PARITY-SHA256SUMS)" -ne 7 ]; then echo "parity SUMS verification failed" >&2; exit 1; fi; \
+      if ! sha256sum -c --strict PARITY-SHA256SUMS; then echo "parity SUMS verification failed" >&2; exit 1; fi; \
+      echo "parity: seven files match PARITY-SHA256SUMS"; \
+    fi
 
 ENV PINEFORGE_PREFIX=/opt/pineforge \
     PYTHONPATH=/opt/pineforge/pycodegen \

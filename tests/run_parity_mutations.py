@@ -82,7 +82,7 @@ MUTANTS = (
 """,
         '    require(True, "parity descriptor commit differs from engine tag")\n',
         "tests/test_parity_source_proof.py",
-        "ParitySourceProofTests.test_negative_rows_have_a_green_control_and_refuse",
+        "ParitySourceProofTests.test_proof_returns_independent_tagged_source_identity_and_inventory",
         "wrong_source_commit",
         "Invalid not raised : wrong_source_commit",
         "wrong_source_commit",

@@ -2,10 +2,14 @@
 """CI/cloud replay of actual workflow shell and finalizer wiring, without network."""
 from __future__ import annotations
 
+import base64
 import copy
+import io
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -24,11 +28,164 @@ import release_pipeline as pipeline  # noqa: E402
 import release_contract as contract  # noqa: E402
 import test_release_workflows as wiring  # noqa: E402
 from test_release_binding import (FinalizeClient, MemoryRegistry, MemoryStore,  # noqa: E402
-                                  ProducerFixture, fixture_manifest)
+                                  ProducerFixture, damage_engine_prerequisite, fixture_manifest)
 
 
 def workflow(name):
     return yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
+
+
+def producer_fixture_cli():
+    """Run the real CLI with serialized public endpoints in a shell replay."""
+    from test_parity_source_proof import TaggedEngineFixture
+    import release_artifacts as artifacts
+
+    root = Path(os.environ["PRODUCER_FIXTURE_ROOT"])
+    endpoints = json.loads((root / "endpoints.json").read_bytes())
+    client = TaggedEngineFixture(endpoints["version"])
+    client.api_data = endpoints["api"]
+    client.downloads = {url: base64.b64decode(raw) for url, raw in endpoints["downloads"].items()}
+    client.commits = endpoints["commits"]
+    calls, downloads = [], []
+    real_producer = pipeline.producer
+    real_download = client.download
+
+    def record_producer(c, component, pin):
+        calls.append({"component": component, "content_reads": c.content_calls})
+        return real_producer(c, component, pin)
+
+    def download(url, origins):
+        downloads.append(url)
+        return real_download(url, origins)
+
+    with patch.object(pipeline, "Client", return_value=client), \
+            patch.object(pipeline, "producer", side_effect=record_producer), \
+            patch.object(client, "download", side_effect=download), \
+            patch.object(artifacts, "PARITY_BUNDLE_ROOT", root / "absent-publish-bundle"):
+        result = pipeline.main()
+    (root / "producer-result.json").write_bytes(contract.canonical({
+        "status": result, "calls": calls, "downloads": downloads,
+        "content_reads": client.content_calls,
+    }))
+    return result
+
+
+class ProducerPreTagTests(unittest.TestCase):
+    def replay(self, root, client, *, component="engine", retag=False):
+        root.mkdir(parents=True)
+        steps = {row.get("name"): row for row in workflow("handle-upstream.yml")["jobs"]["bump"]["steps"]}
+        completing = steps.get("Verify the completing engine before tagging")
+        self.assertIsNotNone(completing)
+        gate = (steps["Verify the dispatched producer artifacts"] if component == "engine" else completing)
+        bump = steps["Bump VERSION, commit, tag"]
+        initial = str(client.v) if retag else "1.10.0"
+        (root / "VERSION").write_text(initial + "\n", encoding="ascii")
+        (root / "endpoints.json").write_bytes(contract.canonical({
+            "version": str(client.v), "api": client.api_data, "commits": client.commits,
+            "downloads": {url: base64.b64encode(raw).decode("ascii")
+                          for url, raw in client.downloads.items()},
+        }))
+        bridge_paths = [str(ROOT / "tests"), str(ROOT / "scripts")]
+        bridge = (
+            f"import sys; sys.path[:0] = {bridge_paths!r}; "
+            "from test_release_binding_workflows import producer_fixture_cli; "
+            "sys.argv = sys.argv[1:]; raise SystemExit(producer_fixture_cli())"
+        )
+        # Only git transport is recorded. The selected workflow CLI, sync,
+        # tagged-source verifier and archive/checksum verifier all run for real.
+        wrappers = (
+            "python3() { command " + shlex.quote(sys.executable) + " -c "
+            + shlex.quote(bridge) + ' "$@"; }\n'
+            'git() {\n printf \'%s\\n\' "$*" >> "$PRODUCER_FIXTURE_ROOT/git-calls";\n'
+            ' case "$1" in log) printf \'%s\\n\' "' + "d" * 40 + '";; esac\n}\n'
+        )
+        done = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-euc", wrappers + gate["run"] + "\n" + bump["run"]],
+            cwd=root, capture_output=True, text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PRODUCER_FIXTURE_ROOT": str(root),
+                 "COMPONENT": component, "VER": str(client.v), "E": str(client.v), "C": str(client.v),
+                 "H": str(client.v), "LINE": "pair", "RELEASE": str(client.v),
+                 "RETAG": str(retag).lower(), "GITHUB_STEP_SUMMARY": str(root / "summary")},
+        )
+        self.assertNotIn("Traceback", done.stderr)
+        self.assertTrue((root / "producer-result.json").is_file(), done.stdout + done.stderr)
+        result = json.loads((root / "producer-result.json").read_bytes())
+        git_calls = (root / "git-calls").read_text().splitlines() if (root / "git-calls").exists() else []
+        return done, result, git_calls, initial
+
+    def assert_control(self, root, component):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+        from test_parity_source_proof import TaggedEngineFixture
+        from test_parity_bundle import ROWS
+
+        done, result, git_calls, initial = self.replay(
+            root, TaggedEngineFixture(), component=component, retag=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(result["status"], 0)
+        self.assertEqual(result["calls"], [{"component": "engine", "content_reads": len(ROWS) + 1}])
+        self.assertEqual(result["content_reads"], len(ROWS) + 1)
+        self.assertEqual(len(result["downloads"]), 4)
+        self.assertTrue(any(call.startswith(f"tag -a v{PARITY_CAPABILITY_FROM} ") for call in git_calls))
+        self.assertIn(f"push origin v{PARITY_CAPABILITY_FROM}", git_calls)
+        self.assertEqual((root / "VERSION").read_text(), initial + "\n")
+        self.assertFalse((root / "absent-publish-bundle").exists())
+
+    def test_engine_last_ordering_prepares_before_published_archive_verification_and_tag(self):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+
+        published = set()
+        for index, component in enumerate(("codegen", "hpo", "engine")):
+            published.add(component)
+            decision, _ = pair.decide(
+                component, PARITY_CAPABILITY_FROM, "false", "1.10.0", "1.10.0", "1.10.0",
+                False, False, False, prev_hpo="1.10.0",
+                partners_published={role: role in published for role in ("engine", "codegen", "hpo")})
+            self.assertEqual(decision["mode"], "bump" if index == 2 else "wait")
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assert_control(Path(temporary) / "engine-last", "engine")
+            self.assert_control(Path(temporary) / "hpo-last", "hpo")
+
+    def test_bad_engine_prerequisites_refuse_before_version_writes_or_git_on_bump_and_retag(self):
+        from test_parity_source_proof import TaggedEngineFixture
+
+        for component in ("engine", "codegen"):
+            for retag in (False, True):
+                for problem in ("missing_archive", "missing_checksum", "checksum_mismatch",
+                                "missing_source", "unapproved_source"):
+                    with self.subTest(component=component, retag=retag, problem=problem), \
+                            tempfile.TemporaryDirectory() as temporary:
+                        base = Path(temporary)
+                        self.assert_control(base / "positive", component)
+                        client = TaggedEngineFixture()
+                        damage_engine_prerequisite(client, problem)
+                        root = base / "negative"
+                        done, result, git_calls, initial = self.replay(
+                            root, client, component=component, retag=retag)
+                        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                        self.assertEqual(result["status"], 1)
+                        self.assertEqual(git_calls, [])
+                        self.assertEqual((root / "VERSION").read_text(), initial + "\n")
+                        self.assertFalse((root / "absent-publish-bundle").exists())
+
+    def test_cli_refuses_a_tag_moved_between_source_sync_and_archive_pin(self):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+        from test_parity_bundle import ENGINE_REPO, ENGINE_TAG, ROWS
+        from test_parity_source_proof import TaggedEngineFixture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assert_control(Path(temporary) / "positive", "engine")
+            client = TaggedEngineFixture()
+            with patch.object(pipeline, "Client", return_value=client), \
+                    patch.object(client, "tag_commit", side_effect=["a" * 40, "b" * 40]) as resolve, \
+                    patch.object(client, "download", wraps=client.download) as downloads, \
+                    patch.object(sys, "argv", ["release_pipeline.py", "producer", "engine", PARITY_CAPABILITY_FROM]), \
+                    patch.object(sys, "stderr", new_callable=io.StringIO):
+                self.assertEqual(pipeline.main(), 1)
+            self.assertEqual(client.content_calls, len(ROWS) + 1)
+            self.assertEqual(downloads.call_count, 4)
+            self.assertEqual(resolve.call_count, 2)
+            self.assertTrue(all(call.args == (ENGINE_REPO, ENGINE_TAG)
+                                for call in resolve.call_args_list))
 
 
 def assert_ready_wiring(case, publish, finalizer):

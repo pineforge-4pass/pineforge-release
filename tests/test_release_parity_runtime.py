@@ -49,6 +49,18 @@ def runtime_case(root):
     return manifest, built, identity, inventory, children
 
 
+def legacy_runtime_case():
+    manifest = fixture_manifest("1.10.0")
+    built = candidate(manifest)
+    built["inventories"] = {
+        role: {name: digest(raw) for name, raw in files.items()}
+        for role, files in PACKAGE_BYTES.items()
+    }
+    children = {arch: {**copy.deepcopy(PACKAGE_BYTES), "parity": None}
+                for arch in ("amd64", "arm64")}
+    return manifest, built, children
+
+
 class ParityRuntimeFake:
     def __init__(self, root, manifest, children):
         self.manifest = manifest
@@ -61,6 +73,7 @@ class ParityRuntimeFake:
         self.reported_identity_arch = None
         self.reported_inventory_arch = None
         self.inputs = {}
+        self.observed = {}
         for arch, roles in children.items():
             self.paths[arch] = {}
             for role, files in roles.items():
@@ -116,6 +129,7 @@ class ParityRuntimeFake:
             if self.missing_output_arch == arch:
                 return b""  # Deliberate dropped-proof transport fault.
             observed = json.loads(done.stdout)
+            self.observed[arch] = copy.deepcopy(observed)
             if "parity" in observed:
                 if self.reported_identity_arch == arch:
                     observed["parity"]["identity"] = alternate_identity(
@@ -176,23 +190,46 @@ class ParityRuntimeTests(unittest.TestCase):
 
     def test_legacy_runtime_needs_no_parity_root_or_child_proof(self):
         with tempfile.TemporaryDirectory() as temporary:
-            manifest = fixture_manifest("1.10.0")
-            built = candidate(manifest)
-            built["inventories"] = {
-                role: {name: digest(raw) for name, raw in files.items()}
-                for role, files in PACKAGE_BYTES.items()
-            }
-            children = {arch: {**copy.deepcopy(PACKAGE_BYTES), "parity": None}
-                        for arch in ("amd64", "arm64")}
-            fake = ParityRuntimeFake(Path(temporary), manifest, children)
-            proof = self.verify(fake, manifest, built)
-            for arch in ("amd64", "arm64"):
-                self.assertFalse(fake.paths[arch]["parity"].exists())
-                self.assertIsNone(fake.inputs[arch]["parity"])
-                self.assertNotIn("parity", fake.inputs[arch]["inventories"])
-                self.assertEqual(set(proof[arch]), {
-                    "backtest_sha256", "trades", "hpo_sha256", "hpo_trials"})
-                self.assertGreater(proof[arch]["trades"], 0)
+            manifest, built, children = legacy_runtime_case()
+            self.assert_legacy_control(Path(temporary), manifest, built, children)
+
+    def assert_legacy_control(self, root, manifest, built, children):
+        fake = ParityRuntimeFake(root, manifest, children)
+        proof = self.verify(fake, manifest, built)
+        self.assertEqual(set(proof), {"amd64", "arm64"})
+        for arch in ("amd64", "arm64"):
+            self.assertFalse(fake.paths[arch]["parity"].exists())
+            self.assertIsNone(fake.inputs[arch]["parity"])
+            self.assertNotIn("parity", fake.inputs[arch]["inventories"])
+            self.assertEqual(fake.inputs[arch]["inventories"], built["inventories"])
+            self.assertEqual(fake.observed[arch], {})
+            self.assertEqual(set(proof[arch]), {
+                "backtest_sha256", "trades", "hpo_sha256", "hpo_trials"})
+            self.assertGreater(proof[arch]["trades"], 0)
+            self.assertEqual(proof[arch]["hpo_trials"], 9)
+        return fake
+
+    def test_legacy_damaged_installed_package_bytes_refuse_before_any_smoke(self):
+        for arch in ("amd64", "arm64"):
+            for role in ("codegen", "hpo"):
+                with self.subTest(arch=arch, role=role), tempfile.TemporaryDirectory() as temporary:
+                    base = Path(temporary)
+                    manifest, built, children = legacy_runtime_case()
+                    self.assert_legacy_control(base / "positive", manifest, built, children)
+                    damaged = copy.deepcopy(children)
+                    name = f"pineforge_{role}/__init__.py"
+                    damaged[arch][role][name] += b"# damaged installed package bytes\n"
+                    fake = ParityRuntimeFake(base / "negative", manifest, damaged)
+                    with self.assertRaisesRegex(contract.Invalid, "^installed package bytes differ$"):
+                        self.verify(fake, manifest, built)
+                    self.assertEqual(fake.observed[arch], {"error": "installed package bytes differ"})
+                    self.assertEqual(fake.inputs[arch]["inventories"], built["inventories"])
+                    self.assertIsNone(fake.inputs[arch]["parity"])
+                    self.assertFalse(fake.paths[arch]["parity"].exists())
+                    self.assertNotEqual(digest((fake.paths[arch][role] / name).read_bytes()),
+                                        built["inventories"][role][name])
+                    self.assertFalse(any(args[:2] == ("docker", "run")
+                                         and "--entrypoint" not in args for args in fake.calls))
 
     def test_unknown_inventory_roles_refuse_before_any_pull(self):
         for role in ("engine", "unknown"):
