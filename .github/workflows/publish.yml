@@ -316,6 +316,17 @@ jobs:
           python3 scripts/release_pair.py check --release="${REF#v}" --engine="$E" --codegen="$C" \
             --hpo="$H" --hpo-wheel-digest="$digest" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Read Debian input arguments
+        id: debian
+        run: |
+          set -euo pipefail
+          args="$(python3 scripts/release_sources.py debian-args docker/debian-inputs.args)"
+          {
+            echo 'args<<DEBIAN_INPUT_ARGS'
+            printf '%s\n' "$args"
+            echo 'DEBIAN_INPUT_ARGS'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Read hpo toolchain arguments
         id: toolchain
         if: steps.pair.outputs.target == 'hpo'
@@ -364,7 +375,11 @@ jobs:
           push: false
           tags: pineforge-source-inspect:amd64
           labels: ${{ steps.meta.outputs.labels }}
+          # Public CA data from the hosted runner, supplied only as a build mount.
+          secret-files: |
+            debian_ca=/etc/ssl/certs/ca-certificates.crt
           build-args: |
+            ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
@@ -384,7 +399,10 @@ jobs:
           push: false
           tags: pineforge-source-inspect:arm64
           labels: ${{ steps.meta.outputs.labels }}
+          secret-files: |
+            debian_ca=/etc/ssl/certs/ca-certificates.crt
           build-args: |
+            ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
@@ -405,7 +423,10 @@ jobs:
           push: false
           tags: pineforge-source-inspect:amd64
           labels: ${{ steps.meta.outputs.labels }}
+          secret-files: |
+            debian_ca=/etc/ssl/certs/ca-certificates.crt
           build-args: |
+            ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
@@ -430,7 +451,10 @@ jobs:
           push: false
           tags: pineforge-source-inspect:arm64
           labels: ${{ steps.meta.outputs.labels }}
+          secret-files: |
+            debian_ca=/etc/ssl/certs/ca-certificates.crt
           build-args: |
+            ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
@@ -490,7 +514,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          secret-files: |
+            debian_ca=/etc/ssl/certs/ca-certificates.crt
           build-args: |
+            ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
@@ -515,7 +542,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          secret-files: |
+            debian_ca=/etc/ssl/certs/ca-certificates.crt
           build-args: |
+            ${{ steps.debian.outputs.args }}
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}

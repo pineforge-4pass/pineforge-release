@@ -17,6 +17,8 @@
 #   CODEGEN_VERSION  pineforge-codegen PyPI version baked in
 #   GUARD_POLICY_SETS_SHA256  pinned guard policy set digest from docker/GUARD-POLICY-SETS.pin
 # The default target needs ENGINE_VERSION, CODEGEN_VERSION and GUARD_POLICY_SETS_SHA256 above.
+# Every target also requires the three validated docker/debian-inputs.args
+# values and the public debian_ca BuildKit file mount for APT HTTPS bootstrap.
 # --target hpo additionally requires HPO_VERSION (no source default) and the
 # six toolchain package version build-args chosen on the signed box.
 # HPO_WHEEL_SHA256 checks the downloaded wheel when supplied to that target.
@@ -26,23 +28,54 @@
 
 ARG ENGINE_VERSION
 ARG CODEGEN_VERSION
+ARG DEBIAN_BASE_IMAGE
 
 # --- Stage 1: stage the pure-Python transpiler (final image carries no pip) ---
-FROM debian:trixie-slim AS codegen
+FROM ${DEBIAN_BASE_IMAGE} AS codegen
+ARG DEBIAN_SNAPSHOT
+ARG DEBIAN_SECURITY_SNAPSHOT
+RUN test -n "${DEBIAN_SNAPSHOT}" && test -n "${DEBIAN_SECURITY_SNAPSHOT}" \
+    && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
+    && printf '%s\n' \
+      "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SECURITY_SNAPSHOT}/ trixie-security main" \
+      > /etc/apt/sources.list
 ARG CODEGEN_VERSION
 RUN test -n "${CODEGEN_VERSION}" || { echo "ERROR: CODEGEN_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=secret,id=debian_ca,target=/run/secrets/debian_ca,required=true,mode=0444 \
+    set -eu; \
+    printf '%s\n' \
+      'Acquire::https::CaInfo "/run/secrets/debian_ca";' \
+      'Acquire::https::Verify-Peer "true";' \
+      'Acquire::https::Verify-Host "true";' \
+      > /etc/apt/apt.conf.d/99pineforge-https; \
+    apt-get update && apt-get install -y --no-install-recommends \
         python3-pip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN pip3 install --break-system-packages --no-cache-dir -U \
         --target /opt/codegen "pineforge-codegen==${CODEGEN_VERSION}"
 
 # --- Stage 2: fetch + verify the engine static-lib tarball (per build arch) ---
-FROM debian:trixie-slim AS engine
+FROM ${DEBIAN_BASE_IMAGE} AS engine
+ARG DEBIAN_SNAPSHOT
+ARG DEBIAN_SECURITY_SNAPSHOT
+RUN test -n "${DEBIAN_SNAPSHOT}" && test -n "${DEBIAN_SECURITY_SNAPSHOT}" \
+    && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
+    && printf '%s\n' \
+      "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SECURITY_SNAPSHOT}/ trixie-security main" \
+      > /etc/apt/sources.list
 ARG ENGINE_VERSION
 ARG TARGETARCH
 RUN test -n "${ENGINE_VERSION}" || { echo "ERROR: ENGINE_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=secret,id=debian_ca,target=/run/secrets/debian_ca,required=true,mode=0444 \
+    set -eu; \
+    printf '%s\n' \
+      'Acquire::https::CaInfo "/run/secrets/debian_ca";' \
+      'Acquire::https::Verify-Peer "true";' \
+      'Acquire::https::Verify-Host "true";' \
+      > /etc/apt/apt.conf.d/99pineforge-https; \
+    apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
@@ -63,7 +96,15 @@ RUN set -eux; \
     cp -r "/tmp/${base}/include" /opt/pineforge/include
 
 # --- Stage 3: final = toolchain + engine lib + codegen + harness --------------
-FROM debian:trixie-slim AS release
+FROM ${DEBIAN_BASE_IMAGE} AS release
+ARG DEBIAN_SNAPSHOT
+ARG DEBIAN_SECURITY_SNAPSHOT
+RUN test -n "${DEBIAN_SNAPSHOT}" && test -n "${DEBIAN_SECURITY_SNAPSHOT}" \
+    && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
+    && printf '%s\n' \
+      "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SECURITY_SNAPSHOT}/ trixie-security main" \
+      > /etc/apt/sources.list
 ARG ENGINE_VERSION
 ARG CODEGEN_VERSION
 ARG GUARD_POLICY_SETS_SHA256
@@ -94,7 +135,14 @@ RUN set -eu; \
 
 # g++ + Eigen compile the transpiled generated.cpp against the static lib;
 # python3 runs the transpiler + the JSON harness. No pip, no network at runtime.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=secret,id=debian_ca,target=/run/secrets/debian_ca,required=true,mode=0444 \
+    set -eu; \
+    printf '%s\n' \
+      'Acquire::https::CaInfo "/run/secrets/debian_ca";' \
+      'Acquire::https::Verify-Peer "true";' \
+      'Acquire::https::Verify-Host "true";' \
+      > /etc/apt/apt.conf.d/99pineforge-https; \
+    apt-get update && apt-get install -y --no-install-recommends \
         g++ \
         libeigen3-dev \
         python3 \
@@ -194,7 +242,14 @@ ARG CODEGEN_VERSION
 ARG HPO_VERSION
 ARG HPO_WHEEL_SHA256
 RUN test -n "${HPO_VERSION}" && test -n "${CODEGEN_VERSION}" || { echo "ERROR: HPO_VERSION + CODEGEN_VERSION build-args are required (CI resolves them)" >&2; exit 1; }
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+RUN --mount=type=secret,id=debian_ca,target=/run/secrets/debian_ca,required=true,mode=0444 \
+    set -eu; \
+    printf '%s\n' \
+      'Acquire::https::CaInfo "/run/secrets/debian_ca";' \
+      'Acquire::https::Verify-Peer "true";' \
+      'Acquire::https::Verify-Host "true";' \
+      > /etc/apt/apt.conf.d/99pineforge-https; \
+    apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/check_hpo_resolution.py /tmp/check_hpo_resolution.py
 RUN set -eu; \
@@ -224,7 +279,15 @@ RUN set -eu; \
 # Exact Debian trixie pins for both architectures come from public package
 # metadata in hpo-toolchain.args. gcc/g++/cpp are the GCC-14 defaults; the compiler
 # and libstdc++ packages share HPO_GCC_VERSION. CMake/make stay build-only.
-FROM debian:trixie-slim AS hpo-toolchain
+FROM ${DEBIAN_BASE_IMAGE} AS hpo-toolchain
+ARG DEBIAN_SNAPSHOT
+ARG DEBIAN_SECURITY_SNAPSHOT
+RUN test -n "${DEBIAN_SNAPSHOT}" && test -n "${DEBIAN_SECURITY_SNAPSHOT}" \
+    && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
+    && printf '%s\n' \
+      "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SECURITY_SNAPSHOT}/ trixie-security main" \
+      > /etc/apt/sources.list
 ARG HPO_GCC_DEFAULTS_VERSION
 ARG HPO_GCC_VERSION
 ARG HPO_BINUTILS_VERSION
@@ -233,7 +296,13 @@ RUN test -n "${HPO_GCC_DEFAULTS_VERSION}" && test -n "${HPO_GCC_VERSION}" \
     && test -n "${HPO_BINUTILS_VERSION}" && test -n "${HPO_EIGEN_VERSION}" \
     || { echo "ERROR: HPO toolchain package version build-args are required (box supplies them)" >&2; exit 1; }
 # Preserve the packages' own copyright files before the existing doc cleanup.
-RUN set -eu; \
+RUN --mount=type=secret,id=debian_ca,target=/run/secrets/debian_ca,required=true,mode=0444 \
+    set -eu; \
+    printf '%s\n' \
+      'Acquire::https::CaInfo "/run/secrets/debian_ca";' \
+      'Acquire::https::Verify-Peer "true";' \
+      'Acquire::https::Verify-Host "true";' \
+      > /etc/apt/apt.conf.d/99pineforge-https; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
       "gcc=${HPO_GCC_DEFAULTS_VERSION}" "g++=${HPO_GCC_DEFAULTS_VERSION}" "cpp=${HPO_GCC_DEFAULTS_VERSION}" \
@@ -255,7 +324,14 @@ ARG HPO_CMAKE_VERSION
 ARG HPO_MAKE_VERSION
 RUN test -n "${HPO_VERSION}" && test -n "${HPO_CMAKE_VERSION}" && test -n "${HPO_MAKE_VERSION}" \
     || { echo "ERROR: HPO_VERSION + HPO_CMAKE_VERSION + HPO_MAKE_VERSION build-args are required" >&2; exit 1; }
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=secret,id=debian_ca,target=/run/secrets/debian_ca,required=true,mode=0444 \
+    set -eu; \
+    printf '%s\n' \
+      'Acquire::https::CaInfo "/run/secrets/debian_ca";' \
+      'Acquire::https::Verify-Peer "true";' \
+      'Acquire::https::Verify-Host "true";' \
+      > /etc/apt/apt.conf.d/99pineforge-https; \
+    apt-get update && apt-get install -y --no-install-recommends \
       "cmake=${HPO_CMAKE_VERSION}" "make=${HPO_MAKE_VERSION}" curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=engine /opt/pineforge/include /opt/pineforge/include
@@ -298,7 +374,14 @@ LABEL org.opencontainers.image.description="Full PineScript v6 -> deterministic 
 # Pin the runtime compiler and Eigen to the same packages as hpo-toolchain.
 # Engine dev files, codegen, Python and the checked harness come from release;
 # CMake, make, pip and the native build tree stay in the build stages.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=secret,id=debian_ca,target=/run/secrets/debian_ca,required=true,mode=0444 \
+    set -eu; \
+    printf '%s\n' \
+      'Acquire::https::CaInfo "/run/secrets/debian_ca";' \
+      'Acquire::https::Verify-Peer "true";' \
+      'Acquire::https::Verify-Host "true";' \
+      > /etc/apt/apt.conf.d/99pineforge-https; \
+    apt-get update && apt-get install -y --no-install-recommends \
       "gcc=${HPO_GCC_DEFAULTS_VERSION}" "g++=${HPO_GCC_DEFAULTS_VERSION}" "cpp=${HPO_GCC_DEFAULTS_VERSION}" \
       "gcc-14=${HPO_GCC_VERSION}" "g++-14=${HPO_GCC_VERSION}" "cpp-14=${HPO_GCC_VERSION}" \
       "libgcc-14-dev=${HPO_GCC_VERSION}" "libstdc++-14-dev=${HPO_GCC_VERSION}" \

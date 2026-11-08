@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate plain HPO pins and require a registered Debian source mirror.
+"""Validate plain Debian/HPO pins and require a registered Debian source mirror.
 
 This helper only reads files. The workflow obtains dpkg inventories, GitHub
 release metadata and the registered SOURCES.list before invoking `check`.
@@ -19,6 +19,16 @@ TOOLCHAIN_NAMES = frozenset({
     "HPO_GCC_DEFAULTS_VERSION", "HPO_GCC_VERSION", "HPO_BINUTILS_VERSION",
     "HPO_EIGEN_VERSION", "HPO_CMAKE_VERSION", "HPO_MAKE_VERSION",
 })
+# The reviewed base/snapshot closure. Changing these inputs requires a
+# newly reviewed closure; a well-shaped but different digest/date is not one.
+DEBIAN_INPUT_PINS = {
+    "DEBIAN_BASE_IMAGE": (
+        "debian:trixie-slim@sha256:"
+        "a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2"
+    ),
+    "DEBIAN_SNAPSHOT": "20261104T140106Z",
+    "DEBIAN_SECURITY_SNAPSHOT": "20261104T140106Z",
+}
 # Per-release artifact pins come from verified producer bindings, not the
 # signed-box Debian toolchain file: argument -> (workflow output, binding field).
 HPO_ARTIFACT_ARGS = {
@@ -71,6 +81,34 @@ def toolchain_args(path: Path) -> list[str]:
     missing = TOOLCHAIN_NAMES - arguments.keys()
     if missing:
         raise SourcesError(f"toolchain args line {len(lines) + 1}: missing toolchain arguments: "
+                           + ", ".join(sorted(missing)))
+    return [f"{name}={value}" for name, value in arguments.items()]
+
+
+def debian_args(path: Path) -> list[str]:
+    """Read only the three reviewed Debian inputs, without shell evaluation."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    arguments = {}
+    for number, line in enumerate(lines, 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        prefix = f"Debian args line {number}: "
+        match = re.fullmatch(r"([A-Z][A-Z0-9_]*)=([A-Za-z0-9.:@/_-]*)", line)
+        if match is None:
+            raise SourcesError(prefix + "expected plain NAME=VALUE with no spaces, quotes or shell syntax")
+        name, value = match.groups()
+        if name not in DEBIAN_INPUT_PINS:
+            raise SourcesError(prefix + "unknown Debian argument: " + name)
+        if name in arguments:
+            raise SourcesError(prefix + "duplicate Debian argument: " + name)
+        if not value:
+            raise SourcesError(prefix + "empty value for " + name)
+        if value != DEBIAN_INPUT_PINS[name]:
+            raise SourcesError(prefix + "value differs from the reviewed Debian input for " + name)
+        arguments[name] = value
+    missing = DEBIAN_INPUT_PINS.keys() - arguments.keys()
+    if missing:
+        raise SourcesError(f"Debian args line {len(lines) + 1}: missing Debian arguments: "
                            + ", ".join(sorted(missing)))
     return [f"{name}={value}" for name, value in arguments.items()]
 
@@ -244,6 +282,8 @@ def check(registry: Path, amd64: Path, arm64: Path, assets_path: Path, sources_l
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    debian = commands.add_parser("debian-args", help="validate and print the three reviewed Debian inputs")
+    debian.add_argument("file", type=Path)
     toolchain = commands.add_parser("toolchain-args", help="validate and print the six plain HPO pins")
     toolchain.add_argument("file", type=Path)
     pairs = commands.add_parser("pairs", help="print canonical source pairs and their set-id")
@@ -260,7 +300,9 @@ def main(argv=None) -> int:
                                  help="downloaded list asset named by the registry")
     args = parser.parse_args(argv)
     try:
-        if args.command == "toolchain-args":
+        if args.command == "debian-args":
+            output = "\n".join(debian_args(args.file)) + "\n"
+        elif args.command == "toolchain-args":
             output = "\n".join(toolchain_args(args.file)) + "\n"
         elif args.command == "pairs":
             found = inventory_pairs(args.inventory)

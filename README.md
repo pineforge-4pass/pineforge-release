@@ -436,6 +436,17 @@ bookworm's GCC 12 pins with GCC 14; the checked harness and entrypoint stay unch
 `ENGINE_VERSION`, `CODEGEN_VERSION` and `GUARD_POLICY_SETS_SHA256` are required for that build, and its
 entrypoint remains `/opt/pineforge/bin/entrypoint.sh`. The guard policy value is read from `docker/GUARD-POLICY-SETS.pin`, computed privately and never re-derived here; the image records it in the `io.pineforge.guard.policy-sets-sha256` label and in `/opt/pineforge/guard-policy.sha256`.
 
+Every target also requires `DEBIAN_BASE_IMAGE`, `DEBIAN_SNAPSHOT` and
+`DEBIAN_SECURITY_SNAPSHOT` from `docker/debian-inputs.args`. Validate that file
+with `python3 scripts/release_sources.py debian-args docker/debian-inputs.args`
+and pass each emitted `NAME=VALUE` line as a separate `--build-arg`. The base
+is pinned by its multiarch digest; APT uses the two fixed, signed snapshots.
+Builds require BuildKit and a readable public CA bundle supplied with
+`--secret id=debian_ca,src=/etc/ssl/certs/ca-certificates.crt` (use the local
+public bundle's path on another host). The bundle is a read-only build mount,
+not an account credential or an image layer. Missing inputs fail the build;
+the publish workflow supplies the same arguments and mount to all six builds.
+
 Use `--target hpo` to build the FULL image with the HPO command. It requires
 `ENGINE_VERSION`, `CODEGEN_VERSION`, `GUARD_POLICY_SETS_SHA256`, `HPO_VERSION` and
 all six toolchain arguments listed below. That image accepts `docker run <image> hpo <subcommand>` for
