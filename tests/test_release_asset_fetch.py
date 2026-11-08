@@ -103,6 +103,7 @@ class _Request:
     status: int
     octet_stream: bool
     authenticated: bool
+    authorization_present: bool
     body_bytes: int
     at: float
 
@@ -113,6 +114,7 @@ class _Request:
             "status": self.status,
             "octet_stream": self.octet_stream,
             "authenticated": self.authenticated,
+            "authorization_present": self.authorization_present,
             "body_bytes": self.body_bytes,
             "elapsed_seconds": round(self.at - start, 3),
         }
@@ -121,7 +123,8 @@ class _Request:
 class _LocalRelease:
     """Real HTTP with exact routes, independent per-route response schedules."""
 
-    def __init__(self, payload: _Payload, *, schedules=None, transferred=None):
+    def __init__(self, payload: _Payload, *, schedules=None, transferred=None,
+                 redirects=None):
         self.payload = payload
         self.transferred = payload.archive if transferred is None else transferred
         self.schedules = {
@@ -135,6 +138,11 @@ class _LocalRelease:
             if route not in self.schedules or not statuses:
                 raise RuntimeError("fixture setup: invalid response schedule")
             self.schedules[route] = tuple(statuses)
+        self.redirects = dict(redirects or {})
+        for route in self.redirects:
+            if route not in ("api-archive", "api-checksum"):
+                raise RuntimeError("fixture setup: invalid redirect route")
+            self.schedules[route] = (302,)
         self._requests = []
         self._attempts = {}
         self._lock = threading.Lock()
@@ -181,7 +189,8 @@ class _LocalRelease:
             "prerelease": False,
             "assets": assets,
         }).encode()
-        self.routes[f"{api_root}/tags/v{payload.version}"] = (
+        self.metadata_path = f"{api_root}/tags/v{payload.version}"
+        self.routes[self.metadata_path] = (
             "api-metadata", metadata, "application/json",
         )
         self.browser_archive_url = self.origin + browser_root + "/" + archive_name
@@ -211,6 +220,7 @@ class _LocalRelease:
             request.path, ("unknown", b"unknown fixture route\n", "text/plain"),
         )
         authenticated = request.headers.get("Authorization") == "Bearer " + self.payload.token
+        authorization_present = request.headers.get("Authorization") is not None
         octet_stream = request.headers.get("Accept") == "application/octet-stream"
         with self._lock:
             attempt = self._attempts.get(route, 0) + 1
@@ -227,10 +237,12 @@ class _LocalRelease:
             body = supplied if status == 200 else f"fixture HTTP {status}\n".encode()
             self._requests.append(_Request(
                 route, attempt, status, octet_stream, authenticated,
-                len(body), time.monotonic(),
+                authorization_present, len(body), time.monotonic(),
             ))
         request.send_response(status)
         request.send_header("Content-Type", content_type)
+        if status == 302:
+            request.send_header("Location", self.redirects[route])
         request.send_header("Content-Length", str(len(body)))
         request.send_header("Connection", "close")
         request.end_headers()
@@ -317,6 +329,7 @@ class ReleaseAssetFetchTest(unittest.TestCase):
         if missing:
             raise RuntimeError("fixture setup: missing real tools: " + ", ".join(missing))
         cls.bash = binaries["bash"]
+        cls.python = binaries["python3"]
         cls.curl = binaries["curl"]
 
     def _environment(self, root: Path, payload: _Payload, retries: int, delay: int):
@@ -328,7 +341,7 @@ class ReleaseAssetFetchTest(unittest.TestCase):
             "PATH": os.defpath,
             "LC_ALL": "C",
             "CURL_HOME": str(root),
-            "NO_PROXY": "127.0.0.1",
+            "NO_PROXY": "127.0.0.1,localhost",
             "ENGINE_VERSION": payload.version,
             "TARGETARCH": payload.arch,
             "ASSET_FETCH_RETRIES": str(retries),
@@ -365,12 +378,61 @@ class ReleaseAssetFetchTest(unittest.TestCase):
             stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=30,
         )
+        self.assertFalse(
+            release.payload.token in completed.stdout or release.payload.token in completed.stderr,
+            "synthetic token appeared in helper output",
+        )
         self.assertNotIn(release.payload.token, completed.stdout)
         self.assertNotIn(release.payload.token, completed.stderr)
         observed = _Observation(completed, release.requests(after))
         print("CR918 " + json.dumps({"case": label, **observed.proof()}, sort_keys=True),
               flush=True)
         return observed
+
+    def _run_helper(self, label: str, root: Path, release: _LocalRelease, *,
+                    after: int, api_root: str | None = None,
+                    token_bytes: bytes | None = None) -> _Observation:
+        work = root / "download"
+        work.mkdir()
+        environment = self._environment(root, release.payload, 0, 1)
+        if token_bytes is not None:
+            (root / "github_token").write_bytes(token_bytes)
+        completed = subprocess.run(
+            [self.python, "-I", str(self.helper),
+             "--repo", "pineforge-4pass/pineforge-engine",
+             "--tag", "v" + release.payload.version,
+             "--name", release.payload.base + ".tar.gz",
+             "--output", str(work / (release.payload.base + ".tar.gz")),
+             "--retries", "0", "--retry-delay", "1",
+             "--api-root", release.origin + "/api" if api_root is None else api_root,
+             "--browser-root", release.origin + "/browser",
+             "--token-file", str(root / "github_token")],
+            cwd=root, env=environment, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=30,
+        )
+        # All nonempty invalid token rows retain this synthetic marker. Assert
+        # a boolean so even a leaking regression cannot print the token value.
+        self.assertFalse(
+            release.payload.token in completed.stdout or release.payload.token in completed.stderr,
+            "synthetic token appeared in helper output",
+        )
+        observed = _Observation(completed, release.requests(after))
+        print("CR918 " + json.dumps({"case": label, **observed.proof()}, sort_keys=True),
+              flush=True)
+        return observed
+
+    def _assert_typed_refusal(self, root: Path, observed: _Observation, reason: str):
+        self.assertEqual(observed.completed.returncode, 1, observed.proof())
+        self.assertEqual(observed.reasons, (ACQUISITION_REASON,))
+        self.assertTrue(
+            f"{ACQUISITION_REASON}: {reason}" in observed.completed.stderr.splitlines(),
+            "helper did not emit the expected safe refusal reason",
+        )
+        self.assertEqual(observed.commands, ())
+        self.assertFalse(any((root / "download").iterdir()),
+                         "refusal left downloaded output")
+        self.assertFalse((root / "installed").exists(),
+                         "refusal reached the installed payload")
 
     def _assert_known_routes(self, observed: _Observation):
         self.assertNotIn("unknown", [request.route for request in observed.requests],
@@ -379,6 +441,8 @@ class ReleaseAssetFetchTest(unittest.TestCase):
             if request.route.startswith("browser-"):
                 self.assertFalse(request.authenticated,
                                  "the read token reached the public browser fallback")
+                self.assertFalse(request.authorization_present,
+                                 "Authorization reached the public browser fallback")
 
     def _assert_bytes_and_consumed(self, root: Path, payload: _Payload,
                                    observed: _Observation):
@@ -605,6 +669,159 @@ class ReleaseAssetFetchTest(unittest.TestCase):
                         attempts = [request.attempt for request in transfers
                                     if request.route == route]
                         self.assertEqual(attempts, list(range(1, retries + 2)))
+
+    def test_e_redirect_to_another_hostname_strips_authorization_and_consumes_bytes(self):
+        payload = _payload("3.1.2", "amd64", b"cross-host redirect fixture\0")
+        with tempfile.TemporaryDirectory() as tmp, _LocalRelease(payload) as receiver:
+            receiver_url = receiver.browser_archive_url.replace(
+                "127.0.0.1", "localhost", 1,
+            )
+            with _LocalRelease(payload, redirects={
+                "api-archive": receiver_url,
+                "api-checksum": receiver_url + ".sha256",
+            }) as release:
+                self.assertEqual(urlsplit(release.origin).hostname, "127.0.0.1")
+                self.assertEqual(urlsplit(receiver_url).hostname, "localhost")
+                observed = self._run("cross-host-redirect", Path(tmp), release,
+                                     retries=0, delay=1)
+            received = receiver.requests()
+            print("CR918 " + json.dumps(
+                {"case": "cross-host-redirect-receiver",
+                 **_Observation(observed.completed, received).proof()}, sort_keys=True,
+            ), flush=True)
+            self._assert_bytes_and_consumed(Path(tmp), payload, observed)
+        self.assertEqual(
+            [(request.route, request.status) for request in observed.requests],
+            [("api-metadata", 200), ("api-archive", 302),
+             ("api-metadata", 200), ("api-checksum", 302)],
+        )
+        self.assertTrue(all(request.authorization_present and request.authenticated
+                            for request in observed.requests))
+        self.assertTrue(all(request.octet_stream for request in observed.requests
+                            if request.route != "api-metadata"))
+        self.assertEqual(
+            [(request.route, request.status, request.body_bytes) for request in received],
+            [("browser-archive", 200, len(payload.archive)),
+             ("browser-checksum", 200, len(payload.checksum))],
+        )
+        self.assertTrue(all(request.octet_stream for request in received))
+        self.assertFalse(any(request.authorization_present for request in received),
+                         "Authorization was forwarded across hostnames")
+
+    def test_f_metadata_identity_refusals_never_request_assets_or_fall_back(self):
+        cases = (
+            ("draft-release", "release identity mismatch"),
+            ("wrong-tag", "release identity mismatch"),
+            ("two-matching-assets", "missing or ambiguous release asset"),
+            ("non-uploaded-state", "malformed asset identity"),
+            ("wrong-api-asset-url", "unapproved asset endpoint"),
+            ("wrong-browser-url", "unapproved asset endpoint"),
+            ("duplicate-json-key", "ambiguous release metadata"),
+            ("nan", "malformed release metadata"),
+        )
+        for case, reason in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                control, refused = root / "control", root / "refused"
+                control.mkdir()
+                refused.mkdir()
+                payload = _payload("3.2.4", "arm64", b"identity-" + case.encode())
+                with _LocalRelease(payload) as release:
+                    positive = self._run("identity-control-" + case, control, release,
+                                         retries=0, delay=1)
+                    self._assert_bytes_and_consumed(control, payload, positive)
+                    route, valid, content_type = release.routes[release.metadata_path]
+                    # Every row starts from independent valid HTTP fixture
+                    # bytes. The unrelated identity fields stay valid, so
+                    # removing the corresponding guard permits acquisition.
+                    document = json.loads(valid)
+                    if case == "draft-release":
+                        document["draft"] = True
+                    elif case == "wrong-tag":
+                        document["tag_name"] = "v0.0.0"
+                    elif case == "two-matching-assets":
+                        document["assets"].append(dict(document["assets"][0]))
+                    elif case == "non-uploaded-state":
+                        document["assets"][0]["state"] = "new"
+                    elif case == "wrong-api-asset-url":
+                        document["assets"][0]["url"] = document["assets"][1]["url"]
+                    elif case == "wrong-browser-url":
+                        document["assets"][0]["browser_download_url"] = (
+                            document["assets"][1]["browser_download_url"]
+                        )
+                    mutated = json.dumps(document).encode()
+                    if case == "duplicate-json-key":
+                        # An ordinary JSON decoder would keep the valid final
+                        # draft=False; only duplicate-key refusal blocks it.
+                        mutated = b'{"draft": true, ' + valid[1:]
+                    elif case == "nan":
+                        # This otherwise unused field isolates parse_constant.
+                        mutated = valid[:-1] + b', "fixture_nonfinite": NaN}'
+                    self.assertNotEqual(mutated, valid, "fixture mutation was not applied")
+                    mark = len(release.requests())
+                    release.routes[release.metadata_path] = (route, mutated, content_type)
+                    observed = self._run("identity-refusal-" + case, refused, release,
+                                         retries=0, delay=1, after=mark)
+                self._assert_typed_refusal(refused, observed, reason)
+                self.assertEqual(
+                    [(request.route, request.status, request.body_bytes)
+                     for request in observed.requests],
+                    [("api-metadata", 200, len(mutated))],
+                    "identity refusal must consume metadata without assets or browser fallback",
+                )
+
+    def test_g_unapproved_root_and_invalid_token_files_refuse_before_any_request(self):
+        payload = _payload("3.3.5", "amd64", b"synthetic invalid input fixtures\0")
+        token = payload.token.encode("ascii")
+        cases = (
+            ("unapproved-api-root", None, "unapproved endpoint root"),
+            ("token-space", token + b" ", "invalid read token file"),
+            ("token-newline", token + b"\nX-Fixture: present", "invalid read token file"),
+            ("token-oversize", token + b"x" * 4097, "invalid read token file"),
+            ("token-nonascii", token + b"\xff", "local acquisition input or tool failure"),
+            ("token-empty", b"", "invalid read token file"),
+        )
+        for case, token_bytes, reason in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                control, refused = root / "control", root / "refused"
+                control.mkdir()
+                refused.mkdir()
+                with _LocalRelease(payload) as release:
+                    positive = self._run("input-control-" + case, control, release,
+                                         retries=0, delay=1)
+                    self._assert_bytes_and_consumed(control, payload, positive)
+                    api_root = None
+                    if case == "unapproved-api-root":
+                        # Even a missing guard can reach only this fixture.
+                        api_root = release.origin.replace("127.0.0.1", "localhost", 1) + "/api"
+                    observed = self._run_helper(
+                        "input-refusal-" + case, refused, release,
+                        after=len(release.requests()), api_root=api_root,
+                        token_bytes=token_bytes,
+                    )
+                self._assert_typed_refusal(refused, observed, reason)
+                self.assertEqual(observed.requests, (),
+                                 "invalid input reached a real HTTP endpoint")
+
+    def test_h_metadata_5xx_exhaustion_falls_back_without_authorization(self):
+        payload = _payload("3.4.6", "arm64", b"metadata exhaustion browser success\0")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with _LocalRelease(payload, schedules={"api-metadata": (503,)}) as release:
+                observed = self._run("metadata-exhaustion-browser-success", root, release,
+                                     retries=1, delay=1)
+            self._assert_bytes_and_consumed(root, payload, observed)
+            self.assertEqual(
+                [(request.route, request.status) for request in observed.requests],
+                [("api-metadata", 503), ("api-metadata", 503), ("browser-archive", 200),
+                 ("api-metadata", 503), ("api-metadata", 503), ("browser-checksum", 200)],
+            )
+            self.assertEqual(
+                [request.body_bytes for request in observed.requests
+                 if request.route.startswith("browser-")],
+                [len(payload.archive), len(payload.checksum)],
+            )
 
 
 if __name__ == "__main__":
