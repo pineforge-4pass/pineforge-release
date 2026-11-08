@@ -21,6 +21,10 @@
 # six toolchain package version build-args chosen on the signed box.
 # HPO_WHEEL_SHA256 checks the downloaded wheel when supplied to that target.
 # HPO_SDIST_SHA256 checks the native sdist before extraction when supplied.
+# Fetch stages declare ASSET_FETCH_RETRIES=3 (0..5 additional attempts) and
+# ASSET_FETCH_RETRY_DELAY=2 (1..10 seconds). The helper documents the finite
+# connection/transfer bounds and worst-case metadata + API + browser budget.
+# Optional BuildKit secret github_token is a producer-scoped contents:read token.
 #
 # Published as ghcr.io/pineforge-4pass/pineforge-release:<own-semver>.
 
@@ -32,7 +36,7 @@ FROM debian:trixie-slim AS codegen
 ARG CODEGEN_VERSION
 RUN test -n "${CODEGEN_VERSION}" || { echo "ERROR: CODEGEN_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3-pip ca-certificates \
+        python3 python3-pip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN pip3 install --break-system-packages --no-cache-dir -U \
         --target /opt/codegen "pineforge-codegen==${CODEGEN_VERSION}"
@@ -41,21 +45,33 @@ RUN pip3 install --break-system-packages --no-cache-dir -U \
 FROM debian:trixie-slim AS engine
 ARG ENGINE_VERSION
 ARG TARGETARCH
+ARG ASSET_FETCH_RETRIES=3
+ARG ASSET_FETCH_RETRY_DELAY=2
 RUN test -n "${ENGINE_VERSION}" || { echo "ERROR: ENGINE_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates \
+        curl ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
-RUN set -eux; \
+COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py
+RUN --mount=type=secret,id=github_token set -eux; \
     case "${TARGETARCH}" in \
       amd64) triple=linux-x86_64 ;; \
       arm64) triple=linux-aarch64 ;; \
       *) echo "unsupported TARGETARCH='${TARGETARCH}'" >&2; exit 1 ;; \
     esac; \
     base="pineforge-v${ENGINE_VERSION}-${triple}"; \
-    url="https://github.com/pineforge-4pass/pineforge-engine/releases/download/v${ENGINE_VERSION}"; \
     cd /tmp; \
-    curl -fsSL "${url}/${base}.tar.gz"        -o "${base}.tar.gz"; \
-    curl -fsSL "${url}/${base}.tar.gz.sha256" -o "${base}.tar.gz.sha256"; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-engine --tag "v${ENGINE_VERSION}" \
+      --name "${base}.tar.gz" --output "${base}.tar.gz" \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-engine --tag "v${ENGINE_VERSION}" \
+      --name "${base}.tar.gz.sha256" --output "${base}.tar.gz.sha256" \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
     sha256sum -c "${base}.tar.gz.sha256"; \
     tar -xzf "${base}.tar.gz"; \
     mkdir -p /opt/pineforge; \
@@ -247,13 +263,21 @@ FROM codegen AS hpo-wheel
 ARG CODEGEN_VERSION
 ARG HPO_VERSION
 ARG HPO_WHEEL_SHA256
+ARG ASSET_FETCH_RETRIES=3
+ARG ASSET_FETCH_RETRY_DELAY=2
 RUN test -n "${HPO_VERSION}" && test -n "${CODEGEN_VERSION}" || { echo "ERROR: HPO_VERSION + CODEGEN_VERSION build-args are required (CI resolves them)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/check_hpo_resolution.py /tmp/check_hpo_resolution.py
-RUN set -eu; \
+COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py
+RUN --mount=type=secret,id=github_token set -eu; \
     wheel="/tmp/pineforge_hpo-${HPO_VERSION}-py3-none-any.whl"; \
-    curl -fsSL "https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v${HPO_VERSION}/pineforge_hpo-${HPO_VERSION}-py3-none-any.whl" -o "$wheel"; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-hpo --tag "v${HPO_VERSION}" \
+      --name "pineforge_hpo-${HPO_VERSION}-py3-none-any.whl" --output "$wheel" \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
     if [ -n "${HPO_WHEEL_SHA256}" ]; then \
       printf '%s  %s\n' "${HPO_WHEEL_SHA256}" "$wheel" > /tmp/hpo-wheel.sha256; \
       sha256sum -c --strict /tmp/hpo-wheel.sha256; \
@@ -305,6 +329,8 @@ RUN set -eu; \
 FROM hpo-toolchain AS hpo-native
 ARG HPO_VERSION
 ARG HPO_SDIST_SHA256
+ARG ASSET_FETCH_RETRIES=3
+ARG ASSET_FETCH_RETRY_DELAY=2
 ARG HPO_CMAKE_VERSION
 ARG HPO_MAKE_VERSION
 RUN test -n "${HPO_VERSION}" && test -n "${HPO_CMAKE_VERSION}" && test -n "${HPO_MAKE_VERSION}" \
@@ -313,10 +339,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       "cmake=${HPO_CMAKE_VERSION}" "make=${HPO_MAKE_VERSION}" curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=engine /opt/pineforge/include /opt/pineforge/include
+COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py
 # The released sdist includes CMake/native sources; its VERSION must match the
 # wheel pin. Upstream CMake pins and SHA256-checks its dlib FetchContent archive.
-RUN set -eu; \
-    curl -fsSL "https://github.com/pineforge-4pass/pineforge-hpo/releases/download/v${HPO_VERSION}/pineforge_hpo-${HPO_VERSION}.tar.gz" -o /tmp/hpo-source.tar.gz; \
+RUN --mount=type=secret,id=github_token set -eu; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-hpo --tag "v${HPO_VERSION}" \
+      --name "pineforge_hpo-${HPO_VERSION}.tar.gz" --output /tmp/hpo-source.tar.gz \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
     if [ -n "${HPO_SDIST_SHA256}" ]; then \
       printf '%s  /tmp/hpo-source.tar.gz\n' "${HPO_SDIST_SHA256}" > /tmp/hpo-source.sha256; \
       sha256sum -c --strict /tmp/hpo-source.sha256; \

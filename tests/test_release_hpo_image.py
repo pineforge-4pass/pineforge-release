@@ -472,6 +472,17 @@ def _pinned_packages(stage: DockerStage) -> dict[str, str]:
     return packages
 
 
+def _apt_packages(stage: DockerStage) -> set[str]:
+    """Read exact package names from the stage's actual apt install commands."""
+    return {
+        token.split("=", 1)[0]
+        for keyword, body in stage.instructions if keyword == "RUN"
+        for match in re.finditer(
+            r"apt-get install -y --no-install-recommends\s+(.+?)(?:;|&&)", body)
+        for token in shlex.split(match[1])
+    }
+
+
 def _read_toolchain_arguments(text: str) -> dict[str, str]:
     """Plain NAME=VALUE data only; never evaluate this file as shell code."""
     arguments = {}
@@ -568,6 +579,169 @@ class DockerfileTargetTest(unittest.TestCase):
         cls.dockerfile = (REPO / "docker" / "Dockerfile").read_bytes().decode("utf-8")
         cls.stages = _dockerfile_stages(cls.dockerfile)
         cls.named = {stage.name: stage for stage in cls.stages}
+
+    # Exact approved acquisition prefixes, including the ARGs, COPYs, build-only
+    # packages and the next checksum boundary. Nothing is stripped from the
+    # historical runtime golden, or normalized away from a mutated instruction.
+    ASSET_FETCH_PREFIXES = {
+        "engine": r'''FROM debian:trixie-slim AS engine
+ARG ENGINE_VERSION
+ARG TARGETARCH
+ARG ASSET_FETCH_RETRIES=3
+ARG ASSET_FETCH_RETRY_DELAY=2
+RUN test -n "${ENGINE_VERSION}" || { echo "ERROR: ENGINE_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py
+RUN --mount=type=secret,id=github_token set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) triple=linux-x86_64 ;; \
+      arm64) triple=linux-aarch64 ;; \
+      *) echo "unsupported TARGETARCH='${TARGETARCH}'" >&2; exit 1 ;; \
+    esac; \
+    base="pineforge-v${ENGINE_VERSION}-${triple}"; \
+    cd /tmp; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-engine --tag "v${ENGINE_VERSION}" \
+      --name "${base}.tar.gz" --output "${base}.tar.gz" \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-engine --tag "v${ENGINE_VERSION}" \
+      --name "${base}.tar.gz.sha256" --output "${base}.tar.gz.sha256" \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
+    sha256sum -c "${base}.tar.gz.sha256";''',
+        "hpo-wheel": r'''FROM codegen AS hpo-wheel
+ARG CODEGEN_VERSION
+ARG HPO_VERSION
+ARG HPO_WHEEL_SHA256
+ARG ASSET_FETCH_RETRIES=3
+ARG ASSET_FETCH_RETRY_DELAY=2
+RUN test -n "${HPO_VERSION}" && test -n "${CODEGEN_VERSION}" || { echo "ERROR: HPO_VERSION + CODEGEN_VERSION build-args are required (CI resolves them)" >&2; exit 1; }
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/check_hpo_resolution.py /tmp/check_hpo_resolution.py
+COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py
+RUN --mount=type=secret,id=github_token set -eu; \
+    wheel="/tmp/pineforge_hpo-${HPO_VERSION}-py3-none-any.whl"; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-hpo --tag "v${HPO_VERSION}" \
+      --name "pineforge_hpo-${HPO_VERSION}-py3-none-any.whl" --output "$wheel" \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
+    if [ -n "${HPO_WHEEL_SHA256}" ]; then''',
+        "hpo-native": r'''FROM hpo-toolchain AS hpo-native
+ARG HPO_VERSION
+ARG HPO_SDIST_SHA256
+ARG ASSET_FETCH_RETRIES=3
+ARG ASSET_FETCH_RETRY_DELAY=2
+ARG HPO_CMAKE_VERSION
+ARG HPO_MAKE_VERSION
+RUN test -n "${HPO_VERSION}" && test -n "${HPO_CMAKE_VERSION}" && test -n "${HPO_MAKE_VERSION}" \
+    || { echo "ERROR: HPO_VERSION + HPO_CMAKE_VERSION + HPO_MAKE_VERSION build-args are required" >&2; exit 1; }
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      "cmake=${HPO_CMAKE_VERSION}" "make=${HPO_MAKE_VERSION}" curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=engine /opt/pineforge/include /opt/pineforge/include
+COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py
+RUN --mount=type=secret,id=github_token set -eu; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-hpo --tag "v${HPO_VERSION}" \
+      --name "pineforge_hpo-${HPO_VERSION}.tar.gz" --output /tmp/hpo-source.tar.gz \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
+    if [ -n "${HPO_SDIST_SHA256}" ]; then''',
+    }
+
+    def assert_asset_fetch_wiring(self, dockerfile):
+        stages = _dockerfile_stages(dockerfile)
+        for stage in stages:
+            if stage.name not in self.ASSET_FETCH_PREFIXES:
+                self.assertNotIn("fetch_release_asset.py", stage.text)
+                self.assertNotIn("ASSET_FETCH_", stage.text)
+                self.assertNotIn("github_token", stage.text)
+                continue
+            expected = _dockerfile_instructions(self.ASSET_FETCH_PREFIXES[stage.name])
+            self.assertEqual(stage.instructions[:-1], expected[:-1], stage.name)
+            keyword, run = stage.instructions[-1]
+            self.assertEqual(keyword, "RUN")
+            self.assertTrue(run.startswith(expected[-1][1] + " "), stage.name)
+            self.assertEqual(run.count("python3 -I /tmp/fetch_release_asset.py"),
+                             2 if stage.name == "engine" else 1)
+        self.assertEqual({stage.name for stage in stages} & set(self.ASSET_FETCH_PREFIXES),
+                         set(self.ASSET_FETCH_PREFIXES))
+
+    def test_exact_asset_fetch_additions_and_mutation_controls(self):
+        self.assert_asset_fetch_wiring(self.dockerfile)
+        copy_line = "COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py\n"
+        for name in self.ASSET_FETCH_PREFIXES:
+            stage = self.named[name].text
+            mutations = [
+                stage.replace("ARG ASSET_FETCH_RETRIES=3\n", "", 1),
+                stage.replace("ARG ASSET_FETCH_RETRIES=3\n", "ARG ASSET_FETCH_RETRIES=3\n" * 2, 1),
+                stage.replace("ARG ASSET_FETCH_RETRY_DELAY=2", "ARG ASSET_FETCH_RETRY_DELAY=0", 1),
+                stage.replace(copy_line, "", 1),
+                stage.replace(copy_line, copy_line * 2, 1),
+                stage.replace(copy_line, copy_line.replace("/tmp/", "/opt/"), 1),
+                stage.replace("--mount=type=secret,id=github_token ", "", 1),
+                stage.replace("id=github_token ", "id=github_token,required=true ", 1),
+                stage.replace("python3 -I /tmp/fetch_release_asset.py",
+                              'echo "python3 -I /tmp/fetch_release_asset.py"', 1),
+                stage.replace(' --retries "${ASSET_FETCH_RETRIES}"', " --retries 0", 1),
+                stage.replace("--token-file /run/secrets/github_token",
+                              "--token-file /tmp/github_token", 1),
+                stage.replace("--api-root https://api.github.com",
+                              "--api-root https://unapproved.invalid", 1),
+                stage.replace("--token-file /run/secrets/github_token;",
+                              "--token-file /run/secrets/github_token; true;", 1),
+            ]
+            if name == "engine":
+                mutations.append(stage.replace("curl ca-certificates python3",
+                                               "curl ca-certificates", 1))
+            for index, altered in enumerate(mutations):
+                with self.subTest(stage=name, mutation=index):
+                    self.assertNotEqual(altered, stage)
+                    mutant = self.dockerfile.replace(stage, altered, 1)
+                    with self.assertRaises(AssertionError):
+                        self.assert_asset_fetch_wiring(mutant)
+
+    def assert_asset_fetch_python_dependencies(self, dockerfile):
+        named = {stage.name: stage for stage in _dockerfile_stages(dockerfile)}
+        for target, provider in (("engine", "engine"),
+                                 ("hpo-wheel", "codegen"),
+                                 ("hpo-native", "hpo-toolchain")):
+            if target != provider:
+                self.assertEqual(named[target].base, provider,
+                                 target + ": Python must come from its FROM ancestor")
+            self.assertIn("python3", _apt_packages(named[provider]),
+                          target + ": " + provider + " must explicitly install python3")
+
+    def test_asset_fetch_python_dependencies_and_mutation_controls(self):
+        self.assert_asset_fetch_python_dependencies(self.dockerfile)
+        for name, original, replacement in (
+                ("codegen", "python3 python3-pip", "python3-pip"),
+                ("hpo-toolchain", " python3;", ";")):
+            with self.subTest(provider=name):
+                stage = self.named[name].text
+                self.assertEqual(stage.count(original), 1)
+                altered = stage.replace(original, replacement, 1)
+                self.assertNotEqual(altered, stage)
+                mutant = self.dockerfile.replace(stage, altered, 1)
+                self.assertNotEqual(mutant, self.dockerfile)
+                named = {stage.name: stage for stage in _dockerfile_stages(mutant)}
+                self.assertEqual(named["hpo-wheel"].base, "codegen")
+                self.assertEqual(named["hpo-native"].base, "hpo-toolchain")
+                self.assertNotIn("python3", _apt_packages(named[name]))
+                if name == "codegen":
+                    self.assertIn("python3-pip", _apt_packages(named[name]))
+                with self.assertRaisesRegex(AssertionError, "explicitly install python3"):
+                    self.assert_asset_fetch_python_dependencies(mutant)
 
     def test_last_stage_is_a_no_op_release_alias_with_the_original_entrypoint(self):
         last = self.stages[-1]
