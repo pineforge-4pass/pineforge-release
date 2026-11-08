@@ -153,8 +153,8 @@ role identities, license source URLs, length, and fixed managed scope. Invalid i
 produce no stdout and no consumer calls. All source and policy bytes validate
 before prepare emits files or minting becomes eligible.
 
-`facts-validate.yml` runs on PRs and main pushes touching `facts/**` or affected
-scripts, tests or workflows. Its token has only `contents: read`; PR code never
+`facts-validate.yml` runs on every pull request and on every push to main, with
+no path filter. Its token has only `contents: read`; PR code never
 receives App credentials. It renders full/corpus SVG in light/dark themes and
 endpoint JSON, compares deterministic bytes, and runs subprocess acceptance that
 parses the actual SVG and JSON and checks their facts. `python-test.yml` also

@@ -2,16 +2,9 @@ name: facts-validate
 
 on:
   pull_request:
+  # Every push to main runs the facts tests, so there is no path filter.
   push:
     branches: [main]
-    paths:
-      - 'facts/**'
-      - 'scripts/repo_descriptions.py'
-      - 'scripts/facts_*.py'
-      - 'tests/test_repo_descriptions.py'
-      - 'tests/test_facts_*.py'
-      - 'tests/test_release_workflows.py'
-      - '.github/workflows/**'
 
 permissions:
   contents: read
@@ -86,8 +79,8 @@ jobs:
 
   validate:
     needs: authz
-    # PR and merge-group legs stay hosted until the member-only admission workflow is in place.
-    runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}
+    # Standard GitHub-hosted runner for every configured event.
+    runs-on: ubuntu-24.04
     steps:
       - name: Install push runner tools
         if: github.event_name == 'push'
