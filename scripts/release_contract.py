@@ -38,6 +38,7 @@ EVENT_TYPES = {
 SHA = r"[0-9a-f]{64}"
 COMMIT = r"[0-9a-f]{40}"
 MANIFEST_KEYS = {"schema", "release_version", "prerelease", "hub_commit", "versions", "image", "facts", "run_id"}
+_INVENTORIES_UNSET = object()
 
 
 class Invalid(ValueError):
@@ -95,6 +96,64 @@ def version(value):
     return v
 
 
+def parity_capable(release):
+    # parity_bundle uses the byte primitives above; import the cutoff lazily
+    # so the shared byte contract does not introduce an import cycle.
+    from parity_bundle import PARITY_CAPABILITY_FROM
+    return version(release) >= version(PARITY_CAPABILITY_FROM)
+
+
+def validate_parity(engine, inventories=_INVENTORIES_UNSET):
+    """Bind the exact wire identity to its source commit and canonical bytes."""
+    from parity_bundle import (APPROVED_FILES, DESCRIPTOR_NAME, DESCRIPTOR_SCHEMA,
+                               SUMS_NAME, sums_bytes)
+    identity = engine.get("parity") if type(engine) is dict else None
+    require(type(identity) is dict, "parity capability missing for release")
+    keys(engine, ("version", "tag", "commit", "parity"))
+    keys(identity, ("schema", "source_manifest_sha256", "engine_commit", "payload_sha256",
+                    "descriptor_sha256", "sums_sha256"))
+    require(identity["schema"] == DESCRIPTOR_SCHEMA, "parity identity differs from manifest")
+    match(COMMIT, engine["commit"])
+    match(COMMIT, identity["engine_commit"])
+    require(identity["engine_commit"] == engine["commit"], "parity identity differs from engine commit")
+    for field in ("source_manifest_sha256", "descriptor_sha256", "sums_sha256"):
+        match(SHA, identity[field])
+    payload_hashes = identity["payload_sha256"]
+    require(type(payload_hashes) is dict
+            and set(payload_hashes) == {destination for _, destination in APPROVED_FILES},
+            "parity inventory differs from candidate")
+    for value in payload_hashes.values():
+        match(SHA, value)
+    descriptor = {key: identity[key] for key in
+                  ("schema", "source_manifest_sha256", "engine_commit", "payload_sha256")}
+    descriptor_raw = canonical(descriptor)
+    require(sha256(descriptor_raw) == identity["descriptor_sha256"], "parity descriptor hash differs")
+    require(sha256(sums_bytes(descriptor_raw, payload_hashes)) == identity["sums_sha256"],
+            "parity SUMS hash differs")
+    if inventories is not _INVENTORIES_UNSET:
+        inventory = inventories.get("parity") if type(inventories) is dict else None
+        require(type(inventory) is dict
+                and set(inventory) == {DESCRIPTOR_NAME, SUMS_NAME, *payload_hashes},
+                "parity inventory differs from candidate")
+        require({name: inventory[name] for name in payload_hashes} == payload_hashes,
+                "parity inventory differs from candidate")
+        require(inventory[DESCRIPTOR_NAME] == identity["descriptor_sha256"],
+                "parity descriptor hash differs")
+        require(inventory[SUMS_NAME] == identity["sums_sha256"], "parity SUMS hash differs")
+    return identity
+
+
+def parity_child_digests(image):
+    require(type(image) is dict, "parity child proof missing")
+    children = {arch: image.get(arch + "_digest") for arch in ("amd64", "arm64")}
+    require(all(value is not None for value in children.values()), "parity child proof missing")
+    digests = [image.get("digest"), *children.values()]
+    require(all(isinstance(value, str) and re.fullmatch("sha256:" + SHA, value) is not None
+                for value in digests) and len(set(digests)) == 3,
+            "parity child digest not verified")
+    return children
+
+
 def validate(manifest):
     keys(manifest, MANIFEST_KEYS)
     require(manifest["schema"] == SCHEMA, "unsupported release schema")
@@ -106,7 +165,12 @@ def validate(manifest):
     versions = manifest["versions"]
     keys(versions, ("engine", "codegen", "hpo"))
     e, c, h = (versions[name] for name in ("engine", "codegen", "hpo"))
-    keys(e, ("version", "tag", "commit"))
+    if parity_capable(str(v)):
+        require(not (type(e) is dict and set(e) == {"version", "tag", "commit"}),
+                "legacy manifest predates parity capability")
+        validate_parity(e)
+    else:
+        keys(e, ("version", "tag", "commit"))
     keys(c, ("version", "pypi_version", "commit", "sdist_sha256", "npm_version", "npm_integrity"))
     version(e["version"])
     cv = version(c["version"])
@@ -160,13 +224,28 @@ def validate_candidate(obj):
     positive(obj["run_id"])
     pins = obj["versions"]
     pair.check(str(v), pins["engine"]["version"], pins["codegen"]["version"], hpo=pins["hpo"]["version"] if pins["hpo"] else "")
+    capable = parity_capable(str(v))
+    if capable:
+        validate_parity(pins["engine"], obj["inventories"])
+        children = parity_child_digests(obj["image"])
+        require(type(obj["verification"]) is dict and set(obj["verification"]) == {"amd64", "arm64"},
+                "parity child proof missing")
     keys(obj["verification"], ("amd64", "arm64"))
-    for result in obj["verification"].values():
+    for arch, result in obj["verification"].items():
+        if capable:
+            require(type(result) is dict, "parity child proof missing")
         match(SHA, result["backtest_sha256"])
         positive(result["trades"])
         if pins["hpo"]:
             require(type(result["hpo_trials"]) is int and result["hpo_trials"] == 9, "HPO smoke incomplete")
             match(SHA, result["hpo_sha256"])
+        if capable:
+            child = result.get("parity")
+            require(type(child) is dict and set(child) == {"image_digest", "identity", "inventory"},
+                    "parity child proof missing")
+            require(child["image_digest"] == children[arch], "parity child digest not verified")
+            require(child["identity"] == pins["engine"]["parity"], "parity descriptor identity differs")
+            require(child["inventory"] == obj["inventories"]["parity"], "parity installed file inventory differs")
     keys(obj["sources"], ("release_tag", "list_asset", "list_sha256", "amd64_sha256", "arm64_sha256"))
     for name in ("list_sha256", "amd64_sha256", "arm64_sha256"):
         match(SHA, obj["sources"][name])
@@ -180,12 +259,22 @@ def pair_payload(manifest_raw, candidate_raw):
     require(all(manifest[name] == candidate[name]
                 for name in ("release_version", "image", "hub_commit", "run_id")),
             "manifest does not bind this candidate")
+    capable = parity_capable(manifest["release_version"])
+    if capable:
+        require(manifest["versions"]["engine"]["parity"] == candidate["versions"]["engine"]["parity"],
+                "parity identity differs from manifest")
     for role in ("engine", "codegen", "hpo"):
         actual = manifest["versions"][role]
+        expected = candidate["versions"][role]
+        if role == "engine" and capable:
+            # The explicit equality above owns parity; compare the remaining
+            # producer fields without a second, generic parity refusal.
+            actual = {key: value for key, value in actual.items() if key != "parity"}
+            expected = {key: value for key, value in expected.items() if key != "parity"}
         if role == "codegen":
             # npm is resolved during finalization, after the candidate is built.
             actual = {key: value for key, value in actual.items() if key not in ("npm_version", "npm_integrity")}
-        require(actual == candidate["versions"][role], "manifest producer identity differs from candidate")
+        require(actual == expected, "manifest producer identity differs from candidate")
     sources = candidate["sources"]
     # Only public source-bundle identities can enter the event. No arbitrary
     # repository, URL, deployment name or private path is copied from a candidate.

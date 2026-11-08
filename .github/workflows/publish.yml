@@ -271,6 +271,23 @@ jobs:
           done
           [ -n "$ok" ] || { echo "::error::engine ${E} tarballs or codegen ${C}${H:+ or hpo ${H}} not available after wait"; exit 1; }
 
+      - name: Sync parity from the immutable engine tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.RELEASE_TAG }}
+          E: ${{ steps.pins.outputs.engine }}
+        run: |
+          python3 - <<'PYPARITY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from parity_bundle import sync_parity_bundle
+          from release_artifacts import Client
+          from release_contract import parity_capable
+          if parity_capable(os.environ['TAG'].removeprefix('v')):
+              sync_parity_bundle(Client(), 'v' + os.environ['E'], Path('docker/parity'))
+          PYPARITY
+
       - name: Bind producer source and package bytes
         id: binding
         env:
@@ -286,10 +303,23 @@ jobs:
             --engine="$E" --codegen="$C" --hpo="$H" --hub-commit="$HUB_COMMIT" \
             --output "$RUNNER_TEMP/release-bindings.json"
           python3 - <<'PYBIND' >> "$GITHUB_OUTPUT"
-          import json, os
+          import os, sys
           from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from release_contract import decode, parity_capable, require, validate_parity
           from scripts.release_sources import hpo_artifact_args
-          obj = json.loads(Path(os.environ['RUNNER_TEMP'], 'release-bindings.json').read_bytes())
+          obj = decode(Path(os.environ['RUNNER_TEMP'], 'release-bindings.json').read_bytes())
+          require(obj['release_version'] == os.environ['TAG'].removeprefix('v'),
+                  'producer binding release version differs')
+          if parity_capable(obj['release_version']):
+              validate_parity(obj['versions']['engine'], obj['inventories'])
+              print('parity_descriptor_sha256=' + obj['versions']['engine']['parity']['descriptor_sha256'])
+              print('parity_carrier=PARITY_CARRIER=1')
+          else:
+              require('parity' not in obj['versions']['engine'] and 'parity' not in obj['inventories'],
+                      'unexpected parity capability before cutoff')
+              print('parity_descriptor_sha256=')
+              print('parity_carrier=PARITY_CARRIER=0')
           hpo = obj['versions']['hpo']
           if hpo:
               for output, argument in hpo_artifact_args(hpo).items():
@@ -383,6 +413,8 @@ jobs:
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
+            PARITY_DESCRIPTOR_SHA256=${{ steps.binding.outputs.parity_descriptor_sha256 }}
+            ${{ steps.binding.outputs.parity_carrier }}
             RELEASE_VERSION=${{ env.RELEASE_TAG }}
             RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: type=gha,scope=release-amd64
@@ -406,6 +438,8 @@ jobs:
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
+            PARITY_DESCRIPTOR_SHA256=${{ steps.binding.outputs.parity_descriptor_sha256 }}
+            ${{ steps.binding.outputs.parity_carrier }}
             RELEASE_VERSION=${{ env.RELEASE_TAG }}
             RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: type=gha,scope=release-arm64
@@ -430,6 +464,8 @@ jobs:
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
+            PARITY_DESCRIPTOR_SHA256=${{ steps.binding.outputs.parity_descriptor_sha256 }}
+            ${{ steps.binding.outputs.parity_carrier }}
             ${{ steps.pair.outputs.hpo_version_arg }}
             ${{ steps.binding.outputs.hpo_wheel_arg }}
             ${{ steps.binding.outputs.hpo_sdist_arg }}
@@ -458,6 +494,8 @@ jobs:
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
+            PARITY_DESCRIPTOR_SHA256=${{ steps.binding.outputs.parity_descriptor_sha256 }}
+            ${{ steps.binding.outputs.parity_carrier }}
             ${{ steps.pair.outputs.hpo_version_arg }}
             ${{ steps.binding.outputs.hpo_wheel_arg }}
             ${{ steps.binding.outputs.hpo_sdist_arg }}
@@ -521,6 +559,8 @@ jobs:
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
+            PARITY_DESCRIPTOR_SHA256=${{ steps.binding.outputs.parity_descriptor_sha256 }}
+            ${{ steps.binding.outputs.parity_carrier }}
             RELEASE_VERSION=${{ env.RELEASE_TAG }}
             RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}
           cache-from: |
@@ -549,6 +589,8 @@ jobs:
             ENGINE_VERSION=${{ steps.pins.outputs.engine }}
             CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}
             GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}
+            PARITY_DESCRIPTOR_SHA256=${{ steps.binding.outputs.parity_descriptor_sha256 }}
+            ${{ steps.binding.outputs.parity_carrier }}
             ${{ steps.pair.outputs.hpo_version_arg }}
             ${{ steps.binding.outputs.hpo_wheel_arg }}
             ${{ steps.binding.outputs.hpo_sdist_arg }}
