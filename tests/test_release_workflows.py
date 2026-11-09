@@ -278,7 +278,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         ),
     }
     APT_GUARD_STEP = {
-        "name": "Stop automatic apt upgrades (LB-504, until the release image is rebaked)",
+        "name": "Stop automatic apt upgrades (until the release image is rebaked)",
         "shell": "bash",
         "run": ("systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true\n"
                 "if systemctl is-active --quiet apt-daily-upgrade.service || "
@@ -354,7 +354,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         jobs = wf.get("jobs", {})
         for identity in ("tag-guard", "prepare", "publish", "failure-report"):
             self.assertEqual((jobs.get(identity, {}).get("steps") or [{}])[0], self.APT_GUARD_STEP,
-                             identity + " must stop the apt timers before anything else (LB-504)")
+                             identity + " must stop the apt timers before anything else")
         for identity in ("tag-guard", "prepare", "publish", "notify-consumers", "failure-report"):
             self.assertIn(identity, jobs)
         self.assertEqual(next(iter(jobs)), "tag-guard")
@@ -726,7 +726,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             ("          persist-credentials: false\n", "          persist-credentials: true\n", 4),
             ("          fetch-depth: 0\n", "          fetch-depth: 1\n", 2),
             ("          ref: main\n", "          ref: ${{ inputs.tag }}\n", 2),
-            # 2 tag consumers + the 4 apt guards (LB-504); every removal must still break a pin
+            # 2 tag consumers + the 4 apt guards; every removal must still break a pin
             ("        shell: bash\n", "", 6),
             ("        if: needs.tag-guard.result == 'success'\n", "", 2),
             # owner 10-21 (msg 1562390657274748981): all four publish jobs must refuse the release array.
@@ -1042,7 +1042,7 @@ class ReleaseTagGuardFailureReportTest(unittest.TestCase):
         job = (wf.get("jobs") or {}).get("failure-report") or {}
         steps = job.get("steps") or []
         self.assertGreater(len(steps), 1, "failure reporting must start with the apt guard and a refusal")
-        # LB-504: the apt guard is steps[0]; the refusal is the first real step after it, before any checkout.
+        # The apt guard is steps[0]; the refusal is the first real step after it, before any checkout.
         self.assertEqual(steps[0], ReleaseTriggerWorkflowTest.APT_GUARD_STEP, "the apt guard must be the first step")
         step = steps[1]
         self.assertEqual(step.get("name"), "Refuse unverified release tag", "the refusal must follow the apt guard")
@@ -2878,7 +2878,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
                     self.assert_no_release_runner_labels(mutant)
 
     def test_release_finalize_stops_the_apt_timers_before_anything_else(self):
-        # LB-504: apt-daily-upgrade.timer re-execs systemd 20-25 minutes after
+        # apt-daily-upgrade.timer re-execs systemd 20-25 minutes after
         # boot and kills the runner, and the finalizer runs hourly on
         # ubuntu-latest (owner 10-21). Both of its jobs must stop the timers before any
         # checkout, secret or repository code.
@@ -2887,7 +2887,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
             with self.subTest(job=identity):
                 self.assertEqual((jobs.get(identity, {}).get("steps") or [{}])[0],
                                  ReleaseTriggerWorkflowTest.APT_GUARD_STEP,
-                                 identity + " must stop the apt timers before anything else (LB-504)")
+                                 identity + " must stop the apt timers before anything else")
 
     def test_runner_pin_refuses_wrong_labels_other_pools_and_fallbacks_on_every_job(self):
         original = self.release_workflows()
@@ -2991,12 +2991,12 @@ class PrTierWorkflowTest(unittest.TestCase):
                 "github.event.pull_request.head.repo.full_name == github.repository")
     AUTHZ_RUNNER_LINE = "    runs-on: ubuntu-24.04"
     AUTHZ_POOL_RUNNER_LINE = '    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]'
-    # Literal current ci-labels.md hosted authz (owner #1050, LB-437).
+    # Literal current ci-labels.md hosted authz.
     # Keep this independent of the workflows: every byte, including comments,
     # permissions and both permission lookups, is pinned.
     AUTHZ_TEXT = """  authz:
     name: authz
-    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
+    # Standard GitHub-hosted label; never a larger-runner label.
     runs-on: ubuntu-24.04
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
@@ -3012,7 +3012,7 @@ class PrTierWorkflowTest(unittest.TestCase):
           WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           WR_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
           GH_TOKEN: ${{ github.token }}   # read-only use: one permission lookup for workflow_run
-          # Bot logins whose same-repository pull requests count as ours: dependabot[bot] (CI-DEPBOT A)
+          # Bot logins whose same-repository pull requests count as ours: dependabot[bot]
           # and the org's own GitHub App bot logins by name (space-separated), nothing else.
           ALLOWED_BOTS: "dependabot[bot] pineforge-app[bot]"
         run: |
@@ -3024,7 +3024,7 @@ class PrTierWorkflowTest(unittest.TestCase):
               # events; none of them runs pull-request code.
               ;;
             workflow_run)
-              # LB-437: bind identity to the triggering run and its re-runner.
+              # Bind identity to the triggering run and its re-runner.
               # These two App bots are fixed canon policy; ALLOWED_BOTS is PR-only.
               [ -n "${WR_HEAD_REPO:-}" ] || fail "workflow_run head repository is missing"
               [ -n "${WR_ACTOR:-}" ] || fail "workflow_run triggering actor is missing"

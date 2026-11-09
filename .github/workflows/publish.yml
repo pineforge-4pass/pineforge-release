@@ -42,7 +42,7 @@ jobs:
       sha: ${{ steps.tag.outputs.sha }}
       tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+      - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
         run: |
           systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
@@ -94,7 +94,7 @@ jobs:
       exists: ${{ steps.candidate.outputs.exists }}
       tag: ${{ needs.tag-guard.outputs.tag }}
     steps:
-      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+      - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
         run: |
           systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
@@ -125,7 +125,7 @@ jobs:
     outputs:
       prerelease: ${{ steps.pair.outputs.prerelease }}
     steps:
-      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+      - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
         run: |
           systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
@@ -702,7 +702,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+      - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
         run: |
           systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true

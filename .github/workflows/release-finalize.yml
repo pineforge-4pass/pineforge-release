@@ -39,7 +39,7 @@ jobs:
       deliveries: ${{ steps.delivery-output.outputs.deliveries }}
       compute_configuration_error: ${{ steps.ready.outputs.compute_configuration_error }}
     steps:
-      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+      - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
         run: |
           systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
@@ -135,7 +135,7 @@ jobs:
       # Private targets never enter matrix outputs, log messages or public receipts.
       TARGET_REPOSITORY: ${{ matrix.consumer == 'offline' && 'pineforge-backtest-mcp' || matrix.consumer == 'hosted' && secrets.RELEASE_HOSTED_MCP_REPOSITORY || matrix.consumer == 'application' && secrets.RELEASE_APPLICATION_REPOSITORY || matrix.consumer == 'web' && secrets.FACTS_WEB_REPOSITORY || matrix.consumer == 'data' && 'pineforge-data' || matrix.consumer == 'license' && 'pineforge-license' || matrix.consumer == 'compute' && secrets.RELEASE_COMPUTE_REPOSITORY || '' }}
     steps:
-      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+      - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
         run: |
           systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
