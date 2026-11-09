@@ -382,7 +382,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             "run": self.VALIDATE_RUN,
         }, "validate before any tagged checkout, secret, or repository code")
         for identity, job in jobs.items():
-            # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+            # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
             if identity != "notify-consumers":
                 self.assertEqual(job.get("runs-on"), "ubuntu-latest", identity)
             if identity != "tag-guard":
@@ -729,7 +729,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             # 2 tag consumers + the 4 apt guards; every removal must still break a pin
             ("        shell: bash\n", "", 6),
             ("        if: needs.tag-guard.result == 'success'\n", "", 2),
-            # owner 10-21 (msg 1562390657274748981): all four publish jobs must refuse the release array.
+            # All four publish jobs must refuse the release array.
             ("    runs-on: ubuntu-latest\n", '    runs-on: ["self-hosted","pf-ci","pf-ci-release"]\n', 4),
         ):
             self.assertEqual(text.count(before), count, "each real tag consumer must be mutated")
@@ -2880,7 +2880,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
     def test_release_finalize_stops_the_apt_timers_before_anything_else(self):
         # apt-daily-upgrade.timer re-execs systemd 20-25 minutes after
         # boot and kills the runner, and the finalizer runs hourly on
-        # ubuntu-latest (owner 10-21). Both of its jobs must stop the timers before any
+        # ubuntu-latest. Both of its jobs must stop the timers before any
         # checkout, secret or repository code.
         jobs = _workflow("release-finalize.yml")["jobs"]
         for identity in ("finalize", "notify-consumers"):
@@ -2954,7 +2954,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         "facts-validate.yml": {"validate"},
     }
     HOSTED_ONLY_RUNNERS = {"authz": "ubuntu-24.04", "release-rules": "ubuntu-latest"}
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
     HOSTED_JOBS = {
         ("python-test.yml", "authz"),
         ("python-test.yml", "changes"),

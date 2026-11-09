@@ -26,7 +26,7 @@ permissions:
 jobs:
   redeliver:
     if: github.ref == 'refs/heads/main'
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
     runs-on: ubuntu-latest
     environment: release-automation
     # Share the normal delivery lock; two repairs cannot reuse an audit number.

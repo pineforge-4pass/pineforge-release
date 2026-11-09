@@ -8,8 +8,8 @@ or deploy consumers.
 
 ## Release runner isolation
 
-Owner decision 10-21 (msg 1562390657274748981) sets these release and facts-automation
-jobs to the literal `runs-on: ubuntu-latest`, a standing R6/rule-B exception
+These release and facts-automation
+jobs use the literal `runs-on: ubuntu-latest`, a standing exception
 for pineforge-release:
 
 | Workflow | Jobs |
@@ -34,7 +34,7 @@ with Contents or Issues write access. The `publish.yml` reusable
 `pull_request` and `pull_request_target` workflows must never use this class.
 The PR jobs in `python-test.yml` and `facts-validate.yml` also use GitHub-hosted runners.
 Their `authz` jobs use `runs-on: ubuntu-24.04`; the other PR jobs use
-`runs-on: ubuntu-latest` per the owner decision, with these CI runner assignments:
+`runs-on: ubuntu-latest` by the same standing exception, with these CI runner assignments:
 `python-test.yml` jobs `changes`, `fingerprint-canonical`, `description-renderer`,
 `release-ready-replay` and `release-ready` use `runs-on: ubuntu-24.04` for every
 configured event, including pushes to `main` and `master`.
@@ -1263,8 +1263,8 @@ suite inventory; only a verified documentation-only PR may skip suites.
 
 The hub's `python-test.yml` and `facts-validate.yml` PR checks use GitHub-hosted
 runners: `authz` uses `runs-on: ubuntu-24.04`; the other PR jobs use
-`runs-on: ubuntu-latest` per owner decision 10-21 (msg 1562390657274748981),
-a standing R6/rule-B exception for pineforge-release, without a `PF_CI_LABELS`
+`runs-on: ubuntu-latest`,
+a standing exception for pineforge-release, without a `PF_CI_LABELS`
 environment variable, with these CI runner assignments:
 `python-test.yml` jobs `changes`, `fingerprint-canonical`, `description-renderer`,
 `release-ready-replay` and `release-ready` use `runs-on: ubuntu-24.04` for every
@@ -1347,7 +1347,7 @@ A member's own fork fails the canonical authz check.
 The existing `merge_group` trigger remains
 configured and passes the canonical authz script. macOS stays hosted
 (no hardware); this repository has no macOS jobs. Credential/release jobs
-use `ubuntu-latest` per owner decision 10-21, including publication workflows.
+use `ubuntu-latest` by the same standing exception, including publication workflows.
 
 | Name / setting | Scope | Purpose |
 |---|---|---|
