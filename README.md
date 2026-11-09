@@ -437,8 +437,8 @@ bookworm's GCC 12 pins with GCC 14; the checked harness and entrypoint stay unch
 entrypoint remains `/opt/pineforge/bin/entrypoint.sh`. The guard policy value is read from `docker/GUARD-POLICY-SETS.pin`, computed privately and never re-derived here; the image records it in the `io.pineforge.guard.policy-sets-sha256` label and in `/opt/pineforge/guard-policy.sha256`.
 
 Use `--target hpo` to build the FULL image with the HPO command. It requires
-`ENGINE_VERSION`, `CODEGEN_VERSION`, `GUARD_POLICY_SETS_SHA256`, `HPO_VERSION` and
-all six toolchain arguments listed below. That image accepts `docker run <image> hpo <subcommand>` for
+`ENGINE_VERSION`, `CODEGEN_VERSION`, `GUARD_POLICY_SETS_SHA256`, `HPO_VERSION`, `HPO_WHEEL_SHA256`,
+`HPO_SDIST_SHA256` and all six toolchain arguments listed below. That image accepts `docker run <image> hpo <subcommand>` for
 `space-info`, `compile`, `run` and `warm-encode`. For example, inspect each
 command's inputs with `docker run --rm <image> hpo compile --help`. The HPO
 command has the C++ compiler, Eigen, engine headers and static library needed
@@ -454,13 +454,14 @@ harness files and their byte and ABI checks remain in place.
 For `--target hpo`, `HPO_VERSION` is a required build argument with no default,
 recorded in the `io.pineforge.hpo.version` label and `PINEFORGE_HPO_VERSION`.
 The build fetches
-that release's wheel and native source, checks the wheel against
-`HPO_WHEEL_SHA256` when supplied, and asks pip to resolve the wheel's `transpile`
+that release's wheel and native source, checks the wheel against the required
+`HPO_WHEEL_SHA256`, and asks pip to resolve the wheel's `transpile`
 extra against the already installed codegen. A resolution error or any planned
 codegen replacement fails the build. The wheel is then installed separately
 without dependencies under `/opt/pineforge/hpo`, beside codegen on `PYTHONPATH`.
 Publishing validates both bound artifact digests before passing
-`HPO_WHEEL_SHA256` and `HPO_SDIST_SHA256` to every HPO build. The native source
+`HPO_WHEEL_SHA256` and `HPO_SDIST_SHA256` to every HPO build, and the Dockerfile
+refuses by name a build that lacks either. The native source
 is checked against the sdist digest before extraction and compilation. These
 per-release artifact pins are declared in `scripts/release_sources.py`, separate
 from the six Debian toolchain versions below.

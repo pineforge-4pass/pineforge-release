@@ -291,6 +291,49 @@ def _hpo_arguments(stages: tuple[DockerStage, ...], reached: set[str], *,
             if name.startswith("HPO_")}
 
 
+_SET_U = re.compile(r"(?<![\w-])set\s+-[A-Za-z]*u[A-Za-z]*\b")
+_EMPTINESS_TEST = re.compile(r'(?:\[|\btest)\s+-[nz]\s+"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"')
+_REFUSING_GUARD = re.compile(r'\btest\s+-n\s+"\$\{([A-Za-z_][A-Za-z0-9_]*)-?\}"')
+# BuildKit sets these itself in every stage that declares them.
+_BUILDKIT_ARGUMENTS = {"TARGETPLATFORM", "TARGETOS", "TARGETARCH", "TARGETVARIANT",
+                       "BUILDPLATFORM", "BUILDOS", "BUILDARCH", "BUILDVARIANT"}
+
+
+def _unguarded_emptiness_tests(stages: tuple[DockerStage, ...],
+                               reached: set[str]) -> list[tuple[str, str]]:
+    """(stage, argument) pairs whose emptiness a `set -u` RUN tests, although the
+    ARG has no default and no earlier RUN of the stage refuses it by name.
+
+    Under `set -u` an ARG that is declared without a default and not passed is
+    unset, so the shell stops at `${NAME}` before `[ -n ... ]` can run: such a
+    test reads as "optional" but behaves as "required", with only the shell's
+    own `parameter not set`. A guard (`test -n "${NAME-}" || { echo ...; exit 1; }`)
+    in an earlier RUN of the same stage makes the requirement explicit.
+    """
+    problems: list[tuple[str, str]] = []
+    for stage in stages:
+        if stage.name not in reached:
+            continue
+        bare: set[str] = set()
+        guarded: set[str] = set()
+        for instruction, body in stage.instructions:
+            if instruction == "ARG":
+                name, equals, _ = body.partition("=")
+                if not equals:
+                    bare.add(name.strip())
+            elif instruction == "RUN":
+                under_u = _SET_U.search(body)
+                if under_u is not None:
+                    for name in _EMPTINESS_TEST.findall(body[under_u.end():]):
+                        if (name in bare - _BUILDKIT_ARGUMENTS and name not in guarded
+                                and (stage.name, name) not in problems):
+                            problems.append((stage.name, name))
+                if "exit" in body:
+                    head = body if under_u is None else body[:under_u.start()]
+                    guarded.update(_REFUSING_GUARD.findall(head))
+    return problems
+
+
 def _inherited_instruction(stages: tuple[DockerStage, ...], target: str,
                            instruction: str) -> str | None:
     references = _stage_references(stages)
@@ -622,6 +665,7 @@ ARG HPO_WHEEL_SHA256
 ARG ASSET_FETCH_RETRIES=3
 ARG ASSET_FETCH_RETRY_DELAY=2
 RUN test -n "${HPO_VERSION}" && test -n "${CODEGEN_VERSION}" || { echo "ERROR: HPO_VERSION + CODEGEN_VERSION build-args are required (CI resolves them)" >&2; exit 1; }
+RUN test -n "${HPO_WHEEL_SHA256-}" || { echo "ERROR: HPO_WHEEL_SHA256 build-arg is required (CI resolves it)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/check_hpo_resolution.py /tmp/check_hpo_resolution.py
@@ -634,7 +678,7 @@ RUN --mount=type=secret,id=github_token set -eu; \
       --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
       --api-root https://api.github.com --browser-root https://github.com \
       --token-file /run/secrets/github_token; \
-    if [ -n "${HPO_WHEEL_SHA256}" ]; then''',
+    printf '%s  %s\n' "${HPO_WHEEL_SHA256}" "$wheel" > /tmp/hpo-wheel.sha256;''',
         "hpo-native": r'''FROM hpo-toolchain AS hpo-native
 ARG HPO_VERSION
 ARG HPO_SDIST_SHA256
@@ -644,6 +688,7 @@ ARG HPO_CMAKE_VERSION
 ARG HPO_MAKE_VERSION
 RUN test -n "${HPO_VERSION}" && test -n "${HPO_CMAKE_VERSION}" && test -n "${HPO_MAKE_VERSION}" \
     || { echo "ERROR: HPO_VERSION + HPO_CMAKE_VERSION + HPO_MAKE_VERSION build-args are required" >&2; exit 1; }
+RUN test -n "${HPO_SDIST_SHA256-}" || { echo "ERROR: HPO_SDIST_SHA256 build-arg is required (CI resolves it)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends \
       "cmake=${HPO_CMAKE_VERSION}" "make=${HPO_MAKE_VERSION}" curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -656,7 +701,7 @@ RUN --mount=type=secret,id=github_token set -eu; \
       --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
       --api-root https://api.github.com --browser-root https://github.com \
       --token-file /run/secrets/github_token; \
-    if [ -n "${HPO_SDIST_SHA256}" ]; then''',
+    printf '%s  /tmp/hpo-source.tar.gz\n' "${HPO_SDIST_SHA256}" > /tmp/hpo-source.sha256;''',
     }
 
     def assert_asset_fetch_wiring(self, dockerfile):
@@ -762,21 +807,100 @@ RUN --mount=type=secret,id=github_token set -eu; \
         self.assertEqual(_hpo_arguments(self.stages, reached), set())
         self.assertEqual(_hpo_arguments(self.stages, reached, required=True), set())
 
-    def test_hpo_reaches_its_build_stages_and_requires_all_seven_arguments(self):
+    def test_hpo_reaches_its_build_stages_and_requires_all_nine_arguments(self):
         reached = _reachable_stages(self.stages, "hpo")
         self.assertEqual(reached, {"hpo", "hpo-wheel", "hpo-toolchain", "hpo-native",
                                    "release", "engine", "codegen"})
         required = {"HPO_VERSION", "HPO_GCC_DEFAULTS_VERSION", "HPO_GCC_VERSION",
                     "HPO_BINUTILS_VERSION", "HPO_EIGEN_VERSION", "HPO_CMAKE_VERSION",
-                    "HPO_MAKE_VERSION"}
+                    "HPO_MAKE_VERSION", "HPO_WHEEL_SHA256", "HPO_SDIST_SHA256"}
         self.assertEqual(_hpo_arguments(self.stages, reached, required=True), required)
-        self.assertEqual(_hpo_arguments(self.stages, reached), required | {"HPO_WHEEL_SHA256", "HPO_SDIST_SHA256"})
+        self.assertEqual(_hpo_arguments(self.stages, reached), required)
         for stage in self.stages:
             for instruction, body in stage.instructions:
                 if instruction == "ARG" and body.startswith("HPO_"):
                     with self.subTest(stage=stage.name, argument=body.split("=", 1)[0]):
                         self.assertNotIn("=", body, "HPO arguments must have no defaults")
                         self.assertIn(stage.name, reached)
+
+    DIGEST_ARGUMENTS = (("hpo-wheel", "HPO_WHEEL_SHA256"), ("hpo-native", "HPO_SDIST_SHA256"))
+
+    def assert_digest_refusals(self, dockerfile):
+        """Each digest build-arg is required: refused by name, before the download."""
+        stages = {stage.name: stage for stage in _dockerfile_stages(dockerfile)}
+        for stage_name, argument in self.DIGEST_ARGUMENTS:
+            stage = stages[stage_name]
+            runs = [(index, body) for index, (keyword, body) in enumerate(stage.instructions)
+                    if keyword == "RUN"]
+            guards = [index for index, body in runs if body.startswith(f'test -n "${{{argument}-}}" || ')]
+            fetches = [index for index, body in runs if "fetch_release_asset.py" in body]
+            self.assertEqual(len(guards), 1, argument + ": exactly one refusal by name")
+            self.assertEqual(len(fetches), 1, stage_name + ": exactly one download RUN")
+            self.assertLess(guards[0], fetches[0], argument + ": refused before the download")
+            self.assertRegex(stage.instructions[guards[0]][1],
+                             rf'^test -n "\$\{{{argument}-\}}" \|\| \{{ echo "ERROR: {argument} build-arg is required[^"]*" >&2; exit 1; \}}$',
+                             argument + ": the message names the argument")
+            self.assertNotIn(f'[ -n "${{{argument}}}" ]', stage.text,
+                             argument + ": no optional-by-comment test remains")
+
+    def test_hpo_digest_arguments_are_refused_by_name_before_the_download(self):
+        self.assert_digest_refusals(self.dockerfile)
+        for stage_name, argument in self.DIGEST_ARGUMENTS:
+            stage = self.named[stage_name].text
+            guard = next(line for line in stage.splitlines(keepends=True)
+                         if line.startswith(f'RUN test -n "${{{argument}-}}"'))
+            mutations = {
+                "guard removed": stage.replace(guard, "", 1),
+                "guard after the download": stage.replace(guard, "", 1).rstrip("\n") + "\n" + guard,
+                "message without the argument name": stage.replace(f"ERROR: {argument} build-arg is required",
+                                                                    "ERROR: a build-arg is required", 1),
+                "guard that does not exit": stage.replace(guard, guard.replace("; exit 1; }", "; true; }", 1), 1),
+                "guard tests the other digest": stage.replace(guard, guard.replace(
+                    argument, "HPO_SDIST_SHA256" if argument == "HPO_WHEEL_SHA256" else "HPO_WHEEL_SHA256"), 1),
+                "optional test restored": stage.replace(
+                    "printf '%s  ", f'[ -n "${{{argument}}}" ] && printf \'%s  ', 1),
+            }
+            for label, altered in mutations.items():
+                with self.subTest(stage=stage_name, mutation=label):
+                    self.assertNotEqual(altered, stage)
+                    with self.assertRaises(AssertionError):
+                        self.assert_digest_refusals(self.dockerfile.replace(stage, altered, 1))
+
+    def test_no_argument_is_tested_for_emptiness_unguarded_under_set_u(self):
+        for target in (None, "hpo"):
+            with self.subTest(target=target or "default"):
+                reached = _reachable_stages(self.stages, target)
+                self.assertEqual(_unguarded_emptiness_tests(self.stages, reached), [])
+
+    def test_unguarded_emptiness_test_controls(self):
+        def problems(text, target=None):
+            stages = _dockerfile_stages(text)
+            return _unguarded_emptiness_tests(stages, _reachable_stages(stages, target))
+
+        # The pattern before the digests were required: optional by comment,
+        # required by behaviour. Rebuilt from the real file for each stage.
+        for stage_name, argument in self.DIGEST_ARGUMENTS:
+            with self.subTest(prefix_pattern=stage_name):
+                stage = self.named[stage_name].text
+                guard = next(line for line in stage.splitlines(keepends=True)
+                             if line.startswith(f'RUN test -n "${{{argument}-}}"'))
+                old = stage.replace(guard, "", 1).replace(
+                    "printf '%s  ", f'[ -n "${{{argument}}}" ] && printf \'%s  ', 1)
+                self.assertNotEqual(old, stage)
+                self.assertEqual(problems(self.dockerfile.replace(stage, old, 1), "hpo"),
+                                 [(stage_name, argument)])
+        template = "FROM debian AS s\nARG X\n{before}RUN set -eu; \\\n    if [ -n \"${{X}}\" ]; then \\\n      true; \\\n    fi\n"
+        guard_x = 'RUN test -n "${X-}" || { echo "ERROR: X build-arg is required" >&2; exit 1; }\n'
+        self.assertEqual(problems(template.format(before="")), [("s", "X")])
+        self.assertEqual(problems(template.format(before=guard_x)), [])
+        self.assertEqual(problems(template.format(before=guard_x.replace("${X-}", "${X}"))), [])
+        self.assertEqual(problems(template.format(before=guard_x.replace("; exit 1", ""))), [("s", "X")])
+        self.assertEqual(problems(template.format(before="").replace("ARG X\n", "ARG X=\n")), [])
+        self.assertEqual(problems(template.format(before="").replace("set -eu", "set -e")), [])
+        self.assertEqual(problems(template.format(before="").replace("ARG X\n", "ARG TARGETARCH\n")
+                                  .replace("${X}", "${TARGETARCH}")), [])
+        after = template.format(before="") + guard_x
+        self.assertEqual(problems(after), [("s", "X")], "a refusal after the use does not count")
 
     # sha256 of the final stage of docker/Dockerfile as it was before the hpo stages were added (what a
     # plain `docker build` built then), kept the way _dockerfile_stages keeps a stage: from its FROM line
@@ -985,7 +1109,8 @@ RUN --mount=type=secret,id=github_token set -eu; \
         self.assertEqual(_pinned_packages(hpo), _pinned_packages(self.named["hpo-toolchain"]))
         self.assertEqual(set(_pinned_packages(self.named["hpo-native"])), {"cmake", "make"})
         wheel = self.named["hpo-wheel"].text
-        self.assertIn('if [ -n "${HPO_WHEEL_SHA256}" ]', wheel)
+        self.assertIn('RUN test -n "${HPO_WHEEL_SHA256-}" || { echo "ERROR: HPO_WHEEL_SHA256 build-arg is required', wheel)
+        self.assertNotIn('[ -n "${HPO_WHEEL_SHA256}" ]', wheel)
         self.assertIn("sha256sum -c --strict /tmp/hpo-wheel.sha256", wheel)
         self.assertIn("python3 -I /tmp/check_hpo_resolution.py", wheel)
         self.assertIn('--target /opt/hpo "$wheel"', wheel)

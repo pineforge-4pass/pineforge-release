@@ -19,8 +19,8 @@
 # The default target needs ENGINE_VERSION, CODEGEN_VERSION and GUARD_POLICY_SETS_SHA256 above.
 # --target hpo additionally requires HPO_VERSION (no source default) and the
 # six toolchain package version build-args chosen on the signed box.
-# HPO_WHEEL_SHA256 checks the downloaded wheel when supplied to that target.
-# HPO_SDIST_SHA256 checks the native sdist before extraction when supplied.
+# HPO_WHEEL_SHA256 is required by that target and checks the downloaded wheel.
+# HPO_SDIST_SHA256 is required likewise and checks the native sdist before extraction.
 # Fetch stages declare ASSET_FETCH_RETRIES=3 (0..5 additional attempts) and
 # ASSET_FETCH_RETRY_DELAY=2 (1..10 seconds). The helper documents the finite
 # connection/transfer bounds and worst-case metadata + API + browser budget.
@@ -266,6 +266,7 @@ ARG HPO_WHEEL_SHA256
 ARG ASSET_FETCH_RETRIES=3
 ARG ASSET_FETCH_RETRY_DELAY=2
 RUN test -n "${HPO_VERSION}" && test -n "${CODEGEN_VERSION}" || { echo "ERROR: HPO_VERSION + CODEGEN_VERSION build-args are required (CI resolves them)" >&2; exit 1; }
+RUN test -n "${HPO_WHEEL_SHA256-}" || { echo "ERROR: HPO_WHEEL_SHA256 build-arg is required (CI resolves it)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/check_hpo_resolution.py /tmp/check_hpo_resolution.py
@@ -278,10 +279,8 @@ RUN --mount=type=secret,id=github_token set -eu; \
       --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
       --api-root https://api.github.com --browser-root https://github.com \
       --token-file /run/secrets/github_token; \
-    if [ -n "${HPO_WHEEL_SHA256}" ]; then \
-      printf '%s  %s\n' "${HPO_WHEEL_SHA256}" "$wheel" > /tmp/hpo-wheel.sha256; \
-      sha256sum -c --strict /tmp/hpo-wheel.sha256; \
-    fi; \
+    printf '%s  %s\n' "${HPO_WHEEL_SHA256}" "$wheel" > /tmp/hpo-wheel.sha256; \
+    sha256sum -c --strict /tmp/hpo-wheel.sha256; \
     python3 -I /tmp/check_hpo_resolution.py \
       --hpo-wheel "$wheel" --hpo-version "${HPO_VERSION}" \
       --codegen-root /opt/codegen --codegen-version "${CODEGEN_VERSION}" \
@@ -335,6 +334,7 @@ ARG HPO_CMAKE_VERSION
 ARG HPO_MAKE_VERSION
 RUN test -n "${HPO_VERSION}" && test -n "${HPO_CMAKE_VERSION}" && test -n "${HPO_MAKE_VERSION}" \
     || { echo "ERROR: HPO_VERSION + HPO_CMAKE_VERSION + HPO_MAKE_VERSION build-args are required" >&2; exit 1; }
+RUN test -n "${HPO_SDIST_SHA256-}" || { echo "ERROR: HPO_SDIST_SHA256 build-arg is required (CI resolves it)" >&2; exit 1; }
 RUN apt-get update && apt-get install -y --no-install-recommends \
       "cmake=${HPO_CMAKE_VERSION}" "make=${HPO_MAKE_VERSION}" curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -349,10 +349,8 @@ RUN --mount=type=secret,id=github_token set -eu; \
       --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
       --api-root https://api.github.com --browser-root https://github.com \
       --token-file /run/secrets/github_token; \
-    if [ -n "${HPO_SDIST_SHA256}" ]; then \
-      printf '%s  /tmp/hpo-source.tar.gz\n' "${HPO_SDIST_SHA256}" > /tmp/hpo-source.sha256; \
-      sha256sum -c --strict /tmp/hpo-source.sha256; \
-    fi; \
+    printf '%s  /tmp/hpo-source.tar.gz\n' "${HPO_SDIST_SHA256}" > /tmp/hpo-source.sha256; \
+    sha256sum -c --strict /tmp/hpo-source.sha256; \
     mkdir -p /tmp/hpo-source; \
     tar -xzf /tmp/hpo-source.tar.gz -C /tmp/hpo-source --strip-components=1; \
     test "$(cat /tmp/hpo-source/VERSION)" = "${HPO_VERSION}"; \

@@ -449,15 +449,18 @@ class HpoArtifactArgumentsTest(unittest.TestCase):
             with self.subTest(argument=argument), tempfile.TemporaryDirectory() as tmp:
                 text = stages[stage].text
                 self.assertIn("ARG " + argument + "\n", text)
-                start = text.index('if [ -n "${' + argument + '}" ]; then')
-                end = text.index("fi;", start) + len("fi;")
+                # The digest is required (refused by name earlier in the stage), so the
+                # check is unconditional: write the sum file, then run sha256sum on it.
+                needle = '"${' + argument + '}"'
+                start = text.rindex("printf ", 0, text.index(needle))
+                end = text.index(";", text.index("sha256sum -c --strict", start)) + 1
                 guard = text[start:end]
-                self.assertIn("sha256sum -c --strict", guard)
+                self.assertEqual(guard.count("sha256sum -c --strict"), 1)
+                self.assertNotIn("if [", guard)
                 # Docker's logical-line parser removes continuation indentation;
                 # identify the guard's RUN by its unique declared argument.
                 runs = [body for keyword, body in stages[stage].instructions
-                        if keyword == "RUN"
-                        and 'if [ -n "${' + argument + '}" ]; then' in body]
+                        if keyword == "RUN" and needle in body]
                 self.assertEqual(len(runs), 1)
                 lexer = shlex.shlex(runs[0], posix=True, punctuation_chars=";&|")
                 lexer.whitespace_split = True
@@ -485,7 +488,7 @@ class HpoArtifactArgumentsTest(unittest.TestCase):
                     "--token-file", "/run/secrets/github_token",
                 ]])
                 guard_positions = [index for index, command in enumerate(commands)
-                                   if command[:4] == ["if", "[", "-n", "${" + argument + "}"]]
+                                   if command[:1] == ["printf"] and "${" + argument + "}" in command]
                 self.assertEqual(len(guard_positions), 1)
                 self.assertLess(acquisitions[0][0], guard_positions[0])
                 self.assertLess(end, text.index(consume))
@@ -510,6 +513,30 @@ class HpoArtifactArgumentsTest(unittest.TestCase):
                 bad = run_guard()
                 self.assertNotEqual(bad.returncode, 0, bad.stdout + bad.stderr)
                 self.assertIn("FAILED", bad.stdout + bad.stderr)
+
+    def test_each_declared_digest_is_refused_by_name_when_unset_or_empty(self):
+        stages = {stage.name: stage for stage in
+                  _dockerfile_stages((REPO / "docker" / "Dockerfile").read_text())}
+        shell = shutil.which("sh", path=os.defpath)
+        self.assertIsNotNone(shell, "sh is required to exercise the real refusals")
+        for argument, stage in (("HPO_WHEEL_SHA256", "hpo-wheel"), ("HPO_SDIST_SHA256", "hpo-native")):
+            with self.subTest(argument=argument):
+                runs = [body for keyword, body in stages[stage].instructions
+                        if keyword == "RUN" and body.startswith('test -n "${' + argument + '-}" ||')]
+                self.assertEqual(len(runs), 1, "exactly one refusal by name in the " + stage + " stage")
+                for label, extra, accepted in (("unset", {}, False), ("empty", {argument: ""}, False),
+                                               ("valid", {argument: "a" * 64}, True)):
+                    with self.subTest(case=label):
+                        done = subprocess.run([shell, "-c", runs[0]],
+                                              env={"PATH": os.defpath, **extra},
+                                              stdin=subprocess.DEVNULL, capture_output=True,
+                                              text=True, timeout=10)
+                        if accepted:
+                            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                        else:
+                            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                            self.assertIn("ERROR: " + argument + " build-arg is required", done.stderr)
+                            self.assertNotIn("parameter not set", done.stderr)
 
 
 class SourceNoticeTest(unittest.TestCase):
