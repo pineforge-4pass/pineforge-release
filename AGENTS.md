@@ -20,7 +20,7 @@ python3 scripts/consumer_receipt_example.py                   # print a syntheti
 python3 tools/release-dry-run/dry_run.py --ready              # offline replay of the release graph on fixtures (needs bash, git, jq, PyYAML)
 docker run --rm -v "$PWD/strategy.pine:/in/strategy.pine:ro" -v "$PWD/ohlcv.csv:/in/ohlcv.csv:ro" ghcr.io/pineforge-4pass/pineforge-release > report.json
 ```
-`docker/Dockerfile` requires build args `ENGINE_VERSION`, `CODEGEN_VERSION` and `GUARD_POLICY_SETS_SHA256` (value from `docker/GUARD-POLICY-SETS.pin`); `--target hpo` adds `HPO_VERSION` and the six `HPO_*` args in `docker/hpo-toolchain.args`. `publish.yml` builds it and also passes `RELEASE_VERSION`, `RELEASE_GIT_SHA` and, for hpo, `HPO_WHEEL_SHA256` and `HPO_SDIST_SHA256`.
+`docker/Dockerfile` requires build args `ENGINE_VERSION`, `CODEGEN_VERSION` and `GUARD_POLICY_SETS_SHA256` (value from `docker/GUARD-POLICY-SETS.pin`); `--target hpo` adds `HPO_VERSION`, the required `HPO_WHEEL_SHA256` and `HPO_SDIST_SHA256`, and the six `HPO_*` args in `docker/hpo-toolchain.args`. `publish.yml` builds it and also passes `RELEASE_VERSION`, `RELEASE_GIT_SHA` and, for hpo, `HPO_WHEEL_SHA256` and `HPO_SDIST_SHA256`.
 
 ## Layout
 - `docker/` — `Dockerfile`, the sixteen vendored engine harness files with `HARNESS-SHA256SUMS`, `GUARD-POLICY-SETS.pin`, `SOURCE-SETS.tsv` (Debian source-set registry), `hpo-toolchain.args`, the HPO dispatcher, license sums.
