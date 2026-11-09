@@ -198,16 +198,16 @@ into a permission-unavailable success. Missing setup reports without displaying
 secret values. Read-only comparisons use `github.token`; there is no fallback
 to the release App.
 
-## TOP setup and migration checklist
+## Release-owner setup and migration checklist
 
-TOP alone provisions settings/secrets and enables application after independent
+The release owner alone provisions settings/secrets and enables application after independent
 review and reviewed dry-run proof. Provisioning has been reported for the new
 descriptions App/environment; the executor does not inspect secrets or mint
 live tokens to verify it. Live environment/App proof, including the authorized
-four-repository descriptions scope, remains pending. TOP reports that the old
+four-repository descriptions scope, remains pending. The release owner reports that the old
 org App is Contents-only and that `release-automation` exists with target secrets.
-TOP reports that the new App key is provisioned in `release-automation` and that
-this release repository's private-key fallback has been removed. This is a TOP
+The release owner reports that the new App key is provisioned in `release-automation` and that
+this release repository's private-key fallback has been removed. This is a release-owner
 setup receipt, not an executor secret inspection. The first protected release's
 no-fallback proof remains separate; engine/codegen environment moves follow
 their own rollout. Never inspect or hash secret values to establish origin.
@@ -224,7 +224,7 @@ their own rollout. Never inspect or hash secret values to establish origin.
    absent environment value can expose an inherited `true`. PRs have no App
    access. Dispatch with `dry_run=true` and review the
    immutable source receipt and every delta. This comparison does not mint a
-   token. A live App mint/apply proof needs TOP's separate authorization.
+   token. A live App mint/apply proof needs the release owner's separate authorization.
 3. Configure `release-automation` with selected deployment **branch `main` and
    tag pattern `v*` only**. Confirm the new `PINEFORGE_APP_ID` and
    `PINEFORGE_APP_PRIVATE_KEY` are provisioned there, together with
@@ -235,11 +235,11 @@ their own rollout. Never inspect or hash secret values to establish origin.
    rather than falling back to all repositories. Never put nonpublic identities
    in public YAML, artifacts or logs.
 4. Verify the next protected release without the repository-level App-key
-   fallback, which TOP reports removed. A no-op mint does not prove the bump push or consumer mapping;
+   fallback, which the release owner reports removed. A no-op mint does not prove the bump push or consumer mapping;
    those need their applicable release proof. Tokens request Contents: write on
    only the job's repository, never Administration. Other repositories' key moves
    are separate work; scoped inputs alone do not remove inherited credentials.
-5. After reviewed dry-run and separately authorized live proof, TOP may set
+5. After reviewed dry-run and separately authorized live proof, the release owner may set
    `FACTS_DESCRIPTIONS_APPLY_ENABLED=true` in `descriptions`. Writes additionally
    require protected `refs/heads/main`, an authorized push/manual/schedule event,
    and effective `dry_run=false`. With rollout enabled, push/schedule reconcile
@@ -249,7 +249,7 @@ their own rollout. Never inspect or hash secret values to establish origin.
    workflow's effective value is `false`. Do not delete the environment value:
    that can expose an inherited `true`. Keep the retired drift job retired.
 
-These are TOP operator commands, not steps executed by the implementation lane.
+These are release-owner operator commands, not steps executed by the implementation.
 Use the approved GitHub wrapper where one is required:
 
 ```sh
@@ -290,7 +290,7 @@ GH_HOST=github.com gh api --hostname github.com 'repos/pineforge-4pass/pineforge
 ```
 
 The executor handoff includes the exact bounded-time heartbeat command and its
-failure/staleness handling for TOP. Full source-versus-served digest monitoring
+failure/staleness handling for the release owner. Full source-versus-served digest monitoring
 with a **30-minute facts-change freshness threshold is pending stage 2**. The
 stage-1 run monitor is not served-state proof and unrelated main commits must
 not reset that future freshness clock.
@@ -369,7 +369,7 @@ credential presence only and does not inspect or hash their values.
 
 Manual `dry_run` defaults to `true` and an explicitly requested `false` survives
 workflow expression evaluation. With the dispatch gate off, either value only
-plans. Once TOP separately enables dispatch, either requested boolean is sent:
+plans. Once the release owner separately enables dispatch, either requested boolean is sent:
 `true` asks the receiver to validate without publishing. Enabled push/schedule
 runs send `false`; disabled automatic runs plan with `true`. The receiver must
 have its own protected publication gate. The hub's enable flag grants no receiver
@@ -394,7 +394,7 @@ receipt has `alert=true` even while rollout is deliberately off. All receipts
 keep `installed=false`. Missing receipts and failed uploads are missing telemetry,
 never a successful consumer health check.
 
-TOP's read-only workflow heartbeat uses the approved `ghq` wrapper on `PATH` and
+The release owner's read-only workflow heartbeat uses the approved `ghq` wrapper on `PATH` and
 requires an explicit path to the reviewed checkout. It bounds the GitHub query
 to 45 seconds and 2 MiB of stdout, and the status parser to 10 seconds and 32
 KiB of stdout. Each budget starts before its command is created and covers
@@ -791,12 +791,12 @@ returns a neutral JSON receipt. It alerts (exit 1) for absent/completed telemetr
 older than 30 minutes, a failed completed run in that window, or a noncompleted
 run older than 15 minutes. Malformed input exits 2. Exit 0 is `workflow-observed`,
 with `served_freshness=unverified`, not installation proof. This heartbeat checks
-workflow runs; TOP must also read each neutral artifact, including setup alerts.
+workflow runs; the release owner must also read each neutral artifact, including setup alerts.
 It cannot replace the receiver's source-versus-served digest check. That required
 30-minute freshness clock starts at the facts-byte change, not an unrelated main
 commit, workflow creation time or a retry.
 
-## TOP Stage 2 rollout checklist (leave dispatch off)
+## Release-owner Stage 2 rollout checklist (leave dispatch off)
 
 1. Land the reviewed receiver first. Confirm it accepts `facts-update`, validates
    exactly the three payload fields and authoritative current source, and gates
@@ -815,7 +815,7 @@ commit, workflow creation time or a retry.
    `false`; an absent environment value can expose an inherited `true`. Inspect
    the disabled manual plan, immutable source, setup receipt and artifact before
    enabling anything. Do not restore the removed repository-level key fallback.
-4. Follow TOP's separately authorized receiver rehearsal on the fixed throwaway
+4. Follow the release owner's separately authorized receiver rehearsal on the fixed throwaway
    branch, preserving its source/receipt proof and exact Spot build. Branch-only
    proof is not deployment proof. Enable hub dispatch only after the receiver
    and its independent rollout controls are ready. For enabled manual
@@ -828,7 +828,7 @@ commit, workflow creation time or a retry.
    GitHub check bound to its exact committed SHA, then independently verify
    served provenance and canonical bytes/digest. Surface deployment races and
    missing telemetry instead of attributing success to the wrong commit.
-6. TOP's first authorized real main run must close source-versus-served proof
+6. The release owner's first authorized real main run must close source-versus-served proof
    within 30 minutes of the facts-byte change. Confirm welcome-template runtime
    override/readback in the consumer rollout. Keep release no-key-fallback proof
    separate. To stop future hub minting/dispatch, set
@@ -853,5 +853,5 @@ parser, validator, workflow shell and dispatch helper. Only external GitHub
 responses and token-action outcomes are simulated. Tests capture exact POST
 bytes, exercise disabled/missing setup, strict payloads and targets, source
 movement, repeated signals, failures/redaction, independent workflow wiring and
-missing/stale telemetry. The implementation lane performs no live mint, dispatch,
+missing/stale telemetry. The implementation performs no live mint, dispatch,
 consumer publication or deployment.

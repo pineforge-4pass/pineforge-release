@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manual redelivery regressions; execute in CI, never on the operator's Mac.
+"""Manual redelivery regressions; execute in CI, never on a laptop.
 
 The existing store fake keys every asset by release and exact name. Only HTTP
 transport is replaced: production code still serializes the real wire bytes.

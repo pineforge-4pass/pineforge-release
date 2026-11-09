@@ -32,7 +32,7 @@ jobs:
   descriptions:
     if: github.ref == 'refs/heads/main'
     environment: descriptions
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
     runs-on: ubuntu-latest
     env:
       FACTS_DESCRIPTIONS_APPLY_ENABLED: ${{ vars.FACTS_DESCRIPTIONS_APPLY_ENABLED }}

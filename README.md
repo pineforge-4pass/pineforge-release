@@ -197,7 +197,7 @@ Pushing a tag alone does not start publication.
 The release, facts-automation and PR-CI jobs use GitHub-hosted runners.
 The `authz` jobs use `runs-on: ubuntu-24.04`; the other jobs use
 `runs-on: ubuntu-latest`, including candidate preparation, receipt planning and failure reporting, with these CI runner assignments: `python-test.yml` jobs `changes`, `fingerprint-canonical`, `description-renderer`, `release-ready-replay` and `release-ready` use `runs-on: ubuntu-24.04` for every configured event, including pushes to `main` and `master`. `facts-validate.yml` job `validate` uses `runs-on: ubuntu-24.04` for pull requests and pushes to `main`.
-Those other jobs have the standing R6/rule-B exception (owner decision 10-21, msg 1562390657274748981).
+Those other jobs use `ubuntu-latest` as a standing exception for this repository.
 The [release runner policy](docs/release-chain.md#release-runner-isolation) lists
 the jobs and the class boundary.
 
@@ -205,7 +205,7 @@ The rules live in `scripts/release_pair.py` (unit-tested in `tests/`).
 `tools/release-dry-run/` replays the current handler and readiness graph offline,
 including all three-component arrival orders, duplicate/lost delivery, missing
 prerequisites and negative controls. Run in CI or on the approved cloud host,
-never on the Mac:
+never on a laptop:
 
 ```
 python3 -m unittest discover -s tests -p 'test_release_*.py'   # the release rules

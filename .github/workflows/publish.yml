@@ -34,7 +34,7 @@ concurrency:
 
 jobs:
   tag-guard:
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,7 +42,7 @@ jobs:
       sha: ${{ steps.tag.outputs.sha }}
       tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+      - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
         run: |
           systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
@@ -84,7 +84,7 @@ jobs:
   prepare:
     needs: tag-guard
     if: github.ref == 'refs/heads/main'
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
     runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
@@ -94,7 +94,7 @@ jobs:
       exists: ${{ steps.candidate.outputs.exists }}
       tag: ${{ needs.tag-guard.outputs.tag }}
     steps:
-      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+      - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
         run: |
           systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
@@ -114,7 +114,7 @@ jobs:
   publish:
     needs: [tag-guard, prepare]
     if: needs.prepare.outputs.exists == 'false'
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
     runs-on: ubuntu-latest
     environment: release-automation
     env:
@@ -125,7 +125,7 @@ jobs:
     outputs:
       prerelease: ${{ steps.pair.outputs.prerelease }}
     steps:
-      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+      - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
         run: |
           systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
@@ -694,7 +694,7 @@ jobs:
   failure-report:
     needs: [tag-guard, prepare, publish, notify-consumers]
     if: ${{ always() && !cancelled() && (needs.tag-guard.result != 'success' || contains(needs.*.result, 'failure')) }}
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
     runs-on: ubuntu-latest
     env:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
@@ -702,7 +702,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - name: Stop automatic apt upgrades (LB-504, until the release image is rebaked)
+      - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
         run: |
           systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true
