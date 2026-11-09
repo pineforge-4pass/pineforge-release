@@ -1,5 +1,5 @@
-This image contains software from Debian GNU/Linux 12 (bookworm), including the GNU C/C++
-compiler (gcc/g++ 12.2.0) and GNU binutils 2.40, Eigen 3.4.0, and the Debian base system.
+This image contains software from Debian GNU/Linux 13 (trixie), including the GNU C/C++
+compiler (gcc/g++ 14.2.0) and GNU binutils 2.44, Eigen 3.4.0, and the Debian base system.
 Each package is distributed under its own license, recorded in /usr/share/doc/<package>/copyright.
 The complete corresponding source code of every Debian package in this image, at the exact
 versions installed, is available at no charge from:

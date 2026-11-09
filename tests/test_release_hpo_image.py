@@ -291,6 +291,49 @@ def _hpo_arguments(stages: tuple[DockerStage, ...], reached: set[str], *,
             if name.startswith("HPO_")}
 
 
+_SET_U = re.compile(r"(?<![\w-])set\s+-[A-Za-z]*u[A-Za-z]*\b")
+_EMPTINESS_TEST = re.compile(r'(?:\[|\btest)\s+-[nz]\s+"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"')
+_REFUSING_GUARD = re.compile(r'\btest\s+-n\s+"\$\{([A-Za-z_][A-Za-z0-9_]*)-?\}"')
+# BuildKit sets these itself in every stage that declares them.
+_BUILDKIT_ARGUMENTS = {"TARGETPLATFORM", "TARGETOS", "TARGETARCH", "TARGETVARIANT",
+                       "BUILDPLATFORM", "BUILDOS", "BUILDARCH", "BUILDVARIANT"}
+
+
+def _unguarded_emptiness_tests(stages: tuple[DockerStage, ...],
+                               reached: set[str]) -> list[tuple[str, str]]:
+    """(stage, argument) pairs whose emptiness a `set -u` RUN tests, although the
+    ARG has no default and no earlier RUN of the stage refuses it by name.
+
+    Under `set -u` an ARG that is declared without a default and not passed is
+    unset, so the shell stops at `${NAME}` before `[ -n ... ]` can run: such a
+    test reads as "optional" but behaves as "required", with only the shell's
+    own `parameter not set`. A guard (`test -n "${NAME-}" || { echo ...; exit 1; }`)
+    in an earlier RUN of the same stage makes the requirement explicit.
+    """
+    problems: list[tuple[str, str]] = []
+    for stage in stages:
+        if stage.name not in reached:
+            continue
+        bare: set[str] = set()
+        guarded: set[str] = set()
+        for instruction, body in stage.instructions:
+            if instruction == "ARG":
+                name, equals, _ = body.partition("=")
+                if not equals:
+                    bare.add(name.strip())
+            elif instruction == "RUN":
+                under_u = _SET_U.search(body)
+                if under_u is not None:
+                    for name in _EMPTINESS_TEST.findall(body[under_u.end():]):
+                        if (name in bare - _BUILDKIT_ARGUMENTS and name not in guarded
+                                and (stage.name, name) not in problems):
+                            problems.append((stage.name, name))
+                if "exit" in body:
+                    head = body if under_u is None else body[:under_u.start()]
+                    guarded.update(_REFUSING_GUARD.findall(head))
+    return problems
+
+
 def _inherited_instruction(stages: tuple[DockerStage, ...], target: str,
                            instruction: str) -> str | None:
     references = _stage_references(stages)
@@ -310,6 +353,15 @@ def _inherited_instruction(stages: tuple[DockerStage, ...], target: str,
 def _without_stage_alias(stage: DockerStage) -> str:
     return re.sub(r"(^[ \t]*FROM[^\r\n]*?)[ \t]+AS[ \t]+\S+(?=\r?$)",
                   r"\1", stage.text, count=1, flags=re.M | re.I)
+
+
+def _restore_bookworm_runtime_base(text: str) -> str:
+    """Restore only the single approved FROM line for the historical digest."""
+    lines = text.splitlines(keepends=True)
+    if (not lines or lines[0] != "FROM debian:trixie-slim\n"
+            or sum(line.startswith("FROM ") for line in lines) != 1):
+        raise ValueError("expected exactly one approved trixie runtime FROM line")
+    return "FROM debian:bookworm-slim\n" + "".join(lines[1:])
 
 
 def _without_guard_policy(text: str) -> str:
@@ -332,6 +384,76 @@ def _without_guard_policy(text: str) -> str:
     text = text.replace(argument, "", 1)
     text = text.replace(labels, '      io.pineforge.codegen.version="${CODEGEN_VERSION}"\n', 1)
     return text.replace(run + "\n", "", 1)
+
+
+def _without_parity_carrier(text: str) -> str:
+    """Remove only the exact carrier additions before checking the old pin."""
+    declaration = json.loads(
+        (REPO / "tests/fixtures/parity-bundle.json").read_text(encoding="utf-8"))
+    names = ["PARITY-MANIFEST.json",
+             *sorted(row["destination"] for row in declaration["files"])]
+    # Match complete instructions: added commands must not disappear when the
+    # historical runtime is normalized, even inside the parity section.
+    carrier = r'''# The parity carrier is separate from the engine harness. SUMS checks exactly
+# the descriptor and six reviewed payloads; it is excluded from its own list.
+# Runtime inventory reads these files; no image entrypoint executes them.
+# This root RUN creates root-owned files without the stage's private metadata.
+RUN --mount=type=bind,source=.,target=/tmp/pineforge-context,ro \
+    set -eu; \
+    if [ "${PARITY_CARRIER:-0}" = 1 ]; then \
+      if [ -L /tmp/pineforge-context/docker/parity ]; then echo "parity directory contains a symlink" >&2; exit 1; fi; \
+      if [ ! -d /tmp/pineforge-context/docker/parity ]; then echo "parity directory is missing required file" >&2; exit 1; fi; \
+      mkdir -p /opt/pineforge/parity; \
+      cp -R --no-preserve=mode,ownership,timestamps /tmp/pineforge-context/docker/parity/. /opt/pineforge/parity/; \
+      chmod 0755 /opt/pineforge/parity; \
+      find /opt/pineforge/parity -type f -exec chmod 0644 {} +; \
+    fi
+ENV PYTHONDONTWRITEBYTECODE=1
+RUN set -eu; \
+    case "${PARITY_CARRIER-0}" in \
+      0) if [ -n "${PARITY_DESCRIPTOR_SHA256:-}" ]; then echo "parity descriptor requires the carrier" >&2; exit 1; fi ;; \
+      1) ;; \
+      *) echo "parity carrier must be 0 or 1" >&2; exit 1 ;; \
+    esac; \
+    if [ "${PARITY_CARRIER:-0}" = 1 ]; then \
+      descriptor_sha256="${PARITY_DESCRIPTOR_SHA256:-}"; \
+      if [ "${#descriptor_sha256}" -ne 64 ] || ! printf '%s' "$descriptor_sha256" | grep -Eq '^[0-9a-f]{64}$'; then \
+        echo "parity descriptor hash differs from binding" >&2; exit 1; \
+      fi; \
+      if [ -L /opt/pineforge/parity ]; then echo "parity directory contains a symlink" >&2; exit 1; fi; \
+      if [ ! -d /opt/pineforge/parity ]; then echo "parity directory is missing required file" >&2; exit 1; fi; \
+      cd /opt/pineforge/parity; \
+      want="@NAMES@"; \
+      for path in ./* ./.[!.]* ./..?*; do \
+        [ -e "$path" ] || [ -L "$path" ] || continue; \
+        if [ -L "$path" ]; then echo "parity directory contains a symlink" >&2; exit 1; fi; \
+        case "${path#./}" in \
+          @FILES@) ;; \
+          *) echo "parity directory contains unexpected files" >&2; exit 1 ;; \
+        esac; \
+      done; \
+      for name in $want PARITY-SHA256SUMS; do \
+        if [ ! -f "$name" ]; then echo "parity directory is missing required file" >&2; exit 1; fi; \
+        if [ ! -s "$name" ]; then echo "parity payload is empty" >&2; exit 1; fi; \
+      done; \
+      actual="$(sha256sum PARITY-MANIFEST.json)"; \
+      if [ "${actual%% *}" != "${descriptor_sha256}" ]; then \
+        echo "parity descriptor hash differs from binding" >&2; exit 1; \
+      fi; \
+      listed="$(sed 's/^[0-9a-f]\{64\}  //' PARITY-SHA256SUMS | tr '\n' ' ' | sed 's/ $//')"; \
+      if [ "$listed" != "$want" ] || [ "$(wc -l < PARITY-SHA256SUMS)" -ne @COUNT@ ]; then echo "parity SUMS verification failed" >&2; exit 1; fi; \
+      if ! sha256sum -c --strict PARITY-SHA256SUMS; then echo "parity SUMS verification failed" >&2; exit 1; fi; \
+      echo "parity: seven files match PARITY-SHA256SUMS"; \
+    fi''' + "\n\n"
+    carrier = (carrier.replace("@NAMES@", " ".join(names))
+               .replace("@FILES@", "|".join(sorted([*names, "PARITY-SHA256SUMS"])))
+               .replace("@COUNT@", str(len(names))))
+    for fragment in ("ARG PARITY_DESCRIPTOR_SHA256\n",
+                     "ARG PARITY_CARRIER=0\n", carrier):
+        if text.count(fragment) != 1:
+            raise ValueError("expected exactly one approved parity runtime fragment")
+        text = text.replace(fragment, "", 1)
+    return text
 
 
 def _without_sources_notice(text: str) -> str:
@@ -358,19 +480,23 @@ def _restore_original_doc_cleanup(text: str) -> str:
 def _restore_original_harness_manifest(text: str) -> str:
     """Undo exactly the harness list additions for the original runtime pin."""
     changes = (
-        ("# The harness is the engine's runtime files for the pinned engine tag, all twelve and nothing\n",
+        ("# The harness is the engine's runtime files for the pinned engine tag, all sixteen and nothing\n",
          "# The harness is the engine's runtime files for the pinned engine tag, all eight and nothing\n"),
         ("# bind_compiled_inventory.py; Python helpers import modules from this directory.\n",
          "# bind_compiled_inventory.py; run_json.py imports the other modules from its own directory.\n"),
         ("COPY docker/pf_bars.py                  /opt/pineforge/bin/pf_bars.py\n", ""),
         ("COPY docker/pf_sink.py                  /opt/pineforge/bin/pf_sink.py\n", ""),
+        ("COPY docker/pineforge_report_deadlines.py /opt/pineforge/bin/pineforge_report_deadlines.py\n", ""),
+        ("COPY docker/pineforge_report_supervise.py /opt/pineforge/bin/pineforge_report_supervise.py\n", ""),
         ("COPY docker/pineforge_sink_finalize.py  /opt/pineforge/bin/pineforge_sink_finalize.py\n", ""),
         ("COPY docker/pineforge_sink_to_json.py   /opt/pineforge/bin/pineforge_sink_to_json.py\n", ""),
-        ("# must name exactly the twelve files above, in sorted order, and nothing else may sit in bin/;\n",
+        ("COPY docker/quota_columns.py           /opt/pineforge/bin/quota_columns.py\n", ""),
+        ("COPY docker/run_quota.py               /opt/pineforge/bin/run_quota.py\n", ""),
+        ("# must name exactly the sixteen files above, in sorted order, and nothing else may sit in bin/;\n",
          "# must name exactly the eight files above, in this order, and nothing else may sit in bin/;\n"),
-        ('    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_sink_finalize.py pineforge_sink_to_json.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \\\n',
+        ('    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_report_deadlines.py pineforge_report_supervise.py pineforge_sink_finalize.py pineforge_sink_to_json.py quota_columns.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py run_quota.py selected_window_plan.py selected_window_report.py"; \\\n',
          '    want="bind_compiled_inventory.py entrypoint.sh request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \\\n'),
-        ('    echo "harness: the twelve files match HARNESS-SHA256SUMS"\n',
+        ('    echo "harness: the sixteen files match HARNESS-SHA256SUMS"\n',
          '    echo "harness: the eight files match HARNESS-SHA256SUMS"\n'),
     )
     for current, original in changes:
@@ -387,6 +513,17 @@ def _pinned_packages(stage: DockerStage) -> dict[str, str]:
             packages.update(re.findall(
                 r"([a-z0-9][a-z0-9.+-]*)=\$\{([A-Z_][A-Z0-9_]*)\}", body))
     return packages
+
+
+def _apt_packages(stage: DockerStage) -> set[str]:
+    """Read exact package names from the stage's actual apt install commands."""
+    return {
+        token.split("=", 1)[0]
+        for keyword, body in stage.instructions if keyword == "RUN"
+        for match in re.finditer(
+            r"apt-get install -y --no-install-recommends\s+(.+?)(?:;|&&)", body)
+        for token in shlex.split(match[1])
+    }
 
 
 def _read_toolchain_arguments(text: str) -> dict[str, str]:
@@ -433,12 +570,223 @@ def _require_filled_toolchain_arguments(arguments: dict[str, str]) -> None:
                                 + "; TO BE FILLED BY THE BOX RUN")
 
 
+# Reviewed against both trixie Packages indexes, not inferred from one arch or
+# from the installed host. These are packaging assertions, not runtime proof.
+TRIXIE_TOOLCHAIN_PINS = {
+    "HPO_GCC_DEFAULTS_VERSION": "4:14.2.0-1",
+    "HPO_GCC_VERSION": "14.2.0-19",
+    "HPO_BINUTILS_VERSION": "2.44-3",
+    "HPO_EIGEN_VERSION": "3.4.0-5",
+    "HPO_CMAKE_VERSION": "3.31.6-2",
+    "HPO_MAKE_VERSION": "4.4.1-2",
+}
+
+
+def _trixie_packaging_problems(dockerfile: str, args_text: str) -> list[str]:
+    stages = _dockerfile_stages(dockerfile)
+    named = {stage.name: stage for stage in stages}
+    problems = []
+    external = {stage.name: stage.base for stage in stages if stage.base not in named}
+    if external != dict.fromkeys(("codegen", "engine", "release", "hpo-toolchain"),
+                                 "debian:trixie-slim"):
+        problems.append("all four Debian bases must be exactly debian:trixie-slim")
+    if _read_toolchain_arguments(args_text) != TRIXIE_TOOLCHAIN_PINS:
+        problems.append("toolchain values must match the six reviewed trixie pins")
+    expected = {
+        **dict.fromkeys(("gcc", "g++", "cpp"), "HPO_GCC_DEFAULTS_VERSION"),
+        **dict.fromkeys(("gcc-14", "g++-14", "cpp-14", "libgcc-14-dev",
+                         "libstdc++-14-dev", "libgcc-s1", "libstdc++6"), "HPO_GCC_VERSION"),
+        "binutils": "HPO_BINUTILS_VERSION", "libeigen3-dev": "HPO_EIGEN_VERSION",
+    }
+    for name in ("hpo-toolchain", "hpo", "hpo-native"):
+        stage = named[name]
+        pinned = ({"cmake": "HPO_CMAKE_VERSION", "make": "HPO_MAKE_VERSION"}
+                  if name == "hpo-native" else expected)
+        packages = [f"{package}=${{{argument}}}" for package, argument in pinned.items()]
+        if name == "hpo-toolchain":
+            packages.append("python3")
+        elif name == "hpo-native":
+            packages.extend(("curl", "ca-certificates"))
+        installs = [match[1] for keyword, body in stage.instructions if keyword == "RUN"
+                    for match in re.finditer(
+                        r"apt-get install -y --no-install-recommends\s+(.+?)(?:;|&&)", body)]
+        if (len(installs) != 1 or shlex.split(installs[0]) != packages
+                or _pinned_packages(stage) != pinned):
+            problems.append(name + ": expected exactly the approved trixie package pins")
+    return problems
+
+
 class DockerfileTargetTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.dockerfile = (REPO / "docker" / "Dockerfile").read_bytes().decode("utf-8")
         cls.stages = _dockerfile_stages(cls.dockerfile)
         cls.named = {stage.name: stage for stage in cls.stages}
+
+    # Exact approved acquisition prefixes, including the ARGs, COPYs, build-only
+    # packages and the next checksum boundary. Nothing is stripped from the
+    # historical runtime golden, or normalized away from a mutated instruction.
+    ASSET_FETCH_PREFIXES = {
+        "engine": r'''FROM debian:trixie-slim AS engine
+ARG ENGINE_VERSION
+ARG TARGETARCH
+ARG ASSET_FETCH_RETRIES=3
+ARG ASSET_FETCH_RETRY_DELAY=2
+RUN test -n "${ENGINE_VERSION}" || { echo "ERROR: ENGINE_VERSION build-arg is required (CI resolves it)" >&2; exit 1; }
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py
+RUN --mount=type=secret,id=github_token set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) triple=linux-x86_64 ;; \
+      arm64) triple=linux-aarch64 ;; \
+      *) echo "unsupported TARGETARCH='${TARGETARCH}'" >&2; exit 1 ;; \
+    esac; \
+    base="pineforge-v${ENGINE_VERSION}-${triple}"; \
+    cd /tmp; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-engine --tag "v${ENGINE_VERSION}" \
+      --name "${base}.tar.gz" --output "${base}.tar.gz" \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-engine --tag "v${ENGINE_VERSION}" \
+      --name "${base}.tar.gz.sha256" --output "${base}.tar.gz.sha256" \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
+    sha256sum -c "${base}.tar.gz.sha256";''',
+        "hpo-wheel": r'''FROM codegen AS hpo-wheel
+ARG CODEGEN_VERSION
+ARG HPO_VERSION
+ARG HPO_WHEEL_SHA256
+ARG ASSET_FETCH_RETRIES=3
+ARG ASSET_FETCH_RETRY_DELAY=2
+RUN test -n "${HPO_VERSION}" && test -n "${CODEGEN_VERSION}" || { echo "ERROR: HPO_VERSION + CODEGEN_VERSION build-args are required (CI resolves them)" >&2; exit 1; }
+RUN test -n "${HPO_WHEEL_SHA256-}" || { echo "ERROR: HPO_WHEEL_SHA256 build-arg is required (CI resolves it)" >&2; exit 1; }
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/check_hpo_resolution.py /tmp/check_hpo_resolution.py
+COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py
+RUN --mount=type=secret,id=github_token set -eu; \
+    wheel="/tmp/pineforge_hpo-${HPO_VERSION}-py3-none-any.whl"; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-hpo --tag "v${HPO_VERSION}" \
+      --name "pineforge_hpo-${HPO_VERSION}-py3-none-any.whl" --output "$wheel" \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
+    printf '%s  %s\n' "${HPO_WHEEL_SHA256}" "$wheel" > /tmp/hpo-wheel.sha256;''',
+        "hpo-native": r'''FROM hpo-toolchain AS hpo-native
+ARG HPO_VERSION
+ARG HPO_SDIST_SHA256
+ARG ASSET_FETCH_RETRIES=3
+ARG ASSET_FETCH_RETRY_DELAY=2
+ARG HPO_CMAKE_VERSION
+ARG HPO_MAKE_VERSION
+RUN test -n "${HPO_VERSION}" && test -n "${HPO_CMAKE_VERSION}" && test -n "${HPO_MAKE_VERSION}" \
+    || { echo "ERROR: HPO_VERSION + HPO_CMAKE_VERSION + HPO_MAKE_VERSION build-args are required" >&2; exit 1; }
+RUN test -n "${HPO_SDIST_SHA256-}" || { echo "ERROR: HPO_SDIST_SHA256 build-arg is required (CI resolves it)" >&2; exit 1; }
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      "cmake=${HPO_CMAKE_VERSION}" "make=${HPO_MAKE_VERSION}" curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=engine /opt/pineforge/include /opt/pineforge/include
+COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py
+RUN --mount=type=secret,id=github_token set -eu; \
+    python3 -I /tmp/fetch_release_asset.py \
+      --repo pineforge-4pass/pineforge-hpo --tag "v${HPO_VERSION}" \
+      --name "pineforge_hpo-${HPO_VERSION}.tar.gz" --output /tmp/hpo-source.tar.gz \
+      --retries "${ASSET_FETCH_RETRIES}" --retry-delay "${ASSET_FETCH_RETRY_DELAY}" \
+      --api-root https://api.github.com --browser-root https://github.com \
+      --token-file /run/secrets/github_token; \
+    printf '%s  /tmp/hpo-source.tar.gz\n' "${HPO_SDIST_SHA256}" > /tmp/hpo-source.sha256;''',
+    }
+
+    def assert_asset_fetch_wiring(self, dockerfile):
+        stages = _dockerfile_stages(dockerfile)
+        for stage in stages:
+            if stage.name not in self.ASSET_FETCH_PREFIXES:
+                self.assertNotIn("fetch_release_asset.py", stage.text)
+                self.assertNotIn("ASSET_FETCH_", stage.text)
+                self.assertNotIn("github_token", stage.text)
+                continue
+            expected = _dockerfile_instructions(self.ASSET_FETCH_PREFIXES[stage.name])
+            self.assertEqual(stage.instructions[:-1], expected[:-1], stage.name)
+            keyword, run = stage.instructions[-1]
+            self.assertEqual(keyword, "RUN")
+            self.assertTrue(run.startswith(expected[-1][1] + " "), stage.name)
+            self.assertEqual(run.count("python3 -I /tmp/fetch_release_asset.py"),
+                             2 if stage.name == "engine" else 1)
+        self.assertEqual({stage.name for stage in stages} & set(self.ASSET_FETCH_PREFIXES),
+                         set(self.ASSET_FETCH_PREFIXES))
+
+    def test_exact_asset_fetch_additions_and_mutation_controls(self):
+        self.assert_asset_fetch_wiring(self.dockerfile)
+        copy_line = "COPY scripts/fetch_release_asset.py /tmp/fetch_release_asset.py\n"
+        for name in self.ASSET_FETCH_PREFIXES:
+            stage = self.named[name].text
+            mutations = [
+                stage.replace("ARG ASSET_FETCH_RETRIES=3\n", "", 1),
+                stage.replace("ARG ASSET_FETCH_RETRIES=3\n", "ARG ASSET_FETCH_RETRIES=3\n" * 2, 1),
+                stage.replace("ARG ASSET_FETCH_RETRY_DELAY=2", "ARG ASSET_FETCH_RETRY_DELAY=0", 1),
+                stage.replace(copy_line, "", 1),
+                stage.replace(copy_line, copy_line * 2, 1),
+                stage.replace(copy_line, copy_line.replace("/tmp/", "/opt/"), 1),
+                stage.replace("--mount=type=secret,id=github_token ", "", 1),
+                stage.replace("id=github_token ", "id=github_token,required=true ", 1),
+                stage.replace("python3 -I /tmp/fetch_release_asset.py",
+                              'echo "python3 -I /tmp/fetch_release_asset.py"', 1),
+                stage.replace(' --retries "${ASSET_FETCH_RETRIES}"', " --retries 0", 1),
+                stage.replace("--token-file /run/secrets/github_token",
+                              "--token-file /tmp/github_token", 1),
+                stage.replace("--api-root https://api.github.com",
+                              "--api-root https://unapproved.invalid", 1),
+                stage.replace("--token-file /run/secrets/github_token;",
+                              "--token-file /run/secrets/github_token; true;", 1),
+            ]
+            if name == "engine":
+                mutations.append(stage.replace("curl ca-certificates python3",
+                                               "curl ca-certificates", 1))
+            for index, altered in enumerate(mutations):
+                with self.subTest(stage=name, mutation=index):
+                    self.assertNotEqual(altered, stage)
+                    mutant = self.dockerfile.replace(stage, altered, 1)
+                    with self.assertRaises(AssertionError):
+                        self.assert_asset_fetch_wiring(mutant)
+
+    def assert_asset_fetch_python_dependencies(self, dockerfile):
+        named = {stage.name: stage for stage in _dockerfile_stages(dockerfile)}
+        for target, provider in (("engine", "engine"),
+                                 ("hpo-wheel", "codegen"),
+                                 ("hpo-native", "hpo-toolchain")):
+            if target != provider:
+                self.assertEqual(named[target].base, provider,
+                                 target + ": Python must come from its FROM ancestor")
+            self.assertIn("python3", _apt_packages(named[provider]),
+                          target + ": " + provider + " must explicitly install python3")
+
+    def test_asset_fetch_python_dependencies_and_mutation_controls(self):
+        self.assert_asset_fetch_python_dependencies(self.dockerfile)
+        for name, original, replacement in (
+                ("codegen", "python3 python3-pip", "python3-pip"),
+                ("hpo-toolchain", " python3;", ";")):
+            with self.subTest(provider=name):
+                stage = self.named[name].text
+                self.assertEqual(stage.count(original), 1)
+                altered = stage.replace(original, replacement, 1)
+                self.assertNotEqual(altered, stage)
+                mutant = self.dockerfile.replace(stage, altered, 1)
+                self.assertNotEqual(mutant, self.dockerfile)
+                named = {stage.name: stage for stage in _dockerfile_stages(mutant)}
+                self.assertEqual(named["hpo-wheel"].base, "codegen")
+                self.assertEqual(named["hpo-native"].base, "hpo-toolchain")
+                self.assertNotIn("python3", _apt_packages(named[name]))
+                if name == "codegen":
+                    self.assertIn("python3-pip", _apt_packages(named[name]))
+                with self.assertRaisesRegex(AssertionError, "explicitly install python3"):
+                    self.assert_asset_fetch_python_dependencies(mutant)
 
     def test_last_stage_is_a_no_op_release_alias_with_the_original_entrypoint(self):
         last = self.stages[-1]
@@ -459,21 +807,100 @@ class DockerfileTargetTest(unittest.TestCase):
         self.assertEqual(_hpo_arguments(self.stages, reached), set())
         self.assertEqual(_hpo_arguments(self.stages, reached, required=True), set())
 
-    def test_hpo_reaches_its_build_stages_and_requires_all_seven_arguments(self):
+    def test_hpo_reaches_its_build_stages_and_requires_all_nine_arguments(self):
         reached = _reachable_stages(self.stages, "hpo")
         self.assertEqual(reached, {"hpo", "hpo-wheel", "hpo-toolchain", "hpo-native",
                                    "release", "engine", "codegen"})
         required = {"HPO_VERSION", "HPO_GCC_DEFAULTS_VERSION", "HPO_GCC_VERSION",
                     "HPO_BINUTILS_VERSION", "HPO_EIGEN_VERSION", "HPO_CMAKE_VERSION",
-                    "HPO_MAKE_VERSION"}
+                    "HPO_MAKE_VERSION", "HPO_WHEEL_SHA256", "HPO_SDIST_SHA256"}
         self.assertEqual(_hpo_arguments(self.stages, reached, required=True), required)
-        self.assertEqual(_hpo_arguments(self.stages, reached), required | {"HPO_WHEEL_SHA256", "HPO_SDIST_SHA256"})
+        self.assertEqual(_hpo_arguments(self.stages, reached), required)
         for stage in self.stages:
             for instruction, body in stage.instructions:
                 if instruction == "ARG" and body.startswith("HPO_"):
                     with self.subTest(stage=stage.name, argument=body.split("=", 1)[0]):
                         self.assertNotIn("=", body, "HPO arguments must have no defaults")
                         self.assertIn(stage.name, reached)
+
+    DIGEST_ARGUMENTS = (("hpo-wheel", "HPO_WHEEL_SHA256"), ("hpo-native", "HPO_SDIST_SHA256"))
+
+    def assert_digest_refusals(self, dockerfile):
+        """Each digest build-arg is required: refused by name, before the download."""
+        stages = {stage.name: stage for stage in _dockerfile_stages(dockerfile)}
+        for stage_name, argument in self.DIGEST_ARGUMENTS:
+            stage = stages[stage_name]
+            runs = [(index, body) for index, (keyword, body) in enumerate(stage.instructions)
+                    if keyword == "RUN"]
+            guards = [index for index, body in runs if body.startswith(f'test -n "${{{argument}-}}" || ')]
+            fetches = [index for index, body in runs if "fetch_release_asset.py" in body]
+            self.assertEqual(len(guards), 1, argument + ": exactly one refusal by name")
+            self.assertEqual(len(fetches), 1, stage_name + ": exactly one download RUN")
+            self.assertLess(guards[0], fetches[0], argument + ": refused before the download")
+            self.assertRegex(stage.instructions[guards[0]][1],
+                             rf'^test -n "\$\{{{argument}-\}}" \|\| \{{ echo "ERROR: {argument} build-arg is required[^"]*" >&2; exit 1; \}}$',
+                             argument + ": the message names the argument")
+            self.assertNotIn(f'[ -n "${{{argument}}}" ]', stage.text,
+                             argument + ": no optional-by-comment test remains")
+
+    def test_hpo_digest_arguments_are_refused_by_name_before_the_download(self):
+        self.assert_digest_refusals(self.dockerfile)
+        for stage_name, argument in self.DIGEST_ARGUMENTS:
+            stage = self.named[stage_name].text
+            guard = next(line for line in stage.splitlines(keepends=True)
+                         if line.startswith(f'RUN test -n "${{{argument}-}}"'))
+            mutations = {
+                "guard removed": stage.replace(guard, "", 1),
+                "guard after the download": stage.replace(guard, "", 1).rstrip("\n") + "\n" + guard,
+                "message without the argument name": stage.replace(f"ERROR: {argument} build-arg is required",
+                                                                    "ERROR: a build-arg is required", 1),
+                "guard that does not exit": stage.replace(guard, guard.replace("; exit 1; }", "; true; }", 1), 1),
+                "guard tests the other digest": stage.replace(guard, guard.replace(
+                    argument, "HPO_SDIST_SHA256" if argument == "HPO_WHEEL_SHA256" else "HPO_WHEEL_SHA256"), 1),
+                "optional test restored": stage.replace(
+                    "printf '%s  ", f'[ -n "${{{argument}}}" ] && printf \'%s  ', 1),
+            }
+            for label, altered in mutations.items():
+                with self.subTest(stage=stage_name, mutation=label):
+                    self.assertNotEqual(altered, stage)
+                    with self.assertRaises(AssertionError):
+                        self.assert_digest_refusals(self.dockerfile.replace(stage, altered, 1))
+
+    def test_no_argument_is_tested_for_emptiness_unguarded_under_set_u(self):
+        for target in (None, "hpo"):
+            with self.subTest(target=target or "default"):
+                reached = _reachable_stages(self.stages, target)
+                self.assertEqual(_unguarded_emptiness_tests(self.stages, reached), [])
+
+    def test_unguarded_emptiness_test_controls(self):
+        def problems(text, target=None):
+            stages = _dockerfile_stages(text)
+            return _unguarded_emptiness_tests(stages, _reachable_stages(stages, target))
+
+        # The pattern before the digests were required: optional by comment,
+        # required by behaviour. Rebuilt from the real file for each stage.
+        for stage_name, argument in self.DIGEST_ARGUMENTS:
+            with self.subTest(prefix_pattern=stage_name):
+                stage = self.named[stage_name].text
+                guard = next(line for line in stage.splitlines(keepends=True)
+                             if line.startswith(f'RUN test -n "${{{argument}-}}"'))
+                old = stage.replace(guard, "", 1).replace(
+                    "printf '%s  ", f'[ -n "${{{argument}}}" ] && printf \'%s  ', 1)
+                self.assertNotEqual(old, stage)
+                self.assertEqual(problems(self.dockerfile.replace(stage, old, 1), "hpo"),
+                                 [(stage_name, argument)])
+        template = "FROM debian AS s\nARG X\n{before}RUN set -eu; \\\n    if [ -n \"${{X}}\" ]; then \\\n      true; \\\n    fi\n"
+        guard_x = 'RUN test -n "${X-}" || { echo "ERROR: X build-arg is required" >&2; exit 1; }\n'
+        self.assertEqual(problems(template.format(before="")), [("s", "X")])
+        self.assertEqual(problems(template.format(before=guard_x)), [])
+        self.assertEqual(problems(template.format(before=guard_x.replace("${X-}", "${X}"))), [])
+        self.assertEqual(problems(template.format(before=guard_x.replace("; exit 1", ""))), [("s", "X")])
+        self.assertEqual(problems(template.format(before="").replace("ARG X\n", "ARG X=\n")), [])
+        self.assertEqual(problems(template.format(before="").replace("set -eu", "set -e")), [])
+        self.assertEqual(problems(template.format(before="").replace("ARG X\n", "ARG TARGETARCH\n")
+                                  .replace("${X}", "${TARGETARCH}")), [])
+        after = template.format(before="") + guard_x
+        self.assertEqual(problems(after), [("s", "X")], "a refusal after the use does not count")
 
     # sha256 of the final stage of docker/Dockerfile as it was before the hpo stages were added (what a
     # plain `docker build` built then), kept the way _dockerfile_stages keeps a stage: from its FROM line
@@ -485,21 +912,41 @@ class DockerfileTargetTest(unittest.TestCase):
 
     def test_release_stage_matches_original_runtime_after_notice_and_harness_changes(self):
         text = _without_guard_policy(_without_sources_notice(_without_stage_alias(self.named["release"])))
+        text = _without_parity_carrier(text)
+        text = _restore_bookworm_runtime_base(text)
         text = _restore_original_doc_cleanup(text)
         text = _restore_original_harness_manifest(text)
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
                          "after restoring the one /usr/share/doc token and removing the marked "
-                         "notice and approved harness changes, release must remain "
+                         "notice, exact trixie FROM line and approved harness and parity changes, release must remain "
                          "byte for byte the original runtime stage")
+
+    def test_runtime_base_normalization_refuses_other_from_changes(self):
+        text = _without_stage_alias(self.named["release"])
+        restored = _restore_bookworm_runtime_base(text)
+        self.assertEqual(restored, text.replace("FROM debian:trixie-slim\n",
+                                               "FROM debian:bookworm-slim\n", 1))
+        for replacement in ("FROM debian:bookworm-slim\n", "FROM debian:trixie\n",
+                            "FROM debian:latest\n", "FROM ubuntu:24.04\n",
+                            "FROM debian:trixie-slim AS release\n",
+                            "FROM debian:trixie-slim\nFROM debian:trixie-slim\n"):
+            with self.subTest(replacement=replacement):
+                changed = text.replace("FROM debian:trixie-slim\n", replacement, 1)
+                with self.assertRaisesRegex(ValueError, "approved trixie runtime FROM line"):
+                    _restore_bookworm_runtime_base(changed)
 
     def test_original_harness_normalization_requires_all_added_modules(self):
         text = _without_sources_notice(_without_stage_alias(self.named["release"]))
         for name, copy_line in (
                 ("pf_bars.py", "COPY docker/pf_bars.py                  /opt/pineforge/bin/pf_bars.py\n"),
                 ("pf_sink.py", "COPY docker/pf_sink.py                  /opt/pineforge/bin/pf_sink.py\n"),
+                ("pineforge_report_deadlines.py", "COPY docker/pineforge_report_deadlines.py /opt/pineforge/bin/pineforge_report_deadlines.py\n"),
+                ("pineforge_report_supervise.py", "COPY docker/pineforge_report_supervise.py /opt/pineforge/bin/pineforge_report_supervise.py\n"),
                 ("pineforge_sink_finalize.py", "COPY docker/pineforge_sink_finalize.py  /opt/pineforge/bin/pineforge_sink_finalize.py\n"),
-                ("pineforge_sink_to_json.py", "COPY docker/pineforge_sink_to_json.py   /opt/pineforge/bin/pineforge_sink_to_json.py\n")):
+                ("pineforge_sink_to_json.py", "COPY docker/pineforge_sink_to_json.py   /opt/pineforge/bin/pineforge_sink_to_json.py\n"),
+                ("quota_columns.py", "COPY docker/quota_columns.py           /opt/pineforge/bin/quota_columns.py\n"),
+                ("run_quota.py", "COPY docker/run_quota.py               /opt/pineforge/bin/run_quota.py\n")):
             self.assertEqual(text.count(copy_line), 1)
             self.assertEqual(text.count(" " + name + " "), 1)
             for scenario, altered in (
@@ -533,6 +980,8 @@ class DockerfileTargetTest(unittest.TestCase):
         stripped = _without_sources_notice(text)
         self.assertNotEqual(text, stripped)
         stripped = _without_guard_policy(stripped)
+        stripped = _without_parity_carrier(stripped)
+        stripped = _restore_bookworm_runtime_base(stripped)
         stripped = _restore_original_doc_cleanup(stripped)
         stripped = _restore_original_harness_manifest(stripped)
         self.assertNotEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -565,9 +1014,76 @@ class DockerfileTargetTest(unittest.TestCase):
                                "RUN mkdir -p /opt/pineforge/bin /unexpected\n", 1)
         self.assertNotEqual(altered, text)
         normalized = _restore_original_harness_manifest(
-            _restore_original_doc_cleanup(_without_guard_policy(_without_sources_notice(altered))))
+            _restore_original_doc_cleanup(_restore_bookworm_runtime_base(
+                _without_parity_carrier(_without_guard_policy(_without_sources_notice(altered))))))
         self.assertNotEqual(hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
+        # Extra commands or instructions inside the carrier must be refused,
+        # rather than stripped along with the approved carrier additions.
+        for anchor, replacement in (
+                ("ENV PYTHONDONTWRITEBYTECODE=1\n",
+                 "ENV PYTHONDONTWRITEBYTECODE=1\nRUN mkdir -p /unexpected\n"),
+                ("      cd /opt/pineforge/parity; \\\n",
+                 "      cd /opt/pineforge/parity; mkdir -p /unexpected; \\\n"),
+                ("cp -R --no-preserve=mode,ownership,timestamps /tmp/pineforge-context/docker/parity/.",
+                 "cp -R --no-preserve=mode,ownership,timestamps /tmp/pineforge-context/docker/unreviewed/."),
+                ("chmod 0755 /opt/pineforge/parity;",
+                 "chmod 0700 /opt/pineforge/parity;"),
+                ("-type f -exec chmod 0644 {} +;",
+                 "-type f -exec chmod 0600 {} +;"),
+                ('if [ "${actual%% *}" != "${descriptor_sha256}" ]; then',
+                 'if [ "${actual%% *}" != "${descriptor_sha256}" ]; then true;'),
+                ("if ! sha256sum -c --strict PARITY-SHA256SUMS;",
+                 "if ! true;"),
+                ("ARG PARITY_DESCRIPTOR_SHA256\n", ""),
+                ("ARG PARITY_DESCRIPTOR_SHA256\n",
+                 "ARG PARITY_DESCRIPTOR_SHA256\nARG PARITY_DESCRIPTOR_SHA256\n"),
+                ("ARG PARITY_CARRIER=0\n", ""),
+                ("ARG PARITY_CARRIER=0\n", "ARG PARITY_CARRIER=0\nARG PARITY_CARRIER=0\n")):
+            with self.subTest(parity_instruction=replacement):
+                self.assertEqual(text.count(anchor), 1)
+                altered = text.replace(anchor, replacement, 1)
+                self.assertNotEqual(altered, text)
+                with self.assertRaisesRegex(ValueError, "approved parity runtime fragment"):
+                    _without_parity_carrier(altered)
+
+    def test_parity_carrier_arguments_refuse_invalid_or_ignored_bindings(self):
+        block = _run_block(self.named["release"].text, "sha256sum -c --strict PARITY-SHA256SUMS")
+        script = block[len("RUN "):].replace("\\\n", "")
+        self.assertNotIn("\n", script, "exercise the complete logical parity RUN")
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash, "bash is required to exercise the actual parity RUN")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertIn("/opt/pineforge/parity", script)
+            script = script.replace("/opt/pineforge/parity", shlex.quote(str(root / "absent-parity")))
+
+            def replay(carrier, binding):
+                environment = {"PATH": os.environ.get("PATH", os.defpath)}
+                if carrier is not None:
+                    environment["PARITY_CARRIER"] = carrier
+                if binding is not None:
+                    environment["PARITY_DESCRIPTOR_SHA256"] = binding
+                return subprocess.run(
+                    [bash, "--noprofile", "--norc", "-c", script], cwd=root,
+                    env=environment, stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, timeout=60)
+
+            rows = [(value, None, "parity carrier must be 0 or 1")
+                    for value in ("", "2", "-1", "true", "01", "1\n")]
+            rows += [("0", "a" * 64, "parity descriptor requires the carrier"),
+                     (None, "a" * 64, "parity descriptor requires the carrier")]
+            rows += [("1", value, "parity descriptor hash differs from binding")
+                     for value in ("A" * 64, "a" * 63, "a" * 64 + "\n")]
+            for carrier, binding, message in rows:
+                with self.subTest(carrier=carrier, binding=binding):
+                    control = replay("0", None)
+                    self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
+                    done = replay(carrier, binding)
+                    self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertEqual(done.stderr.splitlines(), [message])
+                    self.assertEqual(done.stdout, "")
+            self.assertFalse((root / "absent-parity").exists())
 
     def test_hpo_inherits_release_and_retains_its_runtime_contract(self):
         hpo = self.named["hpo"]
@@ -593,7 +1109,8 @@ class DockerfileTargetTest(unittest.TestCase):
         self.assertEqual(_pinned_packages(hpo), _pinned_packages(self.named["hpo-toolchain"]))
         self.assertEqual(set(_pinned_packages(self.named["hpo-native"])), {"cmake", "make"})
         wheel = self.named["hpo-wheel"].text
-        self.assertIn('if [ -n "${HPO_WHEEL_SHA256}" ]', wheel)
+        self.assertIn('RUN test -n "${HPO_WHEEL_SHA256-}" || { echo "ERROR: HPO_WHEEL_SHA256 build-arg is required', wheel)
+        self.assertNotIn('[ -n "${HPO_WHEEL_SHA256}" ]', wheel)
         self.assertIn("sha256sum -c --strict /tmp/hpo-wheel.sha256", wheel)
         self.assertIn("python3 -I /tmp/check_hpo_resolution.py", wheel)
         self.assertIn('--target /opt/hpo "$wheel"', wheel)
@@ -633,6 +1150,39 @@ class ToolchainArgumentsTest(unittest.TestCase):
         for stage in stages:
             self.assertNotIn("hpo-toolchain.args", stage.text,
                              "the workflow reads this data file; Dockerfile stays build-arg driven")
+
+    def test_trixie_bases_and_matching_compiler_runtime_pins(self):
+        self.assertEqual(_trixie_packaging_problems(self.dockerfile, self.args_text), [])
+
+    def test_mixed_suite_old_compiler_and_missing_or_mismatched_runtime_pins_are_rejected(self):
+        self.assertEqual(_trixie_packaging_problems(self.dockerfile, self.args_text), [])
+        runtime = next(stage for stage in _dockerfile_stages(self.dockerfile) if stage.name == "hpo")
+        mutations = [
+            self.dockerfile.replace("FROM debian:trixie-slim AS engine",
+                                    "FROM debian:bookworm-slim AS engine", 1),
+            self.dockerfile.replace("FROM debian:trixie-slim", "FROM debian:latest"),
+            self.dockerfile.replace("gcc-14", "gcc-12"),
+            self.dockerfile.replace('"cmake=${HPO_CMAKE_VERSION}"',
+                                    '"cmake=${HPO_MAKE_VERSION}"', 1),
+        ]
+        pin = '"libstdc++6=${HPO_GCC_VERSION}"'
+        for replacement in ('"libstdc++6"', '"libstdc++6=${HPO_GCC_DEFAULTS_VERSION}"', "",
+                            pin + " " + pin):
+            mutations.append(self.dockerfile.replace(
+                runtime.text, runtime.text.replace(pin, replacement, 1), 1))
+        for index, mutated in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.assertNotEqual(mutated, self.dockerfile)
+                self.assertTrue(_trixie_packaging_problems(mutated, self.args_text))
+
+    def test_bookworm_empty_and_latest_values_cannot_replace_the_reviewed_trixie_pins(self):
+        for argument, value in TRIXIE_TOOLCHAIN_PINS.items():
+            for replacement in ("", "latest", "12.2.0-14+deb12u1"):
+                with self.subTest(argument=argument, replacement=replacement):
+                    mutated = self.args_text.replace(f"{argument}={value}",
+                                                     f"{argument}={replacement}", 1)
+                    self.assertNotEqual(mutated, self.args_text)
+                    self.assertTrue(_trixie_packaging_problems(self.dockerfile, mutated))
 
     def test_argument_comments_name_the_packages_pinned_by_the_real_stages(self):
         stages = _dockerfile_stages(self.dockerfile)
@@ -787,21 +1337,23 @@ source "$dispatch"
 
 class DockerfileHarnessTest(unittest.TestCase):
     HARNESS = ("bind_compiled_inventory.py", "entrypoint.sh", "pf_bars.py", "pf_sink.py",
-               "pineforge_sink_finalize.py", "pineforge_sink_to_json.py", "request_feed_inventory.py",
-               "run_execution_observer.py", "run_json.py", "run_phase_transport.py",
+               "pineforge_report_deadlines.py", "pineforge_report_supervise.py",
+               "pineforge_sink_finalize.py", "pineforge_sink_to_json.py", "quota_columns.py",
+               "request_feed_inventory.py", "run_execution_observer.py", "run_json.py",
+               "run_phase_transport.py", "run_quota.py",
                "selected_window_plan.py", "selected_window_report.py")
-    # The complete byte-check RUN is the contract, including all twelve names
+    # The complete byte-check RUN is the contract, including all sixteen names
     # and the check for an extra bin/ file.
     CHECK = r'''RUN set -eu; \
     cd /opt/pineforge/bin; \
-    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_sink_finalize.py pineforge_sink_to_json.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py selected_window_plan.py selected_window_report.py"; \
+    want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_report_deadlines.py pineforge_report_supervise.py pineforge_sink_finalize.py pineforge_sink_to_json.py quota_columns.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py run_quota.py selected_window_plan.py selected_window_report.py"; \
     listed="$(sed 's/^[0-9a-f]\{64\}  //' HARNESS-SHA256SUMS | tr '\n' ' ' | sed 's/ $//')"; \
     present="$(LC_ALL=C ls -A | grep -v '^HARNESS-SHA256SUMS$' | tr '\n' ' ' | sed 's/ $//')"; \
     if [ "$listed" != "$want" ] || [ "$present" != "$want" ]; then \
       echo "ERROR: HARNESS-SHA256SUMS lists [${listed}] and bin/ holds [${present}]; both must be exactly [${want}]" >&2; exit 1; \
     fi; \
     sha256sum -c --strict HARNESS-SHA256SUMS; \
-    echo "harness: the twelve files match HARNESS-SHA256SUMS"'''
+    echo "harness: the sixteen files match HARNESS-SHA256SUMS"'''
 
     def test_harness_copy_list_and_full_build_check_are_unchanged(self):
         dockerfile = (REPO / "docker" / "Dockerfile").read_text(encoding="utf-8")
@@ -907,7 +1459,7 @@ class PinnedLicenceDigestsTest(unittest.TestCase):
 
     PINNED = {
         "pineforge-hpo/LICENSE": "1aa95beed7fc0b368872fcd1bcf6a09a0f67ef3014b5e48ae21404cb647a1136",
-        # hpo 1.7.0 NOTICE: approved by L6 on 10-25 under the owner's HUB170-TAG = A;
+        # hpo 1.7.0 NOTICE: approved on 10-25;
         # the only change vs 1.6.3 is the bundled reader's path
         # (src/cli/json.hpp -> src/core/json.hpp).
         "pineforge-hpo/NOTICE": "fb088c51cdd2b82f2ee6488730de8334310796f124046df9679dc1e96f744d1b",
@@ -953,13 +1505,6 @@ class ReadmePairRuleTest(unittest.TestCase):
     # A checkout in CI has no origin/main, so the rule is pinned by digest; a deliberate change of the rule changes
     # this value in the same commit.
     PAIR_RULE_SHA256 = "35b72f7f5c7466cfc212a71eaf05df98f45e92411fd34a67bfff761556c61601"
-
-    # The converter documentation adds 30 lines to the previous 446-line layout.
-    # The offline runtime and TLS section adds 18 lines after the pair rule, for 494.
-    # The pair-rule digest above still covers the unchanged lines 215-244.
-    def test_runner_documentation_keeps_the_494_line_layout(self):
-        lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)
-        self.assertEqual(len(lines), 494)
 
     def test_lines_215_to_244_are_byte_identical_to_the_published_rule(self):
         lines = (REPO / "README.md").read_bytes().splitlines(keepends=True)

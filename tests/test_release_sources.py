@@ -135,6 +135,19 @@ class SourceGuardTest(unittest.TestCase):
         self.registry.write_text(REGISTRY_HEADER + "# no mirrors yet\n", encoding="utf-8")
         self.refused(self.check(), f"source set {_set_id(self.pairs)} is not in registry")
 
+    def test_trixie_defaults_source_version_cannot_reuse_a_bookworm_registry_row(self):
+        # The source is gcc-defaults 1.220, not the defaults binaries' epoch version.
+        updated = [(source, "1.220" if source == "gcc-defaults" else version)
+                   for source, version in self.pairs]
+        self.assertNotEqual(updated, self.pairs)
+        for path, arch in ((self.amd64, "amd64"), (self.arm64, "arm64")):
+            data = _inventory(updated, arch).replace("4:12.2.0-3", "4:14.2.0-1")
+            path.write_text(data, encoding="utf-8")
+            pairs = sources.inventory_pairs(path)
+            self.assertIn(("gcc-defaults", "1.220"), pairs)
+            self.assertNotIn(("gcc-defaults", "4:14.2.0-1"), pairs)
+        self.refused(self.check(), f"source set {_set_id(updated)} is not in registry")
+
     def test_02_registered_set_without_list_asset_is_refused(self):
         assets = [item for item in self.assets if item["name"] != self.sources_list.name]
         self.refused(self.check(assets), "missing release asset: set-02.SOURCES.list")
@@ -318,10 +331,11 @@ class SourceGuardTest(unittest.TestCase):
         self.assertTrue(data, "the registry must retain its documented header")
         self.assertEqual(data[0], REGISTRY_HEADER.rstrip("\n"))
         rows = [line.split("\t") for line in data[1:]]
-        self.assertEqual(len(rows), 16, "the registry must contain the 16 real source sets")
+        self.assertEqual(len(rows), 18, "the registry must contain the 18 real source sets")
         expected_tags = ("v0.1.0", "v1.4.0", "v0.1.21", "v0.1.15", "v1.0.1", "v0.1.11",
                          "v0.1.13", "v1.0.0-rc.1", "v0.1.19", "v0.1.25", "v1.3.0", "v1.4.0", "v1.4.0", "v1.4.0",
-                         "v1.4.0", "v1.4.0")
+                         "v1.4.0", "v1.4.0", "v1.4.0", "v1.4.0")
+        expected_counts = ("84",) * 16 + ("72", "72")
         identities = []
         for number, columns in enumerate(rows, 1):
             with self.subTest(source_set=f"set-{number:02d}"):
@@ -332,10 +346,10 @@ class SourceGuardTest(unittest.TestCase):
                 self.assertTrue(tag.startswith("v"), "holding releases must use v-prefixed tags")
                 self.assertIn(tag, expected_tags)
                 self.assertEqual(tag, expected_tags[number - 1], "each set must use its confirmed release")
-                self.assertEqual(count, "84")
+                self.assertEqual(count, expected_counts[number - 1])
                 self.assertEqual(asset, f"set-{number:02d}.SOURCES.list")
                 identities.append(identity)
-        self.assertEqual(len(set(identities)), 16, "source set-ids must be unique")
+        self.assertEqual(len(set(identities)), 18, "the 18 real source sets must have unique set-ids")
 
     def test_96_multiple_assets_for_one_source_pair_keep_the_same_set_id(self):
         source, version = next(pair for pair in self.pairs if ":" in pair[1])
@@ -435,11 +449,48 @@ class HpoArtifactArgumentsTest(unittest.TestCase):
             with self.subTest(argument=argument), tempfile.TemporaryDirectory() as tmp:
                 text = stages[stage].text
                 self.assertIn("ARG " + argument + "\n", text)
-                start = text.index('if [ -n "${' + argument + '}" ]; then')
-                end = text.index("fi;", start) + len("fi;")
+                # The digest is required (refused by name earlier in the stage), so the
+                # check is unconditional: write the sum file, then run sha256sum on it.
+                needle = '"${' + argument + '}"'
+                start = text.rindex("printf ", 0, text.index(needle))
+                end = text.index(";", text.index("sha256sum -c --strict", start)) + 1
                 guard = text[start:end]
-                self.assertIn("sha256sum -c --strict", guard)
-                self.assertLess(text.index("curl -fsSL"), start)
+                self.assertEqual(guard.count("sha256sum -c --strict"), 1)
+                self.assertNotIn("if [", guard)
+                # Docker's logical-line parser removes continuation indentation;
+                # identify the guard's RUN by its unique declared argument.
+                runs = [body for keyword, body in stages[stage].instructions
+                        if keyword == "RUN" and needle in body]
+                self.assertEqual(len(runs), 1)
+                lexer = shlex.shlex(runs[0], posix=True, punctuation_chars=";&|")
+                lexer.whitespace_split = True
+                commands = [[]]
+                for word in lexer:
+                    if word in {";", "&&", "||"}:
+                        commands.append([])
+                    else:
+                        commands[-1].append(word)
+                acquisitions = [(index, command) for index, command in enumerate(commands)
+                                if command[:3] == [
+                                    "python3", "-I", "/tmp/fetch_release_asset.py",
+                                ]]
+                name = ("pineforge_hpo-${HPO_VERSION}-py3-none-any.whl"
+                        if stage == "hpo-wheel" else "pineforge_hpo-${HPO_VERSION}.tar.gz")
+                output = "$wheel" if stage == "hpo-wheel" else "/tmp/hpo-source.tar.gz"
+                self.assertEqual([command for _, command in acquisitions], [[
+                    "python3", "-I", "/tmp/fetch_release_asset.py",
+                    "--repo", "pineforge-4pass/pineforge-hpo", "--tag", "v${HPO_VERSION}",
+                    "--name", name, "--output", output,
+                    "--retries", "${ASSET_FETCH_RETRIES}",
+                    "--retry-delay", "${ASSET_FETCH_RETRY_DELAY}",
+                    "--api-root", "https://api.github.com",
+                    "--browser-root", "https://github.com",
+                    "--token-file", "/run/secrets/github_token",
+                ]])
+                guard_positions = [index for index, command in enumerate(commands)
+                                   if command[:1] == ["printf"] and "${" + argument + "}" in command]
+                self.assertEqual(len(guard_positions), 1)
+                self.assertLess(acquisitions[0][0], guard_positions[0])
                 self.assertLess(end, text.index(consume))
                 # Run only the real checksum guard, on explicit fixture bytes;
                 # downloads, extraction and installation remain outside it.
@@ -463,6 +514,30 @@ class HpoArtifactArgumentsTest(unittest.TestCase):
                 self.assertNotEqual(bad.returncode, 0, bad.stdout + bad.stderr)
                 self.assertIn("FAILED", bad.stdout + bad.stderr)
 
+    def test_each_declared_digest_is_refused_by_name_when_unset_or_empty(self):
+        stages = {stage.name: stage for stage in
+                  _dockerfile_stages((REPO / "docker" / "Dockerfile").read_text())}
+        shell = shutil.which("sh", path=os.defpath)
+        self.assertIsNotNone(shell, "sh is required to exercise the real refusals")
+        for argument, stage in (("HPO_WHEEL_SHA256", "hpo-wheel"), ("HPO_SDIST_SHA256", "hpo-native")):
+            with self.subTest(argument=argument):
+                runs = [body for keyword, body in stages[stage].instructions
+                        if keyword == "RUN" and body.startswith('test -n "${' + argument + '-}" ||')]
+                self.assertEqual(len(runs), 1, "exactly one refusal by name in the " + stage + " stage")
+                for label, extra, accepted in (("unset", {}, False), ("empty", {argument: ""}, False),
+                                               ("valid", {argument: "a" * 64}, True)):
+                    with self.subTest(case=label):
+                        done = subprocess.run([shell, "-c", runs[0]],
+                                              env={"PATH": os.defpath, **extra},
+                                              stdin=subprocess.DEVNULL, capture_output=True,
+                                              text=True, timeout=10)
+                        if accepted:
+                            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                        else:
+                            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                            self.assertIn("ERROR: " + argument + " build-arg is required", done.stderr)
+                            self.assertNotIn("parameter not set", done.stderr)
+
 
 class SourceNoticeTest(unittest.TestCase):
     @classmethod
@@ -472,7 +547,7 @@ class SourceNoticeTest(unittest.TestCase):
         cls.template = (REPO / "docker" / "SOURCES.txt.in").read_text(encoding="utf-8")
 
     def test_template_preserves_biz_notice_verbatim_except_version_token(self):
-        approved = (FIXTURES / "GPL-NOTICE-v1.txt").read_text(encoding="utf-8")
+        approved = (FIXTURES / "GPL-NOTICE-v2.txt").read_text(encoding="utf-8")
         self.assertEqual(self.template, approved.replace("<this version>", "@RELEASE_VERSION@"))
         self.assertEqual(re.findall(r"@[A-Za-z0-9_]+@", self.template), ["@RELEASE_VERSION@"])
         self.assertNotIn("<this version>", self.template)
@@ -717,8 +792,8 @@ class SourceRetentionTest(unittest.TestCase):
 
     def test_no_source_deletion_command_in_real_repository_automation(self):
         paths = list((REPO / ".github" / "workflows").glob("*"))
-        self.assertIn(REPO / ".github" / "workflows" / "diag-gke-python.yml", paths,
-                      "the diagnostic workflow must remain in the complete retention scan")
+        self.assertIn(REPO / ".github" / "workflows" / "python-test.yml", paths,
+                      "the active CI workflow must remain in the complete retention scan")
         paths += list((REPO / "scripts").glob("*"))
         paths += list((REPO / "tools").rglob("*"))
         found = []
@@ -728,23 +803,6 @@ class SourceRetentionTest(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             found += [f"{path.relative_to(REPO)}: {command}" for command in _deletion_commands(text)]
         self.assertEqual(found, [])
-
-    def test_diagnostic_workflow_retention_scan_refuses_added_deletion_commands(self):
-        text = (REPO / ".github" / "workflows" / "diag-gke-python.yml").read_text(encoding="utf-8")
-        self.assertEqual(_deletion_commands(text), [])
-        anchor = "      - name: Install runner tools\n"
-        self.assertEqual(text.count(anchor), 1)
-        for command in (
-            "gh release delete v1.0.0 --yes",
-            "gh release delete-asset v1.0.0 source.tar",
-            "gh api --method DELETE repos/example/project/releases/assets/123",
-            "git push --delete origin v1.0.0",
-            "git push origin :refs/tags/v1.0.0",
-        ):
-            with self.subTest(command=command):
-                mutant = text.replace(anchor, "      - run: " + command + "\n" + anchor, 1)
-                self.assertNotEqual(mutant, text)
-                self.assertIn("- run: " + command, _deletion_commands(mutant))
 
     def test_readme_has_the_retention_sentence_and_notice_path(self):
         readme = (REPO / "README.md").read_text(encoding="utf-8")
@@ -763,10 +821,10 @@ class SourceRetentionTest(unittest.TestCase):
             "README must explain how to make a new source set available before its first publish",
         )
         self.assertIn(
-            "The default image differs from 1.5.0 only by the source notice, the two source "
-            "labels and the retained Debian package copyright files.",
+            "The 1.10.0 packaging refresh moves every Debian-based stage to trixie and replaces "
+            "bookworm's GCC 12 pins with GCC 14; the checked harness and entrypoint stay unchanged.",
             readme,
-            "README must state the notice and copyright differences from the 1.5.0 default image",
+            "README must state the bounded Debian base/compiler refresh",
         )
 
 

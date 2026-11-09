@@ -5,7 +5,7 @@
 The default entry point now runs the candidate → finalizer → completion graph:
 
 ```bash
-# Run in CI or on the approved cloud host, never on the Mac.
+# Run in CI or on the approved cloud host, never on a laptop.
 python3 tools/release-dry-run/dry_run.py --ready -v
 python3 tools/release-dry-run/dry_run.py --ready -k ArrivalReplay
 ```
@@ -122,8 +122,8 @@ Requirements: bash 4.4 or later first on `PATH` (GitHub's runners have bash 5;
 macOS's `/bin/bash` 3.2 is refused), git 2.32 or later, jq, node 20 or later,
 and Python 3.9 or later with PyYAML.
 
-For this campaign, every replay and regression check runs on an AWS Spot EC2
-host, never on the Mac or an on-demand instance. Use a lane-owned output and
+In this project, every replay and regression check runs on an AWS Spot EC2
+host, never on a laptop or an on-demand instance. Use a separate output and
 cache directory; keep build/test transcripts internal. The commands below are
 run on that host, with no production credentials copied to it:
 
