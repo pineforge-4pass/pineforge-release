@@ -205,7 +205,7 @@ The rules live in `scripts/release_pair.py` (unit-tested in `tests/`).
 `tools/release-dry-run/` replays the current handler and readiness graph offline,
 including all three-component arrival orders, duplicate/lost delivery, missing
 prerequisites and negative controls. Run in CI or on the approved cloud host,
-never on the Mac:
+never on a laptop:
 
 ```
 python3 -m unittest discover -s tests -p 'test_release_*.py'   # the release rules

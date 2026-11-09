@@ -1,7 +1,7 @@
 version: 2
 updates:
   # One grouped PR a week for every action bump. Major bumps of release-chain
-  # actions are reviewed and merged by hand (CORE-TOP card CR-135), never
+  # actions are reviewed and merged by hand, never
   # auto-merged.
   - package-ecosystem: github-actions
     directory: /

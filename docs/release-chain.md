@@ -475,7 +475,7 @@ malformed entry streams are invalid evidence.
 
 ## Consumer receipt contract v1
 
-This is the single consumer-to-hub contract for the six receipt lanes;
+This is the single consumer-to-hub contract for the six receipt roles;
 delivery-only compute is excluded. Implement the artifact and callback in the
 consumer's trusted default-branch coordinator.
 No Python knowledge is required. The hub validates both complete examples below
@@ -1252,7 +1252,7 @@ with a longer app default. Monitor these assets/issues, not green dispatch runs.
 
 ## Supervisor configuration
 
-Do not enable a receipt role until its consumer lane has removed moving runtime
+Do not enable a receipt role until its consumer has removed moving runtime
 defaults and installed PR/CI/E2E/deploy gates; the same holds for every role.
 Compute instead waits for its merged pair-validation receiver and explicit
 first-pair gate. Consumer App identities must not bypass
@@ -1470,7 +1470,7 @@ names. Do not use the example E2E/deploy inventories as production gates.
 ```
 
 Supervisor must populate the **actual complete expected job names**, including
-matrix expansions, from each reviewed consumer lane. A tiny example inventory
+matrix expansions, from each reviewed consumer. A tiny example inventory
 must never be used to omit existing required checks.
 
 Rollout order for the application `post_merge` section: a receipt must carry
@@ -1565,7 +1565,7 @@ readback. Newer aliases are left alone. Fixed tags, images, source assets and
 manifests are preserved. If no previous good alias exists, it reports incomplete
 repair rather than deleting an alias or inventing a good target. **A hub rollback
 sends no consumer signal.** Consumers may keep the rejected release while hub
-aliases revert, so mixed versions are possible. Each consumer lane owns its
+aliases revert, so mixed versions are possible. Each consumer owns its
 explicit rollback and served-state verification; coordinate those rollbacks
 separately.
 
@@ -1576,11 +1576,11 @@ truthful hosted receipts and red cases for source trust, binding and candidate
 replacement, archive digests, PR/head/base/attempt mismatches and inventory
 changes, plus regressions for the original exact-SHA path. The existing
 `test_release_*.py` discovery includes it in CI. These tests are written for
-CI/cloud execution and are not run on the Mac; local validation is limited to
+CI/cloud execution and are not run on a laptop; local validation is limited to
 Python compilation and `git diff --check` (plus YAML parsing if a workflow
 changes).
 No test suite, Docker runtime/build, live dispatch, publication, token mint,
-credential read or deployment is needed on the Mac to implement this lane.
+credential read or deployment is needed on a laptop to implement this change.
 
 ## Running the image: scratch space (engine 1.7.0)
 

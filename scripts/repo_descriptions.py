@@ -238,7 +238,7 @@ def main(argv=None):
         document = render(arguments.facts, arguments.policy)
         exit_code = check_live(document, arguments.gh) if arguments.command == "check" else 0
         if arguments.command == "render" and arguments.format == "commands":
-            lines = ["# TOP review only; this program never applies descriptions.",
+            lines = ["# Review only; this program never applies descriptions.",
                      "# facts_sha256=" + document["facts_sha256"],
                      "# policy_sha256=" + document["policy_sha256"]]
             for row in document["repositories"]:

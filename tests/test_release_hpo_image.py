@@ -1334,7 +1334,7 @@ class PinnedLicenceDigestsTest(unittest.TestCase):
 
     PINNED = {
         "pineforge-hpo/LICENSE": "1aa95beed7fc0b368872fcd1bcf6a09a0f67ef3014b5e48ae21404cb647a1136",
-        # hpo 1.7.0 NOTICE: approved by L6 on 10-25 under the owner's HUB170-TAG = A;
+        # hpo 1.7.0 NOTICE: approved on 10-25;
         # the only change vs 1.6.3 is the bundled reader's path
         # (src/cli/json.hpp -> src/core/json.hpp).
         "pineforge-hpo/NOTICE": "fb088c51cdd2b82f2ee6488730de8334310796f124046df9679dc1e96f744d1b",
