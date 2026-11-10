@@ -330,6 +330,9 @@ source coverage checks and runtime smoke on both architectures.
 See the [`publish` job in run 41858128823](https://github.com/pineforge-4pass/pineforge-release/actions/runs/41858128823/job/126672415990)
 for that evidence. The publication job succeeded; the workflow later failed
 during a notification step.
+Set-19 mirrors 72 source/version pairs at `v1.4.0` with `set-19.SOURCES.list`
+(set-id `25857d474e649bb731a4e830ba9103644130832d573fae221adca87cadebe9c8`);
+it updates `linux` to 6.12.116-1 while retaining set-18's other 71 sources.
 The six toolchain pins map to `gcc-defaults` 1.220, `gcc-14` 14.2.0-19,
 `binutils` 2.44-3, `eigen3` 3.4.0-5, `cmake` 3.31.6-2 and `make-dfsg` 4.4.1-2.
 CMake and make remain build-only; the final inventories determine the complete
