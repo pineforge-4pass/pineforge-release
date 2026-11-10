@@ -507,25 +507,51 @@ class ReleaseAssetFetchTest(unittest.TestCase):
             "bin/pineforge-selected-admit",
             "share/pineforge/pineforge-selected-admit.manifest.json",
         ):
-            with self.subTest(omitted=omitted), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                payload = _payload("1.8.7", "amd64", b"missing helper asset\0",
-                                   omit=(omitted,))
-                with _LocalRelease(payload) as release:
-                    observed = self._run("missing-helper-asset", root, release,
-                                         retries=0, delay=1)
-                self._assert_known_routes(observed)
-                self.assertNotEqual(observed.completed.returncode, 0, observed.proof())
-                for relative in ("lib/libpineforge.a", "include/pineforge.h"):
-                    self.assertEqual((root / "installed" / relative).read_bytes(),
-                                     payload.members[relative])
-                if omitted != "bin/pineforge-selected-admit":
-                    self.assertEqual(
-                        (root / "installed" / "bin/pineforge-selected-admit").read_bytes(),
-                        payload.members["bin/pineforge-selected-admit"],
+            with self.subTest(omitted=omitted):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    payload = _payload("1.8.7", "amd64", b"missing helper asset\0")
+                    with _LocalRelease(payload) as release:
+                        observed = self._run("missing-helper-asset-control", root, release,
+                                             retries=0, delay=1)
+                    self._assert_bytes_and_consumed(root, payload, observed)
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    payload = _payload("1.8.7", "amd64", b"missing helper asset\0",
+                                       omit=(omitted,))
+                    with _LocalRelease(payload) as release:
+                        observed = self._run("missing-helper-asset", root, release,
+                                             retries=0, delay=1)
+                    self._assert_known_routes(observed)
+                    self.assertNotEqual(observed.completed.returncode, 0, observed.proof())
+                    self.assertIn(payload.base + ".tar.gz: OK", observed.completed.stdout)
+                    self.assertIn("tar", observed.commands)
+                    self.assertIn("sha256sum", observed.commands)
+                    self.assertLess(observed.commands.index("sha256sum"),
+                                    observed.commands.index("tar"))
+                    stderr_lines = observed.completed.stderr.splitlines()
+                    source = root / "download" / payload.base / omitted
+                    self.assertIn(
+                        f"install: cannot stat '{source}': No such file or directory",
+                        stderr_lines,
                     )
-                self.assertFalse((root / "asset-sums" / "SHA256SUMS").exists())
-                self.assertFalse((root / "installed" / omitted).exists())
+                    trace_lines = [line for line in stderr_lines if re.match(r"^\++ ", line)]
+                    mode = "0755" if omitted == "bin/pineforge-selected-admit" else "0644"
+                    self.assertEqual(
+                        trace_lines[-1],
+                        f"+ install -m {mode} {source} {root / 'installed' / omitted}",
+                        "execution did not stop at the omitted member's install",
+                    )
+                    for relative in ("lib/libpineforge.a", "include/pineforge.h"):
+                        self.assertEqual((root / "installed" / relative).read_bytes(),
+                                         payload.members[relative])
+                    if omitted != "bin/pineforge-selected-admit":
+                        self.assertEqual(
+                            (root / "installed" / "bin/pineforge-selected-admit").read_bytes(),
+                            payload.members["bin/pineforge-selected-admit"],
+                        )
+                    self.assertFalse((root / "asset-sums" / "SHA256SUMS").exists())
+                    self.assertFalse((root / "installed" / omitted).exists())
 
     def test_a_real_curl_recovers_after_configured_transient_retries(self):
         cases = (
