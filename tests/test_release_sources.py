@@ -331,11 +331,11 @@ class SourceGuardTest(unittest.TestCase):
         self.assertTrue(data, "the registry must retain its documented header")
         self.assertEqual(data[0], REGISTRY_HEADER.rstrip("\n"))
         rows = [line.split("\t") for line in data[1:]]
-        self.assertEqual(len(rows), 18, "the registry must contain the 18 real source sets")
+        self.assertEqual(len(rows), 19, "the registry must contain the 19 real source sets")
         expected_tags = ("v0.1.0", "v1.4.0", "v0.1.21", "v0.1.15", "v1.0.1", "v0.1.11",
                          "v0.1.13", "v1.0.0-rc.1", "v0.1.19", "v0.1.25", "v1.3.0", "v1.4.0", "v1.4.0", "v1.4.0",
-                         "v1.4.0", "v1.4.0", "v1.4.0", "v1.4.0")
-        expected_counts = ("84",) * 16 + ("72", "72")
+                         "v1.4.0", "v1.4.0", "v1.4.0", "v1.4.0", "v1.4.0")
+        expected_counts = ("84",) * 16 + ("72", "72", "72")
         identities = []
         for number, columns in enumerate(rows, 1):
             with self.subTest(source_set=f"set-{number:02d}"):
@@ -349,7 +349,7 @@ class SourceGuardTest(unittest.TestCase):
                 self.assertEqual(count, expected_counts[number - 1])
                 self.assertEqual(asset, f"set-{number:02d}.SOURCES.list")
                 identities.append(identity)
-        self.assertEqual(len(set(identities)), 18, "the 18 real source sets must have unique set-ids")
+        self.assertEqual(len(set(identities)), 19, "the 19 real source sets must have unique set-ids")
 
     def test_96_multiple_assets_for_one_source_pair_keep_the_same_set_id(self):
         source, version = next(pair for pair in self.pairs if ":" in pair[1])
