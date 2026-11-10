@@ -13,6 +13,7 @@ The only shell substitutions are URL/destination roots:
 * https://github.com -> the loopback server's /browser root;
 * https://api.github.com -> its /api root, if present in the actual RUN;
 * cd /tmp and the quoted /tmp/ sources -> ASSET_FIXTURE_TMP;
+* /opt/pineforge-asset-sums -> ASSET_FIXTURE_RECORD;
 * /opt/pineforge -> ASSET_FIXTURE_INSTALL.
 * /tmp/fetch_release_asset.py -> the actual COPY source in this repository;
 * /run/secrets/github_token -> a file containing only synthetic read-token bytes.
@@ -44,6 +45,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -72,20 +74,30 @@ class _Payload:
     token: str
 
 
-def _payload(version: str, arch: str, seed: bytes) -> _Payload:
+def _payload(version: str, arch: str, seed: bytes, *,
+             omit: tuple[str, ...] = ()) -> _Payload:
     """Produce independent, nonempty archive inputs, not a product-derived hash."""
     triple = {"amd64": "linux-x86_64", "arm64": "linux-aarch64"}[arch]
     base = f"pineforge-v{version}-{triple}"
     members = {
         "lib/libpineforge.a": b"fixture static library\0" + seed,
         "include/pineforge.h": b"/* loopback fixture */\n" + seed.hex().encode() + b"\n",
+        "bin/pineforge-selected-admit": b"fixture selected-admit helper\0" + seed,
+        "share/pineforge/pineforge-selected-admit.manifest.json": (
+            json.dumps({"fixture_seed": seed.hex()}).encode() + b"\n"
+        ),
     }
+    members = {relative: data for relative, data in members.items() if relative not in omit}
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz") as archive:
         for relative, data in members.items():
             entry = tarfile.TarInfo(f"{base}/{relative}")
             entry.size = len(data)
             entry.mtime = 0
+            if relative == "bin/pineforge-selected-admit":
+                entry.mode = 0o600
+            elif relative == "share/pineforge/pineforge-selected-admit.manifest.json":
+                entry.mode = 0o666
             archive.addfile(entry, io.BytesIO(data))
     supplied = output.getvalue()
     expected = hashlib.sha256(supplied).hexdigest()
@@ -350,6 +362,7 @@ class ReleaseAssetFetchTest(unittest.TestCase):
             "ASSET_FIXTURE_TOKEN_FILE": str(root / "github_token"),
             "ASSET_FIXTURE_TMP": str(root / "download"),
             "ASSET_FIXTURE_INSTALL": str(root / "installed"),
+            "ASSET_FIXTURE_RECORD": str(root / "asset-sums"),
         }
 
     def _run(self, label: str, root: Path, release: _LocalRelease, *,
@@ -363,6 +376,7 @@ class ReleaseAssetFetchTest(unittest.TestCase):
         script = script.replace("/run/secrets/github_token", '"${ASSET_FIXTURE_TOKEN_FILE}"')
         script = script.replace("cd /tmp;", 'cd "${ASSET_FIXTURE_TMP}";')
         script = script.replace('"/tmp/', '"${ASSET_FIXTURE_TMP}/')
+        script = script.replace("/opt/pineforge-asset-sums", '"${ASSET_FIXTURE_RECORD}"')
         script = script.replace("/opt/pineforge", '"${ASSET_FIXTURE_INSTALL}"')
         if "/tmp" in script or "/opt/pineforge" in script:
             raise RuntimeError("fixture setup: unredirected engine destination")
@@ -453,11 +467,23 @@ class ReleaseAssetFetchTest(unittest.TestCase):
                          payload.checksum)
         self.assertTrue(payload.base + ".tar.gz: OK" in observed.completed.stdout,
                         "actual sha256sum did not report the supplied archive as OK")
-        self.assertEqual(observed.commands.count("sha256sum"), 1)
+        self.assertEqual(observed.commands.count("sha256sum"), 2)
         self.assertIn("tar", observed.commands, "actual extraction was not executed")
         self.assertLess(observed.commands.index("sha256sum"), observed.commands.index("tar"))
         for relative, supplied in payload.members.items():
             self.assertEqual((root / "installed" / relative).read_bytes(), supplied)
+        helper_modes = (
+            ("bin/pineforge-selected-admit", 0o755),
+            ("share/pineforge/pineforge-selected-admit.manifest.json", 0o644),
+        )
+        for relative, mode in helper_modes:
+            installed = root / "installed" / relative
+            self.assertEqual(stat.S_IMODE(installed.stat().st_mode), mode)
+        expected_record = "".join(
+            f"{hashlib.sha256(payload.members[relative]).hexdigest()}  {relative}\n"
+            for relative, _ in helper_modes
+        ).encode("ascii")
+        self.assertEqual((root / "asset-sums" / "SHA256SUMS").read_bytes(), expected_record)
         self._assert_known_routes(observed)
 
     def test_healthy_fixture_downloads_verifies_and_consumes_supplied_bytes(self):
@@ -475,6 +501,31 @@ class ReleaseAssetFetchTest(unittest.TestCase):
                 self.assertEqual([request.status for request in transfers], [200, 200])
                 self.assertEqual([request.body_bytes for request in transfers],
                                  [len(payload.archive), len(payload.checksum)])
+
+    def test_an_archive_without_either_helper_asset_is_refused(self):
+        for omitted in (
+            "bin/pineforge-selected-admit",
+            "share/pineforge/pineforge-selected-admit.manifest.json",
+        ):
+            with self.subTest(omitted=omitted), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                payload = _payload("1.8.7", "amd64", b"missing helper asset\0",
+                                   omit=(omitted,))
+                with _LocalRelease(payload) as release:
+                    observed = self._run("missing-helper-asset", root, release,
+                                         retries=0, delay=1)
+                self._assert_known_routes(observed)
+                self.assertNotEqual(observed.completed.returncode, 0, observed.proof())
+                for relative in ("lib/libpineforge.a", "include/pineforge.h"):
+                    self.assertEqual((root / "installed" / relative).read_bytes(),
+                                     payload.members[relative])
+                if omitted != "bin/pineforge-selected-admit":
+                    self.assertEqual(
+                        (root / "installed" / "bin/pineforge-selected-admit").read_bytes(),
+                        payload.members["bin/pineforge-selected-admit"],
+                    )
+                self.assertFalse((root / "asset-sums" / "SHA256SUMS").exists())
+                self.assertFalse((root / "installed" / omitted).exists())
 
     def test_a_real_curl_recovers_after_configured_transient_retries(self):
         cases = (

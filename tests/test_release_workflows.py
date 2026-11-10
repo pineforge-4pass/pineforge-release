@@ -2540,6 +2540,7 @@ class HarnessSyncTest(unittest.TestCase):
         self.assertTrue(block.startswith("RUN set -eu; \\\n"), block[:40])
         self.assertIn("cd /opt/pineforge/bin; \\\n", block)
         self.assertIn('want="' + " ".join(self.HARNESS) + '"; \\\n', block)
+        self.assertIn("grep -v -e '^HARNESS-SHA256SUMS$' -e '^pineforge-selected-admit$'", block)
         self.assertIn('[ "$listed" != "$want" ] || [ "$present" != "$want" ]', block)
         self.assertIn("exit 1;", block)
         self.assertNotIn("|| true", block)
@@ -2653,14 +2654,16 @@ class HarnessBuildCheckTest(unittest.TestCase):
         bin_dir.mkdir()
         for name in self.HARNESS + (self.SUMS,):
             shutil.copyfile(REPO / "docker" / name, bin_dir / name)
+        (bin_dir / "pineforge-selected-admit").write_bytes(b"#!/bin/sh\nexit 0\n")
         return bin_dir
 
     def _names(self, bin_dir: Path) -> tuple[list[str], list[str]]:
         """The two name lists the check compares, read off the layout: the names in its sums file, in the
-        file's order, and the names in its directory, in C order, without the sums file."""
+        file's order, and the names in its directory, in C order, without the sums file or helper."""
         lines = (bin_dir / self.SUMS).read_bytes().decode("utf-8").splitlines()
         listed = [line.split("  ", 1)[1] for line in lines]
-        present = sorted(entry.name for entry in bin_dir.iterdir() if entry.name != self.SUMS)
+        present = sorted(entry.name for entry in bin_dir.iterdir()
+                         if entry.name not in (self.SUMS, "pineforge-selected-admit"))
         return listed, present
 
     def _edit_sums(self, bin_dir: Path, edit) -> None:
@@ -2765,6 +2768,333 @@ class HarnessBuildCheckTest(unittest.TestCase):
             self._passes(bin_dir)
             self._edit_sums(bin_dir, wrong_hash)
             self._fails_on_hash(bin_dir, "run_json.py")
+
+
+SELECTED_ADMIT_PATHS = (
+    "bin/pineforge-selected-admit",
+    "share/pineforge/pineforge-selected-admit.manifest.json",
+)
+
+
+def selected_admit_asset_sums(prefix: Path, sums: Path) -> None:
+    sums.write_text("".join(hashlib.sha256((prefix / name).read_bytes()).hexdigest()
+                            + "  " + name + "\n" for name in SELECTED_ADMIT_PATHS),
+                    encoding="ascii")
+
+
+def selected_admit_layout(root: Path) -> tuple[Path, Path]:
+    """A complete harness and two helper assets, with an ordered manifest in the engine format."""
+    prefix = root / "prefix"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "share/pineforge").mkdir(parents=True)
+    for name in HarnessSyncTest.HARNESS + (HarnessSyncTest.SUMS,):
+        shutil.copyfile(REPO / "docker" / name, prefix / "bin" / name)
+    projection = {
+        "schema": "pineforge-selected-capacity-helper-manifest/v1",
+        "helper": {"name": "pineforge-selected-admit", "path": SELECTED_ADMIT_PATHS[0]},
+        "engine": {"version_full": "1.0.0", "version": "1.0.0", "git_sha": "0" * 40, "dirty": False},
+        "descriptor": {"request_schema": "pineforge-selected-capacity-request/v1",
+                       "result_schema": "pineforge-selected-capacity-result/v1", "spec_sha256": "1" * 64},
+        "failure_catalog": {"codes": ["selected_bytes_limit_exceeded"], "catalog_sha256": "2" * 64},
+        "stages": ["source", "selected"],
+    }
+    line = json.dumps(projection, ensure_ascii=True, separators=(",", ":"))
+    helper = prefix / SELECTED_ADMIT_PATHS[0]
+    helper.write_text("#!/bin/sh\n"
+                      'if [ "$#" -ne 1 ] || [ "$1" != --describe ]; then exit 2; fi\n'
+                      "printf '%s\\n' " + shlex.quote(line) + "\n", encoding="ascii")
+    helper.chmod(0o755)
+    manifest = copy.deepcopy(projection)
+    manifest["helper"]["bytes"] = str(helper.stat().st_size)
+    manifest["helper"]["sha256"] = hashlib.sha256(helper.read_bytes()).hexdigest()
+    installed_manifest = prefix / SELECTED_ADMIT_PATHS[1]
+    installed_manifest.write_text(json.dumps(manifest, ensure_ascii=True, separators=(",", ":")) + "\n",
+                                  encoding="ascii")
+    installed_manifest.chmod(0o644)
+    sums = root / "asset-sums" / "SHA256SUMS"
+    sums.parent.mkdir()
+    selected_admit_asset_sums(prefix, sums)
+    return prefix, sums
+
+
+class HelperBuildCheckTest(unittest.TestCase):
+    """Run the real mounted helper RUN; each defect follows a passing control."""
+
+    CHECK = "helper: the two selected-admit files match the engine release asset"
+    MOUNT = ("--mount=type=bind,from=engine,source=/opt/pineforge-asset-sums,"
+             "target=/tmp/pineforge-asset-sums,ro ")
+    BIN_NAMES = tuple(sorted(HarnessSyncTest.HARNESS
+                             + (HarnessSyncTest.SUMS, "pineforge-selected-admit")))
+    BIN_ERROR = "ERROR: helper bin/ must hold exactly [" + " ".join(BIN_NAMES) + "]"
+    SHARE_ERROR = "ERROR: helper share/ must hold exactly [pineforge]"
+    MANIFEST_ERROR = ("ERROR: helper share/pineforge/ must hold exactly "
+                      "[pineforge-selected-admit.manifest.json]")
+    RECORD_ERROR = ("ERROR: helper asset record must name exactly "
+                    "[bin/pineforge-selected-admit share/pineforge/pineforge-selected-admit.manifest.json]")
+    HASH_ERROR = "ERROR: helper files differ from the engine release asset"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dockerfile = (REPO / "docker/Dockerfile").read_text(encoding="utf-8")
+        tools = ("bash", "ls", "sed", "sha256sum", "stat", "python3")
+        found = {tool: shutil.which(tool) for tool in tools}
+        missing = [tool for tool in tools if found[tool] is None]
+        if missing:
+            raise AssertionError("the Dockerfile's helper check requires " + ", ".join(missing))
+        cls.bash, cls.stat, cls.python = (found[name] for name in ("bash", "stat", "python3"))
+        cls.path = os.environ.get("PATH", os.defpath)
+
+    @classmethod
+    def _script(cls, dockerfile: str, prefix: Path, sums: Path) -> str:
+        if cls.CHECK not in dockerfile:
+            raise AssertionError("docker/Dockerfile holds no RUN for the two helper release assets")
+        block = _run_block(dockerfile, cls.CHECK)
+        leading = "RUN " + cls.MOUNT
+        if not block.startswith(leading):
+            raise AssertionError("the helper RUN must mount the engine asset record read-only")
+        joined = block[len(leading):].replace("\\\n", "")
+        if "\n" in joined:
+            raise AssertionError("the helper RUN must be one complete logical line")
+        for image_path in ("/opt/pineforge", "/tmp/pineforge-asset-sums"):
+            if joined.count(image_path) != 1:
+                raise AssertionError("the helper RUN must name its fixed root exactly once: " + image_path)
+        return (joined.replace("/opt/pineforge", shlex.quote(str(prefix)))
+                .replace("/tmp/pineforge-asset-sums", shlex.quote(str(sums.parent))))
+
+    def _run(self, prefix: Path, sums: Path) -> subprocess.CompletedProcess:
+        script = self._script(self.dockerfile, prefix, sums)
+        tools = prefix.parent / "tools"
+        tools.mkdir(exist_ok=True)
+        record = prefix.parent / "stat-calls"
+        record.write_text("", encoding="ascii")
+        # A different real owner cannot be arranged without root. Normalize
+        # only this fixture owner's uid:gid, after evaluating GNU stat on the
+        # actual file. The real build and image smoke enforce root ownership.
+        # Exact relative names also refuse protected paths and all env files.
+        adapter = (
+            f"#!{self.python} -I\n"
+            "import pathlib,subprocess,sys\n"
+            f"allowed={SELECTED_ADMIT_PATHS!r}\n"
+            "args=sys.argv[1:]\n"
+            "if len(args)!=3 or args[0]!='-c' or args[1] not in ('%u:%g','%a') or args[2] not in allowed:\n"
+            " sys.exit('refused stat fixture path: '+repr(args))\n"
+            f"if pathlib.Path.cwd()!=pathlib.Path({str(prefix)!r}): sys.exit('refused stat fixture directory')\n"
+            "print('stat follows: '+args[2],file=sys.stderr,flush=True)\n"
+            f"done=subprocess.run([{self.stat!r},*args],capture_output=True)\n"
+            "sys.stderr.buffer.write(done.stderr)\n"
+            "if done.returncode: sys.exit(done.returncode)\n"
+            "value=done.stdout.decode('ascii').strip()\n"
+            f"with pathlib.Path({str(record)!r}).open('a',encoding='ascii') as log:\n"
+            " log.write(args[1]+'\\t'+args[2]+'\\t'+value+'\\n')\n"
+            f"if args[1]=='%u:%g' and value=={f'{os.geteuid()}:{os.getegid()}'!r}: value='0:0'\n"
+            "print(value)\n"
+        )
+        (tools / "stat").write_text(adapter, encoding="utf-8")
+        (tools / "stat").chmod(0o755)
+        return subprocess.run([self.bash, "--noprofile", "--norc", "-c", script],
+                              cwd=prefix.parent, env={"PATH": str(tools) + os.pathsep + self.path},
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+
+    def _passes(self, prefix: Path, sums: Path) -> None:
+        done = self._run(prefix, sums)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.splitlines(),
+                         [name + ": OK" for name in SELECTED_ADMIT_PATHS] + [self.CHECK])
+        calls = [line.split("\t") for line in (prefix.parent / "stat-calls").read_text().splitlines()]
+        self.assertEqual([(fmt, name) for fmt, name, _ in calls],
+                         [("%u:%g", name) for name in SELECTED_ADMIT_PATHS]
+                         + [("%a", name) for name in SELECTED_ADMIT_PATHS])
+        self.assertEqual([value for fmt, _, value in calls if fmt == "%u:%g"],
+                         [f"{os.geteuid()}:{os.getegid()}"] * 2)
+
+    def _fails(self, prefix: Path, sums: Path, message: str) -> subprocess.CompletedProcess:
+        done = self._run(prefix, sums)
+        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(message, done.stderr.splitlines())
+        self.assertNotIn(self.CHECK, done.stdout)
+        return done
+
+    def test_the_two_assets_pass_and_both_ownership_expressions_are_evaluated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, sums = selected_admit_layout(Path(tmp))
+            self._passes(prefix, sums)
+            self.assertIn('if [ "$(stat -c %u:%g "$path")" != 0:0 ]', self.dockerfile)
+
+    def test_a_missing_helper_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, sums = selected_admit_layout(Path(tmp))
+            self._passes(prefix, sums)
+            (prefix / SELECTED_ADMIT_PATHS[0]).rename(Path(tmp) / "removed-helper")
+            self._fails(prefix, sums, self.BIN_ERROR)
+
+    def test_a_missing_manifest_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, sums = selected_admit_layout(Path(tmp))
+            self._passes(prefix, sums)
+            (prefix / SELECTED_ADMIT_PATHS[1]).rename(Path(tmp) / "removed-manifest")
+            self._fails(prefix, sums, self.MANIFEST_ERROR)
+
+    def test_changed_asset_bytes_are_refused_against_the_source_record(self):
+        for name in SELECTED_ADMIT_PATHS:
+            with self.subTest(asset=name), tempfile.TemporaryDirectory() as tmp:
+                prefix, sums = selected_admit_layout(Path(tmp))
+                self._passes(prefix, sums)
+                path = prefix / name
+                path.write_bytes(path.read_bytes() + b"\n")
+                done = self._fails(prefix, sums, self.HASH_ERROR)
+                self.assertIn(name + ": FAILED", done.stdout.splitlines())
+
+    def test_a_third_name_in_the_source_record_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, sums = selected_admit_layout(Path(tmp))
+            self._passes(prefix, sums)
+            digest = hashlib.sha256((prefix / SELECTED_ADMIT_PATHS[0]).read_bytes()).hexdigest()
+            sums.write_text(sums.read_text() + digest + "  bin/another-file\n", encoding="ascii")
+            self._fails(prefix, sums, self.RECORD_ERROR)
+
+    def test_either_missing_source_record_name_is_refused(self):
+        for missing in range(2):
+            with self.subTest(missing=SELECTED_ADMIT_PATHS[missing]), tempfile.TemporaryDirectory() as tmp:
+                prefix, sums = selected_admit_layout(Path(tmp))
+                self._passes(prefix, sums)
+                lines = sums.read_text().splitlines(keepends=True)
+                sums.write_text("".join(line for index, line in enumerate(lines) if index != missing),
+                                encoding="ascii")
+                self._fails(prefix, sums, self.RECORD_ERROR)
+
+    def test_helper_modes_other_than_755_are_refused(self):
+        for mode in (0o644, 0o775, 0o777):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as tmp:
+                prefix, sums = selected_admit_layout(Path(tmp))
+                self._passes(prefix, sums)
+                (prefix / SELECTED_ADMIT_PATHS[0]).chmod(mode)
+                self._fails(prefix, sums, "ERROR: helper bin/pineforge-selected-admit must have mode 755")
+
+    def test_manifest_modes_other_than_644_are_refused(self):
+        for mode in (0o755, 0o664):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as tmp:
+                prefix, sums = selected_admit_layout(Path(tmp))
+                self._passes(prefix, sums)
+                (prefix / SELECTED_ADMIT_PATHS[1]).chmod(mode)
+                self._fails(prefix, sums, "ERROR: helper " + SELECTED_ADMIT_PATHS[1] + " must have mode 644")
+
+    def test_either_asset_as_a_symlink_is_refused(self):
+        for name in SELECTED_ADMIT_PATHS:
+            with self.subTest(asset=name), tempfile.TemporaryDirectory() as tmp:
+                prefix, sums = selected_admit_layout(Path(tmp))
+                self._passes(prefix, sums)
+                path = prefix / name
+                target = Path(tmp) / "symlink-target"
+                path.rename(target)
+                path.symlink_to(target)
+                self._fails(prefix, sums,
+                            "ERROR: helper file " + name + " must be a regular file without symlinks")
+
+    def test_the_helper_only_at_another_path_is_refused(self):
+        for wrong in ("sbin/pineforge-selected-admit", "bin/sub/pineforge-selected-admit",
+                      "pineforge-selected-admit"):
+            with self.subTest(path=wrong), tempfile.TemporaryDirectory() as tmp:
+                prefix, sums = selected_admit_layout(Path(tmp))
+                self._passes(prefix, sums)
+                destination = prefix / wrong
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                (prefix / SELECTED_ADMIT_PATHS[0]).rename(destination)
+                self._fails(prefix, sums, self.BIN_ERROR)
+
+    def test_a_third_bin_file_is_refused_for_unrelated_backup_and_hidden_names(self):
+        for name in ("another-file", "pineforge-selected-admit.bak", ".x"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                prefix, sums = selected_admit_layout(Path(tmp))
+                self._passes(prefix, sums)
+                (prefix / "bin" / name).write_bytes(b"extra\n")
+                self._fails(prefix, sums, self.BIN_ERROR)
+
+    def test_the_manifest_only_at_another_path_is_refused(self):
+        for wrong, message in (
+                ("share/pineforge-selected-admit.manifest.json", self.SHARE_ERROR),
+                ("share/pineforge/sub/pineforge-selected-admit.manifest.json", self.MANIFEST_ERROR),
+                ("bin/pineforge-selected-admit.manifest.json", self.BIN_ERROR),
+                ("pineforge-selected-admit.manifest.json", self.MANIFEST_ERROR)):
+            with self.subTest(path=wrong), tempfile.TemporaryDirectory() as tmp:
+                prefix, sums = selected_admit_layout(Path(tmp))
+                self._passes(prefix, sums)
+                destination = prefix / wrong
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                (prefix / SELECTED_ADMIT_PATHS[1]).rename(destination)
+                self._fails(prefix, sums, message)
+
+    def test_an_extra_file_beside_the_manifest_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, sums = selected_admit_layout(Path(tmp))
+            self._passes(prefix, sums)
+            (prefix / "share/pineforge/another-file").write_bytes(b"extra\n")
+            self._fails(prefix, sums, self.MANIFEST_ERROR)
+
+    def test_an_extra_directory_under_share_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, sums = selected_admit_layout(Path(tmp))
+            self._passes(prefix, sums)
+            (prefix / "share/another-directory").mkdir()
+            self._fails(prefix, sums, self.SHARE_ERROR)
+
+    def test_an_extra_file_directly_under_share_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, sums = selected_admit_layout(Path(tmp))
+            self._passes(prefix, sums)
+            (prefix / "share/another-file").write_bytes(b"extra\n")
+            self._fails(prefix, sums, self.SHARE_ERROR)
+
+    def test_manifest_fields_must_identify_the_installed_helper(self):
+        for field, value, message in (
+                ("sha256", "0" * 64, "ERROR: helper manifest sha256 differs from the helper"),
+                ("path", "sbin/pineforge-selected-admit",
+                 "ERROR: helper manifest path must be bin/pineforge-selected-admit"),
+                ("name", "another-helper", "ERROR: helper manifest name must be pineforge-selected-admit"),
+                ("bytes", 1, "ERROR: helper manifest bytes differs from the helper")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                prefix, sums = selected_admit_layout(Path(tmp))
+                self._passes(prefix, sums)
+                path = prefix / SELECTED_ADMIT_PATHS[1]
+                manifest = json.loads(path.read_bytes())
+                manifest["helper"][field] = value
+                path.write_text(json.dumps(manifest, ensure_ascii=True, separators=(",", ":")) + "\n",
+                                encoding="ascii")
+                # Model a source manifest with this one semantic defect, so
+                # source-byte equality passes before manifest validation runs.
+                selected_admit_asset_sums(prefix, sums)
+                self._fails(prefix, sums, message)
+
+
+class HelperAssetSourceTest(unittest.TestCase):
+    def test_exact_asset_installs_copies_and_record_come_from_the_verified_tree(self):
+        dockerfile = (REPO / "docker/Dockerfile").read_text(encoding="utf-8")
+        engine = re.search(r"^FROM \S+ AS engine\n.*?(?=^FROM |\Z)", dockerfile, re.M | re.S).group(0)
+        extraction = _run_block(engine, 'sha256sum -c "${base}.tar.gz.sha256"')
+        self.assertIn("set -eux;", extraction)
+        self.assertLess(extraction.index('sha256sum -c "${base}.tar.gz.sha256"'),
+                        extraction.index('tar -xzf "${base}.tar.gz"'))
+        copies = [line for line in dockerfile.splitlines()
+                  if line.startswith("COPY ") and "pineforge-selected-admit" in line]
+        self.assertEqual(copies, ["COPY --from=engine /opt/pineforge/" + name + " /opt/pineforge/" + name
+                                  for name in SELECTED_ADMIT_PATHS])
+        for name, mode in zip(SELECTED_ADMIT_PATHS, ("0755", "0644")):
+            install = f'install -m {mode} "/tmp/${{base}}/{name}" /opt/pineforge/{name};'
+            self.assertIn(install, extraction)
+            self.assertLess(extraction.index('tar -xzf "${base}.tar.gz"'), extraction.index(install))
+        record = ('( cd "/tmp/${base}" && sha256sum ' + " ".join(SELECTED_ADMIT_PATHS)
+                  + " ) > /opt/pineforge-asset-sums/SHA256SUMS")
+        self.assertIn(record, extraction)
+        check = _run_block(dockerfile, HelperBuildCheckTest.CHECK)
+        self.assertTrue(check.startswith("RUN " + HelperBuildCheckTest.MOUNT))
+        self.assertIn('want="' + " ".join(HelperBuildCheckTest.BIN_NAMES) + '";', check)
+        allowlists = [line for line in check.splitlines()
+                      if line.strip().startswith(("want=", "want_sums=", "for path in "))]
+        for line in copies + allowlists:
+            with self.subTest(line=line):
+                self.assertFalse(any(char in line for char in "*?["), line)
+        self.assertNotIn("pineforge-asset-sums", "\n".join(
+            line for line in dockerfile.splitlines() if line.startswith("COPY ")))
+        self.assertEqual(check.count('sha256sum -c --strict "$asset_sums"'), 1)
 
 
 class PythonTestGateTest(unittest.TestCase):

@@ -477,6 +477,50 @@ def _restore_original_doc_cleanup(text: str) -> str:
     return "".join(lines)
 
 
+def _without_selected_admit(text: str) -> str:
+    """Remove only the exact helper additions before checking the historical pin."""
+    copies = (
+        "COPY --from=engine /opt/pineforge/bin/pineforge-selected-admit /opt/pineforge/bin/pineforge-selected-admit\n"
+        "COPY --from=engine /opt/pineforge/share/pineforge/pineforge-selected-admit.manifest.json /opt/pineforge/share/pineforge/pineforge-selected-admit.manifest.json\n"
+    )
+    check = r'''# The helper and manifest must match the two files in the verified engine release.
+# The asset record is mounted from the engine stage and stays out of the image.
+RUN --mount=type=bind,from=engine,source=/opt/pineforge-asset-sums,target=/tmp/pineforge-asset-sums,ro set -eu; \
+    cd /opt/pineforge; \
+    asset_sums=/tmp/pineforge-asset-sums/SHA256SUMS; \
+    want="HARNESS-SHA256SUMS bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge-selected-admit pineforge_report_deadlines.py pineforge_report_supervise.py pineforge_sink_finalize.py pineforge_sink_to_json.py quota_columns.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py run_quota.py selected_window_plan.py selected_window_report.py"; \
+    if [ "$(LC_ALL=C ls -A bin)" != "$(printf '%s\n' $want)" ]; then echo "ERROR: helper bin/ must hold exactly [${want}]" >&2; exit 1; fi; \
+    if [ "$(LC_ALL=C ls -A share)" != pineforge ]; then echo "ERROR: helper share/ must hold exactly [pineforge]" >&2; exit 1; fi; \
+    if [ "$(LC_ALL=C ls -A share/pineforge)" != pineforge-selected-admit.manifest.json ]; then echo "ERROR: helper share/pineforge/ must hold exactly [pineforge-selected-admit.manifest.json]" >&2; exit 1; fi; \
+    for path in bin/pineforge-selected-admit share/pineforge/pineforge-selected-admit.manifest.json; do \
+      if ! test -f "$path" || ! test ! -L "$path"; then echo "ERROR: helper file ${path} must be a regular file without symlinks" >&2; exit 1; fi; \
+      if [ "$(stat -c %u:%g "$path")" != 0:0 ]; then echo "ERROR: helper file ${path} must be owned by root:root" >&2; exit 1; fi; \
+    done; \
+    if [ "$(stat -c %a bin/pineforge-selected-admit)" != 755 ]; then echo "ERROR: helper bin/pineforge-selected-admit must have mode 755" >&2; exit 1; fi; \
+    if [ "$(stat -c %a share/pineforge/pineforge-selected-admit.manifest.json)" != 644 ]; then echo "ERROR: helper share/pineforge/pineforge-selected-admit.manifest.json must have mode 644" >&2; exit 1; fi; \
+    if ! test -f "$asset_sums" || ! test ! -L "$asset_sums"; then echo "ERROR: helper asset record must be a regular file without symlinks" >&2; exit 1; fi; \
+    want_sums="$(printf '%s\n' bin/pineforge-selected-admit share/pineforge/pineforge-selected-admit.manifest.json)"; \
+    listed="$(sed 's/^[0-9a-f]\{64\}  //' "$asset_sums")"; \
+    if [ "$listed" != "$want_sums" ] || [ "$(sed -n '$=' "$asset_sums")" != 2 ]; then echo "ERROR: helper asset record must name exactly [bin/pineforge-selected-admit share/pineforge/pineforge-selected-admit.manifest.json]" >&2; exit 1; fi; \
+    if ! sha256sum -c --strict "$asset_sums"; then echo "ERROR: helper files differ from the engine release asset" >&2; exit 1; fi; \
+    if ! python3 -I -c 'import hashlib,json,pathlib,sys; data=pathlib.Path("bin/pineforge-selected-admit").read_bytes(); manifest=json.loads(pathlib.Path("share/pineforge/pineforge-selected-admit.manifest.json").read_bytes()); helper=manifest["helper"]; helper.get("name")=="pineforge-selected-admit" or sys.exit("ERROR: helper manifest name must be pineforge-selected-admit"); helper.get("path")=="bin/pineforge-selected-admit" or sys.exit("ERROR: helper manifest path must be bin/pineforge-selected-admit"); helper.get("sha256")==hashlib.sha256(data).hexdigest() or sys.exit("ERROR: helper manifest sha256 differs from the helper"); helper.get("bytes")==str(len(data)) or sys.exit("ERROR: helper manifest bytes differs from the helper")'; then echo "ERROR: helper manifest validation failed" >&2; exit 1; fi; \
+    echo "helper: the two selected-admit files match the engine release asset"''' + "\n\n"
+    changes = (
+        (copies, ""), (check, ""),
+        ("# must name exactly the sixteen files above, in sorted order. The helper is checked by the next RUN;\n",
+         "# must name exactly the sixteen files above, in sorted order, and nothing else may sit in bin/;\n"),
+        ("grep -v -e '^HARNESS-SHA256SUMS$' -e '^pineforge-selected-admit$'",
+         "grep -v '^HARNESS-SHA256SUMS$'"),
+    )
+    for current, original in changes:
+        if text.count(current) != 1:
+            raise ValueError("expected exactly one approved selected-admit runtime fragment")
+        text = text.replace(current, original, 1)
+    if "pineforge-selected-admit" in text:
+        raise ValueError("expected exactly one approved selected-admit runtime fragment")
+    return text
+
+
 def _restore_original_harness_manifest(text: str) -> str:
     """Undo exactly the harness list additions for the original runtime pin."""
     changes = (
@@ -913,13 +957,14 @@ RUN --mount=type=secret,id=github_token set -eu; \
     def test_release_stage_matches_original_runtime_after_notice_and_harness_changes(self):
         text = _without_guard_policy(_without_sources_notice(_without_stage_alias(self.named["release"])))
         text = _without_parity_carrier(text)
+        text = _without_selected_admit(text)
         text = _restore_bookworm_runtime_base(text)
         text = _restore_original_doc_cleanup(text)
         text = _restore_original_harness_manifest(text)
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
                          "after restoring the one /usr/share/doc token and removing the marked "
-                         "notice, exact trixie FROM line and approved harness and parity changes, release must remain "
+                         "notice, exact trixie FROM line and approved harness, helper and parity changes, release must remain "
                          "byte for byte the original runtime stage")
 
     def test_runtime_base_normalization_refuses_other_from_changes(self):
@@ -936,8 +981,31 @@ RUN --mount=type=secret,id=github_token set -eu; \
                 with self.assertRaisesRegex(ValueError, "approved trixie runtime FROM line"):
                     _restore_bookworm_runtime_base(changed)
 
+    def test_helper_normalization_refuses_changed_or_duplicated_runtime_fragments(self):
+        text = _without_stage_alias(self.named["release"])
+        stripped = _without_selected_admit(text)
+        self.assertNotIn("pineforge-selected-admit", stripped)
+        helper_copy = ("COPY --from=engine /opt/pineforge/bin/pineforge-selected-admit "
+                       "/opt/pineforge/bin/pineforge-selected-admit\n")
+        for anchor, replacement in (
+                (helper_copy, ""),
+                (helper_copy, helper_copy * 2),
+                (helper_copy, helper_copy.replace("--from=engine", "--from=codegen")),
+                ("target=/tmp/pineforge-asset-sums,ro", "target=/tmp/pineforge-asset-sums"),
+                ('if ! sha256sum -c --strict "$asset_sums";', "if ! true;"),
+                ('"$(stat -c %u:%g "$path")" != 0:0', '"$(stat -c %u:%g "$path")" != 1:1'),
+                ("bin/pineforge-selected-admit)\" != 755", "bin/pineforge-selected-admit)\" != 777"),
+                ('    echo "helper: the two selected-admit files match the engine release asset"\n',
+                 '    echo "helper: the two selected-admit files match the engine release asset"; true\n')):
+            with self.subTest(fragment=anchor):
+                self.assertEqual(text.count(anchor), 1)
+                altered = text.replace(anchor, replacement, 1)
+                self.assertNotEqual(altered, text)
+                with self.assertRaisesRegex(ValueError, "approved selected-admit runtime fragment"):
+                    _without_selected_admit(altered)
+
     def test_original_harness_normalization_requires_all_added_modules(self):
-        text = _without_sources_notice(_without_stage_alias(self.named["release"]))
+        text = _without_selected_admit(_without_sources_notice(_without_stage_alias(self.named["release"])))
         for name, copy_line in (
                 ("pf_bars.py", "COPY docker/pf_bars.py                  /opt/pineforge/bin/pf_bars.py\n"),
                 ("pf_sink.py", "COPY docker/pf_sink.py                  /opt/pineforge/bin/pf_sink.py\n"),
@@ -981,6 +1049,7 @@ RUN --mount=type=secret,id=github_token set -eu; \
         self.assertNotEqual(text, stripped)
         stripped = _without_guard_policy(stripped)
         stripped = _without_parity_carrier(stripped)
+        stripped = _without_selected_admit(stripped)
         stripped = _restore_bookworm_runtime_base(stripped)
         stripped = _restore_original_doc_cleanup(stripped)
         stripped = _restore_original_harness_manifest(stripped)
@@ -1015,7 +1084,8 @@ RUN --mount=type=secret,id=github_token set -eu; \
         self.assertNotEqual(altered, text)
         normalized = _restore_original_harness_manifest(
             _restore_original_doc_cleanup(_restore_bookworm_runtime_base(
-                _without_parity_carrier(_without_guard_policy(_without_sources_notice(altered))))))
+                _without_selected_admit(
+                    _without_parity_carrier(_without_guard_policy(_without_sources_notice(altered)))))))
         self.assertNotEqual(hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
         # Extra commands or instructions inside the carrier must be refused,
@@ -1348,7 +1418,7 @@ class DockerfileHarnessTest(unittest.TestCase):
     cd /opt/pineforge/bin; \
     want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_report_deadlines.py pineforge_report_supervise.py pineforge_sink_finalize.py pineforge_sink_to_json.py quota_columns.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py run_quota.py selected_window_plan.py selected_window_report.py"; \
     listed="$(sed 's/^[0-9a-f]\{64\}  //' HARNESS-SHA256SUMS | tr '\n' ' ' | sed 's/ $//')"; \
-    present="$(LC_ALL=C ls -A | grep -v '^HARNESS-SHA256SUMS$' | tr '\n' ' ' | sed 's/ $//')"; \
+    present="$(LC_ALL=C ls -A | grep -v -e '^HARNESS-SHA256SUMS$' -e '^pineforge-selected-admit$' | tr '\n' ' ' | sed 's/ $//')"; \
     if [ "$listed" != "$want" ] || [ "$present" != "$want" ]; then \
       echo "ERROR: HARNESS-SHA256SUMS lists [${listed}] and bin/ holds [${present}]; both must be exactly [${want}]" >&2; exit 1; \
     fi; \

@@ -402,6 +402,19 @@ and checks their installed bytes against the sums. It also refuses to build
 when `docker/run_json.py`'s `EXPECTED_PF_ABI` differs from
 `PF_ABI_VERSION` in the bundled engine headers.
 
+The image also carries two selected-admit files from the same sha256-verified
+engine release tarball as the library and headers:
+`/opt/pineforge/bin/pineforge-selected-admit` (mode 0755) and
+`/opt/pineforge/share/pineforge/pineforge-selected-admit.manifest.json` (mode 0644).
+The harness check stays a sixteen-name check. A separate exact helper check
+refuses extra entries in `bin/`, `share/` or `share/pineforge/`, requires both
+files to be regular, non-symlink files owned by root:root, and compares their
+installed sha256 values with a two-file record made from the verified extracted
+tarball. It also checks the manifest's helper name, path, hash and size. Image
+smoke rechecks the layout, metadata and manifest on each architecture and requires
+`pineforge-selected-admit --describe` to exit zero and print the canonical
+manifest with only `helper.bytes` and `helper.sha256` removed.
+
 The image includes the sink-to-JSON converter beside `pf_sink.py`. Invoke the
 module with Python; `/opt/pineforge/bin` is not added to `PATH`, so no command
 wrappers are installed. Use a retained, completed sink and its captured stdout
@@ -453,6 +466,7 @@ with a writable mount to retain compiled artifacts between containers.
 With no first argument `hpo`, the dispatcher passes every argument unchanged
 to the engine's existing `/opt/pineforge/bin/entrypoint.sh`. The sixteen engine
 harness files and their byte and ABI checks remain in place.
+The HPO target inherits the same selected-admit helper, manifest and exact checks.
 
 For `--target hpo`, `HPO_VERSION` is a required build argument with no default,
 recorded in the `io.pineforge.hpo.version` label and `PINEFORGE_HPO_VERSION`.

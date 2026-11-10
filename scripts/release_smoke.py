@@ -82,6 +82,49 @@ print(json.dumps(result,sort_keys=True,separators=(',',':')))
 '''
 
 
+def selected_admit_runtime_script():
+    """Verify the helper's exact layout, manifest and canonical description inside the image."""
+    return r'''import hashlib,json,pathlib,stat,subprocess,sys
+root=pathlib.Path("/opt/pineforge")
+def require(condition,message):
+ if not condition: sys.exit("ERROR: "+message)
+def inventory(directory,expected):
+ try:
+  present=sorted(path.name for path in (root/directory).iterdir())
+ except OSError:
+  sys.exit("ERROR: helper "+directory+"/ inventory is unavailable")
+ require(present==expected,"helper "+directory+"/ must hold exactly ["+" ".join(expected)+"]")
+inventory("bin","HARNESS-SHA256SUMS bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge-selected-admit pineforge_report_deadlines.py pineforge_report_supervise.py pineforge_sink_finalize.py pineforge_sink_to_json.py quota_columns.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py run_quota.py selected_window_plan.py selected_window_report.py".split())
+inventory("share",["pineforge"])
+inventory("share/pineforge",["pineforge-selected-admit.manifest.json"])
+for name,mode in (("bin/pineforge-selected-admit",0o755),("share/pineforge/pineforge-selected-admit.manifest.json",0o644)):
+ path=root/name
+ require(not path.is_symlink() and path.is_file(),"helper file "+name+" must be a regular file without symlinks")
+ info=path.stat()
+ require((info.st_uid,info.st_gid)==(0,0),"helper file "+name+" must be owned by root:root")
+ require(stat.S_IMODE(info.st_mode)==mode,"helper "+name+" must have mode "+format(mode,"o"))
+binary=root/"bin/pineforge-selected-admit"
+data=binary.read_bytes()
+try:
+ manifest=json.loads((root/"share/pineforge/pineforge-selected-admit.manifest.json").read_bytes())
+ helper=manifest["helper"]
+ require(isinstance(helper,dict),"helper manifest helper must be an object")
+except (OSError,ValueError,KeyError,TypeError):
+ sys.exit("ERROR: helper manifest validation failed")
+require(helper.get("name")=="pineforge-selected-admit","helper manifest name must be pineforge-selected-admit")
+require(helper.get("path")=="bin/pineforge-selected-admit","helper manifest path must be bin/pineforge-selected-admit")
+require(helper.get("sha256")==hashlib.sha256(data).hexdigest(),"helper manifest sha256 differs from the helper")
+require(helper.get("bytes")==str(len(data)),"helper manifest bytes differs from the helper")
+del helper["bytes"]
+del helper["sha256"]
+expected=json.dumps(manifest,ensure_ascii=True,separators=(",",":")).encode("ascii")+b"\n"
+described=subprocess.run([str(binary),"--describe"],stdin=subprocess.DEVNULL,capture_output=True,timeout=60)
+require(described.returncode==0,"helper --describe must exit zero")
+require(described.stdout==expected,"helper --describe differs from the canonical manifest projection")
+print("helper: installed files and --describe match the manifest")
+'''
+
+
 def inspect_index(digest):
     from release_pipeline import Registry
     raw = Registry().raw(digest)
@@ -145,6 +188,9 @@ def verify_runtime(image, versions, hub_commit, release_version, inventories):
         if hpo:
             check += " && cd /opt/pineforge/licenses && sha256sum -c --strict LICENSE-SHA256SUMS"
         command(*base, "--entrypoint", "bash", ref, "-euc", check)
+        # The build compares both files with the verified engine tarball.
+        # Bindings omit those asset hashes; recheck the runtime files and description here.
+        command(*base, "--entrypoint", "/usr/bin/python3", ref, "-I", "-c", selected_admit_runtime_script())
         checked.append((arch, base, ref, hpo, observed))
     # Both installed child inventories must verify before either smoke starts.
     for arch, base, ref, hpo, observed in checked:

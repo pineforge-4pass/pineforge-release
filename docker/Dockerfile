@@ -76,7 +76,11 @@ RUN --mount=type=secret,id=github_token set -eux; \
     tar -xzf "${base}.tar.gz"; \
     mkdir -p /opt/pineforge; \
     cp -r "/tmp/${base}/lib"     /opt/pineforge/lib; \
-    cp -r "/tmp/${base}/include" /opt/pineforge/include
+    cp -r "/tmp/${base}/include" /opt/pineforge/include; \
+    mkdir -p /opt/pineforge/bin /opt/pineforge/share/pineforge /opt/pineforge-asset-sums; \
+    install -m 0755 "/tmp/${base}/bin/pineforge-selected-admit" /opt/pineforge/bin/pineforge-selected-admit; \
+    install -m 0644 "/tmp/${base}/share/pineforge/pineforge-selected-admit.manifest.json" /opt/pineforge/share/pineforge/pineforge-selected-admit.manifest.json; \
+    ( cd "/tmp/${base}" && sha256sum bin/pineforge-selected-admit share/pineforge/pineforge-selected-admit.manifest.json ) > /opt/pineforge-asset-sums/SHA256SUMS
 
 # --- Stage 3: final = toolchain + engine lib + codegen + harness --------------
 FROM debian:trixie-slim AS release
@@ -163,24 +167,49 @@ COPY docker/run_phase_transport.py     /opt/pineforge/bin/run_phase_transport.py
 COPY docker/run_quota.py               /opt/pineforge/bin/run_quota.py
 COPY docker/selected_window_plan.py    /opt/pineforge/bin/selected_window_plan.py
 COPY docker/selected_window_report.py  /opt/pineforge/bin/selected_window_report.py
+COPY --from=engine /opt/pineforge/bin/pineforge-selected-admit /opt/pineforge/bin/pineforge-selected-admit
+COPY --from=engine /opt/pineforge/share/pineforge/pineforge-selected-admit.manifest.json /opt/pineforge/share/pineforge/pineforge-selected-admit.manifest.json
 COPY docker/HARNESS-SHA256SUMS         /opt/pineforge/bin/HARNESS-SHA256SUMS
 RUN chmod +x /opt/pineforge/bin/entrypoint.sh /opt/pineforge/bin/run_json.py
 
 # Every harness file in the image must be byte for byte the engine's file at the ref that
 # scripts/sync-harness.sh synced from: the script recorded the sha256 of each fetched file in
 # HARNESS-SHA256SUMS and the build recomputes them here, on the installed files. The sums file
-# must name exactly the sixteen files above, in sorted order, and nothing else may sit in bin/;
+# must name exactly the sixteen files above, in sorted order. The helper is checked by the next RUN;
 # a missing, extra, changed or empty entry fails the build.
 RUN set -eu; \
     cd /opt/pineforge/bin; \
     want="bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge_report_deadlines.py pineforge_report_supervise.py pineforge_sink_finalize.py pineforge_sink_to_json.py quota_columns.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py run_quota.py selected_window_plan.py selected_window_report.py"; \
     listed="$(sed 's/^[0-9a-f]\{64\}  //' HARNESS-SHA256SUMS | tr '\n' ' ' | sed 's/ $//')"; \
-    present="$(LC_ALL=C ls -A | grep -v '^HARNESS-SHA256SUMS$' | tr '\n' ' ' | sed 's/ $//')"; \
+    present="$(LC_ALL=C ls -A | grep -v -e '^HARNESS-SHA256SUMS$' -e '^pineforge-selected-admit$' | tr '\n' ' ' | sed 's/ $//')"; \
     if [ "$listed" != "$want" ] || [ "$present" != "$want" ]; then \
       echo "ERROR: HARNESS-SHA256SUMS lists [${listed}] and bin/ holds [${present}]; both must be exactly [${want}]" >&2; exit 1; \
     fi; \
     sha256sum -c --strict HARNESS-SHA256SUMS; \
     echo "harness: the sixteen files match HARNESS-SHA256SUMS"
+
+# The helper and manifest must match the two files in the verified engine release.
+# The asset record is mounted from the engine stage and stays out of the image.
+RUN --mount=type=bind,from=engine,source=/opt/pineforge-asset-sums,target=/tmp/pineforge-asset-sums,ro set -eu; \
+    cd /opt/pineforge; \
+    asset_sums=/tmp/pineforge-asset-sums/SHA256SUMS; \
+    want="HARNESS-SHA256SUMS bind_compiled_inventory.py entrypoint.sh pf_bars.py pf_sink.py pineforge-selected-admit pineforge_report_deadlines.py pineforge_report_supervise.py pineforge_sink_finalize.py pineforge_sink_to_json.py quota_columns.py request_feed_inventory.py run_execution_observer.py run_json.py run_phase_transport.py run_quota.py selected_window_plan.py selected_window_report.py"; \
+    if [ "$(LC_ALL=C ls -A bin)" != "$(printf '%s\n' $want)" ]; then echo "ERROR: helper bin/ must hold exactly [${want}]" >&2; exit 1; fi; \
+    if [ "$(LC_ALL=C ls -A share)" != pineforge ]; then echo "ERROR: helper share/ must hold exactly [pineforge]" >&2; exit 1; fi; \
+    if [ "$(LC_ALL=C ls -A share/pineforge)" != pineforge-selected-admit.manifest.json ]; then echo "ERROR: helper share/pineforge/ must hold exactly [pineforge-selected-admit.manifest.json]" >&2; exit 1; fi; \
+    for path in bin/pineforge-selected-admit share/pineforge/pineforge-selected-admit.manifest.json; do \
+      if ! test -f "$path" || ! test ! -L "$path"; then echo "ERROR: helper file ${path} must be a regular file without symlinks" >&2; exit 1; fi; \
+      if [ "$(stat -c %u:%g "$path")" != 0:0 ]; then echo "ERROR: helper file ${path} must be owned by root:root" >&2; exit 1; fi; \
+    done; \
+    if [ "$(stat -c %a bin/pineforge-selected-admit)" != 755 ]; then echo "ERROR: helper bin/pineforge-selected-admit must have mode 755" >&2; exit 1; fi; \
+    if [ "$(stat -c %a share/pineforge/pineforge-selected-admit.manifest.json)" != 644 ]; then echo "ERROR: helper share/pineforge/pineforge-selected-admit.manifest.json must have mode 644" >&2; exit 1; fi; \
+    if ! test -f "$asset_sums" || ! test ! -L "$asset_sums"; then echo "ERROR: helper asset record must be a regular file without symlinks" >&2; exit 1; fi; \
+    want_sums="$(printf '%s\n' bin/pineforge-selected-admit share/pineforge/pineforge-selected-admit.manifest.json)"; \
+    listed="$(sed 's/^[0-9a-f]\{64\}  //' "$asset_sums")"; \
+    if [ "$listed" != "$want_sums" ] || [ "$(sed -n '$=' "$asset_sums")" != 2 ]; then echo "ERROR: helper asset record must name exactly [bin/pineforge-selected-admit share/pineforge/pineforge-selected-admit.manifest.json]" >&2; exit 1; fi; \
+    if ! sha256sum -c --strict "$asset_sums"; then echo "ERROR: helper files differ from the engine release asset" >&2; exit 1; fi; \
+    if ! python3 -I -c 'import hashlib,json,pathlib,sys; data=pathlib.Path("bin/pineforge-selected-admit").read_bytes(); manifest=json.loads(pathlib.Path("share/pineforge/pineforge-selected-admit.manifest.json").read_bytes()); helper=manifest["helper"]; helper.get("name")=="pineforge-selected-admit" or sys.exit("ERROR: helper manifest name must be pineforge-selected-admit"); helper.get("path")=="bin/pineforge-selected-admit" or sys.exit("ERROR: helper manifest path must be bin/pineforge-selected-admit"); helper.get("sha256")==hashlib.sha256(data).hexdigest() or sys.exit("ERROR: helper manifest sha256 differs from the helper"); helper.get("bytes")==str(len(data)) or sys.exit("ERROR: helper manifest bytes differs from the helper")'; then echo "ERROR: helper manifest validation failed" >&2; exit 1; fi; \
+    echo "helper: the two selected-admit files match the engine release asset"
 
 # The harness (run_json.py) mirrors the engine's C structs; it must be the copy
 # from the pinned engine tag. Fail the build if its ABI differs from the header
@@ -416,7 +445,11 @@ COPY --from=hpo-wheel /opt/hpo              /opt/pineforge/hpo
 COPY --from=hpo-wheel /opt/hpo-licenses     /opt/pineforge/licenses
 COPY --from=hpo-native /tmp/hpo-build/bin/pineforge-hpo-native /opt/pineforge/pineforge-hpo-native
 COPY --from=hpo-native /opt/hpo-native-licenses /opt/pineforge/licenses/pineforge-hpo/THIRD_PARTY_LICENSES
-# Hub-owned additions live outside the engine's sixteen-file bin/ directory.
+# The inherited image carries sixteen vendored harness files plus the engine helper
+# at /opt/pineforge/bin/pineforge-selected-admit and its manifest at
+# /opt/pineforge/share/pineforge/pineforge-selected-admit.manifest.json, both from
+# the same verified engine release tarball. The harness check stays sixteen-name;
+# the helper check is exact. The dispatcher and licence additions live outside bin/.
 COPY docker/entrypoint-dispatch.sh /opt/pineforge/entrypoint-dispatch.sh
 COPY docker/LICENSE-SHA256SUMS /opt/pineforge/licenses/LICENSE-SHA256SUMS
 RUN chmod +x /opt/pineforge/entrypoint-dispatch.sh /opt/pineforge/pineforge-hpo-native
