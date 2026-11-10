@@ -65,7 +65,7 @@ class HubClient:
 
     def api(self, route):
         self.routes.append(route)
-        if route == f"repos/{contract.HUB}/releases/tags/{TAG}":
+        if route == f"repos/{contract.HUB}/releases/tags/{self.release['tag_name']}":
             return copy.deepcopy(self.release)
         raise AssertionError("unexpected hub route: " + route)
 
@@ -75,10 +75,10 @@ class HubClient:
         return self.assets[asset_id]
 
 
-def release_with_delivery(roles=("hosted",)):
+def release_with_delivery(roles=("hosted",), *, tag=TAG):
     ready = contract.canonical({"event_id": EVENT_ID, "timestamp": DISPATCHED_AT})
     release = {
-        "tag_name": TAG, "draft": False,
+        "tag_name": tag, "draft": False,
         "assets": [{"id": 1, "name": "release-ready.json", "state": "uploaded"}],
     }
     assets = {1: ready}
@@ -95,6 +95,181 @@ def release_with_delivery(roles=("hosted",)):
 
 
 class ReleaseFanoutCheckTests(unittest.TestCase):
+    def setUp(self):
+        # Existing receiver-evidence fixtures need an eligible compute pair.
+        # The floor-policy targets below supply their own complete environment.
+        floor = patch.dict(os.environ, {"RELEASE_COMPUTE_FIRST_PAIR": TAG.removeprefix("v")})
+        floor.start()
+        self.addCleanup(floor.stop)
+
+    def test_selected_compute_below_first_pair_is_disabled_without_receiver_calls(self):
+        delivered = [role for role in contract.ROLES if role != "compute"]
+        targets = {role: "fixture-" + role for role in contract.ROLES}
+        for tag in ("v2.9.9", "v2.10.0-rc.1"):
+            with self.subTest(tag=tag), patch.dict(os.environ, {
+                    "RELEASE_READY_CONSUMERS": ",".join(contract.ROLES),
+                    "RELEASE_READY_EXCLUDE": "",
+                    "RELEASE_COMPUTE_FIRST_PAIR": "2.10.0",
+            }, clear=True):
+                hub = release_with_delivery(delivered, tag=tag)
+                receiver = ReceiverClient([receiver_run(conclusion="success", event_id=EVENT_ID)])
+                report = fanout.check_release(hub, receiver, tag, targets=targets)
+            rows = {row["role"]: row for row in report["roles"]}
+            compute = rows["compute"]
+            self.assertEqual(list(rows), list(contract.ROLES))
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["excluded"], [])
+            self.assertFalse(compute["enabled"])
+            self.assertFalse(compute["excluded"])
+            self.assertTrue(compute["accounted"])
+            self.assertTrue(compute["ok"])
+            self.assertFalse(compute["dispatched"])
+            self.assertFalse(compute["receiver_run_found"])
+            for field in ("repository", "run_id", "status", "conclusion", "url", "event_id_match"):
+                self.assertIsNone(compute[field])
+            self.assertIn("first-pair policy", compute["error"])
+            self.assertIn("RELEASE_COMPUTE_FIRST_PAIR", compute["error"])
+            self.assertIn("compute | disabled |", fanout.render_human(report))
+            for role in delivered:
+                self.assertTrue(rows[role]["enabled"])
+                self.assertTrue(rows[role]["ok"])
+                self.assertTrue(rows[role]["receiver_run_found"])
+            self.assertEqual(len(receiver.routes), len(delivered))
+            self.assertFalse(any("/fixture-compute/" in route for route in receiver.routes))
+
+    def test_selected_compute_at_or_above_first_pair_requires_delivery_and_receiver(self):
+        excluded = [role for role in contract.ROLES if role != "compute"]
+        outcomes = {
+            "success": None,
+            "missing delivery": "delivery asset missing",
+            "failed delivery": "delivery asset identity differs",
+            "missing receiver": "receiver run missing",
+            "failed receiver": "receiver run concluded failure",
+        }
+        for tag in ("v2.10.0", "v2.11.0"):
+            for outcome, expected_error in outcomes.items():
+                with self.subTest(tag=tag, outcome=outcome), patch.dict(os.environ, {
+                        "RELEASE_READY_CONSUMERS": "compute",
+                        "RELEASE_READY_EXCLUDE": ",".join(excluded),
+                        "RELEASE_COMPUTE_FIRST_PAIR": "2.10.0",
+                }, clear=True):
+                    hub = release_with_delivery(
+                        [] if outcome == "missing delivery" else ["compute"], tag=tag)
+                    if outcome == "failed delivery":
+                        delivery = contract.decode(hub.assets[2])
+                        delivery["state"] = "failed"
+                        hub.assets[2] = contract.canonical(delivery)
+                    run = receiver_run(
+                        conclusion="failure" if outcome == "failed receiver" else "success",
+                        event_id=EVENT_ID, workflow="release-pair")
+                    receiver = ReceiverClient([] if outcome == "missing receiver" else [run])
+                    report = fanout.check_release(
+                        hub, receiver, tag, targets={"compute": "fixture-compute"})
+                compute = next(row for row in report["roles"] if row["role"] == "compute")
+                dispatched = outcome not in ("missing delivery", "failed delivery")
+                found = outcome in ("success", "failed receiver")
+                self.assertEqual(report["ok"], outcome == "success")
+                self.assertEqual(report["excluded"], excluded)
+                self.assertTrue(compute["enabled"])
+                self.assertFalse(compute["excluded"])
+                self.assertTrue(compute["accounted"])
+                self.assertEqual(compute["ok"], outcome == "success")
+                self.assertEqual(compute["dispatched"], dispatched)
+                self.assertEqual(compute["receiver_run_found"], found)
+                self.assertEqual(compute["run_id"], run["id"] if found else None)
+                self.assertEqual(compute["error"], expected_error)
+                self.assertEqual(len(receiver.routes), 1 if dispatched else 0)
+                if found:
+                    self.assertEqual(compute["event_id_match"], "exact")
+
+        for first in ("v2.10.0", "not-semver", " "):
+            with self.subTest(malformed_floor=first), patch.dict(os.environ, {
+                    "RELEASE_READY_CONSUMERS": "compute",
+                    "RELEASE_READY_EXCLUDE": ",".join(excluded),
+                    "RELEASE_COMPUTE_FIRST_PAIR": first,
+            }, clear=True):
+                hub = release_with_delivery(["compute"], tag="v2.11.0")
+                receiver = ReceiverClient([receiver_run(
+                    conclusion="success", event_id=EVENT_ID, workflow="release-pair")])
+                with self.assertRaisesRegex(
+                        fanout.pipeline.ConfigurationError,
+                        "^RELEASE_COMPUTE_FIRST_PAIR value was not accepted$"):
+                    fanout.check_release(
+                        hub, receiver, "v2.11.0", targets={"compute": "fixture-compute"})
+                self.assertEqual(receiver.routes, [])
+                self.assertNotIn(
+                    f"https://api.github.com/repos/{contract.HUB}/releases/assets/2", hub.routes)
+
+    def test_selected_compute_without_first_pair_is_disabled_even_with_stale_delivery(self):
+        excluded = [role for role in contract.ROLES if role != "compute"]
+        for first in (None, ""):
+            environment = {
+                "RELEASE_READY_CONSUMERS": "compute",
+                "RELEASE_READY_EXCLUDE": ",".join(excluded),
+            }
+            if first is not None:
+                environment["RELEASE_COMPUTE_FIRST_PAIR"] = first
+            with self.subTest(first=first), patch.dict(os.environ, environment, clear=True):
+                hub = release_with_delivery(["compute"], tag="v99.0.0")
+                receiver = ReceiverClient([receiver_run(
+                    conclusion="success", event_id=EVENT_ID, workflow="release-pair")])
+                report = fanout.check_release(
+                    hub, receiver, "v99.0.0", targets={"compute": "fixture-compute"})
+            compute = next(row for row in report["roles"] if row["role"] == "compute")
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["excluded"], excluded)
+            self.assertFalse(compute["enabled"])
+            self.assertFalse(compute["excluded"])
+            self.assertTrue(compute["accounted"])
+            self.assertTrue(compute["ok"])
+            self.assertFalse(compute["dispatched"])
+            self.assertFalse(compute["receiver_run_found"])
+            for field in ("repository", "run_id", "status", "conclusion", "url", "event_id_match"):
+                self.assertIsNone(compute[field])
+            self.assertIn("first-pair policy", compute["error"])
+            self.assertIn("RELEASE_COMPUTE_FIRST_PAIR", compute["error"])
+            self.assertIn("unset", compute["error"])
+            self.assertIn("compute | disabled |", fanout.render_human(report))
+            self.assertEqual(receiver.routes, [])
+            self.assertNotIn(
+                f"https://api.github.com/repos/{contract.HUB}/releases/assets/2", hub.routes)
+
+    def test_unselected_compute_preserves_exclusion_or_missing_accounting_above_floor(self):
+        for compute_excluded in (True, False):
+            excluded = [
+                role for role in contract.ROLES
+                if role != "hosted" and (role != "compute" or compute_excluded)
+            ]
+            with self.subTest(compute_excluded=compute_excluded), patch.dict(os.environ, {
+                    "RELEASE_READY_CONSUMERS": "hosted",
+                    "RELEASE_READY_EXCLUDE": ",".join(excluded),
+                    "RELEASE_COMPUTE_FIRST_PAIR": "2.10.0",
+            }, clear=True):
+                hub = release_with_delivery(["hosted", "compute"], tag="v99.0.0")
+                receiver = ReceiverClient([receiver_run(conclusion="success", event_id=EVENT_ID)])
+                report = fanout.check_release(
+                    hub, receiver, "v99.0.0",
+                    targets={"hosted": "fixture-hosted", "compute": "fixture-compute"})
+            rows = {row["role"]: row for row in report["roles"]}
+            compute = rows["compute"]
+            self.assertEqual(report["ok"], compute_excluded)
+            self.assertEqual(report["excluded"], excluded)
+            self.assertTrue(rows["hosted"]["ok"])
+            self.assertFalse(compute["enabled"])
+            self.assertEqual(compute["excluded"], compute_excluded)
+            self.assertEqual(compute["accounted"], compute_excluded)
+            self.assertEqual(compute["ok"], compute_excluded)
+            self.assertFalse(compute["dispatched"])
+            self.assertFalse(compute["receiver_run_found"])
+            self.assertIsNone(compute["run_id"])
+            self.assertEqual(
+                compute["error"],
+                "excluded by configuration" if compute_excluded else "role is not accounted for")
+            self.assertEqual(len(receiver.routes), 1)
+            self.assertIn("/fixture-hosted/", receiver.routes[0])
+            self.assertNotIn(
+                f"https://api.github.com/repos/{contract.HUB}/releases/assets/3", hub.routes)
+
     def test_configuration_preserves_explicit_dispatch_selection(self):
         with patch.dict(os.environ, {
                 "RELEASE_READY_CONSUMERS": "hosted",

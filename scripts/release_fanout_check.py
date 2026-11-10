@@ -296,7 +296,16 @@ def check_release(hub_client, receiver_client, tag, *, roles=None, excluded=None
         excluded = pipeline.excluded_roles()
     roles = list(roles)
     excluded = list(excluded)
-    enabled = set(roles)
+    selected = set(roles)
+    compute_first_pair = None
+    first = os.environ.get("RELEASE_COMPUTE_FIRST_PAIR", "")
+    if "compute" in selected and first:
+        try:
+            compute_first_pair = pipeline.version(first)
+        except ValueError:
+            raise pipeline.ConfigurationError(
+                "RELEASE_COMPUTE_FIRST_PAIR value was not accepted") from None
+    enabled = set(pipeline.delivery_roles(tag.removeprefix("v"), roles, compute_first_pair))
     excluded_set = set(excluded)
     targets = {} if targets is None else dict(targets)
     budget = ApiBudget(RECEIVER_CHECK_API_CALL_BUDGET)
@@ -304,14 +313,22 @@ def check_release(hub_client, receiver_client, tag, *, roles=None, excluded=None
     for role in ROLES:
         target = targets.get(role, os.environ.get(TARGET_ENVIRONMENT[role], ""))
         public_target = PUBLIC_RECEIVER_REPOSITORIES.get(role) == target
-        accounted = role in enabled or role in excluded_set
+        accounted = role in selected or role in excluded_set
         if role not in enabled:
+            disabled = role == "compute" and role in selected
+            reason = ("excluded by configuration" if role in excluded_set
+                      else "role is not accounted for")
+            if disabled:
+                reason = ("compute first-pair policy: RELEASE_COMPUTE_FIRST_PAIR is unset"
+                          if compute_first_pair is None else
+                          "compute first-pair policy: release " + tag
+                          + " is below RELEASE_COMPUTE_FIRST_PAIR=" + first)
             rows.append({
                 "role": role,
                 "enabled": False,
                 "excluded": role in excluded_set,
                 "accounted": accounted,
-                "ok": role in excluded_set,
+                "ok": disabled or role in excluded_set,
                 "repository": None,
                 "dispatched": False,
                 "receiver_run_found": False,
@@ -320,7 +337,7 @@ def check_release(hub_client, receiver_client, tag, *, roles=None, excluded=None
                 "conclusion": None,
                 "url": None,
                 "event_id_match": None,
-                "error": "excluded by configuration" if role in excluded_set else "role is not accounted for",
+                "error": reason,
             })
             continue
         delivery = release_asset(hub_client, release, f"delivery-{role}.json")
@@ -384,7 +401,8 @@ def render_human(report):
         "role | state | repository | dispatched | receiver_run | conclusion | url | error",
     ]
     for row in report.get("roles", []):
-        state = "enabled" if row.get("enabled") else "excluded" if row.get("excluded") else "unaccounted"
+        state = ("enabled" if row.get("enabled") else "excluded" if row.get("excluded")
+                 else "disabled" if row.get("accounted") else "unaccounted")
         lines.append("{} | {} | {} | {} | {} | {} | {} | {}".format(
             row.get("role", ""), state, row.get("repository") or "-",
             str(row.get("dispatched", False)).lower(),

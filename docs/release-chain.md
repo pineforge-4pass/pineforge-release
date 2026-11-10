@@ -337,6 +337,7 @@ receiver run evidence without writes and prints stable JSON followed by a
 human table for every role. It returns nonzero for an enabled role with a
 missing delivery, missing receiver run or failed run, and for an unaccounted
 role; excluded roles are visible and do not require a delivery.
+Historical all-consumer probes use `v1.8.0` onward, and compute follows the configured `RELEASE_COMPUTE_FIRST_PAIR` floor.
 An unavailable receiver API (including a 404) produces a failing role row
 while the check continues reporting the other roles.
 Set `RELEASE_TARGET_<ROLE>_REPOSITORY` to the configured short repository names.
