@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   bump:
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
     runs-on: ubuntu-latest
     environment: release-automation
     steps:
@@ -323,6 +323,16 @@ jobs:
           echo "::warning title=pineforge publish needed::${line}"
           printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
           exit 0
+
+      # Engine events already prepare/prove their source before the decision.
+      # A codegen/HPO event that completes the pair must prove the pinned
+      # engine too, before either the normal bump or retag recovery can write.
+      - name: Verify the completing engine before tagging
+        if: steps.decide.outputs.mode == 'bump' && steps.in.outputs.component != 'engine'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          E: ${{ steps.decide.outputs.engine }}
+        run: python3 scripts/release_pipeline.py producer engine "$E"
 
       - name: Bump VERSION, commit, tag
         if: steps.decide.outputs.mode == 'bump'

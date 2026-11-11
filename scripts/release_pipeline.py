@@ -10,18 +10,22 @@ import argparse
 import datetime as dt
 import os
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
 import release_pair as pair
-from release_artifacts import Client, PRODUCERS, SafeRedirect, command, producer, verified_assets
+import release_artifacts as artifacts
+from parity_bundle import (DESCRIPTOR_NAME, DESCRIPTOR_SCHEMA, PARITY_CAPABILITY_FROM,
+                           SUMS_NAME, sync_parity_bundle)
+from release_artifacts import Client, PRODUCERS, SafeRedirect, command, npm, producer, verified_assets
 from release_contract import (ASSET, CANDIDATE, COMMIT, DELIVERY_ONLY, EVENT_TYPES,
                               HUB, IMAGE, RECEIPT_ROLES, ROLES, SCHEMA, SHA, Invalid,
                               Pending, asset_descriptor, bind_facts, canonical, decode, keys, match,
                               pair_payload, payload, positive, require, sha256,
-                              validate, validate_candidate, version)
+                              validate, validate_candidate, validate_parity, version)
 
 FACTS_RECEIPTS_TAG = "facts-receipts"
 COMPLETE_STATES = ("verified", "skipped_by_policy", "superseded", "delivered")
@@ -176,6 +180,28 @@ class Registry:
         require(self.digest(tag) == digest, "image alias readback differs")
 
 
+def producer_preflight(client, component, pin):
+    """Prepare fresh engine source proof before authorizing tags or replay."""
+    if component != "engine":
+        return producer(client, component, pin)
+    v = pair.parse(pin)
+    try:
+        if v < pair.parse(PARITY_CAPABILITY_FROM):
+            return producer(client, component, str(v))
+        # A release event/reconciler has no publish workspace. Sync verifies the
+        # complete tagged source, descriptor and SUMS in its own transient root.
+        with tempfile.TemporaryDirectory(prefix="pineforge-engine-preflight-") as temporary:
+            proof = sync_parity_bundle(client, "v" + str(v), Path(temporary) / "parity")
+            resolved, inventory = producer(client, component, str(v))
+            require(proof["engine_commit"] == resolved["commit"],
+                    "parity descriptor commit differs from engine tag")
+            return resolved, inventory
+    except Pending as error:
+        # An engine event must fail before the handler can change VERSION/tag;
+        # reconciliation must not silently skip this engine and dispatch peers.
+        raise Invalid("engine producer prerequisite unavailable") from error
+
+
 def bindings(client, release_version, engine, codegen, hpo, hub_commit):
     pair.check(release_version, engine, codegen, hpo=hpo)
     match(COMMIT, hub_commit)
@@ -183,7 +209,18 @@ def bindings(client, release_version, engine, codegen, hpo, hub_commit):
     for role, pin in (("engine", engine), ("codegen", codegen), ("hpo", hpo)):
         if pin:
             versions[role], inventory = producer(client, role, pin)
-            if inventory:
+            if role == "engine" and version(release_version) >= version(PARITY_CAPABILITY_FROM):
+                proof = artifacts.parity_source_proof(client, pin, artifacts.PARITY_BUNDLE_ROOT)
+                require(proof["engine_commit"] == versions[role]["commit"],
+                        "parity descriptor commit differs from engine tag")
+                versions[role]["parity"] = {"schema": DESCRIPTOR_SCHEMA, **proof}
+                inventories["parity"] = {
+                    **proof["payload_sha256"],
+                    DESCRIPTOR_NAME: proof["descriptor_sha256"],
+                    SUMS_NAME: proof["sums_sha256"],
+                }
+                validate_parity(versions[role], inventories)
+            elif inventory:
                 inventories[role] = inventory
         else:
             versions[role] = None
@@ -268,9 +305,16 @@ def finalize(client, store, registry, row):
     event = payload(raw)
     require(event["image"] == candidate["image"] and event["hub_commit"] == candidate["hub_commit"],
             "manifest does not bind this candidate")
+    capable = v >= version(PARITY_CAPABILITY_FROM)
+    if capable:
+        require(event["versions"]["engine"]["parity"] == candidate["versions"]["engine"]["parity"],
+                "parity identity differs from manifest")
     for role in ("engine", "codegen", "hpo"):
         expected = candidate["versions"][role]
         actual = event["versions"][role]
+        if role == "engine" and capable:
+            actual = {key: value for key, value in actual.items() if key != "parity"}
+            expected = {key: value for key, value in expected.items() if key != "parity"}
         if role == "codegen":
             actual = {key: value for key, value in actual.items() if key not in ("npm_version", "npm_integrity")}
         require(actual == expected, "manifest producer identity differs from candidate")
@@ -940,11 +984,28 @@ def reconcile(client, store):
         # A hub tag hands responsibility to publish/finalize, including drafts
         # awaiting facts. Do not re-download producer artifacts or re-dispatch.
         return
-    for v, component in sorted(set(candidates), key=lambda item: (item[0], item[1])):
-        if v != desired:
-            continue
+    selected = {(v, component) for v, component in candidates if v == desired}
+    checks = set(selected)
+    if desired >= version(PARITY_CAPABILITY_FROM):
+        # A codegen/HPO listing cannot authorize replay around an absent engine
+        # listing: the desired capable engine's published prerequisites are a
+        # barrier even when only its partners' notifications were discovered.
+        checks.add((desired, "engine"))
+    verified = []
+    for v, component in sorted(checks, key=lambda item: (item[0], item[1])):
         try:
-            producer(client, component, str(v))
+            producer_preflight(client, component, str(v))
+            if (v, component) in selected:
+                verified.append((v, component))
+        except Pending:
+            report_issue(client, f"producer-{component}-{v}", f"Producer {component} {v}: artifacts pending", run_link())
+        except (Invalid, ValueError, KeyError, TypeError):
+            failures.append(component)
+            report_issue(client, f"producer-{component}-{v}", f"Producer {component} {v}: verification failed", run_link())
+    # Finish every source/archive refusal before the first replay side effect.
+    require(not failures, "producer reconciliation failed")
+    for v, component in verified:
+        try:
             client.api(f"repos/{HUB}/dispatches", method="POST", data={"event_type": component + "-release",
                 "client_payload": {"version": v.pep440 if component == "hpo" else str(v), "prerelease": False,
                                    "run_id": int(os.environ["GITHUB_RUN_ID"])}})
@@ -999,7 +1060,7 @@ def main():
         client = Client()
         store = Store(client)
         if args.cmd == "producer":
-            producer(client, args.component, args.version)
+            producer_preflight(client, args.component, args.version)
         elif args.cmd == "bindings":
             Path(args.output).write_bytes(canonical(bindings(client, args.release_version, args.engine,
                                                           args.codegen, args.hpo, args.hub_commit)))

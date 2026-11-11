@@ -3,7 +3,8 @@
 
 The fake serves both old and new discovery routes and records every request;
 the route assertions, rather than a fake response shortcut, enforce the fix.
-Fixed private/public JSON fixtures pin the pre-change stored receipt bytes.
+Fixed private/public JSON fixtures pin the pre-change stored receipt bytes,
+with facts and evidence digests derived independently from the fixture inputs.
 """
 from __future__ import annotations
 
@@ -29,7 +30,8 @@ import release_receipts as receipts  # noqa: E402
 FIXTURES = ROOT / "tests/fixtures/release-receipts"
 REPO = "pineforge-4pass/fixture"
 FACTS_COMMIT = "e" * 40
-FACTS_SHA256 = "acc0639894780a571be10383eb22b1fbd150f704e1f0ee5d8906ab8d101d4f7b"
+FACTS_RAW = (ROOT / "tests/fixtures/repo-descriptions-facts.json").read_bytes()
+FACTS_SHA256 = hashlib.sha256(FACTS_RAW).hexdigest()
 HEAD, MERGE, BASE = "1" * 40, "2" * 40, "3" * 40
 POLICY = {
     "workflow": "release-report.yml", "artifact": "release-receipt-license", "base": "main",
@@ -37,10 +39,29 @@ POLICY = {
     "e2e": {"workflow": "e2e.yml", "expected": ["check"], "approved_skips": []},
     "deploy": {"workflow": "deploy.yml", "expected": ["check"], "approved_skips": []},
 }
+
+
+def receipt_fixture(name):
+    """Bind facts references to the served bytes, preserving other fixture bytes."""
+    raw = (FIXTURES / name).read_bytes()
+    frozen_digest = json.loads(raw)["facts"]["sha256"].encode("ascii")
+    return raw.replace(frozen_digest, FACTS_SHA256.encode("ascii"))
+
+
+def stored_receipt_fixture(name):
+    """Keep the fixed public bytes except for input-dependent digest values."""
+    raw = receipt_fixture("stored-" + name)
+    evidence = (json.dumps(json.loads(receipt_fixture(name)), sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=False,
+                           allow_nan=False) + "\n").encode("utf-8")
+    frozen_digest = json.loads(raw)["evidence_sha256"].encode("ascii")
+    return raw.replace(frozen_digest, hashlib.sha256(evidence).hexdigest().encode("ascii"))
+
+
 STEM = f"facts-consumer-license-{FACTS_COMMIT}-{FACTS_SHA256}-"
 EXPECTED_STORED = {
-    STEM + "1-1.json": (FIXTURES / "stored-ready.json").read_bytes(),
-    STEM + "1-2.json": (FIXTURES / "stored-verified.json").read_bytes(),
+    STEM + "1-1.json": stored_receipt_fixture("ready.json"),
+    STEM + "1-2.json": stored_receipt_fixture("verified.json"),
 }
 
 
@@ -55,8 +76,8 @@ class HistoryClient:
             for run_id in range(1001, 1001 + history_size)
         }
         self.documents = {
-            1007: json.loads((FIXTURES / "ready.json").read_bytes()),
-            1049: json.loads((FIXTURES / "verified.json").read_bytes()),
+            1007: json.loads(receipt_fixture("ready.json")),
+            1049: json.loads(receipt_fixture("verified.json")),
         }
         self.artifact_by_run = {
             run_id: {"id": run_id + 1000, "name": POLICY["artifact"], "expired": False,
@@ -141,7 +162,7 @@ class HistoryClient:
         self.files.append((repo, commit, path))
         if (repo, commit, path) != (contract.HUB, FACTS_COMMIT, "facts/facts.json"):
             raise AssertionError("unexpected fixture file request")
-        return (ROOT / "tests/fixtures/repo-descriptions-facts.json").read_bytes()
+        return FACTS_RAW
 
 
 class MemoryStore:

@@ -7,6 +7,7 @@ from email.parser import BytesParser
 import hashlib
 import io
 import os
+from pathlib import Path
 import re
 import subprocess
 import tarfile
@@ -16,6 +17,7 @@ import urllib.request
 import zipfile
 
 import release_pair as pair
+import parity_bundle as parity
 from release_contract import (COMMIT, Invalid, Pending, canonical, decode,
                               match, require, sha256, validate_assets)
 
@@ -24,6 +26,8 @@ PRODUCERS = {"engine": "pineforge-4pass/pineforge-engine",
              "hpo": "pineforge-4pass/pineforge-hpo"}
 # Engine releases carry no macOS archive from 1.8.0.
 ENGINE_LINUX_ONLY_FROM = pair.parse("1.8.0")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PARITY_BUNDLE_ROOT = REPO_ROOT / "docker/parity"
 
 
 class RequestError(Invalid):
@@ -225,6 +229,19 @@ def attachment(raw, source):
              "size": len(raw), "sha256": sha256(raw), "source": source}, raw)
 
 
+def parity_source_proof(client, version, bundle_root):
+    """Compare the freshly synced local bundle with a second tagged-source fetch."""
+    _, commit = release(client, "engine", version)
+    match(COMMIT, commit)
+    try:
+        source = parity.read_source_bundle(client, commit)
+    except parity.SourceAllowlistError as error:
+        raise Invalid("unapproved parity source file") from error
+    except parity.SourceManifestError as error:
+        raise Invalid("parity source manifest differs from tagged source") from error
+    return parity.verify_bundle(bundle_root, source)
+
+
 def producer(client, component, version, *, attachments=None):
     """Return manifest pin + byte inventory, after checking even the event's own artifacts."""
     v = pair.parse(pair.hpo_version(version, to_semver=True) if component == "hpo" else version)
@@ -250,6 +267,8 @@ def producer(client, component, version, *, attachments=None):
                     "engine tarball checksum differs")
             if attachments is not None and triple.startswith("linux-"):
                 attachments.append(attachment(raw, f"https://github.com/{repo}/releases/download/{obj['tag_name']}/{name}"))
+        # Pre-tag/reconcile callers prepare their source proof separately.
+        # Publish bindings independently prove and inventory their local bundle.
         return pin, inventory
     if component == "codegen":
         meta = decode(client.download(f"https://pypi.org/pypi/pineforge-codegen/{v.pep440}/json", {"pypi.org"}))
@@ -323,9 +342,14 @@ def verified_assets(client, pins, inventory):
     staged = []
     for role in ("engine", "codegen"):
         resolved, _ = producer(client, role, pins[role]["version"], attachments=staged)
+        expected = pins[role]
+        if role == "engine":
+            # The candidate already binds parity to the built image. Refetch
+            # the archive identity without dropping that proof from ready pins.
+            expected = {key: value for key, value in expected.items() if key != "parity"}
         # Codegen includes the original candidate's sdist digest. A newly
         # published API digest cannot authorize replacement of the built bytes.
-        require(resolved == pins[role], role + " producer identity differs from candidate")
+        require(resolved == expected, role + " producer identity differs from candidate")
     ready = {**pins, "codegen": npm(client, pins["codegen"], inventory, attachments=staged)}
     staged.sort(key=lambda item: item[0]["name"])
     validate_assets([descriptor for descriptor, _ in staged], ready)

@@ -36,6 +36,8 @@ import release_receipts as receipts  # noqa: E402
 import release_rollback as rollback  # noqa: E402
 import release_sources as sources  # noqa: E402
 import consumer_receipt_example as receipt_example  # noqa: E402
+from facts_validate import InputError  # noqa: E402
+from facts_other_markets import aggregate_facts, legacy_facts  # noqa: E402
 
 
 def fixture_manifest(v="1.6.0"):
@@ -560,9 +562,32 @@ class FinalizerTests(unittest.TestCase):
         return ",".join(role for role in contract.ROLES if role not in selected)
 
     def plan(self, release="1.6.0", *, enabled="compute", first="1.6.0"):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+
         manifest = fixture_manifest(release)
-        client, store, registry = FinalizeClient(manifest), MemoryStore(manifest), MemoryRegistry()
-        row = store.get("v" + release)
+        capable = pair.parse(release) >= pair.parse(PARITY_CAPABILITY_FROM)
+        if capable:
+            # Use actual fixture byte hashes so parity validation does not mask
+            # the independent compute first-pair comparison under test.
+            from test_parity_source_proof import write_bundle
+            from test_release_parity_wire import finalization_case, fixture_identity
+
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "parity"
+                write_bundle(root, descriptor_commit=manifest["versions"]["engine"]["commit"])
+                identity, inventory = fixture_identity(root)
+            manifest["versions"]["engine"]["parity"] = copy.deepcopy(identity)
+            built = candidate(manifest)
+            built["inventories"]["parity"] = copy.deepcopy(inventory)
+            for arch, record in built["verification"].items():
+                record["parity"] = {
+                    "image_digest": built["image"][arch + "_digest"],
+                    "identity": copy.deepcopy(identity), "inventory": copy.deepcopy(inventory),
+                }
+            client, store, registry, row = finalization_case(manifest, built)
+        else:
+            client, store, registry = FinalizeClient(manifest), MemoryStore(manifest), MemoryRegistry()
+            row = store.get("v" + release)
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
                 "RELEASE_READY_CONSUMERS": enabled, "RELEASE_READY_EXCLUDE": self.exclude(enabled),
                 "RELEASE_COMPUTE_FIRST_PAIR": first,
@@ -573,6 +598,11 @@ class FinalizerTests(unittest.TestCase):
             pipeline.finalize_all(client, store, registry, row["tag_name"], output)
             deliveries = json.loads(output.read_bytes())
         status = json.loads(store.read(row, "release-status-100-1.json"))
+        if capable:
+            self.assertEqual(json.loads(store.read(row, contract.ASSET))["versions"]["engine"]["parity"],
+                             identity)
+            self.assertEqual(json.loads(store.read(row, contract.CANDIDATE))["inventories"]["parity"],
+                             inventory)
         return deliveries, status, store
 
     def test_draft_is_invisible_by_tag_but_found_by_real_store_and_candidate_probe(self):
@@ -1584,9 +1614,15 @@ class DispatchTests(unittest.TestCase):
 
     def test_compute_dispatch_hashes_the_complete_extended_manifest(self):
         from test_release_assets import AttachmentHTTP
-        manifest = AttachmentHTTP().extended
+        http = AttachmentHTTP()
+        manifest = http.extended
         store = self.ready_store(manifest)
         tag = "v" + manifest["release_version"]
+        # Keep the fixture's complete architecture proof with its parity pin.
+        built_raw = contract.canonical(http.built)
+        store.assets[(tag, contract.CANDIDATE)] = built_raw
+        stored_candidate = next(item for item in store.get(tag)["assets"] if item["name"] == contract.CANDIDATE)
+        stored_candidate["digest"] = "sha256:" + hashlib.sha256(built_raw).hexdigest()
         result, sender, _, _, _ = self.send(store, "compute", tag)
         self.assertEqual(result, 0)
         body = sender.api.call_args.kwargs["data"]
@@ -1787,42 +1823,88 @@ class ProducerFixture:
         return data
 
 
+def damage_engine_prerequisite(client, problem):
+    """Change published endpoint fixtures, never a verifier's return value."""
+    name = f"pineforge-v{client.v}-linux-aarch64.tar.gz"
+    if problem in ("missing_archive", "missing_checksum"):
+        missing = name + (".sha256" if problem == "missing_checksum" else "")
+        client.releases["engine"]["assets"][:] = [
+            row for row in client.releases["engine"]["assets"] if row["name"] != missing]
+    elif problem == "checksum_mismatch":
+        item = next(row for row in client.releases["engine"]["assets"]
+                    if row["name"] == name + ".sha256")
+        raw = ("0" * 64 + "  " + name + "\n").encode("ascii")
+        item["digest"] = "sha256:" + contract.sha256(raw)
+        client.downloads[item["browser_download_url"]] = raw
+    elif problem == "missing_source":
+        client.install_source("scripts/run_strategy.py", kind="missing")
+    elif problem == "unapproved_source":
+        from test_parity_bundle import MANIFEST, canonical
+
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["files"].append({"source": "scripts/unapproved.py", "destination": "unapproved.py"})
+        client.install_manifest(canonical(manifest))
+    else:
+        raise AssertionError("unknown engine prerequisite fixture fault")
+
+
 class ProducerTests(unittest.TestCase):
     def test_engine_from_1_8_0_requires_only_linux_archives(self):
-        for v in ("1.8.0", "1.8.0-rc.1", "1.8.1", "2.0.0"):
-            with self.subTest(version=v):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+
+        for v in ("1.8.0", "1.8.0-rc.1", "1.8.1", PARITY_CAPABILITY_FROM, "2.0.0"):
+            with self.subTest(version=v), tempfile.TemporaryDirectory() as temporary:
                 client = ProducerFixture(v)
                 names = {f"pineforge-v{v}-{triple}.tar.gz"
                          for triple in ("linux-x86_64", "linux-aarch64")}
                 self.assertEqual({a["name"] for a in client.releases["engine"]["assets"]},
                                  names | {name + ".sha256" for name in names})
                 self.assertFalse(any("macos" in url for url in client.downloads))
-                pin, inventory = artifacts.producer(client, "engine", v)
-                self.assertEqual(pin, {"version": v, "commit": "a" * 40, "tag": "v" + v})
+                root = Path(temporary) / "absent-publish-bundle"
+                with patch.object(artifacts, "PARITY_BUNDLE_ROOT", root), \
+                        patch.object(artifacts, "parity_source_proof",
+                                     side_effect=AssertionError("producer fetched publish-time proof")) as proof, \
+                        patch.object(client, "download", wraps=client.download) as downloads:
+                    pin, inventory = artifacts.producer(client, "engine", v)
+                proof.assert_not_called()
+                self.assertFalse(root.exists())
+                self.assertEqual(len(downloads.call_args_list), 4)
                 self.assertEqual(inventory, {})
+                self.assertEqual(pin, {"version": v, "commit": "a" * 40, "tag": "v" + v})
 
     def test_engine_from_1_8_0_refuses_missing_or_corrupt_linux_assets(self):
-        for triple in ("linux-x86_64", "linux-aarch64"):
-            for problem, kind, message in (
-                    ("archive", contract.Pending, "^required producer asset unavailable$"),
-                    ("checksum", contract.Pending, "^required producer asset unavailable$"),
-                    ("wrong-checksum", contract.Invalid, "^engine tarball checksum differs$")):
-                with self.subTest(triple=triple, problem=problem):
-                    client = ProducerFixture("1.8.0")
-                    name = f"pineforge-v{client.v}-{triple}.tar.gz"
-                    if problem == "wrong-checksum":
-                        checksum = next(a for a in client.releases["engine"]["assets"]
-                                        if a["name"] == name + ".sha256")
-                        raw = ("0" * 64 + "  " + name + "\n").encode()
-                        client.downloads[checksum["browser_download_url"]] = raw
-                        checksum["digest"] = "sha256:" + contract.sha256(raw)
-                    else:
-                        missing = name + (".sha256" if problem == "checksum" else "")
-                        item = next(a for a in client.releases["engine"]["assets"] if a["name"] == missing)
-                        client.releases["engine"]["assets"].remove(item)
-                        del client.downloads[item["browser_download_url"]]
-                    with self.assertRaisesRegex(kind, message):
-                        artifacts.producer(client, "engine", "1.8.0")
+        from parity_bundle import PARITY_CAPABILITY_FROM
+
+        for v in ("1.8.0", PARITY_CAPABILITY_FROM, "2.0.0"):
+            for triple in ("linux-x86_64", "linux-aarch64"):
+                for problem, kind, message in (
+                        ("archive", contract.Pending, "^required producer asset unavailable$"),
+                        ("checksum", contract.Pending, "^required producer asset unavailable$"),
+                        ("corrupt-archive", contract.Invalid, "^release asset digest differs$"),
+                        ("wrong-checksum", contract.Invalid, "^engine tarball checksum differs$")):
+                    with self.subTest(version=v, triple=triple, problem=problem), \
+                            tempfile.TemporaryDirectory() as temporary:
+                        client = ProducerFixture(v)
+                        name = f"pineforge-v{client.v}-{triple}.tar.gz"
+                        if problem == "wrong-checksum":
+                            checksum = next(a for a in client.releases["engine"]["assets"]
+                                            if a["name"] == name + ".sha256")
+                            raw = ("0" * 64 + "  " + name + "\n").encode()
+                            client.downloads[checksum["browser_download_url"]] = raw
+                            checksum["digest"] = "sha256:" + contract.sha256(raw)
+                        elif problem == "corrupt-archive":
+                            item = next(a for a in client.releases["engine"]["assets"] if a["name"] == name)
+                            client.downloads[item["browser_download_url"]] += b"changed archive bytes"
+                        else:
+                            missing = name + (".sha256" if problem == "checksum" else "")
+                            item = next(a for a in client.releases["engine"]["assets"] if a["name"] == missing)
+                            client.releases["engine"]["assets"].remove(item)
+                            del client.downloads[item["browser_download_url"]]
+                        root = Path(temporary) / "absent-publish-bundle"
+                        with patch.object(artifacts, "PARITY_BUNDLE_ROOT", root), \
+                                self.assertRaisesRegex(kind, message):
+                            artifacts.producer(client, "engine", v)
+                        self.assertFalse(root.exists())
 
     def test_engine_before_1_8_0_still_requires_macos_archive(self):
         for v in ("1.6.0", "1.7.0", "1.7.0-rc.1"):
@@ -1980,10 +2062,15 @@ class ProducerTests(unittest.TestCase):
 
 
 class ReconciliationTests(unittest.TestCase):
-    def client(self):
-        class Client(ProducerFixture):
+    def client(self, v="1.6.0"):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+        from test_parity_source_proof import TaggedEngineFixture
+
+        fixture = TaggedEngineFixture if pair.parse(v) >= pair.parse(PARITY_CAPABILITY_FROM) else ProducerFixture
+
+        class Client(fixture):
             def __init__(self):
-                super().__init__()
+                super().__init__(v)
                 self.dispatched = []
                 self.hub_tag = False
 
@@ -2009,12 +2096,69 @@ class ReconciliationTests(unittest.TestCase):
         return Client()
 
     def test_dropped_notifications_are_replayed_through_the_original_three_events(self):
-        client = self.client()
-        with patch.object(pipeline.Path, "read_text", return_value="1.5.9\n"), patch.dict(os.environ, {"GITHUB_RUN_ID": "42"}):
-            pipeline.reconcile(client, None)
-        self.assertEqual({row["event_type"] for row in client.dispatched}, {"engine-release", "codegen-release", "hpo-release"})
-        for row in client.dispatched:
-            self.assertEqual(row["client_payload"], {"version": "1.6.0", "prerelease": False, "run_id": 42})
+        from parity_bundle import PARITY_CAPABILITY_FROM
+
+        for v in ("1.6.0", PARITY_CAPABILITY_FROM, "2.0.0"):
+            with self.subTest(version=v), tempfile.TemporaryDirectory() as temporary:
+                client = self.client(v)
+                root = Path(temporary) / "absent-publish-bundle"
+                checked = []
+                real_producer = pipeline.producer
+
+                def record_producer(c, component, pin):
+                    checked.append((component, getattr(c, "content_calls", 0)))
+                    return real_producer(c, component, pin)
+
+                with patch.object(pipeline.Path, "read_text", return_value="1.5.9\n"), \
+                        patch.dict(os.environ, {"GITHUB_RUN_ID": "42"}), \
+                        patch.object(artifacts, "PARITY_BUNDLE_ROOT", root), \
+                        patch.object(artifacts, "parity_source_proof",
+                                     side_effect=AssertionError("reconcile relied on publish workspace")) as proof, \
+                        patch.object(pipeline, "producer", side_effect=record_producer):
+                    pipeline.reconcile(client, None)
+                proof.assert_not_called()
+                self.assertFalse(root.exists())
+                self.assertEqual(len(client.dispatched), 3)
+                self.assertEqual({row["event_type"] for row in client.dispatched},
+                                 {"engine-release", "codegen-release", "hpo-release"})
+                for row in client.dispatched:
+                    self.assertEqual(row["client_payload"], {"version": v, "prerelease": False, "run_id": 42})
+                if pair.parse(v) >= pair.parse(PARITY_CAPABILITY_FROM):
+                    from test_parity_bundle import ROWS
+
+                    self.assertEqual(next(reads for role, reads in checked if role == "engine"), len(ROWS) + 1)
+
+    def test_bad_engine_prerequisites_refuse_before_any_replay_dispatch(self):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+
+        rows = [(problem, True) for problem in (
+            "missing_archive", "missing_checksum", "checksum_mismatch", "missing_source", "unapproved_source")]
+        rows.append(("missing_archive", False))
+        for problem, engine_listed in rows:
+            with self.subTest(problem=problem, engine_listed=engine_listed), \
+                    tempfile.TemporaryDirectory() as temporary:
+                client = self.client(PARITY_CAPABILITY_FROM)
+                damage_engine_prerequisite(client, problem)
+                root = Path(temporary) / "absent-publish-bundle"
+                pages = client.pages
+
+                def listed_releases(route):
+                    if not engine_listed and route == f"repos/{artifacts.PRODUCERS['engine']}/releases":
+                        return []
+                    return pages(route)
+
+                with patch.object(pipeline.Path, "read_text", return_value="1.5.9\n"), \
+                        patch.dict(os.environ, {"GITHUB_RUN_ID": "42"}), \
+                        patch.object(artifacts, "PARITY_BUNDLE_ROOT", root), \
+                        patch.object(client, "pages", side_effect=listed_releases), \
+                        patch.object(pipeline, "report_issue") as alert, \
+                        self.assertRaisesRegex(contract.Invalid, "^producer reconciliation failed$"):
+                    pipeline.reconcile(client, None)
+                self.assertEqual(client.dispatched, [])
+                self.assertFalse(root.exists())
+                self.assertTrue(any(call.args[1] == f"producer-engine-{PARITY_CAPABILITY_FROM}"
+                                    and call.args[2].endswith(": verification failed")
+                                    for call in alert.call_args_list))
 
     def test_missing_upload_does_not_replay_that_producer_and_auth_errors_are_not_pending(self):
         for failure in ("upload", "auth"):
@@ -2619,6 +2763,92 @@ class ReceiptTests(unittest.TestCase):
             receipts.collect(self, Hub(), store, "web")
         self.assertTrue(any(asset["name"].startswith("facts-consumer-web-") for asset in store.facts()["assets"]))
         self.assertNotIn("web", pipeline.receipts(store, row, self.event["event_id"]))
+
+
+class OtherMarketsBindingTests(unittest.TestCase):
+    def test_facts_receipt_validation_accepts_both_shapes_and_rejects_bad_aggregate(self):
+        class Hub:
+            def file(self, repo, commit, path):
+                if (repo, commit, path) != (contract.HUB, "e" * 40, "facts/facts.json"):
+                    raise AssertionError("unexpected facts source")
+                return self.raw
+
+            def api(self, route):
+                if route == f"repos/{contract.HUB}/git/ref/heads/main":
+                    return {"object": {"sha": "e" * 40}}
+                if route == f"repos/{contract.HUB}/compare/{'e' * 40}...{'e' * 40}":
+                    return {"status": "identical"}
+                raise AssertionError("unexpected canonical history request")
+
+        hub = Hub()
+        for factory in (aggregate_facts, legacy_facts):
+            hub.raw = contract.canonical(factory())
+            target = {"commit": "e" * 40, "sha256": hashlib.sha256(hub.raw).hexdigest()}
+            with self.subTest(shape=factory.__name__):
+                self.assertIsNone(receipts.validate_facts_target(hub, target))
+        bad = aggregate_facts()
+        bad["scoreboard"]["otherMarkets"]["symbol"] = "PRIVATE:INDEX"
+        hub.raw = contract.canonical(bad)
+        target["sha256"] = hashlib.sha256(hub.raw).hexdigest()
+        with self.assertRaisesRegex(InputError, r"^facts schema validation failed \(additionalProperties\)$"):
+            receipts.validate_facts_target(hub, target)
+
+    def test_bind_and_retain_accept_both_shapes_and_bind_exact_bytes(self):
+        for factory in (aggregate_facts, legacy_facts):
+            with self.subTest(shape=factory.__name__):
+                facts = factory()
+                score = facts["releases"]["1.0.1"]["scoreboard"]
+                versions = {role: {"commit": score[role + "Commit"]} for role in ("engine", "codegen")}
+                raw = contract.canonical(facts)
+                expected = {"commit": "e" * 40, "path": "facts/facts.json",
+                            "sha256": hashlib.sha256(raw).hexdigest(), "release_key": "1.0.1"}
+                self.assertEqual(contract.bind_facts(raw, "e" * 40, "1.0.1", versions), expected)
+                manifest = {"facts": expected, "prerelease": False}
+                self.assertEqual(contract.retain_facts(manifest, raw, raw), expected["sha256"])
+                newer = copy.deepcopy(facts)
+                newer["scoreboard"]["pairs"][0]["hardProbes"] = 0
+                newer["scoreboard"]["hardLane"] = next(
+                    (copy.deepcopy(p) for p in newer["scoreboard"]["pairs"] if p["hardProbes"]), None)
+                installed = contract.canonical(newer)
+                self.assertEqual(contract.retain_facts(manifest, raw, installed),
+                                 hashlib.sha256(installed).hexdigest())
+
+    def test_binding_refuses_identity_payload_and_inconsistent_aggregate_before_binding(self):
+        facts = aggregate_facts()
+        release = facts["releases"]["1.0.1"]["scoreboard"]
+        versions = {role: {"commit": release[role + "Commit"]} for role in ("engine", "codegen")}
+        original = contract.canonical(facts)
+        manifest = {"prerelease": False, "facts": {
+            "release_key": "1.0.1", "sha256": hashlib.sha256(original).hexdigest()}}
+        for location in ("active", "release"):
+            for identity in (True, False):
+                with self.subTest(location=location, identity=identity):
+                    bad = copy.deepcopy(facts)
+                    score = bad["scoreboard"] if location == "active" else bad["releases"]["1.0.1"]["scoreboard"]
+                    score["otherMarkets"].update({"symbol": "PRIVATE:INDEX"} if identity else {"hardProbes": 6})
+                    raw = contract.canonical(bad)
+                    message = ("facts schema validation failed (additionalProperties)" if identity
+                               else "hard probes exceed other markets")
+                    with self.assertRaisesRegex(InputError, "^" + re.escape(message) + "$"):
+                        contract.bind_facts(raw, "e" * 40, "1.0.1", versions)
+                    # Retention validates the installed document; release-entry
+                    # immutability is a separate earlier contract guard.
+                    pinned = dict(manifest, facts=dict(manifest["facts"], sha256=hashlib.sha256(raw).hexdigest()))
+                    with self.assertRaisesRegex(InputError, "^" + re.escape(message) + "$"):
+                        contract.retain_facts(pinned, raw, raw)
+
+    def test_binding_keeps_source_commit_and_release_entry_guards(self):
+        facts = aggregate_facts()
+        raw = contract.canonical(facts)
+        versions = {role: {"commit": "f" * 40} for role in ("engine", "codegen")}
+        with self.assertRaisesRegex(contract.Invalid, "^release facts source commit differs$"):
+            contract.bind_facts(raw, "e" * 40, "1.0.1", versions)
+        manifest = {"prerelease": False, "facts": {
+            "release_key": "1.0.1", "sha256": hashlib.sha256(raw).hexdigest()}}
+        changed = copy.deepcopy(facts)
+        changed["releases"]["1.0.1"]["scoreboard"]["otherMarkets"]["hardProbes"] = 1
+        with self.assertRaisesRegex(contract.Invalid, "^release facts entry changed$"):
+            contract.retain_facts(manifest, raw, contract.canonical(changed))
 
 
 class ImmutableAssetTests(unittest.TestCase):

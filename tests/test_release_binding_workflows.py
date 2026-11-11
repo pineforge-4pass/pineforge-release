@@ -2,10 +2,15 @@
 """CI/cloud replay of actual workflow shell and finalizer wiring, without network."""
 from __future__ import annotations
 
+import base64
 import copy
+import io
 import json
 import os
 import re
+import shlex
+import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -24,11 +29,392 @@ import release_pipeline as pipeline  # noqa: E402
 import release_contract as contract  # noqa: E402
 import test_release_workflows as wiring  # noqa: E402
 from test_release_binding import (FinalizeClient, MemoryRegistry, MemoryStore,  # noqa: E402
-                                  ProducerFixture, fixture_manifest, synthetic_ready_assets)
+                                  ProducerFixture, damage_engine_prerequisite, fixture_manifest,
+                                  synthetic_ready_assets)
 
 
 def workflow(name):
     return yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
+
+
+def write_producer_endpoints(root, client):
+    (root / "endpoints.json").write_bytes(contract.canonical({
+        "version": str(client.v), "api": client.api_data, "commits": client.commits,
+        "downloads": {url: base64.b64encode(raw).decode("ascii")
+                      for url, raw in client.downloads.items()},
+    }))
+
+
+def producer_fixture_client(root):
+    """Restore the same endpoint fake for pre-tag and publish shell replays."""
+    from test_parity_source_proof import TaggedEngineFixture
+
+    endpoints = json.loads((root / "endpoints.json").read_bytes())
+    client = TaggedEngineFixture(endpoints["version"])
+    client.api_data = endpoints["api"]
+    client.downloads = {url: base64.b64decode(raw) for url, raw in endpoints["downloads"].items()}
+    client.commits = endpoints["commits"]
+    return client
+
+
+def producer_fixture_cli():
+    """Run the real CLI with serialized public endpoints in a shell replay."""
+    import release_artifacts as artifacts
+
+    root = Path(os.environ["PRODUCER_FIXTURE_ROOT"])
+    client = producer_fixture_client(root)
+    calls, downloads = [], []
+    real_producer = pipeline.producer
+    real_download = client.download
+
+    def record_producer(c, component, pin):
+        calls.append({"component": component, "content_reads": c.content_calls})
+        return real_producer(c, component, pin)
+
+    def download(url, origins):
+        downloads.append(url)
+        return real_download(url, origins)
+
+    with patch.object(pipeline, "Client", return_value=client), \
+            patch.object(pipeline, "producer", side_effect=record_producer), \
+            patch.object(client, "download", side_effect=download), \
+            patch.object(artifacts, "PARITY_BUNDLE_ROOT", root / "absent-publish-bundle"):
+        result = pipeline.main()
+    (root / "producer-result.json").write_bytes(contract.canonical({
+        "status": result, "calls": calls, "downloads": downloads,
+        "content_reads": client.content_calls,
+    }))
+    return result
+
+
+def publish_fixture_python():
+    """Execute workflow Python unchanged, replacing only endpoint transport and paths."""
+    import release_artifacts as artifacts
+
+    root = Path(os.environ["PRODUCER_FIXTURE_ROOT"])
+    client = producer_fixture_client(root)
+
+    class EndpointClient(artifacts.Client):
+        # Client.file must remain the real inherited byte verifier: parity's
+        # content reader calls it unbound after importing Client in the heredoc.
+        def __new__(cls, *args, **kwargs):
+            return client
+
+    try:
+        with patch.object(artifacts, "Client", EndpointClient), \
+                patch.object(pipeline, "Client", EndpointClient), \
+                patch.object(artifacts, "PARITY_BUNDLE_ROOT", root / "docker/parity"):
+            if sys.argv == ["-"]:
+                exec(compile(sys.stdin.read(), "<publish workflow heredoc>", "exec"),
+                     {"__name__": "__main__"})
+                return 0
+            if sys.argv[:2] != ["scripts/release_pipeline.py", "bindings"]:
+                raise AssertionError("unexpected publish Python command: " + repr(sys.argv))
+            return pipeline.main()
+    except contract.Invalid as error:
+        # A product refusal retains its real reason and a nonzero exit.
+        # Import/syntax/fixture errors propagate and cannot count as refusals.
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+class ProducerPreTagTests(unittest.TestCase):
+    def replay(self, root, client, *, component="engine", retag=False):
+        root.mkdir(parents=True)
+        steps = {row.get("name"): row for row in workflow("handle-upstream.yml")["jobs"]["bump"]["steps"]}
+        completing = steps.get("Verify the completing engine before tagging")
+        self.assertIsNotNone(completing)
+        gate = (steps["Verify the dispatched producer artifacts"] if component == "engine" else completing)
+        bump = steps["Bump VERSION, commit, tag"]
+        initial = str(client.v) if retag else "1.10.0"
+        (root / "VERSION").write_text(initial + "\n", encoding="ascii")
+        write_producer_endpoints(root, client)
+        bridge_paths = [str(ROOT / "tests"), str(ROOT / "scripts")]
+        bridge = (
+            f"import sys; sys.path[:0] = {bridge_paths!r}; "
+            "from test_release_binding_workflows import producer_fixture_cli; "
+            "sys.argv = sys.argv[1:]; raise SystemExit(producer_fixture_cli())"
+        )
+        # Only git transport is recorded. The selected workflow CLI, sync,
+        # tagged-source verifier and archive/checksum verifier all run for real.
+        wrappers = (
+            "python3() { command " + shlex.quote(sys.executable) + " -c "
+            + shlex.quote(bridge) + ' "$@"; }\n'
+            'git() {\n printf \'%s\\n\' "$*" >> "$PRODUCER_FIXTURE_ROOT/git-calls";\n'
+            ' case "$1" in log) printf \'%s\\n\' "' + "d" * 40 + '";; esac\n}\n'
+        )
+        done = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-euc", wrappers + gate["run"] + "\n" + bump["run"]],
+            cwd=root, capture_output=True, text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PRODUCER_FIXTURE_ROOT": str(root),
+                 "COMPONENT": component, "VER": str(client.v), "E": str(client.v), "C": str(client.v),
+                 "H": str(client.v), "LINE": "pair", "RELEASE": str(client.v),
+                 "RETAG": str(retag).lower(), "GITHUB_STEP_SUMMARY": str(root / "summary")},
+        )
+        self.assertNotIn("Traceback", done.stderr)
+        self.assertTrue((root / "producer-result.json").is_file(), done.stdout + done.stderr)
+        result = json.loads((root / "producer-result.json").read_bytes())
+        git_calls = (root / "git-calls").read_text().splitlines() if (root / "git-calls").exists() else []
+        return done, result, git_calls, initial
+
+    def assert_control(self, root, component):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+        from test_parity_source_proof import TaggedEngineFixture
+        from test_parity_bundle import ROWS
+
+        done, result, git_calls, initial = self.replay(
+            root, TaggedEngineFixture(), component=component, retag=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(result["status"], 0)
+        self.assertEqual(result["calls"], [{"component": "engine", "content_reads": len(ROWS) + 1}])
+        self.assertEqual(result["content_reads"], len(ROWS) + 1)
+        self.assertEqual(len(result["downloads"]), 4)
+        self.assertTrue(any(call.startswith(f"tag -a v{PARITY_CAPABILITY_FROM} ") for call in git_calls))
+        self.assertIn(f"push origin v{PARITY_CAPABILITY_FROM}", git_calls)
+        self.assertEqual((root / "VERSION").read_text(), initial + "\n")
+        self.assertFalse((root / "absent-publish-bundle").exists())
+
+    def test_engine_last_ordering_prepares_before_published_archive_verification_and_tag(self):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+
+        published = set()
+        for index, component in enumerate(("codegen", "hpo", "engine")):
+            published.add(component)
+            decision, _ = pair.decide(
+                component, PARITY_CAPABILITY_FROM, "false", "1.10.0", "1.10.0", "1.10.0",
+                False, False, False, prev_hpo="1.10.0",
+                partners_published={role: role in published for role in ("engine", "codegen", "hpo")})
+            self.assertEqual(decision["mode"], "bump" if index == 2 else "wait")
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assert_control(Path(temporary) / "engine-last", "engine")
+            self.assert_control(Path(temporary) / "hpo-last", "hpo")
+
+    def test_bad_engine_prerequisites_refuse_before_version_writes_or_git_on_bump_and_retag(self):
+        from test_parity_source_proof import TaggedEngineFixture
+
+        for component in ("engine", "codegen"):
+            for retag in (False, True):
+                for problem in ("missing_archive", "missing_checksum", "checksum_mismatch",
+                                "missing_source", "unapproved_source"):
+                    with self.subTest(component=component, retag=retag, problem=problem), \
+                            tempfile.TemporaryDirectory() as temporary:
+                        base = Path(temporary)
+                        self.assert_control(base / "positive", component)
+                        client = TaggedEngineFixture()
+                        damage_engine_prerequisite(client, problem)
+                        root = base / "negative"
+                        done, result, git_calls, initial = self.replay(
+                            root, client, component=component, retag=retag)
+                        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                        self.assertEqual(result["status"], 1)
+                        self.assertEqual(git_calls, [])
+                        self.assertEqual((root / "VERSION").read_text(), initial + "\n")
+                        self.assertFalse((root / "absent-publish-bundle").exists())
+
+    def test_cli_refuses_a_tag_moved_between_source_sync_and_archive_pin(self):
+        from parity_bundle import PARITY_CAPABILITY_FROM
+        from test_parity_bundle import ENGINE_REPO, ENGINE_TAG, ROWS
+        from test_parity_source_proof import TaggedEngineFixture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assert_control(Path(temporary) / "positive", "engine")
+            client = TaggedEngineFixture()
+            with patch.object(pipeline, "Client", return_value=client), \
+                    patch.object(client, "tag_commit", side_effect=["a" * 40, "b" * 40]) as resolve, \
+                    patch.object(client, "download", wraps=client.download) as downloads, \
+                    patch.object(sys, "argv", ["release_pipeline.py", "producer", "engine", PARITY_CAPABILITY_FROM]), \
+                    patch.object(sys, "stderr", new_callable=io.StringIO):
+                self.assertEqual(pipeline.main(), 1)
+            self.assertEqual(client.content_calls, len(ROWS) + 1)
+            self.assertEqual(downloads.call_count, 4)
+            self.assertEqual(resolve.call_count, 2)
+            self.assertTrue(all(call.args == (ENGINE_REPO, ENGINE_TAG)
+                                for call in resolve.call_args_list))
+
+
+class PublishParityGlueTests(unittest.TestCase):
+    def replay(self, root, client, step, *, tag=None):
+        root.mkdir(parents=True, exist_ok=True)
+        write_producer_endpoints(root, client)
+        steps = {row.get("name"): row
+                 for row in workflow("publish.yml")["jobs"]["publish"]["steps"]}
+        binding = steps["Bind producer source and package bytes"]["run"]
+        if step == "sync":
+            script = steps["Sync parity from the immutable engine tag"]["run"]
+        elif step == "bind":
+            script = binding
+        else:
+            self.assertEqual(step, "bind-heredoc")
+            # Keep the actual redirection and complete heredoc, leaving out
+            # only the preceding CLI so changed binding input is not replaced.
+            header = "python3 - <<'PYBIND'"
+            self.assertEqual(binding.count(header), 1)
+            script = binding[binding.index(header):]
+            self.assertTrue(script.endswith("\nPYBIND\n"))
+        bridge_paths = [str(ROOT), str(ROOT / "tests"), str(ROOT / "scripts")]
+        bridge = (
+            f"import sys; sys.path[:0] = {bridge_paths!r}; "
+            "from test_release_binding_workflows import publish_fixture_python; "
+            "sys.argv = sys.argv[1:]; raise SystemExit(publish_fixture_python())"
+        )
+        wrapper = (
+            "python3() { command " + shlex.quote(sys.executable) + " -c "
+            + shlex.quote(bridge) + ' "$@"; }\n'
+        )
+        (root / "github-output").unlink(missing_ok=True)
+        done = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-euc", wrapper + script],
+            cwd=root, capture_output=True, text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                 "PRODUCER_FIXTURE_ROOT": str(root), "TAG": tag or "v" + str(client.v),
+                 "E": str(client.v), "C": str(client.v), "H": str(client.v),
+                 "HUB_COMMIT": "d" * 40, "RUNNER_TEMP": str(root),
+                 "GITHUB_OUTPUT": str(root / "github-output")},
+        )
+        self.assertNotIn("Traceback", done.stderr, done.stdout + done.stderr)
+        return done
+
+    def assert_control(self, root, client, *, capable=True):
+        from test_parity_bundle import ROWS
+
+        done = self.replay(root, client, "sync")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        stage = root / "docker/parity"
+        if capable:
+            self.assertTrue(stage.is_dir())
+            self.assertFalse(stage.is_symlink())
+            self.assertEqual(stat.S_IMODE(stage.stat().st_mode), 0o700,
+                             "Sync leaves a private stage; the Dockerfile normalizes its copy")
+            self.assertTrue(all(path.is_file() and not path.is_symlink() for path in stage.iterdir()))
+            files = {path.name: path.read_bytes() for path in stage.iterdir()}
+            payload = {row["destination"]: base64.b64decode(
+                client.api_data[client.route(row["source"])]["content"]) for row in ROWS}
+            self.assertEqual(set(files), {*payload, "PARITY-MANIFEST.json", "PARITY-SHA256SUMS"})
+            self.assertEqual({name: files[name] for name in payload}, payload,
+                             "Sync must consume the serialized tagged endpoint bytes")
+            descriptor = json.loads(files["PARITY-MANIFEST.json"])
+            self.assertEqual(descriptor["engine_commit"], client.commits["engine"])
+            manifest_raw = base64.b64decode(
+                client.api_data[client.route("scripts/parity-bundle.json")]["content"])
+            self.assertEqual(descriptor["source_manifest_sha256"], contract.sha256(manifest_raw))
+            hashes = {name: contract.sha256(raw) for name, raw in payload.items()}
+            self.assertEqual(descriptor["payload_sha256"], hashes)
+            descriptor_hash = contract.sha256(files["PARITY-MANIFEST.json"])
+            self.assertEqual(
+                files["PARITY-SHA256SUMS"],
+                "".join(value + "  " + name + "\n" for name, value in
+                        [("PARITY-MANIFEST.json", descriptor_hash), *sorted(hashes.items())]).encode("ascii"))
+        else:
+            self.assertFalse(stage.exists())
+            files, descriptor_hash = {}, ""
+        done = self.replay(root, client, "bind")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        binding_path = root / "release-bindings.json"
+        output_path = root / "github-output"
+        self.assertTrue(binding_path.is_file(), done.stdout + done.stderr)
+        self.assertTrue(output_path.is_file(), done.stdout + done.stderr)
+        bound = json.loads(binding_path.read_bytes())
+        self.assertEqual(bound["release_version"], str(client.v))
+        lines = output_path.read_text().splitlines()
+        parity_outputs = [line for line in lines if line.startswith("parity_")]
+        self.assertEqual(parity_outputs, [
+            "parity_descriptor_sha256=" + descriptor_hash,
+            "parity_carrier=PARITY_CARRIER=" + ("1" if capable else "0"),
+        ])
+        if capable:
+            self.assertEqual(bound["versions"]["engine"]["parity"]["descriptor_sha256"], descriptor_hash)
+            self.assertEqual(bound["inventories"]["parity"],
+                             {name: contract.sha256(raw) for name, raw in files.items()})
+            self.assertEqual({p.name: p.read_bytes() for p in stage.iterdir()}, files)
+        else:
+            self.assertNotIn("parity", bound["versions"]["engine"])
+            self.assertNotIn("parity", bound["inventories"])
+        return files, bound, parity_outputs
+
+    def test_actual_sync_and_bind_follow_changed_capable_bytes_and_legacy_release(self):
+        from test_parity_bundle import ROWS
+        from test_parity_source_proof import TaggedEngineFixture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            files, _, original = self.assert_control(base / "positive", TaggedEngineFixture())
+            row = ROWS[0]
+            changed = files[row["destination"]] + b"changed publish source bytes\n"
+            client = TaggedEngineFixture()
+            client.mutate_source_bytes(row["source"], changed)
+            updated, _, outputs = self.assert_control(base / "changed", client)
+            self.assertEqual(updated[row["destination"]], changed)
+            self.assertNotEqual(outputs[0], original[0],
+                                "Bind must export the hash of the descriptor Sync actually wrote")
+            self.assert_control(base / "legacy", TaggedEngineFixture("1.10.0"), capable=False)
+
+    def test_actual_sync_refuses_damaged_endpoint_input_before_install(self):
+        from test_parity_bundle import bad_blob_hash
+        from test_parity_source_proof import TaggedEngineFixture
+
+        for problem, message in (
+                ("missing_source", "parity source file missing"),
+                ("unapproved_source", "parity manifest payload differs from approved allowlist"),
+                ("bad_blob_hash", "parity payload blob digest differs")):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                self.assert_control(base / "positive", TaggedEngineFixture())
+                client = TaggedEngineFixture()
+                if problem == "bad_blob_hash":
+                    bad_blob_hash(client)
+                else:
+                    damage_engine_prerequisite(client, problem)
+                root = base / "negative"
+                done = self.replay(root, client, "sync")
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertEqual(done.stderr.splitlines(), [message])
+                self.assertFalse((root / "docker/parity").exists())
+                self.assertFalse((root / "release-bindings.json").exists())
+                self.assertFalse((root / "github-output").exists())
+
+    def test_actual_bind_heredoc_refuses_changed_binding_input_without_exporting_arguments(self):
+        from test_parity_bundle import ROWS
+        from test_parity_source_proof import TaggedEngineFixture
+
+        for problem, message in (
+                ("release_version", "producer binding release version differs"),
+                ("descriptor_hash", "parity descriptor hash differs"),
+                ("inventory", "parity inventory differs from candidate"),
+                ("missing_capability", "parity capability missing for release"),
+                ("legacy_engine_capability", "unexpected parity capability before cutoff"),
+                ("legacy_inventory_capability", "unexpected parity capability before cutoff")):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                client = TaggedEngineFixture()
+                _, bound, _ = self.assert_control(base / "positive", client)
+                damaged = copy.deepcopy(bound)
+                tag = "v" + str(client.v)
+                if problem == "release_version":
+                    damaged["release_version"] = "1.10.0"
+                elif problem == "descriptor_hash":
+                    damaged["versions"]["engine"]["parity"]["descriptor_sha256"] = \
+                        contract.sha256(b"a different descriptor\n")
+                elif problem == "inventory":
+                    damaged["inventories"]["parity"][ROWS[0]["destination"]] = \
+                        contract.sha256(b"a different payload\n")
+                elif problem == "missing_capability":
+                    del damaged["versions"]["engine"]["parity"]
+                else:
+                    damaged["release_version"] = "1.10.0"
+                    tag = "v1.10.0"
+                    if problem == "legacy_engine_capability":
+                        del damaged["inventories"]["parity"]
+                    else:
+                        del damaged["versions"]["engine"]["parity"]
+                root = base / "negative"
+                root.mkdir()
+                (root / "release-bindings.json").write_bytes(contract.canonical(damaged))
+                done = self.replay(root, client, "bind-heredoc", tag=tag)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertEqual(done.stderr.splitlines(), [message])
+                self.assertTrue((root / "github-output").is_file())
+                self.assertEqual((root / "github-output").read_bytes(), b"",
+                                 "refused binding input must not export build arguments")
 
 
 def assert_ready_wiring(case, publish, finalizer):

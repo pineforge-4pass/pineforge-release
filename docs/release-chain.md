@@ -8,8 +8,8 @@ or deploy consumers.
 
 ## Release runner isolation
 
-Owner decision 10-21 (msg 1562390657274748981) sets these release and facts-automation
-jobs to the literal `runs-on: ubuntu-latest`, a standing R6/rule-B exception
+These release and facts-automation
+jobs use the literal `runs-on: ubuntu-latest`, a standing exception
 for pineforge-release:
 
 | Workflow | Jobs |
@@ -34,7 +34,12 @@ with Contents or Issues write access. The `publish.yml` reusable
 `pull_request` and `pull_request_target` workflows must never use this class.
 The PR jobs in `python-test.yml` and `facts-validate.yml` also use GitHub-hosted runners.
 Their `authz` jobs use `runs-on: ubuntu-24.04`; the other PR jobs use
-`runs-on: ubuntu-latest` per the owner decision; the jobs that also run on pushes to main use the push-triggered runner `runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}`.
+`runs-on: ubuntu-latest` by the same standing exception, with these CI runner assignments:
+`python-test.yml` jobs `changes`, `fingerprint-canonical`, `description-renderer`,
+`release-ready-replay` and `release-ready` use `runs-on: ubuntu-24.04` for every
+configured event, including pushes to `main` and `master`.
+`facts-validate.yml` job `validate` uses `runs-on: ubuntu-24.04` for pull requests
+and pushes to `main`.
 The hub runs these jobs on GitHub-hosted runners without waiting for
 the release pool. These hosted jobs do not require a release runner group allowlist.
 
@@ -123,6 +128,11 @@ and on manual replay. It never rebuilds a stored verified candidate. It requires
 - For stable releases, a schema/semantically valid `facts.releases[release_version]` with nonempty
   measured evidence and engine/codegen commits equal to the candidate's sources.
   The active scoreboard is never substituted for the stable release mapping.
+
+Active and released scoreboards may include optional `otherMarkets`, containing
+only counts and tiers for markets absent from `pairs`, with no symbol, venue or
+name. Totals include this aggregate. `hardLane` still names only the first pair
+with hard probes and may be null while `otherMarkets` holds hard probes.
 
 **Prerelease rule:** prereleases skip the per-release measured facts requirement.
 They bind the SHA-256 and commit of schema/semantically validated `main` facts;
@@ -384,9 +394,9 @@ role; excluded roles are visible and do not require a delivery.
 An unavailable receiver API (including a 404) produces a failing role row
 while the check continues reporting the other roles.
 Set `RELEASE_TARGET_<ROLE>_REPOSITORY` to the configured short repository names.
-The optional workflow uses the hub token for public release assets and a
-scoped Actions-read App token for receiver repositories. The
-`release-fanout-check` workflow accepts the same tag for manual inspection.
+Run the CLI directly for manual inspection, using `GH_HUB_TOKEN` for public
+release assets and `GH_RECEIVER_TOKEN` with Actions-read access to the receiver
+repositories.
 
 Prerelease application/web/data/license roles, if configured, are explicitly
 `skipped_by_policy`; offline/hosted must enforce their dev/next policy.
@@ -519,7 +529,7 @@ malformed entry streams are invalid evidence.
 
 ## Consumer receipt contract v1
 
-This is the single consumer-to-hub contract for the six receipt lanes;
+This is the single consumer-to-hub contract for the six receipt roles;
 delivery-only compute is excluded. Implement the artifact and callback in the
 consumer's trusted default-branch coordinator.
 No Python knowledge is required. The hub validates both complete examples below
@@ -547,13 +557,44 @@ separators and a final LF for reproducible canonical evidence hashes. The
 examples are pretty-printed for reading; JSON whitespace is not identity.
 
 The owner policy also names `workflow` (trusted reporting workflow filename),
-`base` (`main` or `dev`), and `ci`, `e2e`, `deploy`. Each check policy has exactly
-`workflow` (a `.yml` filename), `expected` (the complete nonempty, unique list of
-actual job names, including matrix expansions), and `approved_skips` (a subset
-of `expected`, never the whole list). Workflow filenames match
+`base` (`main` or `dev`), and `ci`, `e2e`, `deploy`. Each check policy without
+`shards` has exactly `workflow` (a `.yml` filename), `expected` (the complete
+nonempty, unique list of actual job names, including matrix expansions), and
+`approved_skips` (a subset of `expected`, never the whole list). Only the `ci`
+row may carry the optional `shards` field alongside these three fields.
+Workflow filenames match
 `[A-Za-z0-9_.-]+\.yml`; do not put paths or private repository identities in the
 callback. Reporting runs must use that configured workflow and an event of
 `push`, `workflow_dispatch`, `workflow_run`, or `repository_dispatch`.
+
+For shard CI, `shards` is an object with required keys `format`, `file`, `path`,
+and `max_minutes`, and only the optional key described in TRANSITIONAL below.
+`format` is a string containing exactly one `{i}` and one `{n}` and no other
+brace. That exact string appears exactly once in `expected` as a placeholder
+and never in `approved_skips`. `file` is a repository-relative path using only
+`[A-Za-z0-9_./-]`, with no leading slash and no empty, `.` or `..` component.
+`path` is a nonempty list of nonempty string object keys. `max_minutes`, shard
+counts, and manifest counts and timeouts are exact positive JSON integers,
+never booleans, floats or strings, with no built-in upper bound; the evidence's
+existing 2 MiB size bound limits the expanded list. These values are exempt
+from the identifier range below. `max_minutes` sets the upper limit for each
+shard's declared timeout in minutes.
+
+One neutral `ci` policy row:
+
+```json
+{
+  "workflow": "example-ci.yml",
+  "expected": ["gate", "build", "suite ({i}/{n})", "merge"],
+  "approved_skips": [],
+  "shards": {
+    "format": "suite ({i}/{n})",
+    "file": "config/shards.json",
+    "path": ["matrix", "count"],
+    "max_minutes": 20
+  }
+}
+```
 
 Only the `application` policy may additionally contain `post_merge`. It has the
 same exact `workflow`, `expected`, `approved_skips` fields and inventory rules,
@@ -598,16 +639,134 @@ Any non-null value must be a valid commit SHA and equal GitHub's actual merge
 commit for a merged PR; an unmerged PR cannot claim a merge.
 
 A check-evidence object has exactly these fields, for each of `ci`, `e2e`,
-`deploy`, and the conditional application `post_merge`:
+`deploy`, and the conditional application `post_merge`, with the shard CI
+extension below:
 
 | Field | Type and allowed value |
 |---|---|
 | `run_id` | Integer, GitHub Actions run in the configured consumer repository. |
 | `run_attempt` | Integer, the particular GitHub attempt whose jobs are checked. |
 | `sha` | Commit; `pr.head` for CI/E2E, `pr.merge` for deploy and application post-merge. Hosted `release-postmerge.yml` E2E uses `pr.merge`; legacy hosted `release-coordinator.yml` E2E uses `pr.base_sha`, subject to the binding checks below. |
-| `expected` | Array of unique job-name strings, exactly the corresponding policy list, in the same order. |
+| `expected` | Array of unique job-name strings, exactly the corresponding policy list in the same order, after expanding the shard placeholder when configured. |
 | `approved_skips` | Array of job-name strings, exactly the corresponding policy list, in the same order. |
 | `results` | Object with exactly one key per expected job; values `success`, or `skipped` only for owner-approved skips. Must equal actual GitHub jobs. |
+
+**Shard CI evidence.** With a shard policy, the `ci` object retains `run_id`,
+`run_attempt`, `sha`, `expected`, `approved_skips`, and `results`. Except for
+the TRANSITIONAL branch below, it adds exactly `manifest` and `n_change`;
+neither may be omitted. `manifest` is an object with exactly these eight keys:
+
+| Manifest key | Required value and hub check |
+|---|---|
+| `shard_count` | Exact positive integer equal to the selected count N. |
+| `shards` | Object keyed by exactly the N expanded family names. Each entry has exactly `declared_count` and `timeout_minutes`, both exact positive integers. Each `timeout_minutes` is at most policy `max_minutes`. |
+| `disjoint` | Exactly boolean `true`; the sum of the entries' `declared_count` values must equal `union_count`. |
+| `union_count` | Exact positive integer equal to that sum and to `inventory_count`. |
+| `inventory_count` | Exact positive integer equal to `union_count`. |
+| `union_equals_inventory` | Exactly boolean `true`, with the count equality independently rechecked. |
+| `inventory_sha256` | Exactly 64 lowercase hexadecimal characters. |
+| `plan_sha256` | Exactly 64 lowercase hexadecimal characters. |
+
+The hub requires both flags to be exactly `true` and rechecks both count
+equalities; a true flag never overrides contradictory counts. It cannot
+recompute the inventory or the plan: it checks the manifest for internal
+consistency only.
+
+When both files are present with unchanged counts, `n_change` must be present
+and `null`. For a count change, it is an object with exactly `base_n`,
+`candidate_n`, and `path`. Both counts are exact positive integers equal to
+the old and head counts resolved by the hub, and `path` is a string equal to
+policy `file`, rather than its list of JSON keys.
+
+Each shard job must have valid, timezone-aware `started_at` and `completed_at`
+timestamps with a nonnegative interval. The validator records the observed run
+time, `completed_at - started_at` truncated to whole seconds, in the public
+receipt's `ci.shards.seconds` and does not refuse on it: GitHub cancels a job
+that runs past its `timeout-minutes`, and a cancelled job is already refused.
+The refusal is on the declared `timeout_minutes` in the manifest, which must
+not exceed the policy's `max_minutes`. This declared limit applies whenever a
+manifest is required.
+
+N comes from the JSON value at policy `path` in `file` at the PR's recorded
+base commit, `pr.base_sha`, subject to the count-change rules below. The hub
+also reads the copy at `pr.head`, before reading the CI run or jobs. A present
+file must have inline base64 content containing strict JSON; each key-path
+step must address an existing object key and the result must be an exact
+positive integer. Invalid content or a missing key is refused, not treated as
+an absent file.
+
+| Base file | Head file | Decision |
+|---|---|---|
+| Absent | Absent | TRANSITIONAL: use the temporary count and legacy evidence form below. |
+| Absent | Present | Count change: old count is `absent_count`, N is the head count, subject to TRANSITIONAL below. |
+| Present | Absent | Refuse deletion. |
+| Present | Present, same count | Unchanged: N is the base count. Other JSON content does not affect this decision. |
+| Present | Present, different count | Count change: N is the head count. |
+
+A count change is accepted only with the internally checked manifest, all
+declared time limits satisfied, and a matching `n_change`.
+Every other candidate must match the base count exactly.
+The placeholder expands in its policy position to the names for i = 1..N,
+in ascending order, with denominator N. Evidence `expected` must equal that
+whole list in order, and `approved_skips` must equal the policy list in order.
+The hub compares the evidence list length before building any expanded name
+list, and refuses collisions with static names. Every shard job must exist
+exactly once, be completed and succeed. A run job whose full name matches the
+family format with decimal digits at both placeholders must be in the
+effective expected list; other indices, denominators or numeric spellings
+outside that list are refused. Unrelated jobs do not change the inventory.
+
+**TRANSITIONAL.** The optional `shards.absent_count` policy field is an exact
+positive integer allowing an absent base file. When the file is absent at both
+commits, the legacy form passes: `ci` has exactly the original six members,
+with no `manifest` or `n_change`, and its shard family is exactly the names for
+i = 1..`absent_count`, with that denominator. Observed job timestamps are still
+required. Without `absent_count`, any absent base file is refused. A head that
+adds the file is a count change whose old count is `absent_count`, requiring
+the manifest, time limits and matching change record even when the numeric
+count is the same. A head that deletes the file is always refused. This
+allowance exists for a transition and will be removed in a later change, when
+an absent file will always be refused. The hub holds no built-in count.
+
+One neutral `ci` evidence object for a change from 2 shards to 3, with invented
+counts and placeholder hashes:
+
+```json
+{
+  "run_id": 1,
+  "run_attempt": 1,
+  "sha": "0000000000000000000000000000000000000000",
+  "expected": ["gate", "build", "suite (1/3)", "suite (2/3)", "suite (3/3)", "merge"],
+  "approved_skips": [],
+  "results": {
+    "gate": "success",
+    "build": "success",
+    "suite (1/3)": "success",
+    "suite (2/3)": "success",
+    "suite (3/3)": "success",
+    "merge": "success"
+  },
+  "manifest": {
+    "shard_count": 3,
+    "shards": {
+      "suite (1/3)": {"declared_count": 10, "timeout_minutes": 20},
+      "suite (2/3)": {"declared_count": 10, "timeout_minutes": 20},
+      "suite (3/3)": {"declared_count": 10, "timeout_minutes": 20}
+    },
+    "disjoint": true,
+    "union_count": 30,
+    "inventory_count": 30,
+    "union_equals_inventory": true,
+    "inventory_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "n_change": {
+    "base_n": 2,
+    "candidate_n": 3,
+    "path": "config/shards.json"
+  }
+}
+```
 
 The referenced run must have completed successfully. Every expected job must
 exist exactly once and finish successfully or have its explicit approved skip;
@@ -629,6 +788,21 @@ still require the member but do not validate its value, just as deployment
 evidence is deferred. The neutral verified receipt adds `post_merge` containing
 only `run_id`, `run_attempt`, and `inventory_sha256`, the SHA-256 of the canonical
 results object, in the same form as `deploy`.
+
+The neutral public `ci` and `e2e` entries carry `run_id`, `run_attempt`, and
+`inventory_sha256`, the SHA-256 of canonical `results`. A shard CI entry also
+carries exactly one `shards` member, an object with exactly `count`, `seconds`,
+`inventory`, and `change`. The hub derives these values: `count` is N;
+`seconds` lists observed durations truncated to whole seconds in shard order;
+`inventory` is the manifest's integer `inventory_count`, or `null` for
+TRANSITIONAL; `change` is `null` when no count change is recorded, otherwise an
+object with exactly `from` (the old count) and `to` (N). This addition contains
+only numbers, `null`, or containers of those values, with no job names, paths
+or labels. The complete private evidence stays bound by `evidence_sha256`.
+
+The owner policy and the consumer's evidence producer change together. Until
+the owner switches the live policy, a static policy keeps working unchanged.
+The repository maintainers apply the live policy; this change alters no GitHub setting.
 
 **Hosted post-merge E2E.** Hosted now uses CI `release-pr.yml`, E2E
 `release-postmerge.yml` and deploy `release.yml`. Hosted `verified` means
@@ -1132,7 +1306,7 @@ with a longer app default. Monitor these assets/issues, not green dispatch runs.
 
 ## Supervisor configuration
 
-Do not enable a receipt role until its consumer lane has removed moving runtime
+Do not enable a receipt role until its consumer has removed moving runtime
 defaults and installed PR/CI/E2E/deploy gates; the same holds for every role.
 Compute instead waits for its merged pair-validation receiver and explicit
 first-pair gate. Consumer App identities must not bypass
@@ -1143,10 +1317,15 @@ suite inventory; only a verified documentation-only PR may skip suites.
 
 The hub's `python-test.yml` and `facts-validate.yml` PR checks use GitHub-hosted
 runners: `authz` uses `runs-on: ubuntu-24.04`; the other PR jobs use
-`runs-on: ubuntu-latest` per owner decision 10-21 (msg 1562390657274748981)
-(the jobs that also run on pushes to main use the push-triggered runner `runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}`),
-a standing R6/rule-B exception for pineforge-release, without a `PF_CI_LABELS`
-environment variable. Both workflows run on every pull request without path or
+`runs-on: ubuntu-latest`,
+a standing exception for pineforge-release, without a `PF_CI_LABELS`
+environment variable, with these CI runner assignments:
+`python-test.yml` jobs `changes`, `fingerprint-canonical`, `description-renderer`,
+`release-ready-replay` and `release-ready` use `runs-on: ubuntu-24.04` for every
+configured event, including pushes to `main` and `master`.
+`facts-validate.yml` job `validate` uses `runs-on: ubuntu-24.04` for pull requests
+and pushes to `main`.
+Both workflows run on every pull request without path or
 branch filters. Their first job is the canonical `authz` from
 `ci-labels.md`, `name: authz`,
 `runs-on: ubuntu-24.04`, `permissions: {}`, no
@@ -1222,7 +1401,7 @@ A member's own fork fails the canonical authz check.
 The existing `merge_group` trigger remains
 configured and passes the canonical authz script. macOS stays hosted
 (no hardware); this repository has no macOS jobs. Credential/release jobs
-use `ubuntu-latest` per owner decision 10-21, including publication workflows.
+use `ubuntu-latest` by the same standing exception, including publication workflows.
 
 | Name / setting | Scope | Purpose |
 |---|---|---|
@@ -1269,7 +1448,7 @@ production inventory. The `hosted` entry is the exact policy from hosted
 `receipt.mjs` at `0a1c82c8`, following the 2026-10-21 post-merge change.
 Merge that hosted entry into the existing
 `RELEASE_RECEIPT_POLICY` only after installing this hub adapter, preserving every
-other consumer entry. The supervisor applies the live policy; this change does
+other consumer entry. The release operator applies the live policy; this change does
 not alter GitHub settings.
 
 The `application` entry uses the supplied base `dev`, literal artifact name,
@@ -1345,7 +1524,7 @@ names. Do not use the example E2E/deploy inventories as production gates.
 ```
 
 Supervisor must populate the **actual complete expected job names**, including
-matrix expansions, from each reviewed consumer lane. A tiny example inventory
+matrix expansions, from each reviewed consumer. A tiny example inventory
 must never be used to omit existing required checks.
 
 Rollout order for the application `post_merge` section: a receipt must carry
@@ -1440,7 +1619,7 @@ readback. Newer aliases are left alone. Fixed tags, images, source assets and
 manifests are preserved. If no previous good alias exists, it reports incomplete
 repair rather than deleting an alias or inventing a good target. **A hub rollback
 sends no consumer signal.** Consumers may keep the rejected release while hub
-aliases revert, so mixed versions are possible. Each consumer lane owns its
+aliases revert, so mixed versions are possible. Each consumer owns its
 explicit rollback and served-state verification; coordinate those rollbacks
 separately.
 
@@ -1451,11 +1630,11 @@ truthful hosted receipts and red cases for source trust, binding and candidate
 replacement, archive digests, PR/head/base/attempt mismatches and inventory
 changes, plus regressions for the original exact-SHA path. The existing
 `test_release_*.py` discovery includes it in CI. These tests are written for
-CI/cloud execution and are not run on the Mac; local validation is limited to
+CI/cloud execution and are not run on a laptop; local validation is limited to
 Python compilation and `git diff --check` (plus YAML parsing if a workflow
 changes).
 No test suite, Docker runtime/build, live dispatch, publication, token mint,
-credential read or deployment is needed on the Mac to implement this lane.
+credential read or deployment is needed on a laptop to implement this change.
 
 ## Running the image: scratch space (engine 1.7.0)
 

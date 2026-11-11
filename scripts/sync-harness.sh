@@ -17,10 +17,16 @@ FILES=(
   entrypoint.sh
   pf_bars.py
   pf_sink.py
+  pineforge_report_deadlines.py
+  pineforge_report_supervise.py
+  pineforge_sink_finalize.py
+  pineforge_sink_to_json.py
+  quota_columns.py
   request_feed_inventory.py
   run_execution_observer.py
   run_json.py
   run_phase_transport.py
+  run_quota.py
   selected_window_plan.py
   selected_window_report.py
 )

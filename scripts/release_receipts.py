@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import datetime as dt
 import io
 import os
+import re
 import sys
 import zipfile
 import zlib
@@ -70,6 +72,228 @@ def object_pages(client, route, key):
     raise Invalid("consumer API pagination limit exceeded")
 
 
+# --- Shard receipt plans ----------------------------------------------------
+SHARD_FIELD = "shards"
+SHARD_CHECK_FIELDS = {"run_id", "run_attempt", "sha", "expected", "approved_skips", "results"}
+SHARD_MANIFEST, SHARD_CHANGE = "manifest", "n_change"
+SHARD_COUNT, SHARD_DECLARED, SHARD_TIMEOUT = "shard_count", "declared_count", "timeout_minutes"
+SHARD_DISJOINT, SHARD_UNION, SHARD_INVENTORY = "disjoint", "union_count", "inventory_count"
+SHARD_EQUAL = "union_equals_inventory"
+SHARD_INVENTORY_HASH, SHARD_PLAN_HASH = "inventory_sha256", "plan_sha256"
+SHARD_BASE, SHARD_CANDIDATE, SHARD_PATH = "base_n", "candidate_n", "path"
+SHARD_POLICY_FIELDS = {"format", "file", SHARD_PATH, "max_minutes"}
+SHARD_STEADY_CHANGE = None
+SHARD_PUBLIC_COUNT, SHARD_PUBLIC_INVENTORY, SHARD_PUBLIC_CHANGE = "count", "inventory", "change"
+SHARD_SECONDS, SHARD_FROM, SHARD_TO = "seconds", "from", "to"
+SHARD_CHECKED = "checked_shards"
+SHARD_EVIDENCE_FIELDS = SHARD_CHECK_FIELDS | {SHARD_MANIFEST, SHARD_CHANGE}
+SHARD_MANIFEST_FIELDS = {
+    SHARD_COUNT, SHARD_FIELD, SHARD_DISJOINT, SHARD_UNION, SHARD_INVENTORY,
+    SHARD_EQUAL, SHARD_INVENTORY_HASH, SHARD_PLAN_HASH,
+}
+SHARD_ENTRY_FIELDS = {SHARD_DECLARED, SHARD_TIMEOUT}
+SHARD_CHANGE_FIELDS = {SHARD_BASE, SHARD_CANDIDATE, SHARD_PATH}
+
+
+def shard_positive(value):
+    return type(value) is int and value >= 1
+
+
+def transitional_absent_base_plan(shards, *, validate_only=False, candidate=None, evidence=None):
+    """Keep the optional absent-file allowance and its validation together."""
+    field = "absent_count"
+    require(type(shards) is dict
+            and SHARD_POLICY_FIELDS <= set(shards) <= SHARD_POLICY_FIELDS | {field},
+            "unexpected shard policy fields")
+    if field in shards:
+        require(shard_positive(shards[field]), "invalid transitional shard count")
+    if validate_only:
+        return None
+    require(field in shards, "shard base file absent without transitional count")
+    if candidate is None:
+        require(type(evidence) is dict and set(evidence) == SHARD_CHECK_FIELDS,
+                "transitional shard evidence must use legacy fields")
+    return shards[field]
+
+
+def shard_inventory(row):
+    expected, skips = row["expected"], row["approved_skips"]
+    require(type(expected) is list and bool(expected)
+            and all(type(name) is str for name in expected)
+            and len(expected) == len(set(expected)), "empty or duplicate required inventory")
+    require(type(skips) is list and all(type(name) is str for name in skips)
+            and set(skips) <= set(expected), "invalid skip policy")
+    require(set(expected) - set(skips), "entire required inventory cannot be skipped")
+
+
+def shard_policy(row):
+    shards = row[SHARD_FIELD]
+    transitional_absent_base_plan(shards, validate_only=True)
+    template = shards["format"]
+    require(type(template) is str and template.count("{i}") == template.count("{n}") == 1
+            and not any(char in template.replace("{i}", "").replace("{n}", "") for char in "{}"),
+            "invalid shard format")
+    path = shards["file"]
+    require(type(path) is str and re.fullmatch(r"[A-Za-z0-9_./-]+", path) is not None
+            and not path.startswith("/") and all(part not in ("", ".", "..") for part in path.split("/")),
+            "invalid shard file path")
+    require(type(shards[SHARD_PATH]) is list and bool(shards[SHARD_PATH])
+            and all(type(key) is str and bool(key) for key in shards[SHARD_PATH]), "invalid shard count path")
+    require(shard_positive(shards["max_minutes"]), "invalid shard time limit")
+    require(type(row["expected"]) is list and row["expected"].count(template) == 1,
+            "shard placeholder must appear exactly once")
+    require(type(row["approved_skips"]) is list, "invalid skip policy")
+    require(template not in row["approved_skips"], "shard checks cannot be skipped")
+    shard_inventory(row)
+
+
+def shard_file_count(client, repo, shards, ref):
+    try:
+        contents = client.api(f"repos/{repo}/contents/{shards['file']}?ref={ref}")
+    except Pending:
+        return None
+    require(type(contents) is dict and contents.get("type") == "file", "shard source is not a file")
+    content = contents.get("content")
+    require(contents.get("encoding") == "base64" and type(content) is str and bool(content),
+            "shard file has no inline base64 content")
+    try:
+        # The contents API wraps inline base64 in lines.
+        raw = base64.b64decode(content.replace("\n", "").replace("\r", ""), validate=True)
+    except (ValueError, binascii.Error):
+        raise Invalid("invalid shard file base64") from None
+    try:
+        value = decode(raw)
+    except Invalid:
+        raise Invalid("invalid shard file JSON") from None
+    for key in shards[SHARD_PATH]:
+        require(type(value) is dict and key in value, "shard count path missing")
+        value = value[key]
+    require(shard_positive(value), "shard count must be a positive integer")
+    return value
+
+
+def shard_manifest(manifest, count, family, max_minutes):
+    require(type(manifest) is dict and set(manifest) == SHARD_MANIFEST_FIELDS,
+            "unexpected shard manifest fields")
+    require(type(manifest[SHARD_COUNT]) is int and manifest[SHARD_COUNT] == count,
+            "shard manifest count differs")
+    entries = manifest[SHARD_FIELD]
+    require(type(entries) is dict and len(entries) == count, "shard manifest size differs")
+    require(set(entries) == set(family), "shard manifest names differ")
+    declared = []
+    for entry in entries.values():
+        require(type(entry) is dict and set(entry) == SHARD_ENTRY_FIELDS, "unexpected shard entry fields")
+        require(shard_positive(entry[SHARD_DECLARED]), "shard declared count must be a positive integer")
+        require(shard_positive(entry[SHARD_TIMEOUT]), "shard timeouts must be positive integers")
+        require(entry[SHARD_TIMEOUT] <= max_minutes, "shard timeout exceeds policy limit")
+        declared.append(entry[SHARD_DECLARED])
+    require(manifest[SHARD_DISJOINT] is True, "shard manifest is not disjoint")
+    union = manifest[SHARD_UNION]
+    require(shard_positive(union), "shard manifest union must be a positive integer")
+    require(union == sum(declared), "shard manifest union differs from shard sum")
+    inventory = manifest[SHARD_INVENTORY]
+    require(shard_positive(inventory), "shard manifest inventory must be a positive integer")
+    require(union == inventory, "shard manifest union differs from inventory")
+    require(manifest[SHARD_EQUAL] is True, "shard manifest inventory equality is not true")
+    for field, message in (
+            (SHARD_INVENTORY_HASH, "invalid shard inventory hash"), (SHARD_PLAN_HASH, "invalid shard plan hash")):
+        require(type(manifest[field]) is str and re.fullmatch(SHA, manifest[field]) is not None, message)
+    return inventory
+
+
+def shard_plan(client, repo, evidence, row, pr):
+    """Resolve both commits and validate bounded evidence before reading a run."""
+    shard_policy(row)
+    shards = row[SHARD_FIELD]
+    base = shard_file_count(client, repo, shards, pr["base_sha"])
+    candidate = shard_file_count(client, repo, shards, pr["head"])
+    base_absent = base is None
+    legacy = base_absent and candidate is None
+    if base_absent:
+        base = transitional_absent_base_plan(shards, candidate=candidate, evidence=evidence)
+    else:
+        require(candidate is not None, "shard count file deletion is forbidden")
+    count = base if legacy or candidate == base else candidate
+    changed = not legacy and (base_absent or candidate != base)
+    require(type(evidence) is dict, "unexpected shard check fields")
+    fields = SHARD_CHECK_FIELDS
+    if not legacy:
+        require(SHARD_MANIFEST in evidence, "shard manifest evidence is required")
+        fields = SHARD_EVIDENCE_FIELDS
+    require(set(evidence) == fields, "unexpected shard check fields")
+    expected = evidence["expected"]
+    require(type(expected) is list, "shard evidence expected must be a list")
+    require(len(expected) == len(row["expected"]) - 1 + count, "shard evidence list length differs")
+    # Allocation is bounded by the evidence's own list, after the length check.
+    template = shards["format"]
+    family = [template.format(i=i, n=count) for i in range(1, count + 1)]
+    effective = {"workflow": row["workflow"], "expected": [], "approved_skips": row["approved_skips"]}
+    for name in row["expected"]:
+        effective["expected"].extend(family if name == template else [name])
+    shard_inventory(effective)
+    require(expected == effective["expected"] and evidence["approved_skips"] == effective["approved_skips"],
+            "required check inventory differs from owner policy")
+    inventory, change = None, None
+    if not legacy:
+        inventory = shard_manifest(evidence[SHARD_MANIFEST], count, family, shards["max_minutes"])
+        if changed:
+            claimed = evidence[SHARD_CHANGE]
+            require(claimed is not None, "shard count change record is required")
+            require(type(claimed) is dict and set(claimed) == SHARD_CHANGE_FIELDS,
+                    "unexpected shard change fields")
+            require(type(claimed[SHARD_BASE]) is int and claimed[SHARD_BASE] == base,
+                    "shard change base count differs")
+            require(type(claimed[SHARD_CANDIDATE]) is int and claimed[SHARD_CANDIDATE] == candidate,
+                    "shard change candidate count differs")
+            require(type(claimed[SHARD_PATH]) is str and claimed[SHARD_PATH] == shards["file"],
+                    "shard change file path differs")
+            change = {SHARD_FROM: base, SHARD_TO: count}
+        else:
+            require(evidence[SHARD_CHANGE] is SHARD_STEADY_CHANGE, "unchanged shard count cannot claim change")
+    summary = {SHARD_PUBLIC_COUNT: count, SHARD_PUBLIC_INVENTORY: inventory, SHARD_PUBLIC_CHANGE: change}
+    plain = {key: evidence[key] for key in SHARD_CHECK_FIELDS}
+    return effective, plain, family, summary
+
+
+def shard_duration(job):
+    start, end = job.get("started_at"), job.get("completed_at")
+    require(type(start) is str and type(end) is str, "shard job timestamps missing")
+    try:
+        started = dt.datetime.fromisoformat(start.replace("Z", "+00:00"))
+        completed = dt.datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        raise Invalid("invalid shard job timestamps") from None
+    require(started.utcoffset() is not None and completed.utcoffset() is not None,
+            "invalid shard job timestamps")
+    require(completed >= started, "shard job duration is negative")
+    return completed - started
+
+
+def check_shard_run(client, repo, evidence, row, pr):
+    effective, plain, family, summary = shard_plan(client, repo, evidence, row, pr)
+    template = row[SHARD_FIELD]["format"]
+    pattern = re.escape(template).replace(re.escape("{i}"), "[0-9]+").replace(re.escape("{n}"), "[0-9]+")
+    allowed, family_names, seen = set(effective["expected"]), set(family), {}
+
+    def inspect_jobs(jobs):
+        for job in jobs:
+            name = job["name"]
+            require(re.fullmatch(pattern, name) is None or name in allowed, "unexpected job in shard family")
+            if name in family_names:
+                seen[name] = job
+
+    run = check_run(client, repo, plain, effective, pr["head"], inspect_jobs=inspect_jobs)
+    summary[SHARD_SECONDS] = []
+    for name in family:
+        duration = shard_duration(seen[name])
+        summary[SHARD_SECONDS].append(duration // dt.timedelta(seconds=1))
+    run[SHARD_CHECKED] = summary
+    return run
+
+
+# --- End shard receipt plans ------------------------------------------------
+
+
 def profile(role):
     require(role in RECEIPT_ROLES, "unexpected receipt role")
     profiles = decode(os.environ.get("RELEASE_RECEIPT_POLICY", "{}"))
@@ -86,7 +310,12 @@ def profile(role):
     require(policy["base"] in ("main", "dev"), "unapproved consumer base")
     for name in sections:
         row = policy[name]
-        keys(row, ("workflow", "expected", "approved_skips"))
+        if type(row) is dict and SHARD_FIELD in row:
+            require(name == "ci", "shards policy is only valid for ci")
+            keys(row, ("workflow", "expected", "approved_skips", SHARD_FIELD))
+            shard_policy(row)
+        else:
+            keys(row, ("workflow", "expected", "approved_skips"))
         require(type(row["expected"]) is list and len(row["expected"]) > 0
                 and len(row["expected"]) == len(set(row["expected"])), "empty or duplicate required inventory")
         require(type(row["approved_skips"]) is list and set(row["approved_skips"]) <= set(row["expected"]), "invalid skip policy")
@@ -96,7 +325,7 @@ def profile(role):
     return policy
 
 
-def check_run(client, repo, evidence, policy, expected_sha):
+def check_run(client, repo, evidence, policy, expected_sha, *, inspect_jobs=None):
     keys(evidence, ("run_id", "run_attempt", "sha", "expected", "approved_skips", "results"))
     positive(evidence["run_id"])
     positive(evidence["run_attempt"])
@@ -108,6 +337,8 @@ def check_run(client, repo, evidence, policy, expected_sha):
             "unexpected checks workflow or head")
     require(run["status"] == "completed" and run["conclusion"] == "success", "required check run not successful")
     jobs = object_pages(client, f"repos/{repo}/actions/runs/{evidence['run_id']}/attempts/{evidence['run_attempt']}/jobs", "jobs")
+    if inspect_jobs is not None:
+        inspect_jobs(jobs)
     checked, finished = {}, []
     for name in policy["expected"]:
         found = [row for row in jobs if row["name"] == name]
@@ -324,7 +555,10 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         require(actual["merged"] is True and actual["merge_commit_sha"] == pr["merge"], "PR is not the recorded merge")
     public["pr"] = pr
     if state in ("ready", "merged", "deploying", "verified"):
-        ci_run = check_run(client, repo, receipt["ci"], policy["ci"], pr["head"])
+        if SHARD_FIELD in policy["ci"]:
+            ci_run = check_shard_run(client, repo, receipt["ci"], policy["ci"], pr)
+        else:
+            ci_run = check_run(client, repo, receipt["ci"], policy["ci"], pr["head"])
         if postmerge:
             if state == "verified":
                 e2e_run = check_postmerge(client, repo, receipt["e2e"], policy, pr, actual, receipt["timestamp"])
@@ -347,6 +581,8 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
                 continue
             public[name] = {"run_id": receipt[name]["run_id"], "run_attempt": receipt[name]["run_attempt"],
                             "inventory_sha256": sha256(canonical(receipt[name]["results"]))}
+        if SHARD_FIELD in policy["ci"]:
+            public["ci"][SHARD_FIELD] = ci_run[SHARD_CHECKED]
         public["preview"] = receipt["preview"]
     if state in ("merged", "deploying", "verified"):
         match(COMMIT, pr["merge"])

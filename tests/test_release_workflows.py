@@ -2,7 +2,7 @@
 """Wiring checks: the release workflows run scripts/release_pair.py where its
 rules apply and never fall back to an rc-unsafe version sort, the
 notify-consumers decision (no dispatch to the application for a prerelease) is
-run under bash, and the engine's runtime harness (ten files) is synced from
+run under bash, and the engine's runtime harness (sixteen files) is synced from
 the pinned engine tag by one script and checked against recorded sha256 values
 when the image is built (the Dockerfile's check is run under bash on temporary
 directories). The source mirror wiring checks use PyYAML to parse the workflows."""
@@ -11,7 +11,6 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
-import io
 import json
 import os
 import re
@@ -22,7 +21,6 @@ import sys
 import tempfile
 import textwrap
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -130,6 +128,24 @@ class HandleUpstreamTest(unittest.TestCase):
         self.assertIn("RETAG:   ${{ steps.decide.outputs.retag }}", body)
         self.assertIn('if [ "$RETAG" = true ]; then', body)
         self.assertLess(body.index('if [ "$RETAG" = true ]; then'), body.index('printf \'%s\\n\' "$next" > VERSION'))
+
+    def test_engine_verification_covers_every_completing_event_before_tagging(self):
+        steps = _workflow("handle-upstream.yml")["jobs"]["bump"]["steps"]
+        named = {row.get("name"): row for row in steps}
+        dispatched = named["Verify the dispatched producer artifacts"]
+        completing = named.get("Verify the completing engine before tagging")
+        self.assertIsNotNone(completing)
+        self.assertEqual(dispatched["run"],
+                         'python3 scripts/release_pipeline.py producer "$COMPONENT" "$VER"')
+        self.assertEqual(completing["if"],
+                         "steps.decide.outputs.mode == 'bump' && steps.in.outputs.component != 'engine'")
+        self.assertEqual(completing["run"], 'python3 scripts/release_pipeline.py producer engine "$E"')
+        self.assertEqual(completing["env"]["E"], "${{ steps.decide.outputs.engine }}")
+        decide = next(row for row in steps if row.get("id") == "decide")
+        self.assertLess(steps.index(dispatched), steps.index(decide))
+        self.assertLess(steps.index(completing), steps.index(named["Bump VERSION, commit, tag"]))
+        for step in (dispatched, completing, named["Bump VERSION, commit, tag"]):
+            self.assertNotIn("continue-on-error", step)
 
     def test_the_harness_is_synced_by_the_script_from_the_pinned_tag(self):
         body = _step(self.text, "Bump VERSION")
@@ -262,7 +278,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         ),
     }
     APT_GUARD_STEP = {
-        "name": "Stop automatic apt upgrades (LB-504, until the release image is rebaked)",
+        "name": "Stop automatic apt upgrades (until the release image is rebaked)",
         "shell": "bash",
         "run": ("systemctl show -p ActiveState,SubState apt-daily-upgrade.service apt-daily.service || true\n"
                 "if systemctl is-active --quiet apt-daily-upgrade.service || "
@@ -288,6 +304,17 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         '        required: true\n'
         '        type: string\n'
     )
+    PUBLISH_RELEASE_INPUTS = (
+        ("Assert tag matches VERSION", "TAG"),
+        ("Read pins (from the annotated tag message; fallback = the pair version, or resolve latest on 0.x)", "REF"),
+        ("Pairing rule + release channel", "REF"),
+        ("Sync parity from the immutable engine tag", "TAG"),
+        ("Bind producer source and package bytes", "TAG"),
+        ("Read hpo wheel digest", "REF"),
+        ("GitHub Release", "TAG"),
+    )
+    COMPLETING_ENGINE = "Verify the completing engine before tagging"
+    BUMP = "Bump VERSION, commit, tag"
 
     def parse(self, text):
         import yaml
@@ -298,6 +325,21 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         mutant = text.replace(before, after)
         self.assertNotEqual(mutant, text, "mutation must change the real workflow")
         return mutant
+
+    def step_text(self, text, job, name):
+        jobs = list(re.finditer(
+            r"(?ms)^  " + re.escape(job) + r":\n.*?(?=^  \S|\Z)", text,
+        ))
+        self.assertEqual(len(jobs), 1, "mutation requires exactly one job: " + job)
+        steps = list(re.finditer(
+            r"(?ms)^      - name: " + re.escape(name) + r"\n.*?(?=^      - |\Z)", jobs[0][0],
+        ))
+        self.assertEqual(len(steps), 1, "mutation requires exactly one step: " + job + "/" + name)
+        return steps[0][0]
+
+    def mutate_step(self, text, job, name, before, after):
+        body = self.step_text(text, job, name)
+        return self.mutate(text, body, self.mutate(body, before, after))
 
     def assert_publish(self, text):
         wf = self.parse(text)
@@ -312,7 +354,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         jobs = wf.get("jobs", {})
         for identity in ("tag-guard", "prepare", "publish", "failure-report"):
             self.assertEqual((jobs.get(identity, {}).get("steps") or [{}])[0], self.APT_GUARD_STEP,
-                             identity + " must stop the apt timers before anything else (LB-504)")
+                             identity + " must stop the apt timers before anything else")
         for identity in ("tag-guard", "prepare", "publish", "notify-consumers", "failure-report"):
             self.assertIn(identity, jobs)
         self.assertEqual(next(iter(jobs)), "tag-guard")
@@ -340,7 +382,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             "run": self.VALIDATE_RUN,
         }, "validate before any tagged checkout, secret, or repository code")
         for identity, job in jobs.items():
-            # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+            # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
             if identity != "notify-consumers":
                 self.assertEqual(job.get("runs-on"), "ubuntu-latest", identity)
             if identity != "tag-guard":
@@ -365,10 +407,14 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
                 self.assertEqual((checkouts[0].get("with") or {}).get("fetch-depth"), "0")
         candidate = next((row for row in steps if row.get("id") == "candidate"), {})
         self.assertEqual((candidate.get("env") or {}).get("TAG"), "${{ needs.tag-guard.outputs.tag }}")
-        named = {row.get("name"): row for row in jobs["publish"].get("steps", [])}
-        for name, variable in (("Assert tag matches VERSION", "TAG"), ("Read pins (from the annotated tag message; fallback = the pair version, or resolve latest on 0.x)", "REF"),
-                               ("Pairing rule + release channel", "REF"), ("Bind producer source and package bytes", "TAG"),
-                               ("Read hpo wheel digest", "REF"), ("GitHub Release", "TAG")):
+        publish_steps = jobs["publish"].get("steps", [])
+        named = {row.get("name"): row for row in publish_steps}
+        self.assertCountEqual(
+            [(row.get("name"), variable) for row in publish_steps
+             for variable in (row.get("env") or {}) if variable in {"TAG", "REF"}],
+            self.PUBLISH_RELEASE_INPUTS, "require every intended release input consumer",
+        )
+        for name, variable in self.PUBLISH_RELEASE_INPUTS:
             self.assertEqual(named.get(name, {}).get("env", {}).get(variable), "${{ env.RELEASE_TAG }}", name)
         labels = named.get("Image metadata", {}).get("with", {}).get("labels", "")
         self.assertIn("org.opencontainers.image.version=${{ env.RELEASE_TAG }}\n", labels)
@@ -378,6 +424,19 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
                          "${{ github.run_id }}-${{ github.run_attempt }}\n")
         binding = named.get("Bind producer source and package bytes", {})
         self.assertEqual((binding.get("env") or {}).get("HUB_COMMIT"), "${{ needs.tag-guard.outputs.sha }}")
+        parity = named.get("Sync parity from the immutable engine tag", {})
+        self.assertEqual(parity.get("env"), {
+            "GH_TOKEN": "${{ github.token }}", "TAG": "${{ env.RELEASE_TAG }}",
+            "E": "${{ steps.pins.outputs.engine }}",
+        })
+        self.assertNotIn("if", parity)
+        self.assertNotIn("continue-on-error", parity)
+        self.assertIn(
+            "if parity_capable(os.environ['TAG'].removeprefix('v')):\n"
+            "    sync_parity_bundle(Client(), 'v' + os.environ['E'], Path('docker/parity'))\n",
+            parity.get("run", ""),
+        )
+        self.assertLess(publish_steps.index(parity), publish_steps.index(binding))
         for name in ("Inspect release amd64", "Inspect release arm64", "Inspect hpo amd64", "Inspect hpo arm64",
                      "Build + push (multi-arch)", "Build + push hpo (multi-arch)"):
             self.assertIn("RELEASE_VERSION=${{ env.RELEASE_TAG }}\n",
@@ -447,6 +506,22 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         self.assertNotRegex(_step(text, "Mint org App token"), r"(?m)^\s*permission-actions\s*:")
         replay = next((row for row in steps if row.get("name", "").startswith("Re-publish")), {})
         bump = next((row for row in steps if row.get("name", "").startswith("Bump VERSION")), {})
+        self.assertCountEqual(
+            [row.get("name") for row in steps if "E" in (row.get("env") or {})],
+            [self.COMPLETING_ENGINE, self.BUMP], "require both decided-engine consumers",
+        )
+        completing = next((row for row in steps if row.get("name") == self.COMPLETING_ENGINE), {})
+        self.assertEqual(completing.get("if"),
+                         "steps.decide.outputs.mode == 'bump' && steps.in.outputs.component != 'engine'")
+        self.assertEqual(completing.get("env"), {
+            "GH_TOKEN": "${{ github.token }}", "E": "${{ steps.decide.outputs.engine }}",
+        })
+        self.assertEqual(completing.get("run"), 'python3 scripts/release_pipeline.py producer engine "$E"')
+        self.assertNotIn("continue-on-error", completing)
+        decide = next((row for row in steps if row.get("id") == "decide"), {})
+        self.assertLess(steps.index(decide), steps.index(completing))
+        self.assertLess(steps.index(completing), steps.index(bump))
+        self.assertEqual(bump.get("env", {}).get("E"), "${{ steps.decide.outputs.engine }}")
         self.assertEqual(replay.get("if"), "steps.decide.outputs.mode == 'republish'")
         self.assertEqual(replay.get("env", {}).get("TAG"), "v${{ steps.decide.outputs.cur_ver }}")
         for step in (replay, bump):
@@ -611,11 +686,38 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         for label, mutant in self.guard_check_mutations(text):
             with self.subTest(check=label), self.assertRaises(AssertionError):
                 self.assert_publish(mutant)
+        # Require the semantic consumer set in assert_publish, then break each
+        # step independently. Missing anchors fail before assertRaises.
+        for name, variable in self.PUBLISH_RELEASE_INPUTS:
+            before = "          " + variable + ": ${{ env.RELEASE_TAG }}\n"
+            for after in ("", "          " + variable + ": v0.0.0\n"):
+                mutant = self.mutate_step(text, "publish", name, before, after)
+                with self.subTest(step=name, variable=variable, replacement=after), self.assertRaises(AssertionError):
+                    self.assert_publish(mutant)
+        parity_name = "Sync parity from the immutable engine tag"
+        for before, after in (
+            ("          E: ${{ steps.pins.outputs.engine }}\n", ""),
+            ("          E: ${{ steps.pins.outputs.engine }}", "          E: v0.0.0"),
+            ("          GH_TOKEN: ${{ github.token }}\n", ""),
+            ("          GH_TOKEN: ${{ github.token }}", "          GH_TOKEN: ${{ steps.app.outputs.token }}"),
+            ("        env:\n", "        if: false\n        env:\n"),
+            ("        env:\n", "        continue-on-error: true\n        env:\n"),
+            ("if parity_capable(os.environ['TAG'].removeprefix('v')):", "if True:"),
+            ("'v' + os.environ['E']", "'v0.0.0'"),
+            ("sync_parity_bundle(Client(),", "print(Client(),"),
+        ):
+            mutant = self.mutate_step(text, "publish", parity_name, before, after)
+            with self.subTest(step=parity_name, anchor=before, replacement=after), self.assertRaises(AssertionError):
+                self.assert_publish(mutant)
+        parity_body = self.step_text(text, "publish", parity_name)
+        binding_body = self.step_text(text, "publish", "Bind producer source and package bytes")
+        late_parity = self.mutate(text, parity_body, "")
+        late_parity = self.mutate(late_parity, binding_body, binding_body + parity_body)
+        with self.subTest(step=parity_name, boundary="before binding"), self.assertRaises(AssertionError):
+            self.assert_publish(late_parity)
         # These anchors repeat: mutate each occurrence independently rather
         # than letting the first checkout/build pin hide a later missing pin.
         for before, after, count in (
-            ("          TAG: ${{ env.RELEASE_TAG }}", "          TAG: v0.0.0", 3),
-            ("          REF: ${{ env.RELEASE_TAG }}", "          REF: v0.0.0", 3),
             ("RELEASE_VERSION=${{ env.RELEASE_TAG }}", "RELEASE_VERSION=v0.0.0", 6),
             ("RELEASE_GIT_SHA=${{ needs.tag-guard.outputs.sha }}", "RELEASE_GIT_SHA=${{ github.sha }}", 6),
             ("          ref: ${{ needs.tag-guard.outputs.sha }}\n", "", 2),
@@ -624,10 +726,10 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             ("          persist-credentials: false\n", "          persist-credentials: true\n", 4),
             ("          fetch-depth: 0\n", "          fetch-depth: 1\n", 2),
             ("          ref: main\n", "          ref: ${{ inputs.tag }}\n", 2),
-            # 2 tag consumers + the 4 apt guards (LB-504); every removal must still break a pin
+            # 2 tag consumers + the 4 apt guards; every removal must still break a pin
             ("        shell: bash\n", "", 6),
             ("        if: needs.tag-guard.result == 'success'\n", "", 2),
-            # owner 10-21 (msg 1562390657274748981): all four publish jobs must refuse the release array.
+            # All four publish jobs must refuse the release array.
             ("    runs-on: ubuntu-latest\n", '    runs-on: ["self-hosted","pf-ci","pf-ci-release"]\n', 4),
         ):
             self.assertEqual(text.count(before), count, "each real tag consumer must be mutated")
@@ -662,18 +764,59 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         for before, after in (
             ("          permission-contents: write\n",
              "          permission-contents: write\n          permission-actions: write\n"),
-            ('        env:\n          TAG: v${{ steps.decide.outputs.cur_ver }}',
-             '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          TAG: v${{ steps.decide.outputs.cur_ver }}'),
-            ('        env:\n          E:', '        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n          E:'),
-            ("        if: steps.decide.outputs.mode == 'republish'", "        if: always()"),
-            ("        if: steps.decide.outputs.mode == 'bump'", "        if: always()"),
-            ("          TAG: v${{ steps.decide.outputs.cur_ver }}", "          TAG: v0.0.0"),
             ("      - name: Bump VERSION, commit, tag\n", "      - name: Bump VERSION, commit, tag (fires publish.yml)\n"),
             ('echo "::warning title=pineforge publish needed::${line}"', 'echo "$line"'),
         ):
             mutant = self.mutate(text, before, after)
             with self.subTest(anchor=before), self.assertRaises(AssertionError):
                 self.assert_handler(mutant)
+        replay_name = "Re-publish (recover a half-failed prior release)"
+        for name in (replay_name, self.BUMP):
+            mutant = self.mutate_step(
+                text, "bump", name, "        env:\n",
+                "        env:\n          GH_TOKEN: ${{ steps.app.outputs.token }}\n",
+            )
+            with self.subTest(step=name, boundary="no publish token"), self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
+        for name, mode in ((replay_name, "republish"), (self.BUMP, "bump")):
+            before = "        if: steps.decide.outputs.mode == '" + mode + "'\n"
+            mutant = self.mutate_step(text, "bump", name, before, "        if: always()\n")
+            with self.subTest(step=name, boundary="decision gate"), self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
+        mutant = self.mutate_step(
+            text, "bump", replay_name, "          TAG: v${{ steps.decide.outputs.cur_ver }}",
+            "          TAG: v0.0.0",
+        )
+        with self.subTest(step=replay_name, boundary="release tag"), self.assertRaises(AssertionError):
+            self.assert_handler(mutant)
+        for name, before in (
+            (self.COMPLETING_ENGINE, "          E: ${{ steps.decide.outputs.engine }}\n"),
+            (self.BUMP, "          E:       ${{ steps.decide.outputs.engine }}\n"),
+        ):
+            for after in ("", "          E: v0.0.0\n"):
+                mutant = self.mutate_step(text, "bump", name, before, after)
+                with self.subTest(step=name, boundary="engine input", replacement=after), self.assertRaises(AssertionError):
+                    self.assert_handler(mutant)
+        completing_if = "        if: steps.decide.outputs.mode == 'bump' && steps.in.outputs.component != 'engine'\n"
+        for before, after in (
+            (completing_if, ""),
+            (completing_if, "        if: always()\n"),
+            (completing_if, "        if: steps.decide.outputs.mode == 'bump'\n"),
+            ("          GH_TOKEN: ${{ github.token }}\n", ""),
+            ("          GH_TOKEN: ${{ github.token }}", "          GH_TOKEN: ${{ steps.app.outputs.token }}"),
+            ("        env:\n", "        continue-on-error: true\n        env:\n"),
+            ('        run: python3 scripts/release_pipeline.py producer engine "$E"\n', "        run: echo skipped verification\n"),
+            ('producer engine "$E"', 'producer engine "0.0.0"'),
+        ):
+            mutant = self.mutate_step(text, "bump", self.COMPLETING_ENGINE, before, after)
+            with self.subTest(step=self.COMPLETING_ENGINE, anchor=before, replacement=after), self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
+        completing_body = self.step_text(text, "bump", self.COMPLETING_ENGINE)
+        bump_body = self.step_text(text, "bump", self.BUMP)
+        late_engine = self.mutate(text, completing_body, "")
+        late_engine = self.mutate(late_engine, bump_body, bump_body + completing_body)
+        with self.subTest(step=self.COMPLETING_ENGINE, boundary="before tagging"), self.assertRaises(AssertionError):
+            self.assert_handler(late_engine)
         for name, annotation, notices in (("Re-publish", "warning", 1), ("Bump VERSION", "notice", 2)):
             body = _step(text, name)
             for command, count in (
@@ -899,7 +1042,7 @@ class ReleaseTagGuardFailureReportTest(unittest.TestCase):
         job = (wf.get("jobs") or {}).get("failure-report") or {}
         steps = job.get("steps") or []
         self.assertGreater(len(steps), 1, "failure reporting must start with the apt guard and a refusal")
-        # LB-504: the apt guard is steps[0]; the refusal is the first real step after it, before any checkout.
+        # The apt guard is steps[0]; the refusal is the first real step after it, before any checkout.
         self.assertEqual(steps[0], ReleaseTriggerWorkflowTest.APT_GUARD_STEP, "the apt guard must be the first step")
         step = steps[1]
         self.assertEqual(step.get("name"), "Refuse unverified release tag", "the refusal must follow the apt guard")
@@ -958,6 +1101,125 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         cls.steps = cls.job["steps"]
         cls.named = {step["name"]: step for step in cls.steps if "name" in step}
 
+    ASSET_BUILDS = (
+        "Inspect release amd64", "Inspect release arm64",
+        "Inspect hpo amd64", "Inspect hpo arm64",
+        "Build + push (multi-arch)", "Build + push hpo (multi-arch)",
+    )
+
+    def assert_asset_read_token_wiring(self, workflow):
+        self.assertEqual(workflow.get("permissions"), {"contents": "read"})
+        job = workflow["jobs"]["publish"]
+        self.assertEqual(job.get("environment"), "release-automation")
+        self.assertEqual(job.get("permissions"), {"contents": "write", "packages": "write"})
+        steps = job["steps"]
+        mints = [step for step in steps
+                 if step.get("uses", "").startswith("actions/create-github-app-token@")]
+        self.assertEqual(mints, [{
+            "name": "Mint producer asset read token",
+            "id": "asset_token",
+            "uses": "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
+            "with": {
+                "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
+                "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
+                "owner": "${{ github.repository_owner }}",
+                "repositories": "pineforge-engine\npineforge-hpo\n",
+                "permission-contents": "read",
+                "github-api-url": "https://api.github.com",
+            },
+        }])
+        mint_index = steps.index(mints[0])
+        checkout = next(index for index, step in enumerate(steps)
+                        if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertLess(checkout, mint_index)
+        builds = [(index, step) for index, step in enumerate(steps)
+                  if step.get("uses", "").startswith("docker/build-push-action@")]
+        self.assertEqual([step.get("name") for _, step in builds], list(self.ASSET_BUILDS))
+        for index, step in builds:
+            self.assertLess(mint_index, index)
+            self.assertEqual(step["with"].get("secrets"),
+                             "github_token=${{ steps.asset_token.outputs.token }}\n")
+            self.assertNotIn("secret-envs", step["with"])
+            self.assertNotIn("secret-files", step["with"])
+
+        def reference_paths(node, needle, path=()):
+            if isinstance(node, dict):
+                return [found for key, value in node.items()
+                        for found in reference_paths(value, needle, (*path, key))]
+            if isinstance(node, list):
+                return [found for index, value in enumerate(node)
+                        for found in reference_paths(value, needle, (*path, index))]
+            return [path] if isinstance(node, str) and needle in node else []
+
+        # Token output is confined to the six BuildKit inputs, never a job
+        # output, environment, build ARG, script, label or other action input.
+        self.assertCountEqual(
+            reference_paths(workflow, "steps.asset_token.outputs.token"),
+            [("jobs", "publish", "steps", index, "with", "secrets") for index, _ in builds],
+        )
+        for secret, field in (("PINEFORGE_APP_ID", "app-id"),
+                              ("PINEFORGE_APP_PRIVATE_KEY", "private-key")):
+            self.assertEqual(reference_paths(workflow, "secrets." + secret),
+                             [("jobs", "publish", "steps", mint_index, "with", field)])
+
+    def test_producer_read_token_is_scoped_and_only_enters_buildkit_with_mutation_controls(self):
+        self.assert_asset_read_token_wiring(self.workflow)
+        mint_index = next(index for index, step in enumerate(self.steps)
+                          if step.get("id") == "asset_token")
+        for field, value in (
+                ("permission-contents", "write"),
+                ("permission-actions", "read"),
+                ("repositories", ""),
+                ("repositories", "pineforge-engine\npineforge-hpo\npineforge-release\n"),
+                ("owner", "unapproved-owner"),
+                ("app-id", "${{ secrets.NEW_APP_ID }}"),
+                ("private-key", "${{ secrets.NEW_APP_KEY }}"),
+                ("github-api-url", "https://unapproved.invalid")):
+            mutant = copy.deepcopy(self.workflow)
+            mutant["jobs"]["publish"]["steps"][mint_index]["with"][field] = value
+            with self.subTest(mint_field=field, value=value), self.assertRaises(AssertionError):
+                self.assert_asset_read_token_wiring(mutant)
+        for mode in ("missing", "late", "conditional", "softened"):
+            mutant = copy.deepcopy(self.workflow)
+            steps = mutant["jobs"]["publish"]["steps"]
+            if mode in {"missing", "late"}:
+                mint = steps.pop(mint_index)
+                if mode == "late":
+                    steps.append(mint)
+            elif mode == "conditional":
+                steps[mint_index]["if"] = "steps.pair.outputs.target == 'hpo'"
+            else:
+                steps[mint_index]["continue-on-error"] = "true"
+            with self.subTest(mint=mode), self.assertRaises(AssertionError):
+                self.assert_asset_read_token_wiring(mutant)
+        for name in self.ASSET_BUILDS:
+            for mode in ("missing", "write-token", "build-arg", "environment"):
+                mutant = copy.deepcopy(self.workflow)
+                step = next(row for row in mutant["jobs"]["publish"]["steps"]
+                            if row.get("name") == name)
+                secret = step["with"].pop("secrets")
+                if mode == "write-token":
+                    step["with"]["secrets"] = "github_token=${{ github.token }}\n"
+                elif mode == "build-arg":
+                    step["with"]["secrets"] = secret
+                    step["with"]["build-args"] += secret
+                elif mode == "environment":
+                    step["with"]["secrets"] = secret
+                    step["env"] = {"GH_TOKEN": "${{ steps.asset_token.outputs.token }}"}
+                with self.subTest(build=name, mutation=mode), self.assertRaises(AssertionError):
+                    self.assert_asset_read_token_wiring(mutant)
+        for mode in ("unprotected", "permissions", "job-output"):
+            mutant = copy.deepcopy(self.workflow)
+            job = mutant["jobs"]["publish"]
+            if mode == "unprotected":
+                job.pop("environment")
+            elif mode == "permissions":
+                job["permissions"]["actions"] = "write"
+            else:
+                job["outputs"]["asset_token"] = "${{ steps.asset_token.outputs.token }}"
+            with self.subTest(job=mode), self.assertRaises(AssertionError):
+                self.assert_asset_read_token_wiring(mutant)
+
     def test_toolchain_file_is_validated_and_exported_to_the_hpo_build(self):
         reader = self.named["Read hpo toolchain arguments"]
         self.assertEqual(reader["id"], "toolchain")
@@ -973,6 +1235,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         self.assertIn("${{ steps.toolchain.outputs.args }}\n", build["with"]["build-args"])
         for existing in ("ENGINE_VERSION=${{ steps.pins.outputs.engine }}",
                          "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
+                         "GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}",
                          "${{ steps.pair.outputs.hpo_version_arg }}",
                          "${{ steps.binding.outputs.hpo_wheel_arg }}",
                          "${{ steps.binding.outputs.hpo_sdist_arg }}",
@@ -1004,7 +1267,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                     self.assertEqual(config["load"], "true")
                     self.assertEqual(config["push"], "false")
                     self.assertEqual(config["tags"], f"pineforge-source-inspect:{arch}")
-                    for key in ("context", "file", "target", "build-args", "labels"):
+                    for key in ("context", "file", "target", "build-args", "labels", "secrets"):
                         self.assertEqual(config.get(key), real["with"].get(key), key)
                     scope = f"type=gha,scope={target}-{arch}"
                     self.assertEqual(config["cache-from"], scope,
@@ -1025,6 +1288,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
                 arguments = self.named[name]["with"]["build-args"].splitlines()
                 for expected in ("ENGINE_VERSION=${{ steps.pins.outputs.engine }}",
                                  "CODEGEN_VERSION=${{ steps.pins.outputs.codegen }}",
+                                 "GUARD_POLICY_SETS_SHA256=${{ steps.pins.outputs.guard_policy_sets }}",
                                  "RELEASE_VERSION=${{ env.RELEASE_TAG }}"):
                     self.assertIn(expected, arguments, name + " must receive " + expected)
 
@@ -1254,267 +1518,6 @@ class PublishedHpoWheelCiTest(unittest.TestCase):
         self.assertLess(steps.index(parser), steps.index(tests))
 
 
-class GkePythonDiagnosticWorkflowTest(unittest.TestCase):
-    JOBS = {"diag-gke-python.yml": {"inspect": "gke-2cpu-4gb-amd64"}}
-    SETUP = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
-    CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-    TEST_COMMAND = (
-        "python3 -m unittest discover -s tests -p 'test_release_hpo_image.py' "
-        "-k 'HpoResolutionTest.test_published_transpile_bounds_against_codegen_1_5_0' -v"
-    )
-
-    def text(self):
-        return (WORKFLOWS / "diag-gke-python.yml").read_text(encoding="utf-8")
-
-    def parse(self, text):
-        import yaml
-        return yaml.load(text, Loader=yaml.BaseLoader)
-
-    def assert_diagnostic(self, text):
-        workflow = self.parse(text)
-        self.assertEqual(set(workflow), {"name", "on", "permissions", "jobs"})
-        self.assertEqual(workflow["name"], "Diagnose GKE Python and pip")
-        self.assertEqual(workflow["on"], {"workflow_dispatch": ""})
-        self.assertEqual(workflow["permissions"], {})
-        self.assertEqual(set(workflow["jobs"]), set(self.JOBS["diag-gke-python.yml"]))
-        job = workflow["jobs"]["inspect"]
-        self.assertEqual(set(job), {"runs-on", "timeout-minutes", "permissions", "steps"})
-        self.assertEqual(job["runs-on"], self.JOBS["diag-gke-python.yml"]["inspect"])
-        self.assertEqual(re.findall(r"(?m)^    runs-on:.*$", text),
-                         ["    runs-on: gke-2cpu-4gb-amd64"])
-        self.assertEqual(job["timeout-minutes"], "15")
-        self.assertEqual(job["permissions"], {"contents": "read"})
-        self.assertNotRegex(text, r"(?i)\bsecrets\s*(?:\.|\[)")
-        self.assertNotRegex(text, r"(?i)\bgithub\s*(?:\.\s*token|\[\s*['\"]token['\"]\s*\])")
-        self.assertNotIn("GITHUB_TOKEN", text.upper())
-        steps = job["steps"]
-        self.assertEqual(len(steps), 7)
-        self.assertEqual(steps[0], {
-            "name": "Install runner tools",
-            "run": "sudo apt-get update && sudo apt-get install -y ca-certificates curl git",
-        })
-        setup = {"uses": self.SETUP, "with": {"python-version": "3.12"}}
-        self.assertEqual(steps[1], setup)
-        self.assertEqual(set(steps[2]), {"name", "shell", "run"})
-        self.assertEqual(steps[2]["name"], "Inspect Python and pip visibility")
-        self.assertEqual(steps[2]["shell"], "bash")
-        self.assertEqual(steps[3], {
-            "uses": self.CHECKOUT, "id": "source", "if": "${{ !cancelled() }}",
-            "with": {"persist-credentials": "false"},
-        })
-        release = _workflow("python-test.yml")["jobs"]["release-rules"]["steps"]
-        self.assertEqual(setup, next(step for step in release
-                                    if step.get("uses", "").startswith("actions/setup-python@")))
-        checkout = next(step for step in release
-                        if step.get("uses", "").startswith("actions/checkout@"))
-        self.assertEqual(checkout, {"uses": self.CHECKOUT,
-                                    "with": {"persist-credentials": "false"}})
-        parser = next(step for step in release if step.get("name") == "Install workflow YAML parser")
-        download = next(step for step in release if step.get("name") == "Download published hpo wheels")
-        self.assertEqual(steps[4], {
-            **parser, "id": "dependencies",
-            "if": "${{ !cancelled() && steps.source.outcome == 'success' }}",
-        })
-        self.assertEqual(steps[5], {
-            **download, "id": "wheels",
-            "if": "${{ !cancelled() && steps.dependencies.outcome == 'success' }}",
-        })
-        self.assertEqual(steps[6], {
-            "name": "Reproduce published transpile bounds",
-            "if": "${{ !cancelled() && steps.dependencies.outcome == 'success' && "
-                  "steps.wheels.outcome == 'success' }}",
-            "continue-on-error": "true", "run": self.TEST_COMMAND,
-        })
-        for step in steps:
-            self.assertNotIn("${{", step.get("run", ""))
-            if "uses" in step:
-                self.assertRegex(step["uses"], r"^actions/(?:checkout|setup-python)@[0-9a-f]{40}$")
-
-    def diagnostic_source(self, text):
-        run = self.parse(text)["jobs"]["inspect"]["steps"][2]["run"]
-        self.assertTrue(run.startswith("set -eu\npython3 -B - <<'PY'\n"))
-        self.assertTrue(run.endswith("\nPY\n"))
-        return run.split("python3 -B - <<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0]
-
-    def assert_probe_output(self, text, failed_call=None, config_failure=False):
-        source = self.diagnostic_source(text)
-        environment = {
-            "HOME": "/private/diagnostic-home",
-            "PATH": "/private/diagnostic-bin:/usr/bin",
-            "PYTHONPATH": "/private/first-site:/private/second-site",
-            "PIP_TARGET": "/private/install-target",
-            "PIP_INDEX_URL": "https://example-user:example-password@example.invalid/simple",
-            "DIAGNOSTIC_TOKEN": "example-token-never-print",
-            "DIAGNOSTIC_PATH": "/",
-        }
-        extra_url = "https://unlisted-user:unlisted-password@example.invalid/diagnostic"
-        private_output = "\n".join([
-            *environment.values(), *environment["PYTHONPATH"].split(os.pathsep), extra_url,
-        ]) + "\n"
-        commands = []
-
-        def launch(command, **options):
-            commands.append((command, options))
-            status = int(len(commands) == failed_call)
-            return subprocess.CompletedProcess(command, status, private_output, private_output)
-
-        output = io.StringIO()
-        with patch.dict(os.environ, environment, clear=True), \
-                patch("pip._internal.configuration.Configuration") as configuration, \
-                patch.object(subprocess, "run", side_effect=launch), redirect_stdout(output):
-            configuration.return_value.items.return_value = [
-                ("install.target", environment["PIP_TARGET"]),
-                (":env:.target", environment["PIP_TARGET"]),
-                ("global.index-url", environment["PIP_INDEX_URL"]),
-            ]
-            if config_failure:
-                configuration.return_value.load.side_effect = ValueError(environment["PIP_INDEX_URL"])
-            with self.assertRaises(SystemExit) as stopped:
-                exec(compile(source, "<diagnostic workflow>", "exec"), {})
-        self.assertEqual(stopped.exception.code, int(failed_call is not None or config_failure))
-        log = output.getvalue()
-        for value in environment.values():
-            self.assertNotIn(value, log)
-        for component in environment["PYTHONPATH"].split(os.pathsep):
-            self.assertNotIn(component, log)
-        for index in range(2):
-            self.assertIn("<environment:PYTHONPATH[" + str(index) + "]>", log)
-        self.assertNotIn("example-user", log)
-        self.assertNotIn("example-password", log)
-        self.assertNotIn("unlisted-user", log)
-        self.assertNotIn("unlisted-password", log)
-        self.assertNotIn("global.index-url", log)
-        self.assertIn("environment variable names only:", log)
-        for name in ("HOME", "PYTHONPATH", "PIP_TARGET", "PIP_INDEX_URL"):
-            self.assertIn(name, log)
-        if not config_failure:
-            self.assertIn('pip location settings (values withheld): [":env:.target", "install.target"]', log)
-        self.assertEqual(len(commands), 6, "one failed command must not hide the remaining modes")
-        self.assertEqual(commands[0][0], ["which", "-a", "python3"])
-        self.assertEqual(commands[1][0], ["python3", "-B", "-m", "pip", "--version"])
-        modes = (
-            ("normal", [], None),
-            ("isolated", ["-I"], None),
-            ("stripped", [], {"PATH": os.defpath}),
-            ("isolated and stripped", ["-I"], {"PATH": os.defpath}),
-        )
-        for (label, flags, env), (command, options) in zip(modes, commands[2:]):
-            self.assertIn("\n" + label + "\n", log)
-            self.assertEqual(command[:-1], [sys.executable, *flags, "-B", "-c"])
-            self.assertEqual(options, {
-                "env": env, "capture_output": True, "text": True, "timeout": 30,
-            })
-            ast.parse(command[-1])
-        probe = commands[2][0][-1]
-        self.assertTrue(all(command[-1] == probe for command, _ in commands[2:]))
-        tree = ast.parse(probe)
-        fields = {key.value for node in ast.walk(tree) if isinstance(node, ast.Dict)
-                  for key in node.keys if isinstance(key, ast.Constant)}
-        self.assertEqual(fields, {
-            "executable", "real_executable", "base_executable", "version", "prefix", "base_prefix",
-            "path", "global_sites", "user_site", "user_site_enabled", "home_present", "isolated",
-            "sitecustomize", "usercustomize", "pip_origin", "vendored_import_error", "libpython_mapped",
-        })
-        self.assertIn('importlib.util.find_spec("pip")', probe)
-        self.assertIn("from pip._vendor.packaging.requirements import Requirement", probe)
-        self.assertIn("from pip._vendor.packaging.version import Version", probe)
-
-    def test_dispatch_only_secret_free_diagnostic_and_reproduction_are_exact(self):
-        self.assert_diagnostic(self.text())
-
-    def test_diagnostic_refuses_other_triggers_credentials_permissions_and_environments(self):
-        text = self.text()
-        mutations = [
-            ("on:\n", "on:\n  " + event + ":\n")
-            for event in ("push", "pull_request", "pull_request_target", "schedule",
-                          "workflow_call", "repository_dispatch", "release", "workflow_run")
-        ] + [
-            ("  workflow_dispatch:\n", "  workflow_dispatch:\n    inputs:\n      extra:\n        type: string\n"),
-            ("on:\n  workflow_dispatch:\n", "on: push\n"),
-            ("on:\n  workflow_dispatch:\n", "on: [workflow_dispatch, pull_request]\n"),
-            ("permissions: {}", "permissions: {contents: write}"),
-            ("      contents: read", "      contents: write"),
-            ("      contents: read", "      contents: read\n      actions: write"),
-            ("  inspect:\n", "  inspect:\n    environment: diagnostic\n"),
-            ("  inspect:\n", "  extra:\n    runs-on: ubuntu-latest\n    steps: []\n  inspect:\n"),
-            ("  inspect:\n", "  renamed:\n"),
-            ("        shell: bash\n", "        env:\n          TOKEN: ${{ secrets.DIAGNOSTIC_SECRET }}\n        shell: bash\n"),
-            ("        shell: bash\n", "        env:\n          TOKEN: ${{ secrets['DIAGNOSTIC_SECRET'] }}\n        shell: bash\n"),
-            ("        shell: bash\n", "        env:\n          TOKEN: ${{ github.token }}\n        shell: bash\n"),
-            ("          set -eu\n", "          set -eu\n          echo changed >> \"$GITHUB_TOKEN\"\n"),
-            ("          set -eu\n", "          set -eu\n          echo '${{ SECRETS.DIAGNOSTIC_SECRET }}'\n"),
-            ("          set -eu\n", "          set -eu\n          echo '${{ vars.DIAGNOSTIC_VALUE }}'\n"),
-            ("        shell: bash\n", "        continue-on-error: true\n        shell: bash\n"),
-            ("          persist-credentials: false", "          persist-credentials: true"),
-            (self.SETUP, "actions/setup-python@v7"),
-            (self.CHECKOUT, "actions/checkout@v7"),
-        ]
-        for before, after in mutations:
-            with self.subTest(replacement=after):
-                self.assertEqual(text.count(before), 1)
-                mutant = text.replace(before, after, 1)
-                self.assertNotEqual(mutant, text)
-                with self.assertRaises(AssertionError):
-                    self.assert_diagnostic(mutant)
-
-    def test_diagnostic_refuses_runner_substitution_arrays_and_hosted_fallbacks(self):
-        text = self.text()
-        for runner in (
-            "ubuntu-latest", "ubuntu-24.04", "gke-4cpu-8gb-amd64",
-            "[self-hosted, gke-2cpu-4gb-amd64]",
-            "${{ github.event_name == 'workflow_dispatch' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
-        ):
-            with self.subTest(runner=runner):
-                mutant = text.replace("runs-on: gke-2cpu-4gb-amd64", "runs-on: " + runner, 1)
-                self.assertNotEqual(mutant, text)
-                with self.assertRaises(AssertionError):
-                    self.assert_diagnostic(mutant)
-
-    def test_all_four_modes_run_and_sensitive_values_are_withheld_even_on_failure(self):
-        text = self.text()
-        self.assert_probe_output(text)
-        for failed_call in range(1, 7):
-            with self.subTest(failed_call=failed_call):
-                self.assert_probe_output(text, failed_call=failed_call)
-        self.assert_probe_output(text, config_failure=True)
-
-    def test_output_checks_refuse_environment_config_and_subprocess_value_leaks(self):
-        text = self.text()
-        for before, after in (
-            ("redact(result.stdout)", "result.stdout"),
-            ("redact(result.stderr)", "result.stderr"),
-            ("text = re.sub(", "text = text # re.sub("),
-            ("k for k, _ in config.items() if k in location_keys",
-             "(k, v) for k, v in config.items() if k in location_keys"),
-            ('print("environment variable names only:", json.dumps(sorted(',
-             'print("environment values:", dict(os.environ)); print("environment variable names only:", json.dumps(sorted('),
-        ):
-            with self.subTest(replacement=after):
-                self.assertEqual(text.count(before), 1)
-                mutant = text.replace(before, after, 1)
-                with self.assertRaises(AssertionError):
-                    self.assert_probe_output(mutant)
-
-    def test_probe_checks_refuse_changed_modes_executables_fields_and_failure_status(self):
-        text = self.text()
-        for before, after in (
-            ('("isolated", ["-I"], None)', '("isolated", [], None)'),
-            ('("stripped", [], {"PATH": os.defpath})', '("stripped", [], None)'),
-            ('("isolated and stripped", ["-I"], {"PATH": os.defpath})',
-             '("isolated and stripped", ["-I"], None)'),
-            ('[sys.executable, *flags, "-B", "-c", probe]',
-             '["python3", *flags, "-B", "-c", probe]'),
-            ('"pip_origin": None if spec is None else spec.origin, ', ""),
-            ("failed |= result.returncode != 0", "failed = False"),
-            ("sys.exit(int(failed))", "sys.exit(0)"),
-        ):
-            with self.subTest(replacement=after):
-                self.assertEqual(text.count(before), 1)
-                mutant = text.replace(before, after, 1)
-                with self.assertRaises(AssertionError):
-                    self.assert_probe_output(mutant, failed_call=3)
-
-
 class HpoWorkflowTest(unittest.TestCase):
     """Run the real payload, probe and publish guard scripts on local fixtures.
 
@@ -1533,6 +1536,8 @@ class HpoWorkflowTest(unittest.TestCase):
     def fixture(self, root):
         (root / "scripts").mkdir()
         shutil.copyfile(REPO / "scripts" / "release_pair.py", root / "scripts" / "release_pair.py")
+        (root / "docker").mkdir()
+        shutil.copyfile(REPO / "docker" / "GUARD-POLICY-SETS.pin", root / "docker" / "GUARD-POLICY-SETS.pin")
         (root / "VERSION").write_text("1.5.9\n", encoding="utf-8")
         (root / "state").mkdir()
         (root / "gitconfig-empty").touch()
@@ -2417,15 +2422,23 @@ class RedeliverWorkflowTest(unittest.TestCase):
 
 
 class HarnessSyncTest(unittest.TestCase):
-    """The release image carries exactly the engine's ten runtime harness files. One script holds
+    """The release image carries exactly the engine's sixteen runtime harness files. One script holds
     the list and syncs it from the pinned engine tag; the Dockerfile installs that list and checks
     the installed files against the sums the script recorded. Text checks only: nothing is fetched
     or built here."""
 
-    MODULES = ("bind_compiled_inventory.py", "pf_bars.py", "pf_sink.py", "request_feed_inventory.py",
-               "run_execution_observer.py", "run_phase_transport.py",
+    MODULES = ("bind_compiled_inventory.py", "pf_bars.py", "pf_sink.py",
+               "pineforge_report_deadlines.py",
+               "pineforge_report_supervise.py", "pineforge_sink_finalize.py", "pineforge_sink_to_json.py",
+               "quota_columns.py", "request_feed_inventory.py",
+               "run_execution_observer.py", "run_phase_transport.py", "run_quota.py",
                "selected_window_plan.py", "selected_window_report.py")
-    HARNESS = tuple(sorted(MODULES + ("entrypoint.sh", "run_json.py")))
+    HARNESS = ("bind_compiled_inventory.py", "entrypoint.sh", "pf_bars.py", "pf_sink.py",
+               "pineforge_report_deadlines.py",
+               "pineforge_report_supervise.py", "pineforge_sink_finalize.py", "pineforge_sink_to_json.py",
+               "quota_columns.py", "request_feed_inventory.py", "run_execution_observer.py",
+               "run_json.py", "run_phase_transport.py", "run_quota.py",
+               "selected_window_plan.py", "selected_window_report.py")
     SUMS = "HARNESS-SHA256SUMS"
 
     @classmethod
@@ -2436,13 +2449,13 @@ class HarnessSyncTest(unittest.TestCase):
         cls.listed = array.group(1).split() if array else []
         cls.copied = re.findall(r"^COPY docker/(\S+)\s+/opt/pineforge/bin/(\S+)\s*$", cls.dockerfile, re.M)
 
-    def test_the_list_is_the_ten_engine_harness_files(self):
+    def test_the_list_is_the_sixteen_engine_harness_files(self):
         self.assertEqual(self.listed, list(self.HARNESS))
         for name in self.MODULES:
             with self.subTest(module=name):
                 self.assertIn(name, self.listed)
 
-    def test_the_ten_files_are_committed_in_docker(self):
+    def test_the_sixteen_files_are_committed_in_docker(self):
         for name in self.HARNESS:
             with self.subTest(file=name):
                 self.assertTrue((REPO / "docker" / name).is_file())
@@ -2462,7 +2475,7 @@ class HarnessSyncTest(unittest.TestCase):
         for name in names:
             if name.endswith("_test.py") or name.upper().startswith("README"):
                 problems.append(f"test or readme: {name}")
-        # the ten files, in the order of the script's list and of the build's check: none missing, extra or twice
+        # the sixteen files, in the order of the script's list and of the build's check: none missing, extra or twice
         if names != list(cls.HARNESS):
             problems.append("names")
         for digest, name in entries:
@@ -2483,7 +2496,7 @@ class HarnessSyncTest(unittest.TestCase):
         digest, name = lines[3].rstrip("\n").split("  ")
         ghost = "ghost.py"
         self.assertFalse((docker / ghost).exists(), ghost)
-        # a real file that is not one of the ten, with its real hash: an extra entry that is neither wrong nor absent
+        # a real file that is not one of the sixteen, with its real hash: an extra entry that is neither wrong nor absent
         extra = f"{hashlib.sha256((docker / 'Dockerfile').read_bytes()).hexdigest()}  Dockerfile\n"
         flipped = ("1" if digest[0] == "0" else "0") + digest[1:]
         forced = {
@@ -2591,7 +2604,7 @@ class HarnessBuildCheckTest(unittest.TestCase):
 
     CHECK = "sha256sum -c --strict HARNESS-SHA256SUMS"
     IMAGE_BIN = "/opt/pineforge/bin"
-    SUCCESS = "harness: the ten files match HARNESS-SHA256SUMS"
+    SUCCESS = "harness: the sixteen files match HARNESS-SHA256SUMS"
     SUMS = HarnessSyncTest.SUMS
     HARNESS = HarnessSyncTest.HARNESS
     TOOLS = ("bash", "grep", "ls", "sed", "sha256sum", "tr")  # bash runs the check; the rest are the check's own commands
@@ -2657,7 +2670,7 @@ class HarnessBuildCheckTest(unittest.TestCase):
         path.write_bytes("".join(f"{digest}  {name}\n" for digest, name in edit(entries)).encode("utf-8"))
 
     def _error(self, listed: list[str], present: list[str]) -> str:
-        """The line the check prints when the name lists are not the ten, for these two lists."""
+        """The line the check prints when the name lists are not the sixteen, for these two lists."""
         return (f"ERROR: HARNESS-SHA256SUMS lists [{' '.join(listed)}] and bin/ holds [{' '.join(present)}]; "
                 f"both must be exactly [{' '.join(self.HARNESS)}]")
 
@@ -2702,7 +2715,7 @@ class HarnessBuildCheckTest(unittest.TestCase):
             victim.write_bytes(data[:middle] + bytes([data[middle] ^ 1]) + data[middle + 1:])
             self._fails_on_hash(bin_dir, victim.name)
 
-    def test_an_eleventh_file_in_the_directory_fails_the_check(self):
+    def test_a_seventeenth_file_in_the_directory_fails_the_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = self._layout(Path(tmp))
             self._passes(bin_dir)
@@ -2723,7 +2736,7 @@ class HarnessBuildCheckTest(unittest.TestCase):
             self._edit_sums(bin_dir, lambda entries: [entry for entry in entries if entry[1] != "run_execution_observer.py"])
             self._fails_on_names(bin_dir)
 
-    def test_a_sums_line_for_an_eleventh_name_fails_the_check(self):
+    def test_a_sums_line_for_a_seventeenth_name_fails_the_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = self._layout(Path(tmp))
             self._passes(bin_dir)
@@ -2771,14 +2784,13 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         "publish.yml": {"tag-guard", "prepare", "publish", "failure-report"},
         "release-finalize.yml": {"finalize", "release-attempt-cleanup", "notify-consumers",
                                 "report-compute-configuration-error"},
-        "release-fanout-check.yml": {"check"},
         "release-redeliver.yml": {"redeliver"},
         "release-receipts.yml": {"plan", "verify"},
         "release-reconcile.yml": {"producers"},
         "release-rollback.yml": {"restore"},
     }
     RUNNER = ["self-hosted", "pf-ci", "pf-ci-release"]
-    # Only the read-only fanout probe uses the protected runner.
+    # All remaining release jobs use GitHub-hosted runners.
     HOSTED_JOBS = {
         ("facts-descriptions.yml", "descriptions"),
         ("facts-fanout.yml", "web"),
@@ -2798,14 +2810,6 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
         ("release-reconcile.yml", "producers"),
         ("release-rollback.yml", "restore"),
     }
-    PROTECTED_JOBS = {
-        ("release-fanout-check.yml", "check"): "gkp-2cpu-4gb-amd64",
-    }
-    PROBE_INSTALL_STEP = {
-        "name": "Install tools",
-        "run": "sudo apt-get update && sudo apt-get install -y git ca-certificates python3",
-    }
-
     def release_workflows(self):
         return {name: _workflow(name) for name in self.RELEASE_JOBS}
 
@@ -2826,7 +2830,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
             expected = identities | ({"notify-consumers"} if name == "publish.yml" else set())
             self.assertEqual(set(workflow["jobs"]), expected, f"{name}: release job inventory")
             for identity in sorted(identities):
-                runner = self.PROTECTED_JOBS.get((name, identity), "ubuntu-latest")
+                runner = "ubuntu-latest"
                 self.assertEqual(workflow["jobs"][identity]["runs-on"], runner,
                                  f"{name}:{identity}: runs-on must be {runner}")
         self.assert_hosted_runners(workflows)
@@ -2834,154 +2838,14 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
     def test_release_jobs_pin_exact_runners_and_never_accept_pr_events(self):
         self.assert_release_runners(self.release_workflows())
 
-    def test_only_the_probe_is_protected_among_eighteen_release_jobs(self):
-        self.assertEqual(self.PROTECTED_JOBS, {
-            ("release-fanout-check.yml", "check"): "gkp-2cpu-4gb-amd64",
-        })
+    def test_all_seventeen_release_jobs_are_hosted(self):
         self.assertEqual(len(self.HOSTED_JOBS), 17)
-        self.assertTrue(self.HOSTED_JOBS.isdisjoint(self.PROTECTED_JOBS))
-        self.assertEqual(self.HOSTED_JOBS | set(self.PROTECTED_JOBS), {
+        self.assertEqual(self.HOSTED_JOBS, {
             (name, identity)
             for name, identities in self.RELEASE_JOBS.items()
             for identity in identities
         })
         self.assert_release_runners(self.release_workflows())
-
-    def assert_protected_probe(self, workflow):
-        self.assertEqual(workflow["on"], {
-            "workflow_dispatch": {"inputs": {"tag": {
-                "description": "Published vX.Y.Z tag to inspect",
-                "type": "string",
-                "required": "true",
-            }}},
-        })
-        self.assertEqual(workflow["permissions"], {"contents": "read", "actions": "read"})
-        job = workflow["jobs"]["check"]
-        self.assertEqual(job["runs-on"], "gkp-2cpu-4gb-amd64")
-        self.assertEqual(job["environment"], "release-automation")
-        self.assertNotIn("container", job)
-        self.assertNotIn("if", job)
-        self.assertNotIn("continue-on-error", job)
-        steps = job["steps"]
-        self.assertEqual(steps[0], self.PROBE_INSTALL_STEP)
-        self.assertEqual([(step.get("name"), step.get("uses")) for step in steps], [
-            ("Install tools", None),
-            (None, "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"),
-            ("Mint receiver Actions read token",
-             "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510"),
-            ("Check release fanout", None),
-        ])
-        self.assertEqual(steps[1]["with"], {"ref": "main", "persist-credentials": "false"})
-        for permission in ("permission-contents", "permission-actions"):
-            self.assertEqual(steps[2]["with"][permission], "read")
-        self.assertEqual(steps[3], {
-            "name": "Check release fanout",
-            "env": {
-                "GH_HUB_TOKEN": "${{ github.token }}",
-                "GH_RECEIVER_TOKEN": "${{ steps.receiver-token.outputs.token }}",
-            },
-            "run": 'python3 scripts/release_fanout_check.py check --tag "$TAG"',
-        })
-        for step in steps:
-            self.assertNotIn("if", step)
-            self.assertNotIn("continue-on-error", step)
-
-    def assert_protected_probe_runner_text(self, text):
-        block = re.search(r"(?ms)^  check:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
-        self.assertIsNotNone(block)
-        self.assertEqual(re.findall(r"(?m)^    runs-on:.*$", block[1]),
-                         ["    runs-on: gkp-2cpu-4gb-amd64"])
-
-    def test_protected_probe_installs_tools_before_checkout_and_credentials(self):
-        self.assert_protected_probe(_workflow("release-fanout-check.yml"))
-        text = (WORKFLOWS / "release-fanout-check.yml").read_text(encoding="utf-8")
-        self.assert_protected_probe_runner_text(text)
-
-    def test_protected_probe_refuses_hosted_general_labels_and_fallbacks(self):
-        original = self.release_workflows()
-        self.assert_release_runners(original)
-        for runner in (
-            "ubuntu-latest",
-            "gke-2cpu-4gb-amd64",
-            "gke-4cpu-8gb-amd64",
-            "gkp-4cpu-8gb-amd64",
-            "gkp-2cpu-4gb-arm64",
-            ["gkp-2cpu-4gb-amd64"],
-            ["gkp-2cpu-4gb-amd64", "ubuntu-latest"],
-            {"group": "protected", "labels": "gkp-2cpu-4gb-amd64"},
-            "${{ 'gkp-2cpu-4gb-amd64' }}",
-            "${{ github.event_name == 'workflow_dispatch' && 'gkp-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
-        ):
-            with self.subTest(runner=runner):
-                mutant = copy.deepcopy(original)
-                mutant["release-fanout-check.yml"]["jobs"]["check"]["runs-on"] = runner
-                with self.assertRaisesRegex(AssertionError, "runs-on must be gkp-2cpu-4gb-amd64"):
-                    self.assert_release_runners(mutant)
-
-    def test_protected_probe_refuses_quoted_folded_and_expression_runner_lines(self):
-        text = (WORKFLOWS / "release-fanout-check.yml").read_text(encoding="utf-8")
-        self.assert_protected_probe_runner_text(text)
-        original = "    runs-on: gkp-2cpu-4gb-amd64"
-        self.assertEqual(text.count(original + "\n"), 1)
-        for replacement in (
-            "    runs-on: 'gkp-2cpu-4gb-amd64'",
-            '    runs-on: "gkp-2cpu-4gb-amd64"',
-            "    runs-on: >\n      gkp-2cpu-4gb-amd64",
-            "    runs-on: ${{ 'gkp-2cpu-4gb-amd64' }}",
-        ):
-            with self.subTest(source=replacement):
-                mutant = text.replace(original, replacement, 1)
-                self.assertNotEqual(mutant, text)
-                with self.assertRaises(AssertionError):
-                    self.assert_protected_probe_runner_text(mutant)
-
-    def test_protected_probe_refuses_missing_late_conditional_duplicate_or_changed_installation(self):
-        original = _workflow("release-fanout-check.yml")
-        self.assert_protected_probe(original)
-        mutants = []
-        mutant = copy.deepcopy(original)
-        mutant["jobs"]["check"]["steps"].pop(0)
-        mutants.append(("missing", mutant))
-        for index in (1, 3):
-            mutant = copy.deepcopy(original)
-            steps = mutant["jobs"]["check"]["steps"]
-            steps.insert(index, steps.pop(0))
-            mutants.append((f"late at {index}", mutant))
-        mutant = copy.deepcopy(original)
-        mutant["jobs"]["check"]["steps"].insert(0, copy.deepcopy(self.PROBE_INSTALL_STEP))
-        mutants.append(("duplicate", mutant))
-        for key, value in (
-            ("if", "always()"),
-            ("if", "github.event_name == 'workflow_dispatch'"),
-            ("if", "false"),
-            ("continue-on-error", "true"),
-            ("name", "Install optional tools"),
-            ("run", self.PROBE_INSTALL_STEP["run"] + " || true"),
-            ("run", "sudo apt-get update && sudo apt-get install -y git ca-certificates"),
-        ):
-            mutant = copy.deepcopy(original)
-            mutant["jobs"]["check"]["steps"][0][key] = value
-            mutants.append((f"{key}: {value}", mutant))
-        for label, mutant in mutants:
-            with self.subTest(mutation=label):
-                self.assertNotEqual(mutant, original)
-                with self.assertRaises(AssertionError):
-                    self.assert_protected_probe(mutant)
-
-    def test_protected_probe_refuses_containers_conditions_and_error_suppression(self):
-        original = _workflow("release-fanout-check.yml")
-        self.assert_protected_probe(original)
-        for key, value in (
-            ("container", "ubuntu:24.04"),
-            ("container", {"image": "ubuntu:24.04"}),
-            ("if", "always()"),
-            ("continue-on-error", "true"),
-        ):
-            with self.subTest(key=key, value=value):
-                mutant = copy.deepcopy(original)
-                mutant["jobs"]["check"][key] = value
-                with self.assertRaises(AssertionError):
-                    self.assert_protected_probe(mutant)
 
     def test_hosted_runner_pin_refuses_the_release_array_on_each_release_job(self):
         original = self.release_workflows()
@@ -3006,7 +2870,7 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
             if path.suffix in {".yml", ".yaml"}
         }
         self.assert_no_release_runner_labels(original)
-        for name, identity in sorted(self.HOSTED_JOBS | set(self.PROTECTED_JOBS)):
+        for name, identity in sorted(self.HOSTED_JOBS):
             with self.subTest(workflow=name, job=identity):
                 mutant = copy.deepcopy(original)
                 mutant[name]["jobs"][identity]["runs-on"] = self.RUNNER.copy()
@@ -3014,16 +2878,16 @@ class ReleaseRunnerWorkflowTest(unittest.TestCase):
                     self.assert_no_release_runner_labels(mutant)
 
     def test_release_finalize_stops_the_apt_timers_before_anything_else(self):
-        # LB-504: apt-daily-upgrade.timer re-execs systemd 20-25 minutes after
+        # apt-daily-upgrade.timer re-execs systemd 20-25 minutes after
         # boot and kills the runner, and the finalizer runs hourly on
-        # ubuntu-latest (owner 10-21). Both of its jobs must stop the timers before any
+        # ubuntu-latest. Both of its jobs must stop the timers before any
         # checkout, secret or repository code.
         jobs = _workflow("release-finalize.yml")["jobs"]
         for identity in ("finalize", "notify-consumers"):
             with self.subTest(job=identity):
                 self.assertEqual((jobs.get(identity, {}).get("steps") or [{}])[0],
                                  ReleaseTriggerWorkflowTest.APT_GUARD_STEP,
-                                 identity + " must stop the apt timers before anything else (LB-504)")
+                                 identity + " must stop the apt timers before anything else")
 
     def test_runner_pin_refuses_wrong_labels_other_pools_and_fallbacks_on_every_job(self):
         original = self.release_workflows()
@@ -3090,7 +2954,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         "facts-validate.yml": {"validate"},
     }
     HOSTED_ONLY_RUNNERS = {"authz": "ubuntu-24.04", "release-rules": "ubuntu-latest"}
-    # owner 10-21 (msg 1562390657274748981): pineforge-release runs on GitHub-hosted runners; R6/rule-B exception for this repo
+    # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
     HOSTED_JOBS = {
         ("python-test.yml", "authz"),
         ("python-test.yml", "changes"),
@@ -3104,9 +2968,7 @@ class PrTierWorkflowTest(unittest.TestCase):
     }
     # Old pool labels remain negative-control fixtures.
     RUNNER = ["self-hosted", "pf-ci", "pf-ci-x64"]
-    PUSH_RUNNER = "${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}"
-    RUNNER_LINE = "    runs-on: " + PUSH_RUNNER
-    RUNNER_COUNTS = {"python-test.yml": 5, "facts-validate.yml": 1}
+    LEGACY_PUSH_RUNNER = "${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}"
     PUSH_PACKAGES = {
         "validate": "ca-certificates diffutils git python3",
         "changes": "python3",
@@ -3129,12 +2991,12 @@ class PrTierWorkflowTest(unittest.TestCase):
                 "github.event.pull_request.head.repo.full_name == github.repository")
     AUTHZ_RUNNER_LINE = "    runs-on: ubuntu-24.04"
     AUTHZ_POOL_RUNNER_LINE = '    runs-on: ["self-hosted", "pf-ci", "pf-ci-x64"]'
-    # Literal current ci-labels.md hosted authz (owner #1050, LB-437).
+    # Literal current ci-labels.md hosted authz.
     # Keep this independent of the workflows: every byte, including comments,
     # permissions and both permission lookups, is pinned.
     AUTHZ_TEXT = """  authz:
     name: authz
-    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
+    # Standard GitHub-hosted label; never a larger-runner label.
     runs-on: ubuntu-24.04
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
@@ -3150,7 +3012,7 @@ class PrTierWorkflowTest(unittest.TestCase):
           WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           WR_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
           GH_TOKEN: ${{ github.token }}   # read-only use: one permission lookup for workflow_run
-          # Bot logins whose same-repository pull requests count as ours: dependabot[bot] (CI-DEPBOT A)
+          # Bot logins whose same-repository pull requests count as ours: dependabot[bot]
           # and the org's own GitHub App bot logins by name (space-separated), nothing else.
           ALLOWED_BOTS: "dependabot[bot] pineforge-app[bot]"
         run: |
@@ -3162,7 +3024,7 @@ class PrTierWorkflowTest(unittest.TestCase):
               # events; none of them runs pull-request code.
               ;;
             workflow_run)
-              # LB-437: bind identity to the triggering run and its re-runner.
+              # Bind identity to the triggering run and its re-runner.
               # These two App bots are fixed canon policy; ALLOWED_BOTS is PR-only.
               [ -n "${WR_HEAD_REPO:-}" ] || fail "workflow_run head repository is missing"
               [ -n "${WR_ACTOR:-}" ] || fail "workflow_run triggering actor is missing"
@@ -3218,7 +3080,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         (github.event_name != 'pull_request' ||
          (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)) &&
         fromJSON('["self-hosted","pf-ci","pf-ci-x64"]') || 'ubuntu-24.04' }}"""
-    # Release routes stay hosted except for the read-only protected probe.
+    # All remaining release routes stay hosted.
     EXEMPT_RUNNERS = {
         "facts-descriptions.yml": {"descriptions": "ubuntu-latest"},
         "facts-fanout.yml": {"web": "ubuntu-latest", "license": "ubuntu-latest"},
@@ -3229,7 +3091,6 @@ class PrTierWorkflowTest(unittest.TestCase):
         "release-finalize.yml": {"finalize": "ubuntu-latest", "release-attempt-cleanup": "ubuntu-latest",
                                  "notify-consumers": "ubuntu-latest",
                                  "report-compute-configuration-error": "ubuntu-latest"},
-        "release-fanout-check.yml": {"check": "gkp-2cpu-4gb-amd64"},
         "release-redeliver.yml": {"redeliver": "ubuntu-latest"},
         "release-receipts.yml": {"plan": "ubuntu-latest", "verify": "ubuntu-latest"},
         "release-reconcile.yml": {"producers": "ubuntu-latest"},
@@ -3241,7 +3102,7 @@ class PrTierWorkflowTest(unittest.TestCase):
     }
 
     def expected_runner(self, identity):
-        return self.HOSTED_ONLY_RUNNERS.get(identity, self.PUSH_RUNNER)
+        return self.HOSTED_ONLY_RUNNERS.get(identity, "ubuntu-24.04")
 
     def assert_runner(self, runner, identity):
         expected = self.expected_runner(identity)
@@ -3488,13 +3349,14 @@ class PrTierWorkflowTest(unittest.TestCase):
     def test_each_runner_pin_refuses_pool_arrays_fragments_unavailable_labels_and_labels_env(self):
         for name in self.ROUTED_JOBS:
             text = (WORKFLOWS / name).read_text()
-            self.assertEqual(text.count(self.RUNNER_LINE + "\n"), self.RUNNER_COUNTS[name])
-            for identity, job in _workflow(name)["jobs"].items():
+            jobs = _workflow(name)["jobs"]
+            self.assert_literal_routes(text, jobs)
+            for identity, job in jobs.items():
                 self.assert_hosted_job(job, identity)
                 for runner in (
                     self.RUNNER.copy(),
-                    "ubuntu-latest" if identity == "authz" else "ubuntu-24.04",
-                    self.PUSH_RUNNER if identity == "release-rules" else "ubuntu-latest",
+                    "ubuntu-24.04" if identity == "release-rules" else "ubuntu-latest",
+                    self.LEGACY_PUSH_RUNNER,
                     "gke-2cpu-4gb-amd64",
                     "${{ github.event_name == 'pull_request' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
                     "${{ github.event_name == 'merge_group' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
@@ -3517,18 +3379,21 @@ class PrTierWorkflowTest(unittest.TestCase):
                 mutant = copy.deepcopy(job)
                 mutant.setdefault("env", {})["PF_CI_LABELS"] = json.dumps(self.RUNNER)
                 with self.subTest(workflow=name, job=identity, mutation="labels env"):
+                    self.assertNotEqual(mutant, job)
                     with self.assertRaises(AssertionError):
                         self.assert_hosted_job(mutant, identity)
                 block = re.search(rf"(?ms)^  {re.escape(identity)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", text)
                 self.assertIsNotNone(block)
                 original = "    runs-on: " + self.expected_runner(identity)
-                replacement = self.AUTHZ_POOL_RUNNER_LINE if identity == "authz" else self.POOL_RUNNER_LINE
                 self.assertEqual(block[0].count(original + "\n"), 1, identity)
-                altered = block[0].replace(original, replacement, 1)
-                mutant_text = text[:block.start()] + altered + text[block.end():]
-                self.assertNotEqual(mutant_text, text)
-                with self.assertRaises(AssertionError):
-                    self.assert_literal_routes(mutant_text, {identity})
+                pool = self.AUTHZ_POOL_RUNNER_LINE if identity == "authz" else self.POOL_RUNNER_LINE
+                for replacement in (pool, "    runs-on: " + self.LEGACY_PUSH_RUNNER):
+                    altered = block[0].replace(original, replacement, 1)
+                    mutant_text = text[:block.start()] + altered + text[block.end():]
+                    with self.subTest(workflow=name, job=identity, replacement=replacement):
+                        self.assertNotEqual(mutant_text, text)
+                        with self.assertRaises(AssertionError):
+                            self.assert_literal_routes(mutant_text, {identity})
 
     def test_push_tools_refuse_missing_late_unguarded_or_changed_installation(self):
         for name in self.ROUTED_JOBS:
@@ -4419,6 +4284,10 @@ class PrTierWorkflowTest(unittest.TestCase):
                     with self.assertRaises(AssertionError):
                         self.assert_authz_decision(mutant, inputs, accepted, **options)
 
+    JOB_RUNNER_DOCUMENTATION = re.compile(
+        r"`([^`]+\.yml)` jobs? ((?:`[^`]+`(?:, | and )?)+) uses? `runs-on: ([^`]+)`"
+    )
+
     def assert_authz_runner_documentation(self, chain, readme, workflows):
         introduction, supervisor = chain.split("## Supervisor configuration\n", 1)
         canonical_descriptions = re.findall(
@@ -4445,18 +4314,26 @@ class PrTierWorkflowTest(unittest.TestCase):
                 r"`authz`(?: jobs)? uses? `runs-on: ([^`]+)`; "
                 r"the other (?:PR )?jobs use `runs-on: ([^`]+)`", normalized)
             self.assertTrue(runner_pairs, f"{label}: distinguish authz from the other hosted jobs")
-            # The jobs that run on pushes to main use the documented push-triggered runner; every other
-            # non-authz job uses the documented hosted runner.
-            push_runners = set(re.findall(r"push-triggered runner `runs-on: ([^`]+)`", normalized))
-            self.assertTrue(push_runners, f"{label}: document the push-triggered runner of the PR-CI jobs")
+            self.assertNotIn("push-triggered runner", normalized,
+                             f"{label}: document literal hosted routes for every configured event")
+            documented_jobs = {}
+            for name, identities, runner in self.JOB_RUNNER_DOCUMENTATION.findall(normalized):
+                self.assertIn(name, workflows, f"{label}: documented workflow")
+                for identity in re.findall(r"`([^`]+)`", identities):
+                    self.assertIn(identity, workflows[name]["jobs"], f"{label}: documented job")
+                    self.assertEqual(runner, workflows[name]["jobs"][identity]["runs-on"],
+                                     f"{label}: {name}:{identity}: documented runner")
+                    self.assertNotIn((name, identity), documented_jobs,
+                                     f"{label}: duplicate runner assignment")
+                    documented_jobs[name, identity] = runner
             for runners in runner_pairs:
                 for name, workflow in workflows.items():
                     for identity, job in workflow["jobs"].items():
                         if identity == "authz":
                             self.assertEqual(runners[0], job["runs-on"], f"{label}: {name}:{identity}")
                         else:
-                            self.assertIn(job["runs-on"], {runners[1], *push_runners},
-                                          f"{label}: {name}:{identity}")
+                            self.assertEqual(job["runs-on"], documented_jobs.get((name, identity), runners[1]),
+                                             f"{label}: {name}:{identity}: documented runner")
 
     def test_authz_runner_documentation_matches_workflows_and_refuses_stale_runners(self):
         documents = {"chain": (REPO / "docs/release-chain.md").read_text(),
@@ -4478,6 +4355,25 @@ class PrTierWorkflowTest(unittest.TestCase):
                 self.assertNotEqual(mutant, documents)
                 with self.assertRaises(AssertionError):
                     self.assert_authz_runner_documentation(mutant["chain"], mutant["readme"], workflows)
+        for document, text in documents.items():
+            for match in self.JOB_RUNNER_DOCUMENTATION.finditer(text.replace("\n", " ")):
+                # Match offsets use the same length-preserving newline normalization.
+                original = text[match.start():match.end()]
+                runner = match[3]
+                wrong_runner = "ubuntu-latest" if runner == "ubuntu-24.04" else "ubuntu-24.04"
+                replacements = [
+                    "",
+                    original.replace("`runs-on: " + runner + "`", "`runs-on: " + wrong_runner + "`", 1),
+                ]
+                replacements.extend(original.replace("`" + identity + "`", "`unknown-job`", 1)
+                                    for identity in re.findall(r"`([^`]+)`", match[2]))
+                for replacement in replacements:
+                    mutant = dict(documents)
+                    mutant[document] = text[:match.start()] + replacement + text[match.end():]
+                    with self.subTest(document=document, mutation=original, replacement=replacement):
+                        self.assertNotEqual(mutant, documents)
+                        with self.assertRaises(AssertionError):
+                            self.assert_authz_runner_documentation(mutant["chain"], mutant["readme"], workflows)
 
     def test_authz_runner_documentation_refuses_the_reported_exception_clause(self):
         chain = (REPO / "docs/release-chain.md").read_text()
@@ -4675,13 +4571,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         # This repository has no macOS jobs; its complete workflow/job inventory
         # below also refuses adding an unreviewed macOS/pool matrix.
         self.assertEqual({path.name for path in WORKFLOWS.glob("*.yml")},
-                         set(self.ROUTED_JOBS) | set(self.EXEMPT_RUNNERS) |
-                         set(GkePythonDiagnosticWorkflowTest.JOBS))
-        for name, expected in GkePythonDiagnosticWorkflowTest.JOBS.items():
-            jobs = _workflow(name)["jobs"]
-            self.assertEqual(set(jobs), set(expected))
-            for identity, runner in expected.items():
-                self.assertEqual(jobs[identity]["runs-on"], runner)
+                         set(self.ROUTED_JOBS) | set(self.EXEMPT_RUNNERS))
         for name, expected in self.EXEMPT_RUNNERS.items():
             jobs = _workflow(name)["jobs"]
             self.assertEqual(set(jobs), set(expected))
@@ -4694,9 +4584,7 @@ class PrTierWorkflowTest(unittest.TestCase):
                         "gke-4cpu-8gb-amd64",
                         "${{ github.event_name == 'workflow_dispatch' && 'gkp-2cpu-4gb-amd64' || 'ubuntu-latest' }}",
                     ]
-                    invalid_runners.append(
-                        "ubuntu-latest" if (name, identity) == ("release-fanout-check.yml", "check")
-                        else "gkp-2cpu-4gb-amd64")
+                    invalid_runners.append("gkp-2cpu-4gb-amd64")
                     for runner in invalid_runners:
                         with self.subTest(runner=runner):
                             mutant = copy.deepcopy(job)
@@ -4735,11 +4623,7 @@ class PrTierWorkflowTest(unittest.TestCase):
         facts = _workflow("facts-validate.yml")
         self.assertEqual(set(facts["on"]), {"pull_request", "push"})
         self.assertEqual(facts["on"]["push"]["branches"], ["main"])
-        self.assertEqual(facts["on"]["push"]["paths"], [
-            "facts/**", "scripts/repo_descriptions.py", "scripts/facts_*.py",
-            "tests/test_repo_descriptions.py", "tests/test_facts_*.py",
-            "tests/test_release_workflows.py", ".github/workflows/**",
-        ])
+        self.assertEqual(facts["on"]["push"], {"branches": ["main"]})
         validate = facts["jobs"]["validate"]
         self.assert_job_condition("validate", validate)
         self.assertEqual(validate["needs"], "authz")
@@ -4748,18 +4632,28 @@ class PrTierWorkflowTest(unittest.TestCase):
                          "${{ github.event_name == 'pull_request' && '0' || '1' }}")
         for step in validate["steps"][3:]:
             self.assertEqual(step["if"], "steps.paths.outputs.docs-only == 'false'")
+        discovery_steps = [
+            step for step in validate["steps"]
+            if "unittest discover" in step.get("run", "")
+        ]
+        self.assertTrue(discovery_steps, "validate must run unittest discover")
+        for step in discovery_steps:
+            self.assertEqual(step.get("if"), "steps.paths.outputs.docs-only == 'false'")
 
     def detector(self, workflow):
         jobs = _workflow(workflow)["jobs"]
         job = jobs["changes" if workflow == "python-test.yml" else "validate"]
         return next(step for step in job["steps"] if step.get("id") == "paths")["run"]
 
-    def detect(self, workflow, paths, event="pull_request", *, fail=False, script=None):
+    def detector_program(self, workflow, script=None):
         if script is None:
             script = self.detector(workflow)
         self.assertTrue(script.startswith("python3 - <<'PY'\n"))
         self.assertTrue(script.endswith("PY\n"))
-        program = script.removeprefix("python3 - <<'PY'\n").removesuffix("PY\n")
+        return script.removeprefix("python3 - <<'PY'\n").removesuffix("PY\n")
+
+    def detect(self, workflow, paths, event="pull_request", *, fail=False, script=None):
+        program = self.detector_program(workflow, script)
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "outputs"
             env = {"EVENT_NAME": event, "BASE_SHA": "base", "HEAD_SHA": "head",
@@ -4780,6 +4674,24 @@ class PrTierWorkflowTest(unittest.TestCase):
                 else:
                     diff.assert_not_called()
             return output.read_text() if output.exists() else None
+
+    def detect_subprocess(self, workflow, event):
+        program_text = self.detector_program(workflow)
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            program = directory / "detector.py"
+            output = directory / "outputs"
+            program.write_text(program_text, encoding="utf-8")
+            env = os.environ.copy()
+            env.update(
+                EVENT_NAME=event, BASE_SHA="", HEAD_SHA="", GITHUB_OUTPUT=str(output),
+            )
+            result = subprocess.run(
+                ["python3", "-I", str(program)],
+                cwd=directory, env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return output.read_text(encoding="utf-8")
 
     def test_docs_detection_executes_actual_scripts_on_docs_mixed_and_unknown_paths(self):
         self.assertEqual(self.detector("python-test.yml"), self.detector("facts-validate.yml"))
@@ -4814,6 +4726,8 @@ class PrTierWorkflowTest(unittest.TestCase):
             for event in ("push", "merge_group", "schedule", "workflow_dispatch", "release"):
                 with self.subTest(workflow=workflow, event=event):
                     self.assertEqual(self.detect(workflow, ["README.md"], event), "docs-only=false\n")
+                    if event == "push":
+                        self.assertEqual(self.detect_subprocess(workflow, event), "docs-only=false\n")
 
     def test_test_input_exclusions_are_exact_and_each_is_needed(self):
         rules = (

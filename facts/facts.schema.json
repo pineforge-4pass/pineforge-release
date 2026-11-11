@@ -162,7 +162,7 @@
       "properties": {
         "symbol": {
           "type": "string",
-          "pattern": "^[A-Z0-9_:!.]+$"
+          "pattern": "^(BINANCE|BINANCEUS|BYBIT|COINBASE|KRAKEN|BITSTAMP|BITFINEX|OKX|KUCOIN|GATEIO|MEXC|HUOBI|HTX|BITGET):[A-Z0-9_!.]+$"
         },
         "timeframe": {
           "type": "string",
@@ -194,6 +194,109 @@
         },
         "closedProbes": {
           "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "otherMarketTimeframe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timeframe",
+        "lanes",
+        "graded",
+        "excellent",
+        "strong",
+        "belowStrong",
+        "engineErrors",
+        "tiers"
+      ],
+      "properties": {
+        "timeframe": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*[DSWM]?$"
+        },
+        "lanes": {
+          "$ref": "#/$defs/count"
+        },
+        "graded": {
+          "$ref": "#/$defs/count"
+        },
+        "excellent": {
+          "$ref": "#/$defs/count"
+        },
+        "strong": {
+          "$ref": "#/$defs/count"
+        },
+        "belowStrong": {
+          "$ref": "#/$defs/count"
+        },
+        "engineErrors": {
+          "$ref": "#/$defs/count"
+        },
+        "tiers": {
+          "$ref": "#/$defs/tiers"
+        }
+      }
+    },
+    "otherMarkets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lanes",
+        "markets",
+        "additionalTimeframes",
+        "hardProbes",
+        "corpusProbes",
+        "closedProbes",
+        "graded",
+        "excellent",
+        "strong",
+        "belowStrong",
+        "engineErrors",
+        "tiers"
+      ],
+      "properties": {
+        "lanes": {
+          "$ref": "#/$defs/count"
+        },
+        "markets": {
+          "$ref": "#/$defs/count"
+        },
+        "additionalTimeframes": {
+          "$ref": "#/$defs/count"
+        },
+        "timeframes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/otherMarketTimeframe"
+          }
+        },
+        "hardProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "corpusProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "closedProbes": {
+          "$ref": "#/$defs/count"
+        },
+        "graded": {
+          "$ref": "#/$defs/count"
+        },
+        "excellent": {
+          "$ref": "#/$defs/count"
+        },
+        "strong": {
+          "$ref": "#/$defs/count"
+        },
+        "belowStrong": {
+          "$ref": "#/$defs/count"
+        },
+        "engineErrors": {
+          "$ref": "#/$defs/count"
+        },
+        "tiers": {
+          "$ref": "#/$defs/tiers"
         }
       }
     },
@@ -349,6 +452,9 @@
           "items": {
             "$ref": "#/$defs/pair"
           }
+        },
+        "otherMarkets": {
+          "$ref": "#/$defs/otherMarkets"
         },
         "scopes": {
           "type": "object",

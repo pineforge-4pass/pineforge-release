@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -9,6 +10,8 @@ import textwrap
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from facts_other_markets import aggregate_facts
 
 import test_facts_descriptions as descriptions
 from test_release_workflows import _step
@@ -228,6 +231,31 @@ class FanoutCLI(unittest.TestCase):
                 self.assertFalse((self.directory / "outputs").exists())
                 self.no_post()
 
+    def test_aggregate_snapshot_prepares_loads_and_dispatches_exact_digest(self):
+        raw = json.dumps(aggregate_facts()).encode()
+        self.github.files["facts/facts.json"] = raw
+        source = self.prepared()
+        self.assertEqual(source["sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual((self.directory / "source/facts.json").read_bytes(), raw)
+        result = self.dispatch()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        posts = [call for call in self.calls if call[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(json.loads(posts[0][2]), {
+            "event_type": "facts-update", "client_payload": {
+                "commit": self.github.commit, "sha256": hashlib.sha256(raw).hexdigest(), "dry_run": False}})
+
+    def test_aggregate_identity_payload_never_prepares_mint_or_dispatch(self):
+        facts = aggregate_facts()
+        facts["scoreboard"]["otherMarkets"]["venue"] = "PRIVATE"
+        self.github.files["facts/facts.json"] = json.dumps(facts).encode()
+        result = self.prepare()
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout)["diagnostic"], "invalid-input")
+        self.assertFalse((self.directory / "source").exists())
+        self.assertFalse((self.directory / "outputs").exists())
+        self.no_post()
+
     def test_snapshot_hash_or_schema_tamper_fails_without_calls(self):
         self.prepared()
         for name in ("facts.json", "facts.schema.json"):
@@ -308,6 +336,11 @@ class FanoutCLI(unittest.TestCase):
 
     def test_actual_workflow_prepare_and_dispatch_shells(self):
         text = WORKFLOW.read_text()
+        checkout = self.directory / "checkout"
+        shutil.copytree(ROOT / "scripts", checkout / "scripts")
+        (checkout / "facts").mkdir()
+        for name, raw in self.github.files.items():
+            (checkout / name).write_bytes(raw)
         env = dict(self.env, RUNNER_TEMP=str(self.directory),
                    GITHUB_OUTPUT=str(self.directory / "outputs"), DRY_RUN="true",
                    FACTS_WEB_DISPATCH_ENABLED="false", FACTS_READ_TOKEN="test-read",
@@ -321,7 +354,7 @@ class FanoutCLI(unittest.TestCase):
             if enabled:
                 env.update(FACTS_WEB_DISPATCH_ENABLED="true", MINT_OUTCOME="success")
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
-                                    cwd=ROOT, env=dict(env, TEST_API=self.github.api),
+                                    cwd=checkout, env=dict(env, TEST_API=self.github.api),
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assert_redacted(result)

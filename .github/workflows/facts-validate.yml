@@ -2,16 +2,9 @@ name: facts-validate
 
 on:
   pull_request:
+  # Every push to main runs the facts tests, so there is no path filter.
   push:
     branches: [main]
-    paths:
-      - 'facts/**'
-      - 'scripts/repo_descriptions.py'
-      - 'scripts/facts_*.py'
-      - 'tests/test_repo_descriptions.py'
-      - 'tests/test_facts_*.py'
-      - 'tests/test_release_workflows.py'
-      - '.github/workflows/**'
 
 permissions:
   contents: read
@@ -24,7 +17,7 @@ concurrency:
 jobs:
   authz:
     name: authz
-    # Standard GitHub-hosted label (owner #1050); never a larger-runner label.
+    # Standard GitHub-hosted label; never a larger-runner label.
     runs-on: ubuntu-24.04
     permissions: {}
     # No timeout-minutes: the owner's no-time-limits rule (check-no-time-limits refuses new ones).
@@ -40,7 +33,7 @@ jobs:
           WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           WR_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
           GH_TOKEN: ${{ github.token }}   # read-only use: one permission lookup for workflow_run
-          # Bot logins whose same-repository pull requests count as ours: dependabot[bot] (CI-DEPBOT A)
+          # Bot logins whose same-repository pull requests count as ours: dependabot[bot]
           # and the org's own GitHub App bot logins by name (space-separated), nothing else.
           ALLOWED_BOTS: "dependabot[bot] pineforge-app[bot]"
         run: |
@@ -52,7 +45,7 @@ jobs:
               # events; none of them runs pull-request code.
               ;;
             workflow_run)
-              # LB-437: bind identity to the triggering run and its re-runner.
+              # Bind identity to the triggering run and its re-runner.
               # These two App bots are fixed canon policy; ALLOWED_BOTS is PR-only.
               [ -n "${WR_HEAD_REPO:-}" ] || fail "workflow_run head repository is missing"
               [ -n "${WR_ACTOR:-}" ] || fail "workflow_run triggering actor is missing"
@@ -86,8 +79,8 @@ jobs:
 
   validate:
     needs: authz
-    # PR and merge-group legs stay hosted until the member-only admission workflow is in place.
-    runs-on: ${{ github.event_name == 'push' && 'gke-2cpu-4gb-amd64' || 'ubuntu-latest' }}
+    # Standard GitHub-hosted runner for every configured event.
+    runs-on: ubuntu-24.04
     steps:
       - name: Install push runner tools
         if: github.event_name == 'push'

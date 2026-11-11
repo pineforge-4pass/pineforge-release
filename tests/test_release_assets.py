@@ -34,7 +34,15 @@ class AttachmentHTTP:
     """Serve the real Client, including origin, auth, API and readback handling."""
     def __init__(self):
         self.producers = ProducerFixture((ROOT / "VERSION").read_text().strip())
-        self.manifest = fixture_manifest(str(self.producers.v))
+        if contract.parity_capable(str(self.producers.v)):
+            from test_release_parity_wire import wire_case
+
+            with tempfile.TemporaryDirectory() as temporary:
+                self.manifest, self.built, _, _ = wire_case(
+                    Path(temporary) / "parity", release=str(self.producers.v))
+        else:
+            self.manifest = fixture_manifest(str(self.producers.v))
+            self.built = candidate(self.manifest)
         self.pypi_url = f"https://pypi.org/pypi/pineforge-codegen/{self.producers.v.pep440}/json"
         self.npm_meta_url = "https://registry.npmjs.org/@pineforge%2fcodegen-pyodide/" + str(self.producers.v)
         pypi = json.loads(self.producers.downloads[self.pypi_url])
@@ -42,7 +50,7 @@ class AttachmentHTTP:
         self.manifest["versions"]["codegen"]["sdist_sha256"] = pypi["urls"][0]["digests"]["sha256"]
         self.manifest["versions"]["codegen"]["npm_integrity"] = json.loads(
             self.producers.downloads[self.npm_meta_url])["dist"]["integrity"]
-        self.built = candidate(self.manifest)
+        self.built["versions"]["codegen"]["sdist_sha256"] = self.manifest["versions"]["codegen"]["sdist_sha256"]
         self.built["inventories"]["codegen"] = {
             "pineforge_codegen/__init__.py": hashlib.sha256(b"VERSION='fixture'\n").hexdigest()}
         self.tag = "v" + self.manifest["release_version"]
@@ -539,6 +547,8 @@ class AttachmentFinalizerTests(AttachmentTestCase):
         stored = json.loads(self.http.hub_bytes(contract.ASSET))
         self.assertEqual(stored["assets"], self.http.descriptors)
         self.assertEqual(set(stored), contract.MANIFEST_KEYS | {"assets"})
+        self.assertEqual(stored["versions"], self.http.manifest["versions"])
+        self.assertEqual(event["versions"], stored["versions"])
         self.assertEqual(self.http.uploads[:4], [
             (d["name"], self.http.originals[d["source"]]) for d in self.http.descriptors])
         self.assertEqual(self.http.uploads[4][0], contract.ASSET)
