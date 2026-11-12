@@ -116,6 +116,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         g++ \
         libeigen3-dev \
         python3 \
+        tzdata \
+        tzdata-legacy \
     && rm -rf /var/lib/apt/lists/* /usr/share/man /usr/share/locale /usr/share/info
 
 # --- sources notice (begin)
