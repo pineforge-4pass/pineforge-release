@@ -477,6 +477,19 @@ def _restore_original_doc_cleanup(text: str) -> str:
     return "".join(lines)
 
 
+def _without_tzdata_package(text: str) -> str:
+    """Undo only the approved tzdata line after python3 in the runtime apt list."""
+    added = "        tzdata \\\n"
+    lines = text.splitlines(keepends=True)
+    if lines.count(added) != 1:
+        raise ValueError("expected exactly one tzdata line in the runtime apt list")
+    index = lines.index(added)
+    if index == 0 or lines[index - 1] != "        python3 \\\n":
+        raise ValueError("expected the tzdata line directly after python3")
+    del lines[index]
+    return "".join(lines)
+
+
 def _restore_original_harness_manifest(text: str) -> str:
     """Undo exactly the harness list additions for the original runtime pin."""
     changes = (
@@ -915,6 +928,7 @@ RUN --mount=type=secret,id=github_token set -eu; \
         text = _without_parity_carrier(text)
         text = _restore_bookworm_runtime_base(text)
         text = _restore_original_doc_cleanup(text)
+        text = _without_tzdata_package(text)
         text = _restore_original_harness_manifest(text)
         self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                          self.ORIGINAL_RUNTIME_STAGE_SHA256,
