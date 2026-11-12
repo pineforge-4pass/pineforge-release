@@ -998,6 +998,7 @@ RUN --mount=type=secret,id=github_token set -eu; \
         stripped = _without_parity_carrier(stripped)
         stripped = _restore_bookworm_runtime_base(stripped)
         stripped = _restore_original_doc_cleanup(stripped)
+        stripped = _without_tzdata_package(stripped)
         stripped = _restore_original_harness_manifest(stripped)
         self.assertNotEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
@@ -1028,9 +1029,9 @@ RUN --mount=type=secret,id=github_token set -eu; \
         altered = text.replace("RUN mkdir -p /opt/pineforge/bin\n",
                                "RUN mkdir -p /opt/pineforge/bin /unexpected\n", 1)
         self.assertNotEqual(altered, text)
-        normalized = _restore_original_harness_manifest(
+        normalized = _restore_original_harness_manifest(_without_tzdata_package(
             _restore_original_doc_cleanup(_restore_bookworm_runtime_base(
-                _without_parity_carrier(_without_guard_policy(_without_sources_notice(altered))))))
+                _without_parity_carrier(_without_guard_policy(_without_sources_notice(altered)))))))
         self.assertNotEqual(hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                             self.ORIGINAL_RUNTIME_STAGE_SHA256)
         # Extra commands or instructions inside the carrier must be refused,
