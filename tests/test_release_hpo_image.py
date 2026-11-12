@@ -478,15 +478,16 @@ def _restore_original_doc_cleanup(text: str) -> str:
 
 
 def _without_tzdata_package(text: str) -> str:
-    """Undo only the approved tzdata line after python3 in the runtime apt list."""
-    added = "        tzdata \\\n"
+    """Undo only the approved tzdata and tzdata-legacy lines after python3 in the runtime apt list."""
+    added = ("        tzdata \\\n", "        tzdata-legacy \\\n")
     lines = text.splitlines(keepends=True)
-    if lines.count(added) != 1:
-        raise ValueError("expected exactly one tzdata line in the runtime apt list")
-    index = lines.index(added)
-    if index == 0 or lines[index - 1] != "        python3 \\\n":
-        raise ValueError("expected the tzdata line directly after python3")
-    del lines[index]
+    for line in added:
+        if lines.count(line) != 1:
+            raise ValueError("expected exactly one " + line.strip(" \\\n") + " line in the runtime apt list")
+    index = lines.index(added[0])
+    if index == 0 or lines[index - 1] != "        python3 \\\n" or lines[index + 1:index + 2] != [added[1]]:
+        raise ValueError("expected tzdata directly after python3 and tzdata-legacy directly after tzdata")
+    del lines[index:index + 2]
     return "".join(lines)
 
 
