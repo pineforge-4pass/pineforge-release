@@ -3,6 +3,10 @@
 
 Authorities are captured before mutations. Removing a digest gate must let its
 isolated negative input through, or cause a forbidden upload before refusal.
+
+Fixtures are built at fixed releases, never from the repository's VERSION file:
+one stable, parity-capable release for every case, and one explicit prerelease.
+A prerelease bump of VERSION therefore cannot change what any case proves.
 """
 from __future__ import annotations
 
@@ -26,14 +30,22 @@ sys.path.insert(0, str(ROOT / "tests"))
 import release_artifacts as artifacts  # noqa: E402
 import release_contract as contract  # noqa: E402
 import release_pipeline as pipeline  # noqa: E402
+from parity_bundle import PARITY_CAPABILITY_FROM  # noqa: E402
 from test_release_binding import (MemoryRegistry, ProducerFixture, archive,  # noqa: E402
                                   candidate, facts_for, fixture_manifest)
+
+# The fixed, stable, parity-capable release every case is built at: scripts/parity_bundle.py
+# defines it, and wire_case in test_release_parity_wire.py defaults to the same constant.
+FIXTURE_RELEASE = PARITY_CAPABILITY_FROM
+# The one explicit prerelease case: above the parity cutoff, like the pair prerelease that
+# handle-upstream.yml writes into VERSION.
+PRERELEASE_RELEASE = "1.12.0-rc.1"
 
 
 class AttachmentHTTP:
     """Serve the real Client, including origin, auth, API and readback handling."""
-    def __init__(self):
-        self.producers = ProducerFixture((ROOT / "VERSION").read_text().strip())
+    def __init__(self, release=FIXTURE_RELEASE):
+        self.producers = ProducerFixture(release)
         if contract.parity_capable(str(self.producers.v)):
             from test_release_parity_wire import wire_case
 
@@ -202,8 +214,10 @@ class AttachmentHTTP:
 
 
 class AttachmentTestCase(unittest.TestCase):
+    release = FIXTURE_RELEASE
+
     def setUp(self):
-        self.http = AttachmentHTTP()
+        self.http = AttachmentHTTP(self.release)
         self.opener = patch("urllib.request.build_opener", return_value=self.http)
         self.opener.start()
         self.addCleanup(self.opener.stop)
@@ -343,6 +357,115 @@ class ExtendedManifestTests(AttachmentTestCase):
         expected = (ROOT / "tests/fixtures/release-ready.json").read_bytes()
         self.assertEqual(contract.canonical(contract.payload(raw)), expected)
         self.assertEqual(contract.canonical(contract.validate(contract.decode(raw))), raw)
+
+
+class AssetRuleIsolationTests(AttachmentTestCase):
+    # One frozen-shape rule per test. Each test replaces ONE of the four valid descriptors so that
+    # exactly one rule refuses it: name and source agree with each other and every other field is
+    # valid, so deleting that rule leaves a fully valid inventory. The expected messages are
+    # literals written here; the validator is never asked for them. Some rules share a message
+    # (the two npm checks, the two halves of the name-order check, both engine-source changes),
+    # so the message alone cannot tell them apart; the rule-removal rows of the proof run do.
+    NPM = "https://registry.npmjs.org/@pineforge/codegen-pyodide/-/"
+    ENGINE_RELEASES = "https://github.com/pineforge-4pass/pineforge-engine/releases/download/"
+
+    def setUp(self):
+        super().setUp()
+        found = self.http.descriptors
+        self.versions = self.http.manifest["versions"]
+        self.valid = {
+            "npm": next(d for d in found if urlsplit(d["source"]).netloc == "registry.npmjs.org"),
+            "sdist": next(d for d in found if urlsplit(d["source"]).netloc == "files.pythonhosted.org"),
+            "x86_64": next(d for d in found if d["name"].endswith("-linux-x86_64.tar.gz")),
+            "aarch64": next(d for d in found if d["name"].endswith("-linux-aarch64.tar.gz")),
+        }
+
+    def inventory(self, **replaced):
+        assets = {kind: copy.deepcopy(item) for kind, item in self.valid.items()}
+        assets.update(replaced)
+        return sorted(assets.values(), key=lambda item: item["name"])
+
+    def refused(self, assets, message):
+        # Control: the same four descriptors, unchanged, are accepted.
+        contract.validate_assets(self.inventory(), self.versions)
+        with self.assertRaisesRegex(contract.Invalid, message):
+            contract.validate_assets(assets, self.versions)
+
+    def reserved_prefix_alone(self, prefix):
+        name = prefix + "fixture.tgz"
+        changed = {**self.valid["npm"], "name": name, "source": self.NPM + name}
+        self.refused(self.inventory(npm=changed), "^reserved attachment name$")
+
+    def test_consumer_prefix_alone_is_reserved(self):
+        self.reserved_prefix_alone("consumer-")
+
+    def test_facts_prefix_alone_is_reserved(self):
+        self.reserved_prefix_alone("facts-")
+
+    def test_delivery_prefix_alone_is_reserved(self):
+        self.reserved_prefix_alone("delivery-")
+
+    def test_name_pattern_alone_refuses_a_leading_dot(self):
+        # Not reserved, the source ends in the same name, right package path, right suffix.
+        name = ".hidden.tgz"
+        changed = {**self.valid["npm"], "name": name, "source": self.NPM + name}
+        self.refused(self.inventory(npm=changed), "^malformed identity$")
+
+    def test_duplicate_name_of_two_kinds_alone_is_refused(self):
+        # The npm and the sdist descriptor both name "fixture.tar.gz", each valid for its own kind.
+        # All four kinds are present and the names are sorted, so only uniqueness refuses.
+        name = self.valid["sdist"]["name"]
+        changed = {**self.valid["npm"], "name": name, "source": self.NPM + name}
+        assets = self.inventory(npm=changed)
+        names = [item["name"] for item in assets]
+        self.assertEqual(names.count(name), 2)
+        self.assertEqual(names, sorted(names))
+        self.refused(assets, "^attachment names must be unique and sorted$")
+
+    def test_unsorted_names_alone_are_refused(self):
+        # Unique names, all four kinds, every descriptor valid; only the order is wrong.
+        assets = list(reversed(self.inventory()))
+        names = [item["name"] for item in assets]
+        self.assertEqual(len(set(names)), 4)
+        self.assertNotEqual(names, sorted(names))
+        self.refused(assets, "^attachment names must be unique and sorted$")
+
+    def test_npm_package_path_alone_is_refused(self):
+        # Valid suffix, name equal to the last path part, wrong package in the path.
+        name = self.valid["npm"]["name"]
+        changed = {**self.valid["npm"],
+                   "source": "https://registry.npmjs.org/@pineforge/other-package/-/" + name}
+        self.refused(self.inventory(npm=changed), "^unexpected npm attachment$")
+
+    def test_npm_suffix_alone_is_refused(self):
+        # Right package path and name equal to the last path part; only the suffix is wrong.
+        name = "fixture.zip"
+        changed = {**self.valid["npm"], "name": name, "source": self.NPM + name}
+        self.refused(self.inventory(npm=changed), "^unexpected npm attachment$")
+
+    def test_sdist_suffix_alone_is_refused(self):
+        # An npm-style suffix on the PyPI host; the name is unique and keeps the order.
+        name = "fixture-sdist.tgz"
+        changed = {**self.valid["sdist"], "name": name, "source": "https://files.pythonhosted.org/" + name}
+        self.refused(self.inventory(sdist=changed), "^unexpected sdist attachment$")
+
+    def engine_source_alone(self, source):
+        name = self.valid["x86_64"]["name"]
+        # Controls: the real source is the pinned repository and tag, and the changed one keeps the name.
+        self.assertEqual(self.valid["x86_64"]["source"], f"{self.ENGINE_RELEASES}v{FIXTURE_RELEASE}/{name}")
+        self.assertEqual(source.rsplit("/", 1)[1], name)
+        self.assertNotEqual(source, self.valid["x86_64"]["source"])
+        self.refused(self.inventory(x86_64={**self.valid["x86_64"], "source": source}),
+                     "^unexpected engine attachment source$")
+
+    def test_engine_source_repository_alone_is_refused(self):
+        name = self.valid["x86_64"]["name"]
+        self.engine_source_alone(
+            f"https://github.com/pineforge-4pass/pineforge-other/releases/download/v{FIXTURE_RELEASE}/{name}")
+
+    def test_engine_source_tag_alone_is_refused(self):
+        name = self.valid["x86_64"]["name"]
+        self.engine_source_alone(f"{self.ENGINE_RELEASES}v1.0.0/{name}")
 
 
 class ProducerAttachmentTests(AttachmentTestCase):
@@ -697,6 +820,30 @@ class AttachmentFinalizerTests(AttachmentTestCase):
         self.assertEqual(first["event_id"], "sha256:" + hashlib.sha256(legacy_raw).hexdigest())
         self.assertEqual(first["run_id"], self.http.built["run_id"])
         self.assertFalse(any(name.endswith((".tgz", ".tar.gz")) for name, _ in self.http.uploads))
+
+
+class PrereleaseFactsTests(AttachmentTestCase):
+    release = PRERELEASE_RELEASE
+
+    def test_prerelease_binds_main_facts_without_a_release_entry(self):
+        # A prerelease needs no facts.releases[<release>] entry; it binds the validated bytes of main's
+        # facts. A stable release without that entry stays Pending, see
+        # test_facts_failure_precedes_every_binary_upload.
+        self.assertTrue(self.http.manifest["prerelease"])
+        facts = json.loads(self.http.facts_raw)
+        facts["releases"].pop(PRERELEASE_RELEASE)
+        self.http.facts_raw = contract.canonical(facts)
+        self.assertNotIn(PRERELEASE_RELEASE, json.loads(self.http.facts_raw)["releases"])
+        try:
+            self.finish()
+        except contract.Pending as error:
+            self.fail("a prerelease must bind main's facts without a release entry: " + str(error))
+        stored = json.loads(self.http.hub_bytes(contract.ASSET))
+        # The commit is main's head as the fixture serves it; the digest is of the bytes it served.
+        self.assertEqual(stored["facts"], {
+            "commit": "e" * 40, "path": "facts/facts.json",
+            "sha256": hashlib.sha256(self.http.facts_raw).hexdigest(),
+            "release_key": PRERELEASE_RELEASE}, "prerelease facts binding differs")
 
 
 if __name__ == "__main__":

@@ -165,6 +165,11 @@ unpacking/repacking them. It reads each upload back and checks its size and
 SHA-256, including when GitHub supplies no digest. Identical existing bytes are
 reused; conflicting bytes are never overwritten. A partial upload leaves the
 draft and its attachments for retry, with no manifest or authorized promotion.
+If an interrupted upload leaves an attachment listed in any state other than
+`uploaded`, the writer refuses it as invalid hub asset metadata and finalization
+fails closed: no manifest, promotion or delivery, and nothing is overwritten or
+deleted. Later runs fail the same way until an operator removes that attachment
+from the draft.
 Missing producer checksums stay pending; corruption fails finalization.
 Only then does finalization attach `release-manifest.json`, assign the fixed
 version image tag, move eligible aliases, publish the GitHub release, and fan
