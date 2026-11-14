@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import io
 import os
 import sys
 import tempfile
 import urllib.error
 import urllib.request
+import zipfile
+import zlib
 from pathlib import Path
 from urllib.parse import quote
 
@@ -41,6 +44,11 @@ RECEIPT_FIELDS = ("schema", "consumer", "attempt", "sequence", "state", "timesta
 # Delay after each reserved attempt: two retries, then an acknowledgement grace
 # period before a terminal failure. Unsent reservations are released by cleanup.
 DELIVERY_BACKOFF_MINUTES = (15, 60, 15)
+DELIVERY_SOURCE_FILES = (
+    "scripts/release_pipeline.py", "scripts/release_contract.py",
+    "scripts/release_artifacts.py", "scripts/release_pair.py",
+    "scripts/parity_bundle.py", "scripts/release_sources.py",
+)
 
 
 def now():
@@ -455,16 +463,183 @@ def require_consumer_unverified(store, row, event, consumer):
     require(not verified, "consumer already verified")
 
 
-def confirm_redelivery_run(client, audit):
-    """A public asset is evidence only when the hub confirms its trusted run."""
+def _confirm_producing_run(client, audit, *, manual):
+    """Read the producing attempt, never the mutable latest rerun result."""
+    positive(audit["run_id"])
+    positive(audit["run_attempt"])
     try:
-        run = client.api(f"repos/{HUB}/actions/runs/{audit['run_id']}")
+        run = client.api(f"repos/{HUB}/actions/runs/{audit['run_id']}/attempts/{audit['run_attempt']}")
     except Pending:
-        raise Invalid("redelivery workflow run unavailable") from None
+        raise Invalid("delivery producing workflow attempt unavailable (requires Actions: read)") from None
+    paths = (".github/workflows/release-redeliver.yml",) if manual else (
+        ".github/workflows/release-finalize.yml", ".github/workflows/publish.yml")
+    require(type(run) is dict and type(run.get("repository")) is dict
+            and type(run.get("head_repository")) is dict, "delivery producing workflow attempt differs")
     require(type(run) is dict and type(run.get("id")) is int and run["id"] == audit["run_id"]
-            and run.get("path") == ".github/workflows/release-redeliver.yml"
+            and type(run.get("run_attempt")) is int and run["run_attempt"] == audit["run_attempt"]
+            and run.get("path") in paths
             and run.get("head_branch") == "main" and run.get("status") == "completed"
-            and run.get("conclusion") == "success", "redelivery workflow run differs")
+            and run.get("conclusion") == "success"
+            and run.get("repository", {}).get("full_name") == HUB
+            and run.get("head_repository", {}).get("full_name") == HUB
+            and run.get("event") in (("workflow_dispatch",) if manual else (
+                "workflow_dispatch", "push", "schedule")), "delivery producing workflow attempt differs")
+    match(COMMIT, run["head_sha"])
+    if manual:
+        require(type(run.get("actor")) is dict and run["actor"].get("login") == audit["actor"],
+                "redelivery actor differs")
+    timestamp = dt.datetime.fromisoformat(audit["timestamp"].replace("Z", "+00:00"))
+    start = dt.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
+    end = dt.datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00"))
+    require(start.tzinfo is not None and end.tzinfo is not None, "producing attempt clock is not UTC")
+    require(start <= timestamp <= end, "delivery timestamp outside producing attempt")
+    return run
+
+
+def confirm_redelivery_run(client, audit):
+    """Metadata is one part of proof; callers must also confirm producing bytes."""
+    return _confirm_producing_run(client, audit, manual=True)
+
+
+def delivery_context(raw, candidate_raw, data, *, manual, commit=None, read_source=None):
+    """Bind wire bytes, release inputs and all sender modules to their source."""
+    commit = os.environ["GITHUB_SHA"] if commit is None else commit
+    match(COMMIT, commit)
+    workflows = (".github/workflows/release-redeliver.yml",) if manual else (
+        ".github/workflows/release-finalize.yml", ".github/workflows/publish.yml")
+    if read_source is None:
+        root = Path(__file__).resolve().parent.parent
+        read_source = lambda name: (root / name).read_bytes()
+    event = payload(raw)
+    return {"tag": "v" + event["release_version"], "manifest_sha256": sha256(raw),
+            "candidate_sha256": sha256(candidate_raw) if candidate_raw is not None else None,
+            "dispatch_sha256": sha256(canonical(data)), "workflow_commit": commit,
+            "source_sha256": {name: sha256(read_source(name))
+                              for name in (*DELIVERY_SOURCE_FILES, *workflows)}}
+
+
+def validate_delivery_record(raw, event_id, role, *, manual):
+    obj = decode(raw)
+    require(type(obj) is dict and obj.get("event_id") == event_id
+            and obj.get("consumer") == role and obj.get("state") == "dispatch_accepted",
+            "accepted delivery identity differs")
+    schemas = ("pineforge/release-redelivery/v1", "pineforge/release-redelivery/v2",
+               "pineforge/release-redelivery/v3") if manual else (
+                   "pineforge/release-delivery/v1", "pineforge/release-delivery/v2")
+    require(obj.get("schema") in schemas, "delivery evidence schema differs")
+    fields = ("schema", "event_id", "consumer", "attempt", "state", "run_id", "timestamp")
+    if manual:
+        fields += ("actor",)
+    current = obj["schema"] == schemas[-1]
+    if current:
+        fields += ("run_attempt", "context")
+    if current or (manual and obj["schema"] == "pineforge/release-redelivery/v2"):
+        fields += ("dispatch_status",)
+    keys(obj, fields)
+    positive(obj["attempt"])
+    positive(obj["run_id"])
+    if not manual:
+        require(obj["attempt"] <= len(DELIVERY_BACKOFF_MINUTES), "invalid delivery attempt")
+    if current:
+        positive(obj["run_attempt"])
+    if "dispatch_status" in obj:
+        require(type(obj["dispatch_status"]) is int and obj["dispatch_status"] == 204,
+                "redelivery dispatch status differs")
+    if manual:
+        match(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", obj["actor"])
+    match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
+    dt.datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00"))
+    require(canonical(obj) == raw, "delivery evidence bytes differ")
+    return obj
+
+
+def _delivery_artifacts(client, run_id):
+    rows = []
+    for page in range(1, 1001):
+        try:
+            result = client.api(f"repos/{HUB}/actions/runs/{run_id}/artifacts?per_page=100&page={page}")
+        except Pending:
+            raise Invalid("producing artifact inventory unavailable (requires Actions: read)") from None
+        require(type(result) is dict and type(result.get("artifacts")) is list,
+                "invalid producing artifact inventory")
+        rows.extend(result["artifacts"])
+        if len(result["artifacts"]) < 100:
+            return rows
+    raise Invalid("producing artifact pagination limit exceeded")
+
+
+def _delivery_archive(client, artifact, filename):
+    positive(artifact["id"])
+    require(artifact.get("expired") is False, "producing artifact expired")
+    try:
+        archive = client.request(f"https://api.github.com/repos/{HUB}/actions/artifacts/{artifact['id']}/zip",
+                                 github=True)
+    except Pending:
+        raise Invalid("producing artifact unavailable (requires Actions: read)") from None
+    # Actions artifacts use the JSON media type (octet-stream returns HTTP 415).
+    require(artifact.get("digest") == "sha256:" + sha256(archive), "producing artifact digest differs")
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+            require(zipped.namelist() == [filename], "producing artifact inventory differs")
+            limit = 2 * 1024 * 1024
+            require(zipped.getinfo(filename).file_size <= limit, "producing evidence exceeds size limit")
+            with zipped.open(filename) as entry:
+                raw = entry.read(limit + 1)
+            require(len(raw) <= limit, "producing evidence exceeds size limit")
+            return raw
+    except (zipfile.BadZipFile, EOFError, RuntimeError, zlib.error):
+        raise Invalid("producing evidence archive cannot be decoded") from None
+
+
+def confirm_delivery_content(store, row, audit, raw, *, manual):
+    """A successful unrelated main run cannot authenticate a public audit.
+
+    Old formats have no run_attempt. Only a unique exact-content artifact can
+    recover it; absent/expired legacy proof stays closed, with no latest-run
+    fallback. A v1 manual audit remains history only even when corroborated.
+    """
+    client = store.client
+    tag = row["tag_name"]
+    kind = "redelivery" if manual else "delivery"
+    prefix = f"release-{kind}-{audit['consumer']}-{tag}-{audit['run_id']}-"
+    filename = "redelivery.json" if manual else "delivery.json"
+    matched = []
+    for artifact in _delivery_artifacts(client, audit["run_id"]):
+        require(type(artifact) is dict and type(artifact.get("name")) is str,
+                "invalid producing artifact metadata")
+        name = artifact["name"]
+        if not name.startswith(prefix):
+            continue
+        suffix = name.removeprefix(prefix)
+        match(r"[1-9][0-9]*", suffix)
+        attempt = int(suffix)
+        if "run_attempt" in audit and attempt != audit["run_attempt"]:
+            continue
+        if _delivery_archive(client, artifact, filename) == raw:
+            matched.append((artifact, attempt))
+    require(len(matched) == 1, "matching trusted producing content unavailable or ambiguous")
+    artifact, attempt = matched[0]
+    bound = {**audit, "run_attempt": attempt}
+    run = (confirm_redelivery_run(client, bound) if manual else
+           _confirm_producing_run(client, bound, manual=False))
+    producing = artifact.get("workflow_run")
+    require(type(producing) is dict and type(producing.get("id")) is int
+            and producing["id"] == audit["run_id"] and producing.get("head_sha") == run["head_sha"],
+            "artifact producing workflow differs")
+    manifest_raw = store.read(row, ASSET)
+    event = payload(manifest_raw)
+    require(event["event_id"] == audit["event_id"] and tag == "v" + event["release_version"],
+            "producing release differs")
+    if "context" in audit:
+        candidate_raw = store.read(row, CANDIDATE) if EVENT_TYPES[audit["consumer"]] == "release-pair" else None
+        data = {"event_type": EVENT_TYPES[audit["consumer"]],
+                "client_payload": pair_payload(manifest_raw, candidate_raw) if candidate_raw is not None else event}
+        require(EVENT_TYPES[audit["consumer"]] != "release-pair" or candidate_raw is not None,
+                "producing candidate unavailable")
+        context = delivery_context(
+            manifest_raw, candidate_raw, data, manual=manual, commit=run["head_sha"],
+            read_source=lambda name: client.file(HUB, run["head_sha"], name))
+        require(audit["context"] == context, "producing source or payload context differs")
 
 
 def delivery_accepted(store, row, event_id, role):
@@ -477,40 +652,26 @@ def delivery_accepted(store, row, event_id, role):
         if asset["name"].startswith(prefix):
             evidence.append((asset["name"], store.read(row, asset["name"])))
     attempts, audits = [], []
-    has_acceptance = raw is not None
+    has_acceptance = False
     for asset_name, accepted in evidence:
-        obj = decode(accepted)
-        require(type(obj) is dict and obj.get("event_id") == event_id
-                and obj.get("consumer") == role and obj.get("state") == "dispatch_accepted",
-                "accepted delivery identity differs")
         if asset_name == name:
+            obj = validate_delivery_record(accepted, event_id, role, manual=False)
+            confirm_delivery_content(store, row, obj, accepted, manual=False)
+            has_acceptance = True
             continue
         # Match the append-only redelivery audit contract before using it to
         # complete a delivery-only role. Never infer success from its filename.
-        fields = ("schema", "event_id", "consumer", "attempt", "state", "run_id", "timestamp", "actor")
-        if obj.get("schema") == "pineforge/release-redelivery/v2":
-            fields += ("dispatch_status",)
-        keys(obj, fields)
-        require(obj["schema"] in ("pineforge/release-redelivery/v1", "pineforge/release-redelivery/v2"),
-                "redelivery history identity differs")
-        positive(obj["attempt"])
-        positive(obj["run_id"])
-        if obj["schema"] == "pineforge/release-redelivery/v2":
-            require(type(obj["dispatch_status"]) is int and obj["dispatch_status"] == 204,
-                    "redelivery dispatch status differs")
+        obj = validate_delivery_record(accepted, event_id, role, manual=True)
         require(asset_name == f"{prefix}{obj['attempt']}.json" and canonical(obj) == accepted,
                 "redelivery history asset differs")
-        match(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", obj["actor"])
-        match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
-        dt.datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00"))
         attempts.append(obj["attempt"])
-        audits.append(obj)
+        audits.append((obj, accepted))
     require(sorted(attempts) == list(range(1, len(attempts) + 1)), "invalid redelivery attempt history")
-    for audit in audits:
-        confirm_redelivery_run(store.client, audit)
+    for audit, accepted in audits:
+        confirm_delivery_content(store, row, audit, accepted, manual=True)
         # Confirmed v1 audits remain readable history, but lack a recorded
         # dispatch response and cannot establish compute completion.
-        if audit["schema"] == "pineforge/release-redelivery/v2":
+        if audit["schema"] != "pineforge/release-redelivery/v1":
             has_acceptance = True
     return has_acceptance
 
@@ -589,6 +750,8 @@ def _attempt_released(row, store, event, role, reservation):
 def plan_delivery(store, row, event, role):
     """Reserve at most three deliveries; accepted transport never retries."""
     if store.read(row, f"delivery-{role}.json") is not None:
+        require(delivery_accepted(store, row, event["event_id"], role),
+                "delivery acceptance has no trusted provenance")
         return None, False
     failed_name = f"delivery-failed-{role}.json"
     failed = store.read(row, failed_name)
@@ -677,8 +840,43 @@ def release_delivery_attempts(client, store, tag=""):
                         "run_id": current_run, "run_attempt": current_attempt, "timestamp": now()}))
 
 
-def redelivery_dispatch(client, target, data):
-    """Keep the actual dispatch HTTP status, which Client.api discards."""
+def _authorization_variable(client, name):
+    # These controls are repository variables per the release-chain contract.
+    # Queue-time vars/env are never fallback authority, including on HTTP 404.
+    route = f"repos/{HUB}/actions/variables/{name}"
+    try:
+        result = client.api(route)
+    except artifacts.RequestError as error:
+        raise ConfigurationError(
+            f"send authorization unavailable: GET {route}; {error}; requires repository Variables: read") from None
+    except (Pending, Invalid):
+        raise ConfigurationError(
+            f"send authorization unavailable: GET {route}; requires repository Variables: read") from None
+    require(type(result) is dict and result.get("name") == name and type(result.get("value")) is str,
+            "send authorization variable response differs")
+    return result["value"]
+
+
+def authorize_delivery(client, consumer, data):
+    """Reauthorize at the POST boundary, after all queued/public evidence work."""
+    require(data["event_type"] == EVENT_TYPES[consumer], "consumer dispatch contract differs")
+    enabled = configured_roles(_authorization_variable(client, "RELEASE_READY_CONSUMERS"))
+    require(consumer in enabled, "consumer is not authorized at send")
+    body = data["client_payload"]
+    release = version(body["pair_id"] if data["event_type"] == "release-pair" else body["release_version"])
+    if consumer in DELIVERY_ONLY:
+        first = _authorization_variable(client, "RELEASE_COMPUTE_FIRST_PAIR")
+        try:
+            allowed = bool(first) and release >= version(first)
+        except (Invalid, ValueError, pair.RuleError):
+            raise ConfigurationError("RELEASE_COMPUTE_FIRST_PAIR value was not accepted at send") from None
+        require(allowed, "consumer pair is not authorized at send")
+    require(not (release.prerelease and consumer in ("application", "web", "data", "license")),
+            "consumer is skipped by policy at send")
+
+
+def redelivery_dispatch(client, target, data, *, authority, consumer):
+    """Authorize the actual POST and keep the actual dispatch HTTP status."""
     headers = {"User-Agent": "pineforge-release-reconciler", "Accept": "application/vnd.github+json",
                "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"}
     if client.token:
@@ -687,7 +885,9 @@ def redelivery_dispatch(client, target, data):
         f"https://api.github.com/repos/pineforge-4pass/{target}/dispatches",
         data=canonical(data), headers=headers, method="POST")
     try:
-        with urllib.request.build_opener(SafeRedirect()).open(request, timeout=120) as response:
+        opener = urllib.request.build_opener(SafeRedirect())
+        authorize_delivery(authority, consumer, data)
+        with opener.open(request, timeout=120) as response:
             status = response.status
             require(type(status) is int and status == 204, "redelivery dispatch status differs")
             return status
@@ -734,9 +934,7 @@ def redelivery_source(tag, consumer):
     public_store = Store(public)
     accepted = public_store.read(row, f"delivery-{consumer}.json")
     if accepted is not None:
-        obj = decode(accepted)
-        require(obj["event_id"] == event["event_id"] and obj["consumer"] == consumer
-                and obj["state"] == "dispatch_accepted", "accepted delivery identity differs")
+        validate_delivery_record(accepted, event["event_id"], consumer, manual=False)
     # With or without delivery-<consumer>.json: any verified receipt, a malformed one or two
     # claiming the same identity refuses; a missing, failed or pending one still repairs.
     require_consumer_unverified(public_store, row, event, consumer)
@@ -748,47 +946,44 @@ def redeliver(client, store, tag, consumer, output):
     public_store, row, event, client_payload = redelivery_source(tag, consumer)
     event_type = EVENT_TYPES[consumer]
     prefix = f"delivery-redelivered-{consumer}-"
-    actor_pattern = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?"
     attempts, audits = [], []
     for asset in public_store.get(tag)["assets"]:
         if not asset["name"].startswith(prefix):
             continue
         previous = public_store.read(row, asset["name"])
-        obj = decode(previous)
-        fields = ("schema", "event_id", "consumer", "attempt", "state", "run_id", "timestamp", "actor")
-        if type(obj) is dict and obj.get("schema") == "pineforge/release-redelivery/v2":
-            fields += ("dispatch_status",)
-        keys(obj, fields)
-        require(obj["schema"] in ("pineforge/release-redelivery/v1", "pineforge/release-redelivery/v2")
-                and obj["event_id"] == event["event_id"] and obj["consumer"] == consumer
-                and obj["state"] == "dispatch_accepted", "redelivery history identity differs")
-        positive(obj["attempt"])
-        positive(obj["run_id"])
-        if obj["schema"] == "pineforge/release-redelivery/v2":
-            require(type(obj["dispatch_status"]) is int and obj["dispatch_status"] == 204,
-                    "redelivery dispatch status differs")
+        obj = validate_delivery_record(previous, event["event_id"], consumer, manual=True)
         require(asset["name"] == f"{prefix}{obj['attempt']}.json" and canonical(obj) == previous,
                 "redelivery history asset differs")
-        match(actor_pattern, obj["actor"])
-        match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", obj["timestamp"])
-        dt.datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00"))
         attempts.append(obj["attempt"])
-        audits.append(obj)
+        audits.append((obj, previous))
     attempts.sort()
     require(attempts == list(range(1, len(attempts) + 1)), "invalid redelivery attempt history")
-    for audit in audits:
-        confirm_redelivery_run(store.client, audit)
+    for audit, previous in audits:
+        confirm_delivery_content(store, row, audit, previous, manual=True)
     attempt = len(attempts) + 1
     positive(attempt)
     run_id = int(os.environ["GITHUB_RUN_ID"])
     positive(run_id)
-    actor = match(actor_pattern, os.environ["GITHUB_ACTOR"])
+    run_attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
+    positive(run_attempt)
+    actor = match(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", os.environ["GITHUB_ACTOR"])
     target = os.environ.get("TARGET_REPOSITORY", "")
     match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", target)
-    dispatch_status = redelivery_dispatch(client, target, {"event_type": event_type, "client_payload": client_payload})
-    audit = canonical({"schema": "pineforge/release-redelivery/v2", "event_id": event["event_id"],
+    data = {"event_type": event_type, "client_payload": client_payload}
+    manifest_raw = public_store.read(row, ASSET)
+    candidate_raw = public_store.read(row, CANDIDATE) if event_type == "release-pair" else None
+    # Reconcile the bytes used for the send with the final source read. A changed
+    # input cannot acquire an audit for a different event or dispatch body.
+    require(payload(manifest_raw) == event, "redelivery manifest changed before send")
+    if event_type == "release-pair":
+        require(pair_payload(manifest_raw, candidate_raw) == client_payload,
+                "redelivery candidate changed before send")
+    context = delivery_context(manifest_raw, candidate_raw, data, manual=True)
+    dispatch_status = redelivery_dispatch(client, target, data, authority=store.client, consumer=consumer)
+    audit = canonical({"schema": "pineforge/release-redelivery/v3", "event_id": event["event_id"],
                        "consumer": consumer, "attempt": attempt, "state": "dispatch_accepted",
-                       "run_id": run_id, "dispatch_status": dispatch_status, "timestamp": now(), "actor": actor})
+                       "run_id": run_id, "run_attempt": run_attempt, "context": context,
+                       "dispatch_status": dispatch_status, "timestamp": now(), "actor": actor})
     # No reservation or planner/receipt updates. An unsuccessful append fails
     # this run; absent an audit asset, the next run sends the same event again.
     store.put(row, f"{prefix}{attempt}.json", audit)
@@ -1064,6 +1259,10 @@ def main():
             require(not any(a["name"] == "release-rejected.json" for a in row["assets"]), "release rejected")
             accepted = Store(public).read(row, f"delivery-{args.consumer}.json")
             if accepted is not None:
+                obj = decode(accepted)
+                obj = validate_delivery_record(accepted, obj["event_id"], args.consumer, manual=False)
+                confirm_delivery_content(Store(Client(token=os.environ["HUB_TOKEN"])), row,
+                                         obj, accepted, manual=False)
                 Path(args.output).write_bytes(accepted)
                 return 0
             exhausted = Store(public).read(row, f"delivery-failed-{args.consumer}.json")
@@ -1081,17 +1280,25 @@ def main():
                         "release superseded before dispatch")
             event_type = EVENT_TYPES[args.consumer]
             client_payload = event
+            candidate_raw = None
             if event_type == "release-pair":
                 candidate_raw = public.download(f"https://github.com/{HUB}/releases/download/{args.tag}/{CANDIDATE}", {"github.com"})
                 client_payload = pair_payload(raw, candidate_raw)
             target = os.environ.get("TARGET_REPOSITORY", "")
             match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", target)
+            run_id = int(os.environ["GITHUB_RUN_ID"])
+            run_attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
+            positive(run_id)
+            positive(run_attempt)
+            data = {"event_type": event_type, "client_payload": client_payload}
+            context = delivery_context(raw, candidate_raw, data, manual=False)
+            authority = Client(token=os.environ["HUB_TOKEN"])
             dispatch_time = now()
-            client.api(f"repos/pineforge-4pass/{target}/dispatches", method="POST",
-                       data={"event_type": event_type, "client_payload": client_payload})
-            Path(args.output).write_bytes(canonical({"schema": "pineforge/release-delivery/v1", "event_id": event["event_id"],
+            dispatch_status = redelivery_dispatch(client, target, data, authority=authority, consumer=args.consumer)
+            Path(args.output).write_bytes(canonical({"schema": "pineforge/release-delivery/v2", "event_id": event["event_id"],
                 "consumer": args.consumer, "state": "dispatch_accepted", "attempt": args.attempt,
-                "run_id": int(os.environ["GITHUB_RUN_ID"]), "timestamp": dispatch_time}))
+                "run_id": run_id, "run_attempt": run_attempt, "context": context,
+                "dispatch_status": dispatch_status, "timestamp": dispatch_time}))
         else:
             report_issue(client, args.stage + "-failure", "Release chain: " + args.stage + " failed", run_link())
     except Pending as error:
