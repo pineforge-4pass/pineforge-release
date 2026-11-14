@@ -29,6 +29,7 @@ concurrency:
 
 permissions:
   contents: read   # the App token does the push
+  actions: read    # exact release-commit main-push proof
   issues: write    # neutral failure incidents only
 
 jobs:
@@ -337,6 +338,7 @@ jobs:
       - name: Bump VERSION, commit, tag
         if: steps.decide.outputs.mode == 'bump'
         env:
+          MAIN_PROOF_TOKEN: ${{ github.token }}
           E:       ${{ steps.decide.outputs.engine }}
           C:       ${{ steps.decide.outputs.codegen }}
           H:       ${{ steps.decide.outputs.hpo }}
@@ -356,6 +358,7 @@ jobs:
             # release commit (VERSION = the pair version). Tag that commit.
             commit="$(git log HEAD --format=%H -n 1 --fixed-strings --grep="chore(release): v${RELEASE} — ${components}")"
             [ -n "$commit" ] || { echo "::error::VERSION is ${RELEASE} but main has no release commit for it; refusing to tag"; exit 1; }
+            python3 scripts/release_main_proof.py commit --sha "$commit" --wait-seconds 1800
             git tag -a "v${RELEASE}" "$commit" -m "$(tag_message "$RELEASE")"
             git push origin "v${RELEASE}"
             line="pushed v${RELEASE} at ${commit} (${components}); after the tag exists on main and handle-upstream is green, a user with write access must run: gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=v${RELEASE}"
@@ -394,8 +397,12 @@ jobs:
           git add VERSION ${harness}
           git diff --cached --quiet && { echo "::error::nothing staged — refusing empty release"; exit 1; }
           git commit -m "chore(release): v${next} — ${components}"
-          git tag -a "v${next}" -m "$(tag_message "$next")"
+          commit="$(git rev-parse HEAD)"
+          # Push the FINAL release commit first so its own full main-push CI
+          # and facts run can execute. Base/PR proof cannot authorize its tag.
           git push origin HEAD:main
+          python3 scripts/release_main_proof.py commit --sha "$commit" --wait-seconds 1800
+          git tag -a "v${next}" "$commit" -m "$(tag_message "$next")"
           git push origin "v${next}"
           line="pushed v${next} (${components}); after the tag exists on main and handle-upstream is green, a user with write access must run: gh workflow run publish.yml --repo pineforge-4pass/pineforge-release --ref main -f tag=v${next}"
           echo "::notice title=pineforge publish needed::${line}"

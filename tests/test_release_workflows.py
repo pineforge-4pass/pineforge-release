@@ -305,6 +305,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         '        type: string\n'
     )
     PUBLISH_RELEASE_INPUTS = (
+        ("Require full main proof before image publication", "TAG"),
         ("Assert tag matches VERSION", "TAG"),
         ("Read pins (from the annotated tag message; fallback = the pair version, or resolve latest on 0.x)", "REF"),
         ("Pairing rule + release channel", "REF"),
@@ -407,6 +408,19 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
                 self.assertEqual((checkouts[0].get("with") or {}).get("fetch-depth"), "0")
         candidate = next((row for row in steps if row.get("id") == "candidate"), {})
         self.assertEqual((candidate.get("env") or {}).get("TAG"), "${{ needs.tag-guard.outputs.tag }}")
+        for identity, name, tag in (
+            ("prepare", "Require full main proof before candidate reuse", "${{ needs.tag-guard.outputs.tag }}"),
+            ("publish", "Require full main proof before image publication", "${{ env.RELEASE_TAG }}"),
+        ):
+            gates = [row for row in jobs[identity]["steps"] if row.get("name") == name]
+            self.assertEqual(gates, [{
+                "name": name,
+                "env": {"GH_TOKEN": "${{ github.token }}", "TAG": tag,
+                        "RELEASE_SHA": "${{ needs.tag-guard.outputs.sha }}"},
+                "run": 'python3 scripts/release_main_proof.py tag --tag "$TAG" --sha "$RELEASE_SHA"',
+            }])
+            self.assertEqual(jobs[identity]["permissions"]["actions"], "read")
+        self.assertEqual(jobs["notify-consumers"]["permissions"]["actions"], "read")
         publish_steps = jobs["publish"].get("steps", [])
         named = {row.get("name"): row for row in publish_steps}
         self.assertCountEqual(
@@ -499,6 +513,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
     def assert_handler(self, text):
         self.assert_no_publish_dispatch(text)
         wf = self.parse(text)
+        self.assertEqual(wf.get("permissions"), {"contents": "read", "actions": "read", "issues": "write"})
         steps = wf.get("jobs", {}).get("bump", {}).get("steps", [])
         app = next((row for row in steps if row.get("id") == "app"), {})
         self.assertEqual(app.get("with", {}).get("permission-contents"), "write")
@@ -522,6 +537,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
         self.assertLess(steps.index(decide), steps.index(completing))
         self.assertLess(steps.index(completing), steps.index(bump))
         self.assertEqual(bump.get("env", {}).get("E"), "${{ steps.decide.outputs.engine }}")
+        self.assertEqual(bump.get("env", {}).get("MAIN_PROOF_TOKEN"), "${{ github.token }}")
         self.assertEqual(replay.get("if"), "steps.decide.outputs.mode == 'republish'")
         self.assertEqual(replay.get("env", {}).get("TAG"), "v${{ steps.decide.outputs.cur_ver }}")
         for step in (replay, bump):
@@ -655,7 +671,7 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             ("      tag: ${{ needs.tag-guard.outputs.tag }}\n", "", 1),
             ("      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}\n", "", 1),
             ("      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}", "      RELEASE_TAG: ${{ inputs.tag }}", 1),
-            ("          TAG: ${{ needs.tag-guard.outputs.tag }}", "          TAG: ${{ inputs.tag }}", 1),
+            ("          TAG: ${{ needs.tag-guard.outputs.tag }}", "          TAG: ${{ inputs.tag }}", 2),
             ("      tag: ${{ needs.prepare.outputs.tag }}", "      tag: ${{ inputs.tag }}", 1),
             ("    needs: tag-guard\n", "", 1),
             ("    needs: [tag-guard, prepare]", "    needs: prepare", 1),
@@ -693,6 +709,21 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
             for after in ("", "          " + variable + ": v0.0.0\n"):
                 mutant = self.mutate_step(text, "publish", name, before, after)
                 with self.subTest(step=name, variable=variable, replacement=after), self.assertRaises(AssertionError):
+                    self.assert_publish(mutant)
+        for identity, name in (
+            ("prepare", "Require full main proof before candidate reuse"),
+            ("publish", "Require full main proof before image publication"),
+        ):
+            for before, after in (
+                ("        env:\n", "        if: false\n        env:\n"),
+                ("        env:\n", "        continue-on-error: true\n        env:\n"),
+                ("          GH_TOKEN: ${{ github.token }}\n", ""),
+                ("          RELEASE_SHA: ${{ needs.tag-guard.outputs.sha }}", "          RELEASE_SHA: ${{ github.sha }}"),
+                ('        run: python3 scripts/release_main_proof.py tag --tag "$TAG" --sha "$RELEASE_SHA"\n',
+                 "        run: echo ignored proof\n"),
+            ):
+                mutant = self.mutate_step(text, identity, name, before, after)
+                with self.subTest(step=name, mutation=after), self.assertRaises(AssertionError):
                     self.assert_publish(mutant)
         parity_name = "Sync parity from the immutable engine tag"
         for before, after in (
@@ -797,6 +828,11 @@ class ReleaseTriggerWorkflowTest(unittest.TestCase):
                 mutant = self.mutate_step(text, "bump", name, before, after)
                 with self.subTest(step=name, boundary="engine input", replacement=after), self.assertRaises(AssertionError):
                     self.assert_handler(mutant)
+        for after in ("", "          MAIN_PROOF_TOKEN: ${{ steps.app.outputs.token }}\n"):
+            mutant = self.mutate_step(text, "bump", self.BUMP,
+                                      "          MAIN_PROOF_TOKEN: ${{ github.token }}\n", after)
+            with self.subTest(boundary="read-only hub proof token", replacement=after), self.assertRaises(AssertionError):
+                self.assert_handler(mutant)
         completing_if = "        if: steps.decide.outputs.mode == 'bump' && steps.in.outputs.component != 'engine'\n"
         for before, after in (
             (completing_if, ""),
@@ -1111,7 +1147,7 @@ class SourceMirrorWorkflowTest(unittest.TestCase):
         self.assertEqual(workflow.get("permissions"), {"contents": "read"})
         job = workflow["jobs"]["publish"]
         self.assertEqual(job.get("environment"), "release-automation")
-        self.assertEqual(job.get("permissions"), {"contents": "write", "packages": "write"})
+        self.assertEqual(job.get("permissions"), {"contents": "write", "packages": "write", "actions": "read"})
         steps = job["steps"]
         mints = [step for step in steps
                  if step.get("uses", "").startswith("actions/create-github-app-token@")]
@@ -2033,7 +2069,7 @@ class NotifyConsumersTest(unittest.TestCase):
         ready = next(step for step in finalize["steps"] if step.get("id") == "ready")
         self.assertEqual(ready["run"].splitlines(), [
             "set -euo pipefail",
-            'python3 scripts/release_pipeline.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"',
+            'python3 scripts/release_main_proof.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"',
         ])
         output = next(step for step in finalize["steps"] if step.get("id") == "delivery-output")
         self.assertEqual(output["if"], "${{ always() }}")
@@ -2143,15 +2179,19 @@ class RedeliverWorkflowTest(unittest.TestCase):
         self.assertLess(steps.index(checkout), steps.index(check))
         self.assertLess(steps.index(check), steps.index(mint))
         self.assertLess(steps.index(mint), steps.index(send))
-        # Both pre-mint checks stay, in this order: authorization, this public eligibility check,
-        # then the repository guard (the first step that resolves a target secret), then the mint.
+        # Authorization and public eligibility precede main proof, then the
+        # repository guard (the first target-secret read) and the token mint.
         authorization = next(step for step in steps
                              if step.get("name") == "Authorize consumer and pair before token mint")
+        proof = next(step for step in steps if step.get("id") == "main-proof")
         guard = next(step for step in steps if step.get("name") == "Require one configured consumer repository")
         self.assertLess(steps.index(checkout), steps.index(authorization))
         self.assertLess(steps.index(authorization), steps.index(check))
-        self.assertLess(steps.index(check), steps.index(guard))
+        self.assertLess(steps.index(check), steps.index(proof))
+        self.assertLess(steps.index(proof), steps.index(guard))
         self.assertLess(steps.index(guard), steps.index(mint))
+        self.assertEqual(proof["env"], {"GH_TOKEN": "${{ github.token }}", "TAG": "${{ inputs.tag }}"})
+        self.assertEqual(proof["run"], 'python3 scripts/release_main_proof.py delivery --tag "$TAG"')
         self.assertNotIn("secrets.", json.dumps(steps[:steps.index(check) + 1]),
                          "a step resolves a secret before authorization and eligibility complete")
         self.assertEqual(check["env"], {
@@ -2162,7 +2202,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
         })
         self.assertEqual(check["run"],
                          'python3 scripts/release_pipeline.py redeliver-check --tag "$TAG" --consumer "$CONSUMER"\n')
-        for step in (check, mint, send):
+        for step in (check, proof, mint, send):
             self.assertNotIn("if", step)
             self.assertNotIn("continue-on-error", step)
 
@@ -2195,16 +2235,46 @@ class RedeliverWorkflowTest(unittest.TestCase):
                     self.assertNotIn("if", step, "target secrets require successful authorization")
                     self.assertNotIn("continue-on-error", step, "authorization failure must stop the job")
 
-    def authorization_flow(self, steps, *, enabled="compute", first="1.6.0", tag="v1.6.0", consumer="compute"):
+    def proof_shell(self, script, environment, tag, problem):
+        from test_release_binding import fixture_manifest
+        from test_release_binding_workflows import main_proof_endpoints
+
+        manifest = fixture_manifest(tag.removeprefix("v"))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "endpoints.json").write_text(json.dumps({"main_proof": main_proof_endpoints(
+                manifest["hub_commit"], problem=problem, manifest=manifest, tag=tag)}))
+            paths = [str(REPO / "tests"), str(REPO / "scripts")]
+            bridge = (
+                f"import sys; sys.path[:0] = {paths!r}; "
+                "from test_release_binding_workflows import main_proof_fixture_cli; "
+                "sys.argv = sys.argv[1:]; raise SystemExit(main_proof_fixture_cli())"
+            )
+            wrapper = ("python3() { command " + shlex.quote(sys.executable) + " -c "
+                       + shlex.quote(bridge) + ' "$@"; }\n')
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", wrapper + script],
+                cwd=REPO, env={**environment, "PRODUCER_FIXTURE_ROOT": str(root)},
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotIn("Traceback", result.stderr, result.stdout + result.stderr)
+            recorded = json.loads((root / "main-proof-result.json").read_bytes())
+            self.assertEqual(recorded["status"], result.returncode)
+            self.assertTrue(any("/actions/workflows/" in route for route in recorded["calls"]))
+            return result
+
+    def authorization_flow(self, steps, *, enabled="compute", first="1.6.0", tag="v1.6.0", consumer="compute", proof_problem=None):
         """CI only: execute actual guards; count reached mint/dispatch boundaries.
 
         The public eligibility step reads the live hub, so this walk counts it instead of running it:
         test_release_redeliver.RedeliverTest.workflow_before_target_mint runs that same step against
-        its fake hub. A mint reached before that step fails here, so both pre-mint checks stay in line.
+        its fake hub. The main proof shell executes against serialized hub GETs.
+        A mint before either check fails; no proof decision is assumed green.
         """
         follows = (".github/workflows/release-redeliver.yml", "scripts/release_pipeline.py",
                    "scripts/release_contract.py", "scripts/release_pair.py",
-                   "scripts/release_artifacts.py", "scripts/release_sources.py", os.devnull)
+                   "scripts/release_artifacts.py", "scripts/release_sources.py",
+                   "scripts/release_main_proof.py", os.devnull)
         forbidden = ("/.config/zsh/keys", "/.ssh", "/.aws", "/.codex", "/.config/pineforge")
         for name in follows:
             path = str(REPO / name)
@@ -2219,6 +2289,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
             "${{ vars.RELEASE_READY_EXCLUDE }}": ",".join(
                 role for role in contract.ROLES if role not in enabled.split(",")),
             "${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}": first,
+            "${{ github.token }}": "test-hub-read",
         }
         for step in steps:
             target = step.get("env", {}).get("TARGET_REPOSITORY")
@@ -2228,13 +2299,14 @@ class RedeliverWorkflowTest(unittest.TestCase):
                        "TARGET_REPOSITORY": "configured-target", "GITHUB_OUTPUT": os.devnull}
         checkout = next(i for i, step in enumerate(steps)
                         if step.get("uses", "").startswith("actions/checkout@"))
-        mints, dispatches, eligibility_checks, results = 0, 0, 0, []
+        mints, dispatches, eligibility_checks, proof_checks, results = 0, 0, 0, 0, []
         for step in steps[checkout + 1:]:
             self.assertNotIn("if", step, "authorization and token steps must use the default success guard")
             self.assertNotIn("continue-on-error", step, "a failed authorization must stop later steps")
             self.assertEqual(step.get("shell", "bash"), "bash")
             if step.get("uses", "").startswith("actions/create-github-app-token@"):
                 self.assertEqual(eligibility_checks, 1, "the public eligibility check must precede the token mint")
+                self.assertEqual(proof_checks, 1, "full main proof must precede the token mint")
                 mints += 1
                 continue
             if "release_pipeline.py redeliver " in step.get("run", ""):
@@ -2254,10 +2326,15 @@ class RedeliverWorkflowTest(unittest.TestCase):
                     self.assertIn(value, context, "unexpected workflow control context")
                     value = context[value]
                 step_env[key] = value
-            result = subprocess.run(
-                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
-                cwd=REPO, env=step_env, capture_output=True, text=True, timeout=30,
-            )
+            if "scripts/release_main_proof.py delivery" in script:
+                self.assertEqual(eligibility_checks, 1, "eligibility must precede hub proof reads")
+                result = self.proof_shell(script, step_env, tag, proof_problem)
+                proof_checks += 1
+            else:
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+                    cwd=REPO, env=step_env, capture_output=True, text=True, timeout=30,
+                )
             results.append(result)
             if result.returncode:
                 return mints, dispatches, results
@@ -2304,6 +2381,27 @@ class RedeliverWorkflowTest(unittest.TestCase):
         self.assertEqual(results[-1].returncode, 1)
         self.assertIn("RuntimeError: deliberate authorization crash", results[-1].stderr)
 
+    def test_redelivery_main_proof_refuses_before_mint_and_detects_missing_or_softened_gate(self):
+        original = _workflow("release-redeliver.yml")["jobs"]["redeliver"]["steps"]
+        for problem in (None, "missing", "red", "running", "wrong_sha", "pr", "skipped"):
+            with self.subTest(problem=problem):
+                mints, dispatches, results = self.authorization_flow(original, proof_problem=problem)
+                self.assertEqual((mints, dispatches), (1, 1) if problem is None else (0, 0))
+                self.assertEqual(results[-1].returncode, 0 if problem is None else 1)
+        for mutation in ("removed", "late", "conditional", "softened"):
+            steps = copy.deepcopy(original)
+            gate = next(step for step in steps if step.get("id") == "main-proof")
+            if mutation in {"removed", "late"}:
+                steps.remove(gate)
+                if mutation == "late":
+                    steps.append(gate)
+            elif mutation == "conditional":
+                gate["if"] = "success()"
+            else:
+                gate["continue-on-error"] = "true"
+            with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
+                self.authorization_flow(steps)
+
     def test_manual_inputs_protected_single_job_and_serialized_permissions(self):
         """Mutation: delete the redeliver job's main-ref if."""
         wf = _workflow("release-redeliver.yml")
@@ -2325,7 +2423,7 @@ class RedeliverWorkflowTest(unittest.TestCase):
         self.assertNotIn("needs", job)
         self.assertEqual(job["runs-on"], "ubuntu-latest")
         self.assertEqual(job["environment"], "release-automation")
-        self.assertEqual(job["permissions"], {"contents": "write", "issues": "write"})
+        self.assertEqual(job["permissions"], {"contents": "write", "issues": "write", "actions": "read"})
         self.assertEqual(job["concurrency"], {
             "group": "release-delivery-${{ inputs.consumer }}-${{ inputs.tag }}",
             "cancel-in-progress": "false",
