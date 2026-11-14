@@ -1974,6 +1974,26 @@ class NotifyConsumersTest(unittest.TestCase):
         send = next(s for s in job["steps"] if s.get("name", "").startswith("Dispatch pineforge-release"))
         self.assertIn("release_pipeline.py dispatch", send["run"])
         self.assertNotIn("client_payload[", send["run"])
+        checkout = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"], {"ref": "${{ github.sha }}", "persist-credentials": "false"})
+        self.assertEqual(send["env"], {
+            "GH_TOKEN": "${{ steps.app.outputs.token }}", "HUB_TOKEN": "${{ github.token }}",
+            "TAG": "${{ matrix.tag }}", "CONSUMER": "${{ matrix.consumer }}",
+            "DELIVERY_ATTEMPT": "${{ matrix.attempt }}",
+        })
+        receipt = next(s for s in job["steps"] if s.get("name") == "Preserve delivery receipt")
+        self.assertEqual(receipt["env"]["GH_TOKEN"], "${{ github.token }}")
+        artifact = next(s for s in job["steps"] if s.get("name") == "Preserve this delivery attempt")
+        self.assertEqual(artifact["uses"],
+                         "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
+        self.assertEqual(artifact["if"], "${{ !cancelled() }}")
+        self.assertEqual(artifact["with"], {
+            "name": "release-delivery-${{ matrix.consumer }}-${{ matrix.tag }}-${{ github.run_id }}-${{ github.run_attempt }}",
+            "path": "${{ runner.temp }}/delivery.json", "if-no-files-found": "error",
+        })
+        self.assertLess(job["steps"].index(checkout), job["steps"].index(send))
+        self.assertLess(job["steps"].index(send), job["steps"].index(receipt))
+        self.assertLess(job["steps"].index(receipt), job["steps"].index(artifact))
 
     def test_all_consumer_roles_have_explicit_registry_and_policy(self):
         import release_contract as contract
@@ -2350,12 +2370,13 @@ class RedeliverWorkflowTest(unittest.TestCase):
         self.assertEqual(target, sibling["env"]["TARGET_REPOSITORY"].replace("matrix.consumer", "inputs.consumer"))
         steps = job["steps"]
         self.assertEqual(steps[0], ReleaseTriggerWorkflowTest.APT_GUARD_STEP)
-        self.assertEqual(len([step for step in steps if "uses" in step]), 2)
+        self.assertEqual(len([step for step in steps if "uses" in step]), 3)
         actions = {step["uses"]: step for step in steps if "uses" in step}
         checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         mint = "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
-        self.assertEqual(set(actions), {checkout, mint})
-        self.assertEqual(actions[checkout]["with"], {"ref": "main", "persist-credentials": "false"})
+        upload = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+        self.assertEqual(set(actions), {checkout, mint, upload})
+        self.assertEqual(actions[checkout]["with"], {"ref": "${{ github.sha }}", "persist-credentials": "false"})
         self.assertEqual(actions[mint]["with"], {
             "app-id": "${{ secrets.PINEFORGE_APP_ID }}",
             "private-key": "${{ secrets.PINEFORGE_APP_PRIVATE_KEY }}",
@@ -2385,6 +2406,13 @@ class RedeliverWorkflowTest(unittest.TestCase):
         self.assertEqual(sends[0]["run"],
                          'python3 scripts/release_pipeline.py redeliver --tag "$TAG" --consumer "$CONSUMER" \\\n'
                          '  --output "$RUNNER_TEMP/redelivery.json"\n')
+        self.assertEqual(actions[upload]["with"], {
+            "name": "release-redelivery-${{ inputs.consumer }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}",
+            "path": "${{ runner.temp }}/redelivery.json", "if-no-files-found": "error",
+        })
+        self.assertLess(steps.index(sends[0]), steps.index(actions[upload]))
+        self.assertNotIn("env", actions[upload])
+        self.assertNotIn("continue-on-error", actions[upload])
         self.assertNotIn("release_receipts.py", str(steps))
         self.assertNotIn("client_payload", str(steps))
 

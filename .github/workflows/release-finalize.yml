@@ -143,7 +143,7 @@ jobs:
           exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Require one configured consumer repository
         shell: bash
@@ -168,6 +168,8 @@ jobs:
       - name: Dispatch pineforge-release from immutable bytes
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          # Read authority from the hub; the App token is target-only.
+          HUB_TOKEN: ${{ github.token }}
           TAG: ${{ matrix.tag }}
           CONSUMER: ${{ matrix.consumer }}
           DELIVERY_ATTEMPT: ${{ matrix.attempt }}
@@ -199,7 +201,7 @@ jobs:
         with:
           name: release-delivery-${{ matrix.consumer }}-${{ matrix.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/delivery.json
-          if-no-files-found: warn
+          if-no-files-found: error
       - name: Report failed dispatch
         if: ${{ failure() && !cancelled() }}
         env:

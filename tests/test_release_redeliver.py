@@ -25,7 +25,8 @@ import release_artifacts as artifacts  # noqa: E402
 import release_contract as contract  # noqa: E402
 import release_pipeline as pipeline  # noqa: E402
 import release_receipts as adapter  # noqa: E402
-from test_release_binding import (FinalizeClient, MemoryRegistry, MemoryStore,  # noqa: E402
+from test_release_binding import (DELIVERY_SOURCES as SOURCE_FILES,  # noqa: E402
+                                  FinalizeClient, MemoryRegistry, MemoryStore,
                                   expected_pair_payload, fixture_manifest)
 
 TAG = "v1.6.0"
@@ -87,13 +88,23 @@ class RedeliverTest(unittest.TestCase):
         self.row.update(draft=False, prerelease=False)
         self.store.workflow_runs[900] = {
             "id": 900, "path": ".github/workflows/release-redeliver.yml",
-            "head_branch": "main", "status": "completed", "conclusion": "success"}
+            "run_attempt": 1, "head_sha": "a" * 40,
+            "head_branch": "main", "status": "completed", "conclusion": "success",
+            "event": "workflow_dispatch", "repository": {"full_name": contract.HUB},
+            "head_repository": {"full_name": contract.HUB},
+            "actor": {"login": "release-operator"}, "run_started_at": CLOCK,
+            "updated_at": "2026-10-23T00:01:00Z"}
+        self.store.runs[900, 1] = self.store.workflow_runs[900]
         self.seed = self.store.put
         self.seed(self.row, contract.ASSET, self.raw)
         self.store.operations.clear()
         self.public = PublicHub(self.store)
+        self.authority = self.store
+        self.authority.variables = {"RELEASE_READY_CONSUMERS": ",".join(contract.ROLES),
+                                    "RELEASE_COMPUTE_FIRST_PAIR": "1.0.0"}
+        self.store.client = self.authority
         self.target_client = artifacts.Client(token="target-app-token")
-        self.hub_client = object()
+        self.hub_client = self.authority
         self.real_store = pipeline.Store
         self.tokens, self.requests, self.accepted, self.puts, self.effects = [], [], [], [], []
         self.fail_send = self.fail_put = False
@@ -104,7 +115,8 @@ class RedeliverTest(unittest.TestCase):
         self.start_patch(patch.dict(os.environ, {
             "GH_TOKEN": "target-app-token", "HUB_TOKEN": "hub-write-token",
             "TARGET_REPOSITORY": TARGET, "RELEASE_READY_CONSUMERS": CONSUMER,
-            "GITHUB_RUN_ID": "900", "GITHUB_ACTOR": "release-operator",
+            "GITHUB_RUN_ID": "900", "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_SHA": "a" * 40, "GITHUB_ACTOR": "release-operator",
         }, clear=True))
         self.start_patch(patch.object(pipeline, "now", return_value=CLOCK))
         self.start_patch(patch.object(pipeline, "Client", side_effect=self.client))
@@ -149,22 +161,43 @@ class RedeliverTest(unittest.TestCase):
         if self.fail_put:
             raise OSError("hub audit storage unavailable")
         self.seed(row, name, raw)
+        if name.startswith("delivery-redelivered-"):
+            self.publish_audit(contract.decode(raw))
 
     def audit(self, attempt, *, consumer=CONSUMER):
-        return {"schema": "pineforge/release-redelivery/v2", "event_id": self.event["event_id"],
+        candidate = self.store.read(self.row, contract.CANDIDATE) if consumer == "compute" else None
+        body = {"event_type": contract.EVENT_TYPES[consumer],
+                "client_payload": contract.pair_payload(self.raw, candidate) if candidate else self.event}
+        source_files = (*SOURCE_FILES, ".github/workflows/release-redeliver.yml")
+        return {"schema": "pineforge/release-redelivery/v3", "event_id": self.event["event_id"],
                 "consumer": consumer, "attempt": attempt, "state": "dispatch_accepted",
-                "run_id": 900, "dispatch_status": 204, "timestamp": CLOCK, "actor": "release-operator"}
+                "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": 1,
+                "dispatch_status": 204, "timestamp": CLOCK, "actor": "release-operator",
+                "context": {"tag": self.row["tag_name"], "manifest_sha256": contract.sha256(self.raw),
+                            "candidate_sha256": contract.sha256(candidate) if candidate else None,
+                            "dispatch_sha256": contract.sha256(contract.canonical(body)),
+                            "workflow_commit": "a" * 40,
+                            "source_sha256": {name: contract.sha256(self.authority.sources[name])
+                                              for name in source_files}}}
+
+    def publish_audit(self, obj):
+        self.authority.publish_delivery(obj, tag=self.row["tag_name"])
 
     def seed_audit(self, number, *, consumer=CONSUMER, changes=None, name=None):
-        obj = {**self.audit(number, consumer=consumer), **(changes or {})}
+        genuine = self.audit(number, consumer=consumer)
+        genuine["run_id"] = 700 + number
+        self.publish_audit(genuine)
+        obj = {**genuine, **(changes or {})}
         name = name or f"delivery-redelivered-{consumer}-{number}.json"
         self.seed(self.row, name, contract.canonical(obj))
 
     def seed_acceptance(self):
-        self.seed(self.row, f"delivery-{CONSUMER}.json", contract.canonical({
+        obj = {
             "schema": "pineforge/release-delivery/v1", "event_id": self.event["event_id"],
             "consumer": CONSUMER, "attempt": 3, "state": "dispatch_accepted",
-            "run_id": 800, "timestamp": CLOCK}))
+            "run_id": 800, "timestamp": CLOCK}
+        self.authority.publish_delivery(obj, manual=False, tag=self.row["tag_name"])
+        self.seed(self.row, f"delivery-{CONSUMER}.json", contract.canonical(obj))
 
     def receipt_body(self, state, *, consumer=CONSUMER, attempt=1, sequence=1):
         # A trusted hub summary, after the existing receipt adapter verified the
@@ -377,8 +410,9 @@ class RedeliverTest(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_RUN_ID": "9123"}):
             self.invoke()
         audit = contract.decode(self.output.read_bytes())
-        self.assertEqual(audit["schema"], "pineforge/release-redelivery/v2")
+        self.assertEqual(audit["schema"], "pineforge/release-redelivery/v3")
         self.assertEqual(audit["run_id"], 9123)
+        self.assertEqual(audit["run_attempt"], 1)
         self.assertEqual(audit["dispatch_status"], self.dispatch_status)
         self.assertEqual(audit["dispatch_status"], 204)
         self.assertEqual(self.puts, [(TAG, f"delivery-redelivered-{CONSUMER}-1.json",
@@ -403,41 +437,52 @@ class RedeliverTest(unittest.TestCase):
         """Mutation: omit confirm_redelivery_run from redeliver's history check."""
         success = self.store.workflow_runs[900]
         cases = (
-            ({**success, "path": ".github/workflows/release-finalize.yml"}, "redelivery workflow run differs"),
-            ({**success, "head_branch": "repair"}, "redelivery workflow run differs"),
-            ({**success, "conclusion": "failure"}, "redelivery workflow run differs"),
-            ({**success, "status": "in_progress", "conclusion": None}, "redelivery workflow run differs"),
-            (None, "redelivery workflow run unavailable"),
+            ({**success, "path": ".github/workflows/release-finalize.yml"}, "delivery producing workflow attempt differs"),
+            ({**success, "head_branch": "repair"}, "delivery producing workflow attempt differs"),
+            ({**success, "conclusion": "failure"}, "delivery producing workflow attempt differs"),
+            ({**success, "status": "in_progress", "conclusion": None}, "delivery producing workflow attempt differs"),
+            (None, "delivery producing workflow attempt unavailable (requires Actions: read)"),
             (contract.Invalid("artifact request failed (HTTP 500)"), "artifact request failed (HTTP 500)"),
         )
         for schema in ("pineforge/release-redelivery/v1", "pineforge/release-redelivery/v2"):
             obj = {**self.audit(1), "schema": schema}
+            obj = {key: value for key, value in obj.items() if key not in ("run_attempt", "context")}
             if schema.endswith("/v1"):
                 obj = {key: value for key, value in obj.items() if key != "dispatch_status"}
+            self.authority.artifacts.clear()
+            self.authority.archives.clear()
+            self.authority.artifact_runs.clear()
+            self.store.runs[900, 1] = copy.deepcopy(success)
+            self.store.workflow_runs[900] = self.store.runs[900, 1]
+            self.authority.publish_delivery(obj)
             for run, message in cases:
                 with self.subTest(schema=schema, run=run):
                     before = copy.deepcopy(self.store.assets)
                     assets = copy.deepcopy(self.row["assets"])
                     self.store.workflow_runs = {} if run is None else {900: run}
+                    self.store.runs = {} if run is None else {(900, 1): run}
                     self.store.run_reads.clear()
                     try:
                         self.seed(self.row, f"delivery-redelivered-{CONSUMER}-1.json", contract.canonical(obj))
                         self.assert_refused(message=message)
-                        self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+                        self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900/attempts/1"])
                     finally:
                         self.store.assets = before
                         self.row["assets"] = assets
 
-    def test_confirmed_v1_history_can_append_v2_without_rewriting_history(self):
+    def test_confirmed_v1_history_can_append_v3_without_rewriting_history(self):
         """Mutation: reject all legacy history instead of confirming its workflow run."""
         legacy = {**self.audit(1), "schema": "pineforge/release-redelivery/v1"}
-        legacy = {key: value for key, value in legacy.items() if key != "dispatch_status"}
+        legacy = {key: value for key, value in legacy.items()
+                  if key not in ("dispatch_status", "run_attempt", "context")}
+        self.publish_audit(legacy)
         self.seed(self.row, f"delivery-redelivered-{CONSUMER}-1.json", contract.canonical(legacy))
         before = copy.deepcopy(self.store.assets)
+        os.environ["GITHUB_RUN_ID"] = "901"
         self.invoke()
         audit = contract.canonical(self.audit(2))
         name = f"delivery-redelivered-{CONSUMER}-2.json"
-        self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+        self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900/attempts/1"])
         self.assertEqual(self.puts, [(TAG, name, audit)])
         self.assertEqual(self.store.assets, {**before, (TAG, name): audit})
         self.assertEqual(self.effects, ["send", "put"])
@@ -481,6 +526,7 @@ class RedeliverTest(unittest.TestCase):
         self.seed_audit(7, consumer="offline")
         before = copy.deepcopy(self.store.assets)
         for number in (2, 3, 4):
+            os.environ["GITHUB_RUN_ID"] = str(900 + number)
             self.invoke()
             self.assertEqual(self.output.read_bytes(), contract.canonical(self.audit(number)))
         self.assertEqual([name for _, name, _ in self.puts],
@@ -628,10 +674,12 @@ class RedeliverTest(unittest.TestCase):
         row.update(id=2, draft=False, prerelease=False)
         self.store.rows[row["tag_name"]] = row
         self.seed(row, contract.ASSET, contract.canonical(newer))
-        self.seed(self.row, "delivery-compute.json", contract.canonical({
+        accepted = {
             "schema": "pineforge/release-delivery/v1", "event_id": self.event["event_id"],
             "consumer": "compute", "attempt": 1, "state": "dispatch_accepted",
-            "run_id": 800, "timestamp": CLOCK}))
+            "run_id": 800, "timestamp": CLOCK}
+        self.authority.publish_delivery(accepted, manual=False, tag=self.row["tag_name"])
+        self.seed(self.row, "delivery-compute.json", contract.canonical(accepted))
         before = copy.deepcopy(self.store.assets)
         tag = self.row["tag_name"]
         with patch.dict(os.environ, {"RELEASE_READY_CONSUMERS": "compute",
@@ -700,7 +748,7 @@ class RedeliverTest(unittest.TestCase):
             self.assertEqual(self.store.assets, {**before, (TAG, name): audit_raw})
             self.assertEqual(contract.decode(deliveries.read_bytes()), [])
             self.assertFalse(report.call_args.kwargs.get("complete", False))
-            self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+            self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900/attempts/1"])
             self.store.workflow_runs[900].update(status="completed", conclusion="success")
             self.store.run_reads.clear()
             report.reset_mock()
@@ -714,7 +762,7 @@ class RedeliverTest(unittest.TestCase):
             self.assertEqual(status["stale"], [])
             self.assertEqual(contract.decode(deliveries.read_bytes()), [])
             self.assertTrue(report.call_args.kwargs["complete"])
-            self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900"])
+            self.assertEqual(self.store.run_reads, [f"repos/{contract.HUB}/actions/runs/900/attempts/1"])
             for key, raw in before.items():
                 self.assertEqual(self.store.assets[key], raw)
             self.assertFalse(any(name.startswith("consumer-") for _, name in self.store.assets))
