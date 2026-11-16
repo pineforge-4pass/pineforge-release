@@ -128,6 +128,10 @@ jobs:
         if: steps.paths.outputs.docs-only == 'false'
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.paths.outputs.docs-only == 'false'
+        with:
+          node-version: "20"
       - run: python3 -m pip install -r facts/requirements-validation.txt
         if: steps.paths.outputs.docs-only == 'false'
       - name: Validate the whole canonical document and descriptions
