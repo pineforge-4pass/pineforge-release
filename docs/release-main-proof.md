@@ -41,19 +41,45 @@ the optional per-job attempt field, it must match that endpoint's attempt.
 | Producer reconciliation | Prove the checked-out main SHA before replaying producer events; the handler separately proves the release commit it creates. |
 
 `finalize` in the new helper calls the existing `release_pipeline.finalize_all`
-with guarded storage and source reads. This covers reusable, manual, scheduled,
+with guarded candidate and manifest storage. This covers reusable, manual, scheduled,
 and facts-push finalization, including an empty-tag candidate sweep. It avoids a
 preflight over one candidate list followed by publication from a newly selected
 list. Facts may arrive in a later main commit than the release commit, so each
-of those exact SHAs requires its own full CI and facts proof. Historical rows
+of those exact SHAs requires its own full CI and facts proof. The manifest's
+bound facts commit is proved before its immutable write, ahead of every alias,
+publication and readiness step; replay proves the existing manifest's bound
+commit too. The latest facts read used only for a freshness report needs no
+publication proof.
+
+When candidate proof is refused for a row that already has `release-ready.json`,
+the finalizer leaves that row as historical data: it performs no alias,
+publication or delivery work for it, and continues the sweep. An unprovable row
+without readiness remains pending or failed as appropriate. Historical rows
 read only to compare versions do not acquire publication authority.
 
-The handler waits up to 1,800 seconds for missing or unfinished runs, without
-dispatching or rerunning CI. Failed proof stops immediately. If proof never
-becomes complete, the main commit remains available and no release tag is
-created. Other routes refuse unavailable proof at their normal wake-up; their
-existing recovery triggers remain responsible for subsequent attempts. Old
-releases without the required proof receive no exemption.
+The handler and facts-fanout push jobs wait up to 1,800 seconds for missing or
+unfinished runs, without dispatching or rerunning CI. The `commit` and
+`facts-source` commands accept `--wait-seconds` (default zero, maximum 3,600).
+Failed proof stops immediately; an expired wait still refuses publication.
+The finalizer reports unfinished proof as readiness pending and retries at its
+next normal wake-up. Other routes refuse unavailable proof at their normal
+wake-up; their existing recovery triggers remain responsible for subsequent
+attempts.
+
+## Recovering a release commit with failed CI
+
+The handler pushes the VERSION bump before proving that exact release commit.
+If its CI is red, no tag is created and VERSION can remain ahead of the landed
+pair. Sending the same event again still checks the original release commit;
+a later green main commit cannot authorize its missing tag.
+
+A maintainer must manually revert the untagged VERSION bump on `main` to the
+landed release version, then send the upstream event again. Use the normal
+reviewed main change process and resolve the CI failure before replaying the
+event. The handler can then create a fresh release commit, whose own complete
+main-push CI and facts proof must pass before tagging. Leave existing tags and
+release assets intact. If proof was only pending, retry the event after that
+original commit's proof passes; the retag route still selects that commit.
 
 The workflows grant their hub token `actions: read` for proof reads; consumer
 tokens retain their existing scopes. Proof snapshots are cached only within

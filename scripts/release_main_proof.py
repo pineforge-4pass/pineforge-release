@@ -2,8 +2,8 @@
 """Require this hub's complete successful main-push CI on an exact commit.
 
 The proof reader only GETs public hub identities. Publication still uses the
-existing release pipeline; its candidate and facts reads are guarded here so
-scheduled reconciliation cannot select an unproved commit after a preflight.
+existing release pipeline; candidate reads and manifest storage are guarded
+here so scheduled reconciliation cannot publish an unproved bound commit.
 """
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ class ProofError(Invalid):
     """No publication is authorized by this proof."""
 
 
-class ProofPending(ProofError):
-    """The handler may wait for a missing or unfinished main-push run."""
+class ProofPending(ProofError, Pending):
+    """Wait or retry later for a missing or unfinished main-push run."""
 
 
 def insist(condition, message):
@@ -192,21 +192,6 @@ class MainProof:
         return self.require_commit(commit)
 
 
-class GuardedClient:
-    """Prove the facts commit actually selected by the existing finalizer."""
-
-    def __init__(self, client, checker):
-        self.client, self.checker = client, checker
-
-    def __getattr__(self, name):
-        return getattr(self.client, name)
-
-    def file(self, repo, commit, path):
-        if repo == HUB and path == "facts/facts.json":
-            self.checker.require_commit(commit)
-        return self.client.file(repo, commit, path)
-
-
 class GuardedStore:
     """Check each candidate before the real pipeline can publish its manifest."""
 
@@ -228,7 +213,12 @@ class GuardedStore:
         if raw is not None and name == CANDIDATE:
             candidate = validate_candidate(decode(raw))
             insist(row["tag_name"] == "v" + candidate["release_version"], "main proof candidate tag differs")
-            self.checker.require_tag(row["tag_name"], candidate["hub_commit"])
+            try:
+                self.checker.require_tag(row["tag_name"], candidate["hub_commit"])
+            except ProofError:
+                if self.store.read(row, "release-ready.json") is not None:
+                    return None  # Historical readiness authorizes no new work.
+                raise
             self.candidates.add(row["tag_name"])
         elif raw is not None and name == ASSET and row["tag_name"] in self.candidates:
             # Existing manifests can replay aliases too; they need proof for
@@ -255,18 +245,18 @@ def require_delivery(checker, tag):
     guarded.manifest(row, raw)
 
 
-def require_facts_source(checker, directory):
+def require_facts_source(checker, directory, wait_seconds=0):
     obj = decode((directory / "payload.json").read_bytes())
     keys(obj, ("commit", "sha256", "dry_run"))
     insist(type(obj["dry_run"]) is bool and obj["sha256"] == sha256((directory / "facts.json").read_bytes()),
            "main proof facts snapshot differs")
-    return checker.require_commit(obj["commit"])
+    return wait_for_commit(checker, obj["commit"], wait_seconds)
 
 
 def finalize(checker, tag, output):
     import release_pipeline as pipeline
 
-    client = GuardedClient(checker.client, checker)
+    client = checker.client
     store = GuardedStore(pipeline.Store(client), checker)
     # Keep the existing per-release reconciliation, alias, reservation and
     # consumer policy code. Guarded reads also cover the empty-tag sweep.
@@ -298,6 +288,7 @@ def main(argv=None):
     command.add_argument("--tag", required=True)
     command = sub.add_parser("facts-source", allow_abbrev=False)
     command.add_argument("--source-dir", type=Path, required=True)
+    command.add_argument("--wait-seconds", type=int, default=0)
     command = sub.add_parser("finalize", allow_abbrev=False)
     command.add_argument("--tag", default="")
     command.add_argument("--output", required=True)
@@ -312,7 +303,8 @@ def main(argv=None):
         elif args.command == "delivery":
             require_delivery(checker, args.tag)
         elif args.command == "facts-source":
-            require_facts_source(checker, args.source_dir)
+            insist(0 <= args.wait_seconds <= 3600, "main proof wait is out of bounds")
+            require_facts_source(checker, args.source_dir, args.wait_seconds)
         else:
             finalize(checker, args.tag, args.output)
     except (ProofError, Pending, Invalid, ValueError, OSError, KeyError, TypeError):

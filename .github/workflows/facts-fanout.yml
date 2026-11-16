@@ -58,7 +58,8 @@ jobs:
         id: main-proof
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/release_main_proof.py facts-source --source-dir "$RUNNER_TEMP/fanout-source"
+          WAIT_SECONDS: ${{ github.event_name == 'push' && '1800' || '0' }}
+        run: python3 scripts/release_main_proof.py facts-source --source-dir "$RUNNER_TEMP/fanout-source" --wait-seconds "$WAIT_SECONDS"
       - name: Mint consumer token
         id: app
         if: >-
@@ -132,7 +133,8 @@ jobs:
         id: main-proof
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/release_main_proof.py facts-source --source-dir "$RUNNER_TEMP/fanout-source"
+          WAIT_SECONDS: ${{ github.event_name == 'push' && '1800' || '0' }}
+        run: python3 scripts/release_main_proof.py facts-source --source-dir "$RUNNER_TEMP/fanout-source" --wait-seconds "$WAIT_SECONDS"
       - name: Mint consumer token
         id: app
         if: >-
