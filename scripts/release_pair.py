@@ -217,10 +217,14 @@ def _decide_triple(component: str, v: Version, ep: Version, cp: Version,
         if landed_pair and cur != ep:
             raise RuleError(f"VERSION {cur} does not match the landed pair {landed}; "
                             f"if main carries its release commit without its tag, send an "
-                            f"event for {cur} again to tag it")
+                            f"event for {cur} again only after that exact release commit's "
+                            "main-push CI and facts proof pass; for red CI, see manual "
+                            "recovery in docs/release-main-proof.md")
         if not landed_pair and (cur.line != "legacy" or cur.prerelease):
             raise RuleError(f"VERSION {cur} has no release tag: a pair release is half-done; "
-                            f"send an event for {cur} again to tag it")
+                            f"send an event for {cur} again only after that exact release "
+                            "commit's main-push CI and facts proof pass; for red CI, see "
+                            "manual recovery in docs/release-main-proof.md")
     out = {"line": v.line, "eprev": str(ep), "cprev": str(cp), "hprev": str(hp) if hp else "",
            "release": "", "prerelease": _flag(v.prerelease), "awaiting": "", "retag": _flag(retag)}
     if not missing:
@@ -345,11 +349,15 @@ def decide(component: str, version: str, prerelease_flag: str, prev_engine: str,
         if landed_pair and cur != ep:
             raise RuleError(f"VERSION {cur} does not match the landed pair engine {ep} + "
                             f"codegen {cp}; if main carries a release commit for {cur} without "
-                            f"its tag, send an event for {cur} again to tag it")
+                            f"its tag, send an event for {cur} again only after that exact "
+                            "release commit's main-push CI and facts proof pass; for red CI, "
+                            "see manual recovery in docs/release-main-proof.md")
         if not landed_pair and (cur.line != "legacy" or cur.prerelease):
             raise RuleError(f"VERSION {cur} has no release tag: a pair release is half-done "
                             f"(main carries its commit, tag v{cur} is missing); send an "
-                            f"event for {cur} again to tag it")
+                            f"event for {cur} again only after that exact release commit's "
+                            "main-push CI and facts proof pass; for red CI, see manual "
+                            "recovery in docs/release-main-proof.md")
     if completes:
         out.update(mode="bump" if retag else same_or_bump(v, v), engine=str(v), codegen=str(v),
                    release=str(v), prerelease=_flag(v.prerelease), retag=_flag(retag))

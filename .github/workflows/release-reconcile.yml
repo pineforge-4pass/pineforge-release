@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   issues: write
 
 concurrency:
@@ -15,6 +16,7 @@ concurrency:
 
 jobs:
   producers:
+    if: github.ref == 'refs/heads/main'
     # pineforge-release runs on GitHub-hosted runners; standing exception for this repository
     runs-on: ubuntu-latest
     environment: release-automation
@@ -23,6 +25,11 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      - name: Require full main proof before producer reconciliation
+        id: main-proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release_main_proof.py commit --sha "$(git rev-parse HEAD)"
       - name: Mint hub-only dispatch token
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0

@@ -23,6 +23,7 @@ permissions:
 
 jobs:
   finalize:
+    if: github.ref == 'refs/heads/main'
     # Job-level concurrency also applies when invoked through workflow_call.
     # Serialize alias decisions and persistent delivery reservations together.
     concurrency:
@@ -35,6 +36,7 @@ jobs:
       contents: write
       packages: write
       issues: write
+      actions: read
     outputs:
       deliveries: ${{ steps.delivery-output.outputs.deliveries }}
       compute_configuration_error: ${{ steps.ready.outputs.compute_configuration_error }}
@@ -75,7 +77,7 @@ jobs:
           RELEASE_APPLICATION_MAX_AGE_MINUTES: ${{ vars.RELEASE_APPLICATION_MAX_AGE_MINUTES || '1440' }}
         run: |
           set -euo pipefail
-          python3 scripts/release_pipeline.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"
+          python3 scripts/release_main_proof.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"
       - name: Publish delivery matrix
         id: delivery-output
         if: ${{ always() }}
@@ -127,6 +129,7 @@ jobs:
     permissions:
       contents: write  # append neutral delivery audit assets in this hub only
       issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -145,6 +148,12 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      - name: Require full main proof before release delivery
+        id: main-proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ matrix.tag }}
+        run: python3 scripts/release_main_proof.py delivery --tag "$TAG"
       - name: Require one configured consumer repository
         shell: bash
         env:

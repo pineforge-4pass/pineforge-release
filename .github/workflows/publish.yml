@@ -90,6 +90,7 @@ jobs:
       PF_CI_LABELS: '["self-hosted","pf-ci","pf-ci-x64"]'
     permissions:
       contents: write  # GitHub lists draft candidates only with push access
+      actions: read
     outputs:
       exists: ${{ steps.candidate.outputs.exists }}
       tag: ${{ needs.tag-guard.outputs.tag }}
@@ -104,6 +105,12 @@ jobs:
         with:
           ref: ${{ needs.tag-guard.outputs.sha }}
           persist-credentials: false
+      - name: Require full main proof before candidate reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag-guard.outputs.tag }}
+          RELEASE_SHA: ${{ needs.tag-guard.outputs.sha }}
+        run: python3 scripts/release_main_proof.py tag --tag "$TAG" --sha "$RELEASE_SHA"
       - name: Reuse an already verified candidate
         id: candidate
         env:
@@ -122,6 +129,7 @@ jobs:
     permissions:
       contents: write   # append verified candidate to its draft release
       packages: write   # push to GHCR
+      actions: read
     outputs:
       prerelease: ${{ steps.pair.outputs.prerelease }}
     steps:
@@ -141,6 +149,13 @@ jobs:
         with:
           python-version: '3.12'
       - run: python3 -m pip install -r facts/requirements-validation.txt
+
+      - name: Require full main proof before image publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.RELEASE_TAG }}
+          RELEASE_SHA: ${{ needs.tag-guard.outputs.sha }}
+        run: python3 scripts/release_main_proof.py tag --tag "$TAG" --sha "$RELEASE_SHA"
 
       - name: Assert tag matches VERSION
         env:
@@ -690,6 +705,7 @@ jobs:
       contents: write
       packages: write
       issues: write
+      actions: read
 
   failure-report:
     needs: [tag-guard, prepare, publish, notify-consumers]

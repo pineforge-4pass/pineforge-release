@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 # This signal serializes independently of descriptions and release automation.
 concurrency:
@@ -53,10 +54,16 @@ jobs:
           python3 scripts/facts_fanout.py prepare --facts facts/facts.json --dry-run "$DRY_RUN" \
             --output-dir "$RUNNER_TEMP/fanout-source" --github-output "$GITHUB_OUTPUT" \
             --receipt "$RUNNER_TEMP/fanout-audit/prepare.json"
+      - name: Require full main proof for the facts snapshot
+        id: main-proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WAIT_SECONDS: ${{ github.event_name == 'push' && '1800' || '0' }}
+        run: python3 scripts/release_main_proof.py facts-source --source-dir "$RUNNER_TEMP/fanout-source" --wait-seconds "$WAIT_SECONDS"
       - name: Mint consumer token
         id: app
         if: >-
-          steps.source.outcome == 'success' && steps.source.outputs.mint_allowed == 'true' &&
+          steps.source.outcome == 'success' && steps.source.outputs.mint_allowed == 'true' && steps.main-proof.outcome == 'success' &&
           github.ref == 'refs/heads/main' && github.ref_protected &&
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') &&
           vars.FACTS_WEB_DISPATCH_ENABLED == 'true'
@@ -72,7 +79,7 @@ jobs:
           permission-contents: write
           github-api-url: https://api.github.com
       - name: Send the validated signal and record its status
-        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.source.outputs.mint_allowed == 'true' }}
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.source.outputs.mint_allowed == 'true' && steps.main-proof.outcome == 'success' }}
         env:
           FACTS_READ_TOKEN: ${{ github.token }}
           FACTS_WEB_REPOSITORY: ${{ secrets.FACTS_WEB_REPOSITORY }}
@@ -122,10 +129,16 @@ jobs:
           python3 scripts/facts_fanout.py prepare --facts facts/facts.json --dry-run "$DRY_RUN" \
             --output-dir "$RUNNER_TEMP/fanout-source" --github-output "$GITHUB_OUTPUT" \
             --receipt "$RUNNER_TEMP/fanout-audit/prepare.json"
+      - name: Require full main proof for the facts snapshot
+        id: main-proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WAIT_SECONDS: ${{ github.event_name == 'push' && '1800' || '0' }}
+        run: python3 scripts/release_main_proof.py facts-source --source-dir "$RUNNER_TEMP/fanout-source" --wait-seconds "$WAIT_SECONDS"
       - name: Mint consumer token
         id: app
         if: >-
-          steps.source.outcome == 'success' && steps.source.outputs.mint_allowed == 'true' &&
+          steps.source.outcome == 'success' && steps.source.outputs.mint_allowed == 'true' && steps.main-proof.outcome == 'success' &&
           github.ref == 'refs/heads/main' && github.ref_protected &&
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') &&
           vars.FACTS_LICENSE_DISPATCH_ENABLED == 'true'
@@ -141,7 +154,7 @@ jobs:
           permission-contents: write
           github-api-url: https://api.github.com
       - name: Send the validated signal and record its status
-        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.source.outputs.mint_allowed == 'true' }}
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.source.outputs.mint_allowed == 'true' && steps.main-proof.outcome == 'success' }}
         env:
           FACTS_READ_TOKEN: ${{ github.token }}
           FACTS_WEB_REPOSITORY: pineforge-license

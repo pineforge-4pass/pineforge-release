@@ -28,6 +28,8 @@ import release_pair as pair  # noqa: E402
 import release_pipeline as pipeline  # noqa: E402
 import release_contract as contract  # noqa: E402
 import test_release_workflows as wiring  # noqa: E402
+import release_main_proof as main_proof  # noqa: E402
+from test_release_main_proof import GitHubProof  # noqa: E402
 from test_release_binding import (FinalizeClient, MemoryRegistry, MemoryStore,  # noqa: E402
                                   ProducerFixture, damage_engine_prerequisite, fixture_manifest)
 
@@ -36,11 +38,113 @@ def workflow(name):
     return yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
 
 
-def write_producer_endpoints(root, client):
+def main_proof_endpoints(commit, *, problem=None, manifest=None, tag=None):
+    """Serialize API responses, never the proof reader's decision."""
+    commits = [commit]
+    if manifest is not None:
+        commits.append(manifest["facts"]["commit"])
+    sources = {}
+    for index, sha in enumerate(dict.fromkeys(commits)):
+        api = GitHubProof(sha, run_offset=index * 1000)
+        if sha == commit and problem is not None:
+            run = api.runs["facts-validate.yml"][0]
+            if problem == "missing":
+                api.runs["facts-validate.yml"] = []
+            else:
+                changes = {
+                    "red": {"conclusion": "failure"},
+                    "running": {"status": "in_progress", "conclusion": None},
+                    "skipped": {"conclusion": "skipped"},
+                    "pr": {"event": "pull_request", "head_branch": "feature"},
+                    "wrong_sha": {"head_sha": "b" * 40},
+                }
+                if problem not in changes:
+                    raise AssertionError("unknown proof fixture damage")
+                run.update(changes[problem])
+                api.details[run["id"]].update(changes[problem])
+        sources[sha] = {field: copy.deepcopy(getattr(api, field)) for field in
+                        ("repo", "compare", "workflows", "runs", "details", "jobs")}
+    return {"commit": commit, "sources": sources, "manifest": manifest,
+            "tag": tag or ("v" + manifest["release_version"] if manifest is not None else None)}
+
+
+class MainProofEndpointClient:
+    """Hub GET transport for shell replays; no proof or publication mocks."""
+
+    def __init__(self, data):
+        self.commit, self.tag = data["commit"], data["tag"]
+        self.sources, self.calls = {}, []
+        for commit, fields in data["sources"].items():
+            api = GitHubProof(commit)
+            for field, value in fields.items():
+                if field in {"details", "jobs"}:
+                    value = {int(key): item for key, item in value.items()}
+                setattr(api, field, value)
+            self.sources[commit] = api
+        self.active = self.sources[self.commit]
+        manifest = data["manifest"]
+        self.store = None
+        if manifest is not None:
+            self.store = MemoryStore(manifest)
+            row = self.store.rows[self.tag]
+            row["draft"] = False
+            self.store.put(row, contract.ASSET, contract.canonical(manifest))
+            self.store.operations.clear()
+
+    def api(self, route, *, method="GET", data=None):
+        if method != "GET" or data is not None:
+            raise AssertionError("proof replay attempted a hub mutation")
+        self.calls.append(route)
+        if "/releases/" in route and self.store is not None:
+            return self.store.api(route)
+        if "/compare/" in route:
+            commit = route.split("/compare/", 1)[1].split("...", 1)[0]
+            self.active = self.sources[commit]
+        return self.active.api(route)
+
+    def pages(self, route):
+        self.calls.append(route)
+        if self.store is None:
+            raise AssertionError("unmodeled proof release list")
+        return self.store.pages(route)
+
+    def request(self, url, **kwargs):
+        if kwargs.get("method", "GET") != "GET" or kwargs.get("data") is not None or self.store is None:
+            raise AssertionError("proof replay attempted an asset mutation")
+        self.calls.append(url)
+        return self.store.request(url, **kwargs)
+
+    def tag_commit(self, repo, tag):
+        if repo != contract.HUB or tag != self.tag:
+            raise AssertionError("proof replay selected another tag")
+        return self.commit
+
+
+def main_proof_fixture_cli():
+    """Execute the actual proof CLI using serialized GitHub GET responses."""
+    root = Path(os.environ["PRODUCER_FIXTURE_ROOT"])
+    data = json.loads((root / "endpoints.json").read_bytes())["main_proof"]
+    client = MainProofEndpointClient(data)
+    # Keep the workflow's bounded wait argument. Advancing the fixture clock
+    # expires unfinished proof without a real sleep or an assumed success.
+    with patch.object(main_proof, "Client", return_value=client), \
+            patch.object(main_proof.time, "monotonic", side_effect=[0, 4001]), \
+            patch.object(main_proof.time, "sleep", side_effect=AssertionError("unexpected live proof wait")):
+        result = main_proof.main(sys.argv[1:])
+    (root / "main-proof-result.json").write_bytes(contract.canonical({
+        "status": result, "calls": client.calls,
+    }))
+    with (root / "git-calls").open("a", encoding="utf-8") as stream:
+        stream.write("main-proof " + shlex.join(sys.argv[1:]) + "\n")
+    return result
+
+
+def write_producer_endpoints(root, client, *, proof_problem=None):
     (root / "endpoints.json").write_bytes(contract.canonical({
         "version": str(client.v), "api": client.api_data, "commits": client.commits,
         "downloads": {url: base64.b64encode(raw).decode("ascii")
                       for url, raw in client.downloads.items()},
+        "main_proof": main_proof_endpoints("d" * 40, problem=proof_problem, tag="v" + str(client.v)),
     }))
 
 
@@ -60,6 +164,10 @@ def producer_fixture_cli():
     """Run the real CLI with serialized public endpoints in a shell replay."""
     import release_artifacts as artifacts
 
+    if sys.argv[0] == "scripts/release_main_proof.py":
+        return main_proof_fixture_cli()
+    if sys.argv[:2] != ["scripts/release_pipeline.py", "producer"]:
+        raise AssertionError("unexpected producer replay command: " + repr(sys.argv))
     root = Path(os.environ["PRODUCER_FIXTURE_ROOT"])
     client = producer_fixture_client(root)
     calls, downloads = [], []
@@ -90,6 +198,8 @@ def publish_fixture_python():
     """Execute workflow Python unchanged, replacing only endpoint transport and paths."""
     import release_artifacts as artifacts
 
+    if sys.argv[0] == "scripts/release_main_proof.py":
+        return main_proof_fixture_cli()
     root = Path(os.environ["PRODUCER_FIXTURE_ROOT"])
     client = producer_fixture_client(root)
 
@@ -118,36 +228,43 @@ def publish_fixture_python():
 
 
 class ProducerPreTagTests(unittest.TestCase):
-    def replay(self, root, client, *, component="engine", retag=False):
+    def replay(self, root, client, *, component="engine", retag=False, proof_problem=None, release_tail=False, bump_run=None):
         root.mkdir(parents=True)
         steps = {row.get("name"): row for row in workflow("handle-upstream.yml")["jobs"]["bump"]["steps"]}
         completing = steps.get("Verify the completing engine before tagging")
         self.assertIsNotNone(completing)
         gate = (steps["Verify the dispatched producer artifacts"] if component == "engine" else completing)
         bump = steps["Bump VERSION, commit, tag"]
-        initial = str(client.v) if retag else "1.10.0"
+        initial = str(client.v) if retag or release_tail else "1.10.0"
         (root / "VERSION").write_text(initial + "\n", encoding="ascii")
-        write_producer_endpoints(root, client)
+        write_producer_endpoints(root, client, proof_problem=proof_problem)
+        script = bump["run"] if bump_run is None else bump_run
+        if release_tail:
+            # Replay the actual fresh-release publication boundary after its
+            # VERSION/harness commit exists. Harness sync has its own controls;
+            # this test must distinguish main's base SHA from that final SHA.
+            script = script[:script.index('if [ "$RETAG" = true ]; then')] + script[script.index('commit="$(git rev-parse HEAD)"'):]
         bridge_paths = [str(ROOT / "tests"), str(ROOT / "scripts")]
         bridge = (
             f"import sys; sys.path[:0] = {bridge_paths!r}; "
             "from test_release_binding_workflows import producer_fixture_cli; "
             "sys.argv = sys.argv[1:]; raise SystemExit(producer_fixture_cli())"
         )
-        # Only git transport is recorded. The selected workflow CLI, sync,
-        # tagged-source verifier and archive/checksum verifier all run for real.
+        # Git transport is recorded; both CLIs and all source/archive/proof
+        # decisions execute unchanged against their serialized endpoint data.
         wrappers = (
             "python3() { command " + shlex.quote(sys.executable) + " -c "
             + shlex.quote(bridge) + ' "$@"; }\n'
             'git() {\n printf \'%s\\n\' "$*" >> "$PRODUCER_FIXTURE_ROOT/git-calls";\n'
-            ' case "$1" in log) printf \'%s\\n\' "' + "d" * 40 + '";; esac\n}\n'
+            ' case "$1" in log|rev-parse) printf \'%s\\n\' "' + "d" * 40 + '";; esac\n}\n'
         )
         done = subprocess.run(
-            ["bash", "--noprofile", "--norc", "-euc", wrappers + gate["run"] + "\n" + bump["run"]],
+            ["bash", "--noprofile", "--norc", "-euc", wrappers + gate["run"] + "\n" + script],
             cwd=root, capture_output=True, text=True,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PRODUCER_FIXTURE_ROOT": str(root),
                  "COMPONENT": component, "VER": str(client.v), "E": str(client.v), "C": str(client.v),
                  "H": str(client.v), "LINE": "pair", "RELEASE": str(client.v),
+                 "next": str(client.v),
                  "RETAG": str(retag).lower(), "GITHUB_STEP_SUMMARY": str(root / "summary")},
         )
         self.assertNotIn("Traceback", done.stderr)
@@ -168,6 +285,9 @@ class ProducerPreTagTests(unittest.TestCase):
         self.assertEqual(result["calls"], [{"component": "engine", "content_reads": len(ROWS) + 1}])
         self.assertEqual(result["content_reads"], len(ROWS) + 1)
         self.assertEqual(len(result["downloads"]), 4)
+        proof_result = json.loads((root / "main-proof-result.json").read_bytes())
+        self.assertEqual(proof_result["status"], 0)
+        self.assertTrue(any("head_sha=" + "d" * 40 in route for route in proof_result["calls"]))
         self.assertTrue(any(call.startswith(f"tag -a v{PARITY_CAPABILITY_FROM} ") for call in git_calls))
         self.assertIn(f"push origin v{PARITY_CAPABILITY_FROM}", git_calls)
         self.assertEqual((root / "VERSION").read_text(), initial + "\n")
@@ -210,6 +330,51 @@ class ProducerPreTagTests(unittest.TestCase):
                         self.assertEqual((root / "VERSION").read_text(), initial + "\n")
                         self.assertFalse((root / "absent-publish-bundle").exists())
 
+    def assert_proof_boundary(self, root, done, git_calls, *, allowed, fresh):
+        result_path = root / "main-proof-result.json"
+        self.assertTrue(result_path.is_file(), done.stdout + done.stderr)
+        result = json.loads(result_path.read_bytes())
+        self.assertEqual(done.returncode, 0 if allowed else 1, done.stdout + done.stderr)
+        self.assertEqual(result["status"], done.returncode)
+        self.assertTrue(result["calls"], "the proof decision must read GitHub identities")
+        proof_at = next(i for i, call in enumerate(git_calls) if call.startswith("main-proof commit --sha "))
+        self.assertIn("--sha " + "d" * 40, git_calls[proof_at])
+        if fresh:
+            self.assertLess(git_calls.index("push origin HEAD:main"), proof_at)
+        tags = [i for i, call in enumerate(git_calls) if call.startswith("tag -a ")]
+        if allowed:
+            self.assertEqual(len(tags), 1)
+            self.assertLess(proof_at, tags[0])
+        else:
+            self.assertEqual(tags, [], "unproved final commits must never create a tag")
+            self.assertFalse(any(call.startswith("push origin v") for call in git_calls))
+
+    def test_real_tag_boundaries_require_final_commit_full_proof_and_detect_removed_guard(self):
+        from test_parity_source_proof import TaggedEngineFixture
+
+        for fresh in (False, True):
+            for problem in (None, "missing", "red", "running", "wrong_sha", "pr", "skipped"):
+                with self.subTest(fresh=fresh, problem=problem), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary) / "tag-boundary"
+                    done, producer, git_calls, initial = self.replay(
+                        root, TaggedEngineFixture(), retag=not fresh, release_tail=fresh, proof_problem=problem)
+                    self.assertEqual(producer["status"], 0, "producer proof must not hide the hub proof control")
+                    self.assert_proof_boundary(root, done, git_calls, allowed=problem is None, fresh=fresh)
+                    self.assertEqual((root / "VERSION").read_text(), initial + "\n")
+            script = next(step["run"] for step in workflow("handle-upstream.yml")["jobs"]["bump"]["steps"]
+                          if step.get("name") == "Bump VERSION, commit, tag")
+            guard = 'python3 scripts/release_main_proof.py commit --sha "$commit" --wait-seconds 1800'
+            self.assertEqual(script.count(guard), 2)
+            mutant = script.replace(guard, ":")
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "removed-guard"
+                done, _, git_calls, _ = self.replay(
+                    root, TaggedEngineFixture(), retag=not fresh, release_tail=fresh,
+                    proof_problem="red", bump_run=mutant)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                with self.assertRaises(AssertionError):
+                    self.assert_proof_boundary(root, done, git_calls, allowed=False, fresh=fresh)
+
     def test_cli_refuses_a_tag_moved_between_source_sync_and_archive_pin(self):
         from parity_bundle import PARITY_CAPABILITY_FROM
         from test_parity_bundle import ENGINE_REPO, ENGINE_TAG, ROWS
@@ -232,9 +397,9 @@ class ProducerPreTagTests(unittest.TestCase):
 
 
 class PublishParityGlueTests(unittest.TestCase):
-    def replay(self, root, client, step, *, tag=None):
+    def replay(self, root, client, step, *, tag=None, proof_problem=None):
         root.mkdir(parents=True, exist_ok=True)
-        write_producer_endpoints(root, client)
+        write_producer_endpoints(root, client, proof_problem=proof_problem)
         steps = {row.get("name"): row
                  for row in workflow("publish.yml")["jobs"]["publish"]["steps"]}
         binding = steps["Bind producer source and package bytes"]["run"]
@@ -242,6 +407,11 @@ class PublishParityGlueTests(unittest.TestCase):
             script = steps["Sync parity from the immutable engine tag"]["run"]
         elif step == "bind":
             script = binding
+        elif step == "main-proof":
+            script = steps["Require full main proof before image publication"]["run"]
+        elif step == "main-proof-reuse":
+            script = next(row["run"] for row in workflow("publish.yml")["jobs"]["prepare"]["steps"]
+                          if row.get("name") == "Require full main proof before candidate reuse")
         else:
             self.assertEqual(step, "bind-heredoc")
             # Keep the actual redirection and complete heredoc, leaving out
@@ -268,10 +438,24 @@ class PublishParityGlueTests(unittest.TestCase):
                  "PRODUCER_FIXTURE_ROOT": str(root), "TAG": tag or "v" + str(client.v),
                  "E": str(client.v), "C": str(client.v), "H": str(client.v),
                  "HUB_COMMIT": "d" * 40, "RUNNER_TEMP": str(root),
+                 "RELEASE_SHA": "d" * 40,
                  "GITHUB_OUTPUT": str(root / "github-output")},
         )
         self.assertNotIn("Traceback", done.stderr, done.stdout + done.stderr)
         return done
+
+    def test_image_and_candidate_reuse_shells_execute_exact_commit_proof(self):
+        from test_parity_source_proof import TaggedEngineFixture
+
+        for step in ("main-proof", "main-proof-reuse"):
+            for problem in (None, "missing", "red", "running", "wrong_sha", "pr", "skipped"):
+                with self.subTest(step=step, problem=problem), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    done = self.replay(root, TaggedEngineFixture(), step, proof_problem=problem)
+                    self.assertEqual(done.returncode, 0 if problem is None else 1, done.stdout + done.stderr)
+                    result = json.loads((root / "main-proof-result.json").read_bytes())
+                    self.assertEqual(result["status"], done.returncode)
+                    self.assertTrue(any("head_sha=" + "d" * 40 in route for route in result["calls"]))
 
     def assert_control(self, root, client, *, capable=True):
         from test_parity_bundle import ROWS
@@ -437,7 +621,15 @@ def assert_ready_wiring(case, publish, finalizer):
                   named["Image metadata"]["with"]["labels"])
     case.assertEqual(publish["jobs"]["notify-consumers"]["uses"], "./.github/workflows/release-finalize.yml")
     finalize = finalizer["jobs"]["finalize"]
-    case.assertTrue(any("scripts/release_pipeline.py finalize" in row.get("run", "") for row in finalize["steps"]))
+    ready = next(row for row in finalize["steps"] if row.get("id") == "ready")
+    case.assertEqual(ready["run"].splitlines(), [
+        "set -euo pipefail",
+        'python3 scripts/release_main_proof.py finalize --tag "$TAG" --output "$RUNNER_TEMP/deliveries.json"',
+    ])
+    case.assertNotIn("if", ready)
+    case.assertNotIn("continue-on-error", ready)
+    case.assertEqual(finalize["permissions"]["actions"], "read")
+    case.assertEqual(publish["jobs"]["notify-consumers"]["permissions"]["actions"], "read")
     dispatch = finalizer["jobs"]["notify-consumers"]
     case.assertEqual(dispatch["needs"], "finalize")
     case.assertEqual(dispatch["strategy"]["fail-fast"], "false")
@@ -545,7 +737,7 @@ class ReadyWiringTests(unittest.TestCase):
 
     def test_negative_controls_detect_removed_runtime_gate_early_latest_and_skipped_fanout(self):
         original = workflow("publish.yml")
-        for mutation in ("runtime", "latest", "fanout"):
+        for mutation in ("runtime", "latest", "fanout", "proof-entry", "proof-softened", "proof-permissions"):
             obj, finalizer = copy.deepcopy(original), workflow("release-finalize.yml")
             if mutation == "runtime":
                 obj["jobs"]["publish"]["steps"] = [s for s in obj["jobs"]["publish"]["steps"]
@@ -553,8 +745,17 @@ class ReadyWiringTests(unittest.TestCase):
             elif mutation == "latest":
                 step = next(s for s in obj["jobs"]["publish"]["steps"] if s.get("name") == "Image metadata")
                 step["with"]["tags"] += "\ntype=raw,value=latest"
-            else:
+            elif mutation == "fanout":
                 finalizer["jobs"]["notify-consumers"]["needs"] = "publish"
+            else:
+                finalize = finalizer["jobs"]["finalize"]
+                ready = next(step for step in finalize["steps"] if step.get("id") == "ready")
+                if mutation == "proof-entry":
+                    ready["run"] = ready["run"].replace("scripts/release_main_proof.py finalize", "scripts/release_pipeline.py finalize")
+                elif mutation == "proof-softened":
+                    ready["continue-on-error"] = "true"
+                else:
+                    finalize["permissions"]["actions"] = "write"
             with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
                 assert_ready_wiring(self, obj, finalizer)
 

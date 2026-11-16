@@ -36,6 +36,7 @@ jobs:
     permissions:
       contents: write  # append one neutral redelivery audit asset in this hub
       issues: write
+      actions: read
     steps:
       - name: Stop automatic apt upgrades (until the release image is rebaked)
         shell: bash
@@ -86,6 +87,12 @@ jobs:
           RELEASE_COMPUTE_FIRST_PAIR: ${{ vars.RELEASE_COMPUTE_FIRST_PAIR }}
         run: |
           python3 scripts/release_pipeline.py redeliver-check --tag "$TAG" --consumer "$CONSUMER"
+      - name: Require full main proof before release redelivery
+        id: main-proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: python3 scripts/release_main_proof.py delivery --tag "$TAG"
       - name: Require one configured consumer repository
         id: target
         shell: bash
