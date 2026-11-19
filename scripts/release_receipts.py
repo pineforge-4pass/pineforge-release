@@ -819,7 +819,9 @@ def collect(client, hub_client, store, role, run_id=0):
             receipt_raw = canonical(public)
             if run_id:
                 store.put(row, name, receipt_raw)
-            if public["state"] == "failed":
+            # Superseded failures still belong in the archive.
+            if (public["state"] == "failed"
+                    and (facts_only or not release_superseded(event, store.releases()))):
                 incident = "facts-" + facts_target["sha256"] if facts_only else row["tag_name"]
                 title = "Facts consumer failed" if facts_only else f"Release {event['release_version']}: consumer failed"
                 report_issue(hub_client, incident, title,

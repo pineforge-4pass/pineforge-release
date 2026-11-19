@@ -37,7 +37,7 @@ RECEIPT_EXCLUSION_REASON = (
 class SweepFixture(history.HistoryClient):
     """Use the existing archive/discovery fake and real hosted evidence fixture."""
 
-    def __init__(self, run_ids=(90,), release_version="1.6.0"):
+    def __init__(self, run_ids=(90,), release_version="1.6.0", *, other_manifests=()):
         hosted = postmerge.HostedPostmergeFixture()
         manifest = binding.fixture_manifest(release_version)
         self.facts_raw = contract.canonical(binding.facts_for(manifest))
@@ -67,7 +67,7 @@ class SweepFixture(history.HistoryClient):
         for name in ("ci", "e2e", "deploy"):
             self.old_shape[name] = copy.deepcopy(legacy[name])
         self.old_shape["preview"]["source"] = legacy["pr"]["head"]
-        self.store = binding.MemoryStore(manifest)
+        self.store = binding.MemoryStore(manifest, *other_manifests)
         self.row = self.store.get("v" + manifest["release_version"])
         self.row.update(draft=False, prerelease=manifest["prerelease"])
         self.store.put(self.row, contract.ASSET, contract.canonical(manifest))
@@ -1135,6 +1135,93 @@ class ReceiptCollectSweepTests(unittest.TestCase):
             self.collect(f)
         self.assertEqual(f.written_names(), [])
         self.assert_skipped(90, "hub write rejected", f)
+
+    def test_failed_receipt_reports_only_for_current_release(self):
+        cases = (
+            ("superseded", "1.6.2"),
+            ("current", "1.6.0"),
+            ("draft", "1.6.2"),
+            ("rejected", "1.6.2"),
+            ("prerelease", "1.6.2-rc.1"),
+        )
+        for case, other_version in cases:
+            for run_id in (0, 90):
+                with self.subTest(case=case, run_id=run_id):
+                    other = binding.fixture_manifest(other_version)
+                    f = SweepFixture(release_version="1.6.1", other_manifests=(other,))
+                    row = f.store.get(f"v{other_version}")
+                    row.update(draft=case == "draft", prerelease=other["prerelease"])
+                    f.store.put(row, contract.ASSET, contract.canonical(other))
+                    if case == "rejected":
+                        f.store.put(row, "release-rejected.json", contract.canonical({"state": "rejected"}))
+                    f.store.operations.clear()
+
+                    receipt = f.documents[90]
+                    receipt.update(state="failed", pr=None, ci=None, e2e=None, deploy=None,
+                                   preview=None, deployed=None, previous=None)
+                    f.seal(90)
+                    name = "consumer-hosted-90-7.json"
+                    expected = contract.canonical({
+                        "schema": "pineforge/consumer-receipt/v1", "consumer": "hosted",
+                        "event_id": f.event["event_id"], "release_version": "1.6.1",
+                        "attempt": 90, "sequence": 7, "state": "failed", "timestamp": receipt["timestamp"],
+                        "reporting_run_id": 90, "evidence_sha256": contract.sha256(contract.canonical(receipt)),
+                    })
+                    self.report.reset_mock()
+                    with patch.dict(os.environ, {"GITHUB_RUN_ID": "500"}), \
+                            patch.object(f.store, "put", wraps=f.store.put) as put:
+                        self.collect(f, run_id=run_id)
+                        put.assert_called_once_with(f.row, name, expected)
+                        self.assertEqual(f.written_names(), [name])
+                        self.assertEqual(f.store.read(f.row, name), expected)
+                        self.assertEqual(self.output.getvalue(), "")
+                        if case == "superseded":
+                            self.report.assert_not_called()
+                        else:
+                            self.report.assert_called_once_with(
+                                f, "v1.6.1", "Release 1.6.1: consumer failed",
+                                "Consumer role: hosted; failed stage evidence retained in the consumer's private report.\n\n"
+                                f"https://github.com/{contract.HUB}/actions/runs/500",
+                            )
+
+                        put.reset_mock()
+                        self.report.reset_mock()
+                        self.collect(f, run_id=run_id)
+                        put.assert_not_called()
+                        self.report.assert_not_called()
+                        self.assertEqual(f.store.read(f.row, name), expected)
+                        self.assertEqual(self.output.getvalue(), "")
+
+    def test_facts_only_failure_is_reported_and_archived(self):
+        client = history.HistoryClient()
+        store = SweepFixture().store
+        audit = store.facts()
+        store.operations.clear()
+        run_id = 1007
+        client.artifacts = [client.artifact_by_run[run_id]]
+        receipt = client.documents[run_id]
+        receipt.update(state="failed", pr=None, ci=None, e2e=None, deploy=None,
+                       preview=None, deployed=None, previous=None)
+        client.seal(run_id)
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "500"}):
+            self.collect(client, store, role="license")
+
+        facts = receipt["facts"]
+        name = (f"facts-consumer-license-{facts['commit']}-{facts['sha256']}"
+                f"-{receipt['attempt']}-{receipt['sequence']}.json")
+        self.assertEqual(store.operations, [("asset", name)])
+        self.assertEqual(store.read(audit, name), contract.canonical({
+            "schema": "pineforge/facts-consumer-receipt/v1", "consumer": "license",
+            "facts": facts, "attempt": receipt["attempt"], "sequence": receipt["sequence"],
+            "state": "failed", "timestamp": receipt["timestamp"],
+            "reporting_run_id": run_id, "evidence_sha256": contract.sha256(contract.canonical(receipt)),
+        }))
+        self.report.assert_called_once_with(
+            client, f"facts-{facts['sha256']}", "Facts consumer failed",
+            "Consumer role: license; failed stage evidence retained in the consumer's private report.\n\n"
+            f"https://github.com/{contract.HUB}/actions/runs/500",
+        )
+        self.assertEqual(self.output.getvalue(), "")
 
     def test_failed_state_report_error_cannot_leave_a_stored_skipped_receipt(self):
         f = SweepFixture()
