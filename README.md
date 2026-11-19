@@ -333,6 +333,9 @@ during a notification step.
 Set-19 mirrors 72 source/version pairs at `v1.4.0` with `set-19.SOURCES.list`
 (set-id `25857d474e649bb731a4e830ba9103644130832d573fae221adca87cadebe9c8`);
 it updates `linux` to 6.12.116-1 while retaining set-18's other 71 sources.
+Set-20 mirrors 72 source/version pairs at `v1.4.0` with `set-20.SOURCES.list`
+(set-id `8932a268ceda3a75586c758b40a742b91c78d488d5276383105d20499ec8e672`);
+it updates `linux` to 6.12.117-1 while retaining set-19's other 71 sources.
 The six toolchain pins map to `gcc-defaults` 1.220, `gcc-14` 14.2.0-19,
 `binutils` 2.44-3, `eigen3` 3.4.0-5, `cmake` 3.31.6-2 and `make-dfsg` 4.4.1-2.
 CMake and make remain build-only; the final inventories determine the complete
