@@ -303,7 +303,11 @@ def profile(role):
     if type(policy) is dict and "post_merge" in policy:
         require(role == "application", "post-merge policy is only valid for application")
         sections += ("post_merge",)
-    keys(policy, ("workflow", "artifact", "base", *sections))
+    reporter = ()
+    if type(policy) is dict and APPLICATION_REPORTER in policy:
+        require(role == "application", "application reporter policy is only valid for application")
+        reporter = (APPLICATION_REPORTER,)
+    keys(policy, ("workflow", "artifact", "base", *sections, *reporter))
     for item in (policy, *(policy[name] for name in sections)):
         match(r"[A-Za-z0-9_.-]+\.yml", item["workflow"])
     match(r"[A-Za-z0-9_.-]+", policy["artifact"])
@@ -322,6 +326,8 @@ def profile(role):
         require(set(row["expected"]) - set(row["approved_skips"]), "entire required inventory cannot be skipped")
         if name == "post_merge":
             require(row["approved_skips"] == [], "post-merge checks cannot be skipped")
+    if reporter:
+        application_reporter_policy(policy)
     return policy
 
 
@@ -451,6 +457,429 @@ def check_postmerge(client, repo, evidence, policy, pr, actual, timestamp):
     return run
 
 
+# --- Application protected-main reporter ------------------------------------
+# An application `verified` receipt normally needs its reporting run at pr.merge. When
+# the application policy carries `application_reporter`, the reporter is instead one
+# reviewed commit on protected main. That history is separate from the development
+# merge, so the reporter is never compared with pr.merge or required to descend from
+# it. The bridge is two signed App records (kinds `snapshot` and `receipt-run`) read
+# from GitHub deployments and verified only with the policy-pinned coordinator key.
+# Their members are exactly the ones the pinned App coordinator (blob 0c96484d) and its
+# signed state (blob 260912eb) write. The served source stays pr.merge. Without the
+# profile nothing here runs; once it is selected there is no fallback to the legacy rule
+# on missing or invalid evidence.
+#
+# Step 1 verifies the signed binders. It still fails closed on the missing authenticated
+# dispatch inputs; see docs/application-receipt-reporter.md.
+APPLICATION_REPORTER = "application_reporter"
+REPORTER_FIELDS = ("commit", "workflow_id", "reusable", "actor", "coordinator_public_key",
+                   "coordinator_spki_sha256")
+EVIDENCE_ENVIRONMENT, EVIDENCE_TASK = "dev-release-evidence", "dev-release-observation"
+EVIDENCE_SCHEMA = "pineforge/dev-observation/v1"
+SNAPSHOT_KIND, RECEIPT_RUN_KIND = "snapshot", "receipt-run"
+REPORTER_BRANCH, REPORTER_EVENT = "main", "workflow_dispatch"
+# The ref of the reporter's reusable-workflow reference. The signed records carry another ref: the
+# receipt tag the coordinator creates at the served source.
+REPORTER_REF = "refs/heads/main"
+# The receipt-run row: the members the coordinator names when it writes the row, plus the three every
+# signed record carries (schema, owner, owner_sha). dry_run and receipt_only are NOT among them: they
+# are inputs of the coordinator's workflow dispatch, and no signed record keeps them.
+RECEIPT_RUN_FIELDS = ("schema", "kind", "owner", "owner_sha", "snapshot_id", "request", "repository",
+                      "workflow", "dispatch_ref", "workflow_run_id", "workflow_sha", "ref", "source",
+                      "pair", "sequence", "attempt", "owner_attempt", "created_at")
+# The snapshot: the members this validator reads must be present; the rest of what the coordinator may
+# write (the observation's neighbours) are allowed and otherwise ignored; nothing else is.
+SNAPSHOT_REQUIRED = ("schema", "kind", "owner", "owner_sha", "ref", "source", "request", "payload",
+                     "sequence", "observation", "pair", "owner_attempt", "created_at")
+SNAPSHOT_OPTIONAL = ("before", "after", "previousGood", "deployedGood", "landed", "postMerge",
+                     "deploy_ref", "landed_ref")
+# A policy key is one Ed25519 SubjectPublicKeyInfo PEM: 44 DER bytes are exactly one 60-character line.
+ED25519_PUBLIC_KEY_PEM = re.compile(r"-----BEGIN PUBLIC KEY-----\n([A-Za-z0-9+/]{59}=)\n-----END PUBLIC KEY-----\n?")
+# A signature is the canonical standard base64 of 64 raw bytes (the padding bits are zero: A, Q, g or w).
+SIGNATURE_TEXT = re.compile(r"[A-Za-z0-9+/]{85}[AQgw]==")
+
+
+def positive_number(value):
+    return type(value) is int and 0 < value <= 2**53 - 1
+
+
+def commit_text(value):
+    return type(value) is str and re.fullmatch(COMMIT, value) is not None
+
+
+def plain_text(value):
+    return type(value) is str and value != ""
+
+
+def pinned_key_der(pem):
+    found = ED25519_PUBLIC_KEY_PEM.fullmatch(pem) if type(pem) is str else None
+    require(found is not None, "application reporter coordinator public key is malformed")
+    try:
+        der = base64.b64decode(found.group(1), validate=True)
+    except (ValueError, binascii.Error):
+        raise Invalid("application reporter coordinator public key is malformed") from None
+    require(base64.b64encode(der).decode("ascii") == found.group(1),
+            "application reporter coordinator public key is malformed")
+    return der
+
+
+def application_reporter_policy(policy):
+    """Validate the pinned reporter profile and return it. The key is this pin and nothing else."""
+    require(type(policy) is dict and type(policy.get(APPLICATION_REPORTER)) is dict,
+            "application reporter policy missing")
+    pin = policy[APPLICATION_REPORTER]
+    require(set(pin) == set(REPORTER_FIELDS), "application reporter policy fields differ from the schema")
+    for name, valid in (
+            ("commit", commit_text(pin["commit"])),
+            ("workflow_id", positive_number(pin["workflow_id"])),
+            ("reusable", type(pin["reusable"]) is str
+             and re.fullmatch(r"[A-Za-z0-9_.-]+\.yml", pin["reusable"]) is not None),
+            ("actor", type(pin["actor"]) is str
+             and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?", pin["actor"]) is not None)):
+        require(valid, f"application reporter policy member {name} is malformed")
+    require(pin["reusable"] != policy["workflow"],
+            "application reporter reusable workflow must differ from the reporting workflow")
+    # Never a key from the provider run, a signed record, a repository variable or a snapshot.
+    der = pinned_key_der(pin["coordinator_public_key"])
+    require(type(pin["coordinator_spki_sha256"]) is str
+            and re.fullmatch(SHA, pin["coordinator_spki_sha256"]) is not None,
+            "application reporter coordinator key pin is malformed")
+    require(sha256(der) == pin["coordinator_spki_sha256"],
+            "application reporter coordinator public key is not the pinned key")
+    return pin
+
+
+def run_member(run, name):
+    require(type(run) is dict and name in run, "application reporter run lacks a required member")
+    return run[name]
+
+
+def instant(value, message):
+    require(type(value) is str
+            and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value) is not None,
+            message)
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise Invalid(message) from None
+
+
+def reporter_run(repo, policy, pin, actual, run):
+    """Checks that need only the pin and the provider run; they precede every reporter API read."""
+    require(run_member(run, "event") == REPORTER_EVENT, "application reporter requires workflow_dispatch")
+    positive(run_member(run, "id"))
+    require(run_member(run, "path") == ".github/workflows/" + policy["workflow"]
+            and type(run_member(run, "workflow_id")) is int and run["workflow_id"] == pin["workflow_id"],
+            "application reporter workflow differs from policy")
+    require(type(run_member(run, "run_attempt")) is int and run["run_attempt"] == 1,
+            "application reporter attempt differs")
+    require(run_member(run, "head_branch") == REPORTER_BRANCH, "application reporter branch differs from main")
+    require(run_member(run, "head_sha") == pin["commit"], "application reporter head differs from the pinned commit")
+    # Both actors come from the pin; an actor named inside signed evidence is never trusted.
+    for name in ("actor", "triggering_actor"):
+        who = run_member(run, name)
+        require(type(who) is dict and who.get("login") == pin["actor"],
+                "application reporter actor differs from policy")
+    for name in ("repository", "head_repository"):
+        where = run_member(run, name)
+        require(type(where) is dict and type(where.get("full_name")) is str
+                and where["full_name"].lower() == repo.lower(), "application reporter repository differs")
+    malformed = "application reporter timestamp is malformed"
+    require(instant(run_member(run, "created_at"), malformed) > instant(actual.get("merged_at"), malformed),
+            "application reporter was not created after the PR merge")
+    # Exactly one direct reference, to the reviewed reusable workflow, at the pinned commit and
+    # at the explicit main ref: nothing floating, foreign, extra or otherwise shaped.
+    tail = f"/.github/workflows/{pin['reusable']}@{pin['commit']}"
+    references = run_member(run, "referenced_workflows")
+    require(type(references) is list and len(references) == 1,
+            "application reporter must reference exactly one reusable workflow")
+    reference = references[0]
+    require(type(reference) is dict and set(reference) == {"path", "sha", "ref"},
+            "application reporter reusable reference members differ")
+    require(type(reference["path"]) is str and reference["path"].endswith(tail)
+            and reference["path"][:-len(tail)].lower() == repo.lower(),
+            "application reporter reusable workflow path differs from the pin")
+    require(reference["sha"] == pin["commit"], "application reporter reusable workflow commit differs from the pin")
+    require(reference["ref"] == REPORTER_REF, "application reporter reusable workflow ref is not refs/heads/main")
+
+
+def reporter_source(client, repo, pin):
+    """The pinned commit is on protected main; main may since have advanced."""
+    try:
+        branch = client.api(f"repos/{repo}/branches/{REPORTER_BRANCH}")
+    except Pending:
+        raise Invalid("application reporter branch is not protected main") from None
+    require(type(branch) is dict and branch.get("name") == REPORTER_BRANCH and branch.get("protected") is True
+            and type(branch.get("commit")) is dict, "application reporter branch is not protected main")
+    head = match(COMMIT, branch["commit"].get("sha"))
+    try:
+        comparison = client.api(f"repos/{repo}/compare/{pin['commit']}...{head}")
+    except Pending:
+        raise Invalid("application reporter commit is not on protected main") from None
+    require(type(comparison) is dict and comparison.get("status") in ("ahead", "identical"),
+            "application reporter commit is not on protected main")
+
+
+def deployment_pages(client, route):
+    rows = []
+    for page in range(1, 1001):
+        result = client.api(f"{route}&per_page=100&page={page}")
+        require(type(result) is list, "unexpected application deployment listing")
+        rows.extend(result)
+        if len(result) < 100:
+            return rows
+    raise Invalid("application deployment pagination limit exceeded")
+
+
+def deployment_claim(deployment):
+    """The (envelope, record) a store deployment appears to carry, or None. Nothing here is trusted yet."""
+    if (type(deployment) is not dict or deployment.get("environment") != EVIDENCE_ENVIRONMENT
+            or deployment.get("task") != EVIDENCE_TASK):
+        return None
+    envelope = deployment.get("payload")
+    value = envelope
+    if type(envelope) is str:
+        try:
+            value = decode(envelope)
+        except Invalid:
+            return None
+    if type(value) is not dict or type(value.get("record")) is not dict:
+        return None
+    return envelope, value["record"]
+
+
+def authenticate_record(envelope, kind, noun, pin):
+    """The record of a store envelope once the pinned key has signed it as `kind`.
+
+    A record is evidence only through this, and every way it can fail names its own check.
+    """
+    # Keep the new dependency off the legacy path, including the signal job.
+    import release_signed_record as signed
+
+    value = envelope
+    if type(envelope) is str:
+        try:
+            value = signed.parse_json_strict(envelope.encode("utf-8"))
+        except (UnicodeError, signed.SignedRecordError):
+            raise Invalid(f"application {noun} envelope is malformed") from None
+    # For a provider object payload, Client.api already rejected duplicate JSON members.
+    # An envelope is a record and, optionally, its signature: any other member is not the coordinator's.
+    require(type(value) is dict and set(value) - {"signature"} == {"record"} and type(value["record"]) is dict,
+            f"application {noun} envelope is malformed")
+    record, signature = value["record"], value.get("signature")
+    require(signature not in (None, ""), f"application {noun} record is not signed")
+    # 64 bytes are 21 whole groups plus one byte: 85 characters, then one of the four that carry two bits, then "==".
+    require(type(signature) is str and SIGNATURE_TEXT.fullmatch(signature) is not None,
+            f"application {noun} signature is malformed")
+    try:
+        trusted_key = signed.load_trusted_key(pinned_key_der(pin["coordinator_public_key"]),
+                                              expected_spki_sha256=pin["coordinator_spki_sha256"])
+        return signed.verify_envelope(value, trusted_key, expected_kind=kind)
+    except signed.SignedRecordError as error:
+        reasons = {
+            "kind_mismatch": f"record is not a {kind} binder",
+            "schema_mismatch": "record schema differs",
+            "owner_invalid": "member owner is malformed",
+            "signature_invalid": "signature does not verify against the pinned key",
+            "signature_noncanonical": "signature does not verify against the pinned key",
+        }
+        reason = reasons.get(error.code, f"signed record rejected ({error.code})")
+        raise Invalid(f"application {noun} {reason}") from None
+
+
+def signed_instant(value):
+    """Whole seconds in UTC, the form the coordinator's signedAt() writes."""
+    try:
+        instant(value, "")
+    except Invalid:
+        return False
+    return True
+
+
+# Each member of a signed record, by name, with the form its writer gives it. `pair` is not listed: it is
+# the coordinator's published pair of the PR, whose form comes from a module outside the pinned inputs, so
+# it is only ever compared (row against snapshot), never read.
+RECEIPT_RUN_MEMBERS = {
+    "owner": positive_number, "owner_sha": commit_text, "snapshot_id": positive_number,
+    "request": positive_number, "repository": plain_text, "workflow": plain_text,
+    "dispatch_ref": plain_text, "workflow_run_id": positive_number, "workflow_sha": commit_text,
+    "ref": plain_text, "source": commit_text, "sequence": positive_number, "attempt": positive_number,
+    "owner_attempt": positive_number, "created_at": signed_instant,
+}
+SNAPSHOT_MEMBERS = {
+    "owner": positive_number, "owner_sha": commit_text, "ref": plain_text, "source": commit_text,
+    "request": positive_number, "sequence": positive_number, "owner_attempt": positive_number,
+    "created_at": signed_instant,
+}
+
+
+def receipt_run_shape(record):
+    """The signed row is exactly the members the coordinator writes, each of its form."""
+    require(set(record) == set(RECEIPT_RUN_FIELDS), "application receipt-run record fields differ from the schema")
+    require(record["schema"] == EVIDENCE_SCHEMA, "application receipt-run record schema differs")
+    for name, valid in RECEIPT_RUN_MEMBERS.items():
+        require(valid(record[name]), f"application receipt-run member {name} is malformed")
+
+
+def snapshot_shape(record):
+    """The members of the signed snapshot this binding reads; the rest of the observation is the App's."""
+    require(set(SNAPSHOT_REQUIRED) <= set(record) <= set(SNAPSHOT_REQUIRED) | set(SNAPSHOT_OPTIONAL),
+            "application snapshot record fields differ from the schema")
+    require(record["schema"] == EVIDENCE_SCHEMA, "application snapshot record schema differs")
+    for name, valid in SNAPSHOT_MEMBERS.items():
+        require(valid(record[name]), f"application snapshot member {name} is malformed")
+    release = record["payload"]
+    require(type(release) is dict and type(release.get("release_version")) is str
+            and type(release.get("manifest")) is dict and type(release["manifest"].get("sha256")) is str
+            and re.fullmatch(SHA, release["manifest"]["sha256"]) is not None,
+            "application snapshot member payload is malformed")
+    observed = record["observation"]
+    require(type(observed) is dict and type(observed.get("pr")) is dict
+            and positive_number(observed["pr"].get("number")) and commit_text(observed["pr"].get("merge")),
+            "application snapshot member observation is malformed")
+    # The receipt tag the coordinator created at the served source: its run (the owner) and its sequence.
+    tag = "dev-release/%d/receipt-%d-" % (record["owner"], record["sequence"])
+    require(re.fullmatch(tag + "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                         record["ref"]) is not None,
+            "application snapshot ref is not the receipt tag of its owner and sequence")
+
+
+def owner_run(client, repo, owner, owner_sha):
+    """The coordinator run the signed records name, bound to their commit and this repository."""
+    try:
+        found = client.api(f"repos/{repo}/actions/runs/{owner}")
+    except Pending:
+        raise Invalid("application coordinator owner run is missing") from None
+    require(type(found) is dict and type(found.get("id")) is int and found["id"] == owner
+            and found.get("head_sha") == owner_sha
+            and type(found.get("repository")) is dict and type(found["repository"].get("full_name")) is str
+            and found["repository"]["full_name"].lower() == repo.lower(),
+            "application coordinator owner run differs from the signed owner")
+    return found
+
+
+def reporter_evidence(client, repo, policy, pin, receipt, event, pr, run):
+    """Bind the provider run to this release through two signed App records from the deployment store."""
+    route = f"repos/{repo}/deployments?environment={EVIDENCE_ENVIRONMENT}&task={EVIDENCE_TASK}"
+    claims = []
+    for deployment in deployment_pages(client, route):
+        claimed = deployment_claim(deployment)
+        if claimed is not None:
+            claims.append((deployment, claimed[0], claimed[1]))
+    run_id = run["id"]
+
+    # The row is found by the run it names, never by a hash. Only a record the pinned key signed as a
+    # receipt-run counts. A record naming this run that is not one is ignored when a good row exists,
+    # and otherwise the first such record's own failure is the refusal.
+    rows, failure = [], None
+    for deployment, envelope, record in claims:
+        if type(record.get("workflow_run_id")) is int and record["workflow_run_id"] == run_id:
+            try:
+                rows.append((deployment, authenticate_record(envelope, RECEIPT_RUN_KIND, "receipt-run", pin)))
+            except Invalid as error:
+                failure = failure or error
+    if not rows:
+        raise failure or Invalid("missing signed application receipt-run binding")
+    # One run binds one receipt: a replay is the very same canonical record, anything else is reuse.
+    row = rows[0][1]
+    require(all(canonical(signed) == canonical(row) for _, signed in rows),
+            "application receipt run is bound more than once")
+    receipt_run_shape(row)
+
+    # The row against the provider run, field by field. Its ref (the receipt tag) and created_at (the
+    # coordinator's own signing clock) belong to the coordinator: they are bound to the snapshot below.
+    require(row["repository"].lower() == repo.lower(),
+            "application receipt-run repository differs from the provider run")
+    require(row["workflow"] == run["path"] == ".github/workflows/" + policy["workflow"],
+            "application receipt-run workflow differs from the provider run")
+    require(row["dispatch_ref"] == run["head_branch"] == REPORTER_BRANCH,
+            "application receipt-run dispatch ref differs from the provider run")
+    require(row["workflow_sha"] == run["head_sha"] == pin["commit"],
+            "application receipt-run workflow SHA differs from the provider run")
+    require(row["attempt"] == run["run_attempt"] == 1,
+            "application receipt-run attempt differs from the provider run")
+
+    # The snapshot is the deployment the row names, read by that ID.
+    snapshot_id = row["snapshot_id"]
+    try:
+        snapshot_deployment = client.api(f"repos/{repo}/deployments/{snapshot_id}")
+    except Pending:
+        raise Invalid("application snapshot deployment is missing") from None
+    require(type(snapshot_deployment) is dict and type(snapshot_deployment.get("id")) is int
+            and snapshot_deployment["id"] == snapshot_id,
+            "application snapshot deployment differs from the receipt-run")
+    claimed = deployment_claim(snapshot_deployment)
+    require(claimed is not None, "application snapshot deployment is not a coordinator observation")
+    snapshot = authenticate_record(claimed[0], SNAPSHOT_KIND, "snapshot", pin)
+    snapshot_shape(snapshot)
+
+    # The snapshot against this release: version, manifest, PR and the served source, which stays the
+    # development merge and never becomes the reporter commit.
+    release = snapshot["payload"]
+    require(release["release_version"] == receipt["release_version"],
+            "application snapshot release differs from the receipt")
+    require(release["manifest"]["sha256"] == event["manifest"]["sha256"],
+            "application snapshot manifest differs from the release")
+    observed = snapshot["observation"]["pr"]
+    require(observed["number"] == pr["number"], "application snapshot PR differs from the receipt")
+    require(observed["merge"] == pr["merge"], "application snapshot merge differs from the receipt")
+    require(snapshot["source"] == pr["merge"], "application snapshot source differs from the merge commit")
+    # The row against the snapshot: the coordinator writes both in one call, from the same values.
+    for name in ("owner", "owner_sha", "owner_attempt", "request", "source", "sequence", "ref"):
+        require(row[name] == snapshot[name], f"application receipt-run {name} differs from the signed snapshot")
+    require(canonical(row["pair"]) == canonical(snapshot["pair"]),
+            "application receipt-run pair differs from the signed snapshot")
+    # The receipt against the snapshot: its attempt is the coordinator's run, its sequence the snapshot's.
+    require(receipt["attempt"] == snapshot["owner"],
+            "application receipt attempt differs from the signed snapshot owner")
+    require(receipt["sequence"] == snapshot["sequence"],
+            "application receipt sequence differs from the signed snapshot")
+
+    # One snapshot is reported by one run: any other authentic row for it is reuse.
+    for deployment, envelope, record in claims:
+        if (type(record.get("snapshot_id")) is int and record["snapshot_id"] == snapshot_id
+                and record.get("workflow_run_id") != run_id):
+            try:
+                authenticate_record(envelope, RECEIPT_RUN_KIND, "receipt-run", pin)
+            except Invalid:
+                continue
+            raise Invalid("application snapshot is bound to another receipt run")
+
+    # Both signed records name one coordinator run: deployment SHA, owner SHA and the owner run's head agree.
+    for deployment, record in (*rows, (snapshot_deployment, snapshot)):
+        require(deployment.get("sha") == record["owner_sha"],
+                "application deployment SHA differs from the coordinator owner SHA")
+    owner = owner_run(client, repo, row["owner"], row["owner_sha"])
+    require(type(owner.get("run_attempt")) is int and owner["run_attempt"] == row["owner_attempt"],
+            "application coordinator owner attempt differs from the receipt-run")
+
+
+def require_authenticated_dispatch_inputs(run):
+    """dry_run == "false" and receipt_only == "true" need an authenticated record of this run's dispatch inputs.
+
+    None exists. They are inputs of the coordinator's workflow dispatch, which the coordinator sends and
+    keeps no signed record of (pinned coordinator, receipt dispatch and receipt-run row); the run API does
+    not return them (the retained manual-dispatch run record has no `inputs`); and the receipt contract
+    has no field for them. A value inferred from the workflow name, the event or a job's success would be
+    an invented claim, so until the producer records them for this run ID and attempt, no application
+    receipt can be verified under this profile. This is the last check, so every other one is exercised first.
+    """
+    raise Invalid("application reporter dispatch inputs are not authenticated for this run")
+
+
+def check_application_reporter(client, repo, policy, receipt, event, pr, actual, run):
+    """Everything that replaces the reporting_run.head_sha == pr.merge rule for application."""
+    require(receipt["consumer"] == "application" and type(event) is dict,
+            "application reporter policy is only valid for application")
+    pin = application_reporter_policy(policy)
+    reporter_run(repo, policy, pin, actual, run)
+    reporter_source(client, repo, pin)
+    reporter_evidence(client, repo, policy, pin, receipt, event, pr, run)
+
+
+# --- End application protected-main reporter --------------------------------
+
+
 def identity(obj, *, facts_only=False, consumer=None, slot=None):
     if type(obj) is dict and "legacy" in obj:
         require(not facts_only and consumer == "offline" and slot == "previous",
@@ -499,6 +928,9 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         fields.add("post_merge")
     keys(receipt, COMMON_FIELDS | fields)
     require(receipt["schema"] in (PRODUCT_SCHEMA, FACTS_SCHEMA) and receipt["consumer"] in RECEIPT_ROLES, "invalid consumer receipt schema")
+    if APPLICATION_REPORTER in policy:
+        require(not facts_only and receipt["consumer"] == "application",
+                "application reporter policy is only valid for application")
     if facts_only:
         require(event is None and receipt["consumer"] in ("web", "license"), "unexpected facts-only receipt")
         keys(receipt["facts"], ("commit", "sha256"))
@@ -597,7 +1029,11 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
         require(merged_commit["parents"] and merged_commit["parents"][0]["sha"] == pr["base_sha"],
                 "merge inputs differ from the tested base; require updated merge/squash candidate")
     if state == "verified":
-        require(reporting_run["head_sha"] == pr["merge"] and reporting_run["event"] != "pull_request", "served receipt source differs")
+        if APPLICATION_REPORTER in policy:
+            # Only the application profile replaces the equality below, and only here.
+            check_application_reporter(client, repo, policy, receipt, event, pr, actual, reporting_run)
+        else:
+            require(reporting_run["head_sha"] == pr["merge"] and reporting_run["event"] != "pull_request", "served receipt source differs")
         deployed_run = check_run(client, repo, receipt["deploy"], policy["deploy"], pr["merge"])
         require(receipt["timestamp"] >= deployed_run["checked_finished_at"], "served receipt predates verification")
         identity(receipt["deployed"], facts_only=facts_only, consumer=receipt["consumer"], slot="deployed")
@@ -626,6 +1062,9 @@ def validate_receipt(client, repo, receipt, event, policy, reporting_run):
                 require(public[name]["facts_commit"] == receipt["facts"]["commit"]
                         and public[name]["facts_sha256"] == receipt["facts"]["sha256"],
                         "facts-only target differs from consumed identity")
+    if state == "verified" and APPLICATION_REPORTER in policy:
+        # Last, so every check above is exercised first: the dispatch inputs have no authenticated record.
+        require_authenticated_dispatch_inputs(reporting_run)
     return public
 
 

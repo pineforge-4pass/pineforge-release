@@ -2164,6 +2164,52 @@ class ReceiptCollectorWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "configured receipt roles"):
             self.assert_configured_collectors(mutant)
 
+    # Step 1 must not alter the shared consumer token: hosted reads must remain independent of
+    # the application installation's Deployments permission, which has not been granted yet.
+    RECEIPT_TOKEN_PERMISSIONS = {
+        "permission-contents": "read", "permission-actions": "read",
+        "permission-pull-requests": "read",
+    }
+
+    @staticmethod
+    def receipt_token_mints(workflow):
+        return [step for step in workflow["jobs"]["verify"]["steps"]
+                if step.get("uses", "").startswith("actions/create-github-app-token@")]
+
+    def assert_receipt_token_permissions(self, workflow):
+        mints = self.receipt_token_mints(workflow)
+        self.assertEqual(len(mints), 1, "receipt token mint step missing or duplicated")
+        requested = {name: value for name, value in mints[0]["with"].items()
+                     if name.startswith("permission-")}
+        self.assertEqual(requested, self.RECEIPT_TOKEN_PERMISSIONS, "receipt token permissions differ")
+
+    def test_receipt_token_keeps_the_three_existing_read_permissions(self):
+        """Mutation: add, drop, rename or widen any permission-* input of the receipt evidence token."""
+        workflow = _workflow("release-receipts.yml")
+        self.assert_receipt_token_permissions(workflow)
+        self.assertEqual(self.receipt_token_mints(workflow)[0]["with"]["repositories"],
+                         "${{ env.TARGET_REPOSITORY }}")
+        mutations = {
+            "drop contents": lambda inputs: inputs.pop("permission-contents"),
+            "drop actions": lambda inputs: inputs.pop("permission-actions"),
+            "drop pull requests": lambda inputs: inputs.pop("permission-pull-requests"),
+            "add deployments": lambda inputs: inputs.update({"permission-deployments": "read"}),
+            "widen contents": lambda inputs: inputs.update({"permission-contents": "write"}),
+            "add statuses": lambda inputs: inputs.update({"permission-statuses": "read"}),
+            "add issues": lambda inputs: inputs.update({"permission-issues": "write"}),
+            "rename pull requests": lambda inputs: inputs.update(
+                {"permission-pull-request": inputs.pop("permission-pull-requests")}),
+        }
+        for name, mutate in mutations.items():
+            mutant = copy.deepcopy(workflow)
+            mutate(self.receipt_token_mints(mutant)[0]["with"])
+            with self.subTest(mutation=name), self.assertRaisesRegex(AssertionError, "receipt token permissions differ"):
+                self.assert_receipt_token_permissions(mutant)
+        duplicated = copy.deepcopy(workflow)
+        duplicated["jobs"]["verify"]["steps"].append(copy.deepcopy(self.receipt_token_mints(workflow)[0]))
+        with self.assertRaisesRegex(AssertionError, "receipt token mint step missing or duplicated"):
+            self.assert_receipt_token_permissions(duplicated)
+
 
 class RedeliverWorkflowTest(unittest.TestCase):
     def test_public_eligibility_is_checked_before_target_token_mint(self):

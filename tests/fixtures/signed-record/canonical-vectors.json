@@ -1,0 +1,313 @@
+{
+  "schema": "pineforge/signed-record-canonical-vectors/v1",
+  "label": "test-key vectors, not a live receipt proof",
+  "scope": "Canonical bytes only. No key, signature or receipt is involved, so nothing here proves a live receipt.",
+  "pinned_app_source": {
+    "canonical": {"app_path": "scripts/release-evidence.mjs", "git_blob": "6520023f1b6f4ef5af6bb8ffab064a52cd755616", "function": "canonical"}
+  },
+  "how_to_read": "input_json is the exact JSON text a verifier receives. app is what the pinned App canonical(JSON.parse(input_json)) returns: result canonical with the text, or throws when JSON.parse throws. hub is the decision of scripts/release_signed_record.py: accept (the bytes equal app.text encoded as UTF-8 and utf8_hex) or reject with the stable code. utf8_hex appears only where the hub accepts. Every non-ASCII character in this file is written as a JSON escape so the file stays ASCII.",
+  "vectors": [
+    {
+      "id": "empty-object",
+      "covers": "smallest record; compact output and the trailing LF",
+      "input_json": "{}",
+      "app": {"result": "canonical", "text": "{}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b7d0a"
+    },
+    {
+      "id": "compact-separators-and-whitespace",
+      "covers": "exact separators: no space around colon or comma; input space, CRLF and tab are not part of the signed value",
+      "input_json": "{ \"a\" : [ 1 , 2 ] ,\r\n\t\"b\" : { } }",
+      "app": {"result": "canonical", "text": "{\"a\":[1,2],\"b\":{}}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2261223a5b312c325d2c2262223a7b7d7d0a"
+    },
+    {
+      "id": "recursive-key-order-and-array-order",
+      "covers": "keys are sorted at every depth, including objects inside arrays; array order is preserved",
+      "input_json": "{\"b\":{\"z\":1,\"a\":[{\"d\":1,\"c\":2},{\"b\":3,\"a\":4}]},\"a\":0}",
+      "app": {"result": "canonical", "text": "{\"a\":0,\"b\":{\"a\":[{\"c\":2,\"d\":1},{\"a\":4,\"b\":3}],\"z\":1}}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2261223a302c2262223a7b2261223a5b7b2263223a322c2264223a317d2c7b2261223a342c2262223a337d5d2c227a223a317d7d0a"
+    },
+    {
+      "id": "key-order-index-like-keys-first",
+      "covers": "JS property enumeration: array-index keys come first in ascending numeric order (2 before 10), then the other keys in UTF-16 order; 01 and -1 are not indexes",
+      "input_json": "{\"b\":1,\"10\":2,\"2\":3,\"a\":4,\"01\":5,\"-1\":6}",
+      "app": {"result": "canonical", "text": "{\"2\":3,\"10\":2,\"-1\":6,\"01\":5,\"a\":4,\"b\":1}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2232223a332c223130223a322c222d31223a362c223031223a352c2261223a342c2262223a317d0a"
+    },
+    {
+      "id": "key-order-array-index-boundary",
+      "covers": "4294967294 (2**32 - 2) is the largest array index and still sorts numerically before the named keys 1a and a",
+      "input_json": "{\"4294967294\":1,\"a\":2,\"5\":3,\"1a\":4}",
+      "app": {"result": "canonical", "text": "{\"5\":3,\"4294967294\":1,\"1a\":4,\"a\":2}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2235223a332c2234323934393637323934223a312c223161223a342c2261223a327d0a"
+    },
+    {
+      "id": "key-order-utf16-code-units",
+      "covers": "UTF-16 order, not code point order: U+1F600 (surrogates D83D DE00) sorts between a and U+E000",
+      "input_json": "{\"\\ud83d\\ude00\":1,\"\\ue000\":2,\"a\":3}",
+      "app": {"result": "canonical", "text": "{\"a\":3,\"\ud83d\ude00\":1,\"\ue000\":2}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2261223a332c22f09f9880223a312c22ee8080223a327d0a"
+    },
+    {
+      "id": "key-order-uses-unescaped-keys",
+      "covers": "keys sort on their own characters, not on their escaped spelling: LF (0x0a) < quote (0x22) < backslash (0x5c)",
+      "input_json": "{\"a\\\"b\":1,\"a\\\\b\":2,\"a\\nb\":3}",
+      "app": {"result": "canonical", "text": "{\"a\\nb\":3,\"a\\\"b\":1,\"a\\\\b\":2}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b22615c6e62223a332c22615c2262223a312c22615c5c62223a327d0a"
+    },
+    {
+      "id": "string-short-escapes",
+      "covers": "quote, backslash, backspace, form feed, LF, CR and tab use two-character escapes; the solidus is written raw even when the input escapes it",
+      "input_json": "{\"s\":\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"}",
+      "app": {"result": "canonical", "text": "{\"s\":\"\\\"\\\\/\\b\\f\\n\\r\\t\"}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2273223a225c225c5c2f5c625c665c6e5c725c74227d0a"
+    },
+    {
+      "id": "string-control-characters",
+      "covers": "other control characters below U+0020 use lowercase \\u00xx; U+007F is written raw",
+      "input_json": "{\"s\":\"\\u0000\\u0001\\u001f\\u007f\"}",
+      "app": {"result": "canonical", "text": "{\"s\":\"\\u0000\\u0001\\u001f\u007f\"}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2273223a225c75303030305c75303030315c75303031667f227d0a"
+    },
+    {
+      "id": "string-unicode-raw",
+      "covers": "raw U+00E9, U+1F600, U+2028 and U+2029 stay raw and are encoded as UTF-8 (U+2028 and U+2029 are not escaped)",
+      "input_json": "{\"s\":\"\u00e9\ud83d\ude00\u2028\u2029\"}",
+      "app": {"result": "canonical", "text": "{\"s\":\"\u00e9\ud83d\ude00\u2028\u2029\"}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2273223a22c3a9f09f9880e280a8e280a9227d0a"
+    },
+    {
+      "id": "string-unicode-escaped-equals-raw",
+      "covers": "the same string spelled with \\u escapes and a surrogate pair signs the same bytes as the raw spelling above",
+      "input_json": "{\"s\":\"\\u00e9\\ud83d\\ude00\\u2028\\u2029\"}",
+      "app": {"result": "canonical", "text": "{\"s\":\"\u00e9\ud83d\ude00\u2028\u2029\"}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2273223a22c3a9f09f9880e280a8e280a9227d0a"
+    },
+    {
+      "id": "unicode-nfc-not-normalized",
+      "covers": "precomposed U+00E9 stays precomposed: no normalization",
+      "input_json": "{\"s\":\"\\u00e9\"}",
+      "app": {"result": "canonical", "text": "{\"s\":\"\u00e9\"}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2273223a22c3a9227d0a"
+    },
+    {
+      "id": "unicode-nfd-not-normalized",
+      "covers": "e plus U+0301 stays decomposed and signs different bytes from the precomposed vector: no normalization",
+      "input_json": "{\"s\":\"e\\u0301\"}",
+      "app": {"result": "canonical", "text": "{\"s\":\"e\u0301\"}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2273223a2265cc81227d0a"
+    },
+    {
+      "id": "null-present",
+      "covers": "null is a value: it is kept in objects and arrays and sorted with its key",
+      "input_json": "{\"b\":null,\"a\":[null,{\"c\":null}]}",
+      "app": {"result": "canonical", "text": "{\"a\":[null,{\"c\":null}],\"b\":null}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2261223a5b6e756c6c2c7b2263223a6e756c6c7d5d2c2262223a6e756c6c7d0a"
+    },
+    {
+      "id": "null-versus-absent-null-key",
+      "covers": "pair with null-versus-absent-missing-key: a key holding null is signed",
+      "input_json": "{\"a\":null,\"b\":1}",
+      "app": {"result": "canonical", "text": "{\"a\":null,\"b\":1}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2261223a6e756c6c2c2262223a317d0a"
+    },
+    {
+      "id": "null-versus-absent-missing-key",
+      "covers": "pair with null-versus-absent-null-key: an absent key signs different bytes. A signer-side undefined also vanishes, but JSON text cannot carry undefined",
+      "input_json": "{\"b\":1}",
+      "app": {"result": "canonical", "text": "{\"b\":1}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2262223a317d0a"
+    },
+    {
+      "id": "numbers-small-integers",
+      "covers": "plain integers, one negative, written without a plus sign, fraction or exponent",
+      "input_json": "{\"n\":[ 0 , 1 , -1 , 10 ]}",
+      "app": {"result": "canonical", "text": "{\"n\":[0,1,-1,10]}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b226e223a5b302c312c2d312c31305d7d0a"
+    },
+    {
+      "id": "numbers-largest-safe-integer",
+      "covers": "2**53 - 1 is the largest integer the hub signs",
+      "input_json": "{\"n\":9007199254740991}",
+      "app": {"result": "canonical", "text": "{\"n\":9007199254740991}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b226e223a393030373139393235343734303939317d0a"
+    },
+    {
+      "id": "numbers-smallest-safe-integer",
+      "covers": "-(2**53 - 1) is the smallest integer the hub signs",
+      "input_json": "{\"n\":-9007199254740991}",
+      "app": {"result": "canonical", "text": "{\"n\":-9007199254740991}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b226e223a2d393030373139393235343734303939317d0a"
+    },
+    {
+      "id": "proto-name-is-an-ordinary-key",
+      "covers": "a key named __proto__ is an own data key and sorts as 0x5f before b",
+      "input_json": "{\"__proto__\":{\"a\":1},\"b\":2}",
+      "app": {"result": "canonical", "text": "{\"__proto__\":{\"a\":1},\"b\":2}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b225f5f70726f746f5f5f223a7b2261223a317d2c2262223a327d0a"
+    },
+    {
+      "id": "empty-string-key-sorts-first",
+      "covers": "the empty key is a prefix of every key and sorts first among the named keys",
+      "input_json": "{\"b\":1,\"\":2}",
+      "app": {"result": "canonical", "text": "{\"\":2,\"b\":1}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b22223a322c2262223a317d0a"
+    },
+    {
+      "id": "booleans",
+      "covers": "true and false literals",
+      "input_json": "{\"t\":true,\"f\":false}",
+      "app": {"result": "canonical", "text": "{\"f\":false,\"t\":true}\n"},
+      "hub": {"result": "accept"},
+      "utf8_hex": "7b2266223a66616c73652c2274223a747275657d0a"
+    },
+    {
+      "id": "number-decimal-point-zero",
+      "covers": "number forms: 1.0 means 1 to the App, which signs 1; the hub refuses the spelling instead of normalizing it",
+      "input_json": "{\"n\":1.0}",
+      "app": {"result": "canonical", "text": "{\"n\":1}\n"},
+      "hub": {"result": "reject", "code": "number_form"}
+    },
+    {
+      "id": "number-exponent",
+      "covers": "number forms: 1e2 means 100 to the App; the hub refuses any exponent",
+      "input_json": "{\"n\":1e2}",
+      "app": {"result": "canonical", "text": "{\"n\":100}\n"},
+      "hub": {"result": "reject", "code": "number_form"}
+    },
+    {
+      "id": "number-negative-zero",
+      "covers": "number forms: -0 is signed as 0 by the App; the hub refuses it",
+      "input_json": "{\"n\":-0}",
+      "app": {"result": "canonical", "text": "{\"n\":0}\n"},
+      "hub": {"result": "reject", "code": "number_form"}
+    },
+    {
+      "id": "number-fraction",
+      "covers": "number forms: the hub does not reimplement ECMAScript number printing, so every fraction is refused",
+      "input_json": "{\"n\":1.5}",
+      "app": {"result": "canonical", "text": "{\"n\":1.5}\n"},
+      "hub": {"result": "reject", "code": "number_form"}
+    },
+    {
+      "id": "number-overflow-reads-as-null",
+      "covers": "number forms: 1e999 parses to Infinity in the App and is signed as null; the hub refuses it",
+      "input_json": "{\"n\":1e999}",
+      "app": {"result": "canonical", "text": "{\"n\":null}\n"},
+      "hub": {"result": "reject", "code": "number_form"}
+    },
+    {
+      "id": "number-first-unsafe-integer",
+      "covers": "range: 2**53 is exact in the App but is the first integer the hub refuses",
+      "input_json": "{\"n\":9007199254740992}",
+      "app": {"result": "canonical", "text": "{\"n\":9007199254740992}\n"},
+      "hub": {"result": "reject", "code": "number_range"}
+    },
+    {
+      "id": "number-silent-rounding",
+      "covers": "range: 2**53 + 1 is silently rounded to 2**53 by the App; the hub refuses it",
+      "input_json": "{\"n\":9007199254740993}",
+      "app": {"result": "canonical", "text": "{\"n\":9007199254740992}\n"},
+      "hub": {"result": "reject", "code": "number_range"}
+    },
+    {
+      "id": "number-first-unsafe-negative-integer",
+      "covers": "range: the negative mirror of the first unsafe integer",
+      "input_json": "{\"n\":-9007199254740992}",
+      "app": {"result": "canonical", "text": "{\"n\":-9007199254740992}\n"},
+      "hub": {"result": "reject", "code": "number_range"}
+    },
+    {
+      "id": "nonfinite-nan",
+      "covers": "NaN is not JSON; Python's parser would accept it, so the hub refuses it by name",
+      "input_json": "{\"n\":NaN}",
+      "app": {"result": "throws"},
+      "hub": {"result": "reject", "code": "nonfinite_constant"}
+    },
+    {
+      "id": "nonfinite-infinity",
+      "covers": "Infinity is not JSON",
+      "input_json": "{\"n\":Infinity}",
+      "app": {"result": "throws"},
+      "hub": {"result": "reject", "code": "nonfinite_constant"}
+    },
+    {
+      "id": "nonfinite-negative-infinity",
+      "covers": "-Infinity is not JSON",
+      "input_json": "{\"n\":-Infinity}",
+      "app": {"result": "throws"},
+      "hub": {"result": "reject", "code": "nonfinite_constant"}
+    },
+    {
+      "id": "duplicate-key",
+      "covers": "JSON.parse keeps the last duplicate; the hub refuses the ambiguity",
+      "input_json": "{\"a\":1,\"a\":2}",
+      "app": {"result": "canonical", "text": "{\"a\":2}\n"},
+      "hub": {"result": "reject", "code": "duplicate_key"}
+    },
+    {
+      "id": "duplicate-key-via-escape",
+      "covers": "a and \\u0061 are the same key once unescaped",
+      "input_json": "{\"a\":1,\"\\u0061\":2}",
+      "app": {"result": "canonical", "text": "{\"a\":2}\n"},
+      "hub": {"result": "reject", "code": "duplicate_key"}
+    },
+    {
+      "id": "lone-high-surrogate",
+      "covers": "an unpaired high surrogate: the App signs the six-character escape \\ud800; the hub refuses it as outside UTF-8",
+      "input_json": "{\"s\":\"\\ud800\"}",
+      "app": {"result": "canonical", "text": "{\"s\":\"\\ud800\"}\n"},
+      "hub": {"result": "reject", "code": "unpaired_surrogate"}
+    },
+    {
+      "id": "lone-low-surrogate",
+      "covers": "an unpaired low surrogate",
+      "input_json": "{\"s\":\"\\udc00\"}",
+      "app": {"result": "canonical", "text": "{\"s\":\"\\udc00\"}\n"},
+      "hub": {"result": "reject", "code": "unpaired_surrogate"}
+    },
+    {
+      "id": "swapped-surrogate-pair",
+      "covers": "low then high is two unpaired surrogates, not a pair",
+      "input_json": "{\"s\":\"\\ude00\\ud83d\"}",
+      "app": {"result": "canonical", "text": "{\"s\":\"\\ude00\\ud83d\"}\n"},
+      "hub": {"result": "reject", "code": "unpaired_surrogate"}
+    },
+    {
+      "id": "lone-surrogate-in-key",
+      "covers": "the surrogate rule applies to object keys too",
+      "input_json": "{\"\\ud800\":1}",
+      "app": {"result": "canonical", "text": "{\"\\ud800\":1}\n"},
+      "hub": {"result": "reject", "code": "unpaired_surrogate"}
+    },
+    {
+      "id": "index-key-at-two-pow-32-minus-one",
+      "covers": "an integer-like key at or above 2**32 - 1 is not an array index; engines have differed on its order, so the hub refuses it",
+      "input_json": "{\"4294967295\":1}",
+      "app": {"result": "canonical", "text": "{\"4294967295\":1}\n"},
+      "hub": {"result": "reject", "code": "ambiguous_index_key"}
+    }
+  ]
+}

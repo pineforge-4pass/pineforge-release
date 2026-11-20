@@ -1,0 +1,831 @@
+{
+  "schema": "pineforge/signed-record-signature-vectors/v1",
+  "label": "test-key vectors, not a live receipt proof",
+  "generation": {
+    "status": "generated",
+    "pending": "Every null below (test_keys.*.spki_der_base64, base.canonical_utf8_hex, base.signature_base64, cases[].record_text and cases[].envelope_json) is filled by the approved Spot generator and nowhere else. Until then nothing in this file is signed and the pre-signed tests refuse to pass.",
+    "generator": "handoff/spot/signed-record-oracle.mjs generate-signatures",
+    "signer": "the App signedEnvelope() text extracted from the pinned signed-state source (git blob 260912eb7255d7ac59e6867df94e34bc94a4c00f), running the App canonical() text extracted from the pinned canonical source (git blob 6520023f1b6f4ef5af6bb8ffab064a52cd755616)",
+    "environment": {
+      "node": "v22.23.3",
+      "openssl": "3.5.8"
+    },
+    "verified_input_blobs": {
+      "canonical": "6520023f1b6f4ef5af6bb8ffab064a52cd755616",
+      "signed_state": "260912eb7255d7ac59e6867df94e34bc94a4c00f"
+    }
+  },
+  "how_to_read": "Each case starts from base.record_json, applies record_edits (every find must occur exactly once) or replaces it with record_json, and builds envelope_json from the template. mutates says what the case changes: none, record-representation (the signed value is unchanged: the hub may accept, or refuse the spelling, but must never call it a bad signature), record-value (the signed value changed: bad signature), signature, key, envelope, or signed-semantics (a correctly signed record that the caller must still refuse). hub is the decision of scripts/release_signed_record.py. app is what the pinned App verifyEnvelope() decides: accept, reject, or unspecified when the behavior is not pinned.",
+  "tokens": {
+    "__RECORD__": "the case's record text",
+    "__SIGNATURE__": "base64 Ed25519 signature by test key signer over the canonical bytes of the signed record (the base record, or the case's own record when sign_case_record is true)",
+    "__SIGNATURE_OTHER__": "the same signature made by test key other",
+    "__SIGNATURE_ZERO__": "base64 of 64 zero bytes",
+    "__SIGNATURE_BITFLIP__": "__SIGNATURE__ with the lowest bit of its first byte flipped",
+    "__SIGNATURE_TRUNCATED__": "base64 of the first 63 bytes of __SIGNATURE__",
+    "__SIGNATURE_UNPADDED__": "__SIGNATURE__ without its trailing padding",
+    "__SIGNATURE_S_PLUS_L__": "the signature with its scalar S replaced by S + L (L is the Ed25519 group order), 64 bytes, base64",
+    "__OTHER_PUBLIC_KEY__": "base64 DER SubjectPublicKeyInfo of test key other"
+  },
+  "test_keys": {
+    "signer": {
+      "seed_phrase": "pineforge signed-record test key A: test-key vectors, not a live receipt proof",
+      "derivation": "Ed25519 private key seed = SHA-256 of the UTF-8 seed_phrase (RFC 8032 seed); a test key, never trusted by policy",
+      "spki_der_base64": "MCowBQYDK2VwAyEAyQOHW6NPjqllwAFVIVhXwkN+c8aZ2Aeve+QpakgX4u4="
+    },
+    "other": {
+      "seed_phrase": "pineforge signed-record test key B: test-key vectors, not a live receipt proof",
+      "derivation": "Ed25519 private key seed = SHA-256 of the UTF-8 seed_phrase (RFC 8032 seed); a test key, never trusted by policy",
+      "spki_der_base64": "MCowBQYDK2VwAyEALdAqr4REzUJ/c6mdi5pCH+0SNagKX7Xgict3UuudkuQ="
+    }
+  },
+  "base": {
+    "record_json": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+    "canonical_text": "{\"kind\":\"receipt-run\",\"label\":\"caf\u00e9 \ud83d\ude00\",\"owner\":1234567890,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"pair\":null,\"schema\":\"pineforge/dev-observation/v1\",\"sequence\":1,\"source\":\"3333333333333333333333333333333333333333\"}\n",
+    "canonical_utf8_hex": "7b226b696e64223a22726563656970742d72756e222c226c6162656c223a22636166c3a920f09f9880222c226f776e6572223a313233343536373839302c226f776e65725f736861223a2231313131313131313131313131313131313131313131313131313131313131313131313131313131222c2270616972223a6e756c6c2c22736368656d61223a2270696e65666f7267652f6465762d6f62736572766174696f6e2f7631222c2273657175656e6365223a312c22736f75726365223a2233333333333333333333333333333333333333333333333333333333333333333333333333333333227d0a",
+    "signature_base64": "UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg=="
+  },
+  "default_template": "{\"record\":__RECORD__,\"signature\":\"__SIGNATURE__\"}",
+  "cases": [
+    {
+      "id": "accept-base",
+      "covers": [
+        "accept"
+      ],
+      "mutates": "none",
+      "why": "The unmodified record signed by the test key and verified under the same key.",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "accept"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "accept-key-order-reversed",
+      "covers": [
+        "key-ordering"
+      ],
+      "mutates": "record-representation",
+      "why": "Same eight keys and values in the opposite order. The signed value is unchanged, so this is not tampering and must be accepted.",
+      "record_json": "{\"sequence\":1,\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"owner_sha\":\"1111111111111111111111111111111111111111\",\"pair\":null,\"schema\":\"pineforge/dev-observation/v1\",\"kind\":\"receipt-run\",\"owner\":1234567890,\"source\":\"3333333333333333333333333333333333333333\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "accept"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"sequence\":1,\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"owner_sha\":\"1111111111111111111111111111111111111111\",\"pair\":null,\"schema\":\"pineforge/dev-observation/v1\",\"kind\":\"receipt-run\",\"owner\":1234567890,\"source\":\"3333333333333333333333333333333333333333\"}",
+      "envelope_json": "{\"record\":{\"sequence\":1,\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"owner_sha\":\"1111111111111111111111111111111111111111\",\"pair\":null,\"schema\":\"pineforge/dev-observation/v1\",\"kind\":\"receipt-run\",\"owner\":1234567890,\"source\":\"3333333333333333333333333333333333333333\"},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "accept-unicode-raw-characters",
+      "covers": [
+        "unicode-escaping"
+      ],
+      "mutates": "record-representation",
+      "why": "The label is written with raw U+00E9 and U+1F600 instead of \\u escapes. The string is the same, so the signature still verifies.",
+      "record_edits": [
+        [
+          "caf\\u00e9 \\ud83d\\ude00",
+          "caf\u00e9 \ud83d\ude00"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "accept"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\u00e9 \ud83d\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\u00e9 \ud83d\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "accept-unicode-escaped-ascii-keys",
+      "covers": [
+        "unicode-escaping"
+      ],
+      "mutates": "record-representation",
+      "why": "Two ASCII keys are spelled with \\u006b and \\u006f escapes. They are the same keys, so the signature still verifies.",
+      "record_edits": [
+        [
+          "\"kind\":",
+          "\"\\u006bind\":"
+        ],
+        [
+          "\"owner\":",
+          "\"\\u006fwner\":"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "accept"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"\\u006fwner\":1234567890,\"\\u006bind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"\\u006fwner\":1234567890,\"\\u006bind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "accept-whitespace-and-crlf",
+      "covers": [
+        "whitespace"
+      ],
+      "mutates": "record-representation",
+      "why": "Spaces, tabs and CRLF around tokens in both the record and the envelope. Whitespace is not part of the signed bytes.",
+      "record_edits": [
+        [
+          "{\"source\":",
+          "{\r\n\t\"source\" : "
+        ],
+        [
+          "\"sequence\":1}",
+          "\"sequence\" : 1\r\n}"
+        ]
+      ],
+      "template": "{\r\n\t\"record\" : __RECORD__ ,\r\n\t\"signature\" : \"__SIGNATURE__\"\r\n}\r\n",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "accept"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\r\n\t\"source\" : \"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\" : 1\r\n}",
+      "envelope_json": "{\r\n\t\"record\" : {\r\n\t\"source\" : \"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\" : 1\r\n} ,\r\n\t\"signature\" : \"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"\r\n}\r\n"
+    },
+    {
+      "id": "refuse-number-form-decimal-point",
+      "covers": [
+        "number-forms"
+      ],
+      "mutates": "record-representation",
+      "why": "sequence is spelled 1.0. The App reads it as 1 and still verifies; the hub refuses the spelling. The value is unchanged, so the cause is number_form, never signature_invalid.",
+      "record_edits": [
+        [
+          "\"sequence\":1}",
+          "\"sequence\":1.0}"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "number_form"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1.0}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1.0},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "refuse-number-form-exponent",
+      "covers": [
+        "number-forms"
+      ],
+      "mutates": "record-representation",
+      "why": "owner is spelled 1.23456789e9, which is exactly 1234567890. The App still verifies; the hub refuses the exponent form.",
+      "record_edits": [
+        [
+          "\"owner\":1234567890,",
+          "\"owner\":1.23456789e9,"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "number_form"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1.23456789e9,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1.23456789e9,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "refuse-number-form-leading-zero",
+      "covers": [
+        "number-forms"
+      ],
+      "mutates": "record-representation",
+      "why": "sequence is spelled 01, which is not JSON. Both sides refuse it at parse time.",
+      "record_edits": [
+        [
+          "\"sequence\":1}",
+          "\"sequence\":01}"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "json_syntax"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":01}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":01},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "tamper-value-number",
+      "covers": [
+        "number-values"
+      ],
+      "mutates": "record-value",
+      "why": "sequence changes from 1 to 2 under the old signature: a different signed value.",
+      "record_edits": [
+        [
+          "\"sequence\":1}",
+          "\"sequence\":2}"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":2}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":2},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "tamper-one-byte-flip-owner",
+      "covers": [
+        "one-byte-flip"
+      ],
+      "mutates": "record-value",
+      "why": "One byte of the envelope text changes: the last digit of owner, 0 to 1.",
+      "record_edits": [
+        [
+          "\"owner\":1234567890,",
+          "\"owner\":1234567891,"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567891,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567891,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "tamper-one-byte-flip-owner-sha",
+      "covers": [
+        "one-byte-flip"
+      ],
+      "mutates": "record-value",
+      "why": "One byte of the envelope text changes: the first character of owner_sha, 1 to 2.",
+      "record_edits": [
+        [
+          "\"owner_sha\":\"1",
+          "\"owner_sha\":\"2"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"2111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"2111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "tamper-null-removed",
+      "covers": [
+        "null-handling"
+      ],
+      "mutates": "record-value",
+      "why": "The key pair holding null is removed. Null is a signed value, so absent differs from null.",
+      "record_edits": [
+        [
+          "\"pair\":null,",
+          ""
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "tamper-null-added",
+      "covers": [
+        "null-handling"
+      ],
+      "mutates": "record-value",
+      "why": "A new key extra holding null is added. A signed record has no spare null keys.",
+      "record_edits": [
+        [
+          "\"pair\":null,",
+          "\"pair\":null,\"extra\":null,"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"extra\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"extra\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "tamper-null-to-false",
+      "covers": [
+        "null-handling"
+      ],
+      "mutates": "record-value",
+      "why": "pair changes from null to false: another falsy value is still a different value.",
+      "record_edits": [
+        [
+          "\"pair\":null,",
+          "\"pair\":false,"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":false,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":false,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "tamper-unicode-accent-dropped",
+      "covers": [
+        "unicode-values"
+      ],
+      "mutates": "record-value",
+      "why": "U+00E9 in the label becomes e: a different string.",
+      "record_edits": [
+        [
+          "caf\\u00e9",
+          "cafe"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"cafe \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"cafe \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "tamper-nfd-for-nfc",
+      "covers": [
+        "unicode-values",
+        "no-normalization"
+      ],
+      "mutates": "record-value",
+      "why": "Precomposed U+00E9 becomes e plus U+0301. They look alike but are different code points, and nothing normalizes them.",
+      "record_edits": [
+        [
+          "caf\\u00e9",
+          "cafe\\u0301"
+        ]
+      ],
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"cafe\\u0301 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"cafe\\u0301 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "refuse-signature-all-zero",
+      "covers": [
+        "bad-signature"
+      ],
+      "mutates": "signature",
+      "why": "Well-formed 64 zero bytes in place of the signature.",
+      "template": "{\"record\":__RECORD__,\"signature\":\"__SIGNATURE_ZERO__\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"}"
+    },
+    {
+      "id": "refuse-signature-bit-flipped",
+      "covers": [
+        "bad-signature"
+      ],
+      "mutates": "signature",
+      "why": "The real signature with one bit changed.",
+      "template": "{\"record\":__RECORD__,\"signature\":\"__SIGNATURE_BITFLIP__\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UcnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "refuse-signature-missing",
+      "covers": [
+        "missing-signature"
+      ],
+      "mutates": "envelope",
+      "why": "The envelope has no signature key.",
+      "template": "{\"record\":__RECORD__}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_missing"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}}"
+    },
+    {
+      "id": "refuse-signature-null",
+      "covers": [
+        "missing-signature"
+      ],
+      "mutates": "envelope",
+      "why": "The signature is null, not a string.",
+      "template": "{\"record\":__RECORD__,\"signature\":null}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_type"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":null}"
+    },
+    {
+      "id": "refuse-signature-empty",
+      "covers": [
+        "bad-signature"
+      ],
+      "mutates": "signature",
+      "why": "An empty signature string.",
+      "template": "{\"record\":__RECORD__,\"signature\":\"\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_length"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"\"}"
+    },
+    {
+      "id": "refuse-signature-truncated",
+      "covers": [
+        "bad-signature"
+      ],
+      "mutates": "signature",
+      "why": "Canonical base64 of only 63 signature bytes.",
+      "template": "{\"record\":__RECORD__,\"signature\":\"__SIGNATURE_TRUNCATED__\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_length"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4\"}"
+    },
+    {
+      "id": "refuse-signature-unpadded-base64",
+      "covers": [
+        "bad-signature",
+        "signature-encoding"
+      ],
+      "mutates": "signature",
+      "why": "The real signature without its base64 padding. Node decodes it and the App accepts; the hub accepts only canonical padded base64.",
+      "template": "{\"record\":__RECORD__,\"signature\":\"__SIGNATURE_UNPADDED__\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_encoding"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg\"}"
+    },
+    {
+      "id": "refuse-signature-trailing-newline",
+      "covers": [
+        "bad-signature",
+        "signature-encoding"
+      ],
+      "mutates": "signature",
+      "why": "The real signature followed by a newline. Node ignores whitespace and the App accepts; the hub does not.",
+      "template": "{\"record\":__RECORD__,\"signature\":\"__SIGNATURE__\\n\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_encoding"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\\n\"}"
+    },
+    {
+      "id": "refuse-signature-s-plus-l",
+      "covers": [
+        "bad-signature",
+        "signature-encoding"
+      ],
+      "mutates": "signature",
+      "why": "The scalar S is replaced by S + L, an equivalent but non-canonical encoding. The hub refuses it before verifying; the App result depends on the OpenSSL build and is not pinned.",
+      "template": "{\"record\":__RECORD__,\"signature\":\"__SIGNATURE_S_PLUS_L__\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_noncanonical"
+      },
+      "app": {
+        "result": "unspecified"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRAl8MsRAj6Pj3MGDt1Y5sMvBnmPr2wsjp96fcnSux4Gg==\"}"
+    },
+    {
+      "id": "refuse-wrong-key-signature",
+      "covers": [
+        "wrong-key"
+      ],
+      "mutates": "key",
+      "why": "A well-formed signature over the right bytes made by test key other, verified under test key signer.",
+      "template": "{\"record\":__RECORD__,\"signature\":\"__SIGNATURE_OTHER__\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"CIfOQ0npt64/rEo4GyyVtCu8+kPjKm07T6cFsOxHS278EzIrYLIwuiq+jBcpbnOwLYuA+dq3BAMlL8+wbjQ0Dw==\"}"
+    },
+    {
+      "id": "refuse-wrong-trusted-key",
+      "covers": [
+        "wrong-key"
+      ],
+      "mutates": "key",
+      "why": "The accepted envelope verified under test key other instead of signer.",
+      "trusted_key": "other",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "signature_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    },
+    {
+      "id": "refuse-key-in-envelope-with-valid-signature",
+      "covers": [
+        "key-substitution"
+      ],
+      "mutates": "envelope",
+      "why": "A valid signature plus an unrequested public_key field. The App ignores the extra field; the hub accepts exactly record and signature and never reads a key from an envelope.",
+      "template": "{\"record\":__RECORD__,\"signature\":\"__SIGNATURE__\",\"public_key\":\"__OTHER_PUBLIC_KEY__\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "envelope_shape"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\",\"public_key\":\"MCowBQYDK2VwAyEALdAqr4REzUJ/c6mdi5pCH+0SNagKX7Xgict3UuudkuQ=\"}"
+    },
+    {
+      "id": "refuse-key-in-envelope-signed-by-that-key",
+      "covers": [
+        "key-substitution",
+        "wrong-key"
+      ],
+      "mutates": "envelope",
+      "why": "A signature by test key other plus that key's public_key in the envelope: the classic self-vouching envelope.",
+      "template": "{\"record\":__RECORD__,\"signature\":\"__SIGNATURE_OTHER__\",\"public_key\":\"__OTHER_PUBLIC_KEY__\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "envelope_shape"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"CIfOQ0npt64/rEo4GyyVtCu8+kPjKm07T6cFsOxHS278EzIrYLIwuiq+jBcpbnOwLYuA+dq3BAMlL8+wbjQ0Dw==\",\"public_key\":\"MCowBQYDK2VwAyEALdAqr4REzUJ/c6mdi5pCH+0SNagKX7Xgict3UuudkuQ=\"}"
+    },
+    {
+      "id": "refuse-snapshot-kind-as-binder",
+      "covers": [
+        "kind-confusion"
+      ],
+      "mutates": "signed-semantics",
+      "why": "A correctly signed record of kind snapshot offered where the caller expects a receipt-run binder. The App's verifyEnvelope does not check kind; the hub requires the caller's kind.",
+      "record_edits": [
+        [
+          "\"kind\":\"receipt-run\"",
+          "\"kind\":\"snapshot\""
+        ]
+      ],
+      "sign_case_record": true,
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "kind_mismatch"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"snapshot\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"snapshot\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"Ul+H/0RwvnhXpbR66uAWkC793weoRBnln+bsSDLn2ZfkUDtrgxiRgIamsJuh/qJA2Ewg3PPfgPAosOmOFhSSDw==\"}"
+    },
+    {
+      "id": "accept-snapshot-kind-as-itself",
+      "covers": [
+        "kind-confusion"
+      ],
+      "mutates": "signed-semantics",
+      "why": "The same snapshot envelope accepted when the caller asks for kind snapshot.",
+      "record_edits": [
+        [
+          "\"kind\":\"receipt-run\"",
+          "\"kind\":\"snapshot\""
+        ]
+      ],
+      "sign_case_record": true,
+      "trusted_key": "signer",
+      "expected_kind": "snapshot",
+      "hub": {
+        "result": "accept"
+      },
+      "app": {
+        "result": "accept"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"snapshot\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"snapshot\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"Ul+H/0RwvnhXpbR66uAWkC793weoRBnln+bsSDLn2ZfkUDtrgxiRgIamsJuh/qJA2Ewg3PPfgPAosOmOFhSSDw==\"}"
+    },
+    {
+      "id": "refuse-schema-v2",
+      "covers": [
+        "schema"
+      ],
+      "mutates": "signed-semantics",
+      "why": "A correctly signed record whose schema is not pineforge/dev-observation/v1.",
+      "record_edits": [
+        [
+          "dev-observation/v1",
+          "dev-observation/v2"
+        ]
+      ],
+      "sign_case_record": true,
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "schema_mismatch"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v2\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v2\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"Ua5dpN5MpAL03l5iFCnKCKXqYbdwLiC+Y79JFOpy/ADrB1MPf5FXkgU9MOX4kafORk5kBSRXpxh0Xi9oLmkLBA==\"}"
+    },
+    {
+      "id": "refuse-owner-zero",
+      "covers": [
+        "owner"
+      ],
+      "mutates": "signed-semantics",
+      "why": "A correctly signed record whose owner is 0, not a positive safe integer.",
+      "record_edits": [
+        [
+          "\"owner\":1234567890,",
+          "\"owner\":0,"
+        ]
+      ],
+      "sign_case_record": true,
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "owner_invalid"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":0,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":0,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1},\"signature\":\"fpoZ3lA74+2oJNZrZyeXC6QrXexzuNk+404arjXiYDoFeJgr4iFFmzQYuuerlkF6uH1NkTX/KDsJ/Z7N1Y4mBw==\"}"
+    },
+    {
+      "id": "refuse-record-not-an-object",
+      "covers": [
+        "envelope-shape"
+      ],
+      "mutates": "envelope",
+      "why": "The record is an array, with an otherwise well-formed signature.",
+      "template": "{\"record\":[],\"signature\":\"__SIGNATURE__\"}",
+      "trusted_key": "signer",
+      "expected_kind": "receipt-run",
+      "hub": {
+        "result": "reject",
+        "code": "record_shape"
+      },
+      "app": {
+        "result": "reject"
+      },
+      "record_text": "{\"source\":\"3333333333333333333333333333333333333333\",\"owner\":1234567890,\"kind\":\"receipt-run\",\"schema\":\"pineforge/dev-observation/v1\",\"pair\":null,\"owner_sha\":\"1111111111111111111111111111111111111111\",\"label\":\"caf\\u00e9 \\ud83d\\ude00\",\"sequence\":1}",
+      "envelope_json": "{\"record\":[],\"signature\":\"UMnaeTwbqzDfIfBZTRqSA8iUoE92eE6oDhxfbGSDJRRTw83PKaXn5mYvIZiWabz3uxnmPr2wsjp96fcnSux4Cg==\"}"
+    }
+  ]
+}

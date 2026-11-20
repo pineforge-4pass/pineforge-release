@@ -9,3 +9,6 @@ six==1.16.0
 
 # YAML workflow structure checks used by acceptance tests.
 PyYAML==6.0.3
+
+# Ed25519 verification of the App signed records (scripts/release_signed_record.py).
+cryptography==46.0.3
