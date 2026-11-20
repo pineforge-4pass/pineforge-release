@@ -121,6 +121,8 @@ jobs:
               paths = [PurePosixPath(os.fsdecode(path)) for path in paths if path]
               # Release tests consume these documents and scan automation files.
               test_inputs = {'README.md', 'docs/release-chain.md', 'LICENSE'}
+              # Signed-record tests also read the receipt specification.
+              test_inputs.add('docs/release-signed-record.md')
               docs_only = bool(paths) and all(
                   str(path) not in test_inputs and
                   path.parts[:2] != ('.github', 'workflows') and
