@@ -48,7 +48,7 @@
         "commit": "59082e696f0c7a95c1aa0d3179e1aac23f79fc04",
         "url": "https://github.com/pineforge-4pass/pineforge-engine/blob/59082e696f0c7a95c1aa0d3179e1aac23f79fc04/LICENSE"
       },
-      "template": "Open-source {{word:cpp_standard}} engine for backtesting and forward execution, with a versioned C ABI; {{word:pine_language}} runs through code generation. Against TradingView's own trade lists, all {{facts:scoreboard.graded|grouped}} graded probes ({{facts:inventory.corpusScripts|int}} open-corpus strategies, {{facts:inventory.closedScripts|int}} closed-test scripts) grade excellent or strong: {{facts:scoreboard.excellent|grouped}} excellent, {{facts:scoreboard.strong|int}} strong. {{license:engine}}."
+      "template": "Open-source {{word:cpp_standard}} engine for backtesting and forward execution, with a versioned C ABI; {{word:pine_language}} runs through code generation. Against TradingView's own trade lists ({{facts:inventory.corpusScripts|grouped}} open-corpus strategies, {{facts:inventory.closedScripts|grouped}} closed-test scripts), {{facts:scoreboard.graded|grouped}} graded probes: {{facts:scoreboard.excellent|grouped}} excellent, {{facts:scoreboard.strong|grouped}} strong, {{facts:scoreboard.belowStrong|grouped}} below strong. {{license:engine}}."
     },
     {
       "role": "codegen-oss",
