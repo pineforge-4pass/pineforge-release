@@ -1,0 +1,4483 @@
+{
+  "schema": "pineforge/facts/v1",
+  "scoreboard": {
+    "source": "Registry baseline pineforge-parity-owner-accepted-engine-998; owner-accepted (cited acceptance records sha256:20be1fd3a32f6a61ae1a8fdfaa6e532f5b588009af421d391c810e1519bb45d1, sha256:52295066ca7a9ba9e2fba8d9ccf611dfee405d43a80fea6cfd5dc5a674ca4f57); digest-verified snapshot ecc8c482021495a986e4cbce4b1f5d1ece9b467dff78b9436602030981e436ab; private evidence sha256:056136a96b7dc9555e97dcadf976999dbfa247d01d0fddac4af926adc7490a7e.",
+    "provenance": {
+      "baselineId": "pineforge-parity-owner-accepted-engine-998",
+      "snapshotSha256": "ecc8c482021495a986e4cbce4b1f5d1ece9b467dff78b9436602030981e436ab",
+      "populationSha256": "77fc77ba0e14c5c1b35984a97c50cb000fc38394e776b9af826bef8d14346eb7",
+      "engineCommit": "1684e07fceab17d8ea2b9c1c9a7dd00b4f1c1e33",
+      "codegenCommit": "ecebe4189049b8b11992517d49460bb613d32899",
+      "promotionDate": "2026-11-25T17:13:36.193Z",
+      "privateEvidenceSha256": "056136a96b7dc9555e97dcadf976999dbfa247d01d0fddac4af926adc7490a7e"
+    },
+    "id": "pineforge-parity-owner-accepted-engine-998",
+    "date": "2026-11-25",
+    "engineCommit": "1684e07fceab17d8ea2b9c1c9a7dd00b4f1c1e33",
+    "codegenCommit": "ecebe4189049b8b11992517d49460bb613d32899",
+    "snapshotSha256": "ecc8c482021495a986e4cbce4b1f5d1ece9b467dff78b9436602030981e436ab",
+    "populationSha256": "77fc77ba0e14c5c1b35984a97c50cb000fc38394e776b9af826bef8d14346eb7",
+    "population": 8011,
+    "anomaliesExcluded": 17,
+    "graded": 7993,
+    "excellent": 7951,
+    "strong": 40,
+    "belowStrong": 2,
+    "engineErrors": 1,
+    "tiers": {
+      "excellent": 7951,
+      "strong": 40,
+      "moderate": 1,
+      "weak": 1,
+      "minimal": 0,
+      "no-trades": 0
+    },
+    "scopes": {
+      "corpus": {
+        "graded": 308,
+        "excellent": 301,
+        "strong": 7,
+        "belowStrong": 0,
+        "engineErrors": 1,
+        "tiers": {
+          "excellent": 301,
+          "strong": 7,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        }
+      },
+      "closed": {
+        "graded": 7685,
+        "excellent": 7650,
+        "strong": 33,
+        "belowStrong": 2,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7650,
+          "strong": 33,
+          "moderate": 1,
+          "weak": 1,
+          "minimal": 0,
+          "no-trades": 0
+        }
+      }
+    },
+    "excellentPct": 99.47,
+    "strongPct": 0.5,
+    "excellentOrStrongPct": 99.97,
+    "markets": 9,
+    "timeframes": 2,
+    "lanes": 18,
+    "corpusProbes": 309,
+    "closedProbes": 7685,
+    "hardLane": {
+      "symbol": "BINANCE:ETHUSDT.P",
+      "timeframe": "15",
+      "hardProbes": 1009,
+      "corpusProbes": 309,
+      "closedProbes": 700,
+      "graded": 1008,
+      "excellent": 998,
+      "strong": 9,
+      "belowStrong": 1,
+      "engineErrors": 1,
+      "tiers": {
+        "excellent": 998,
+        "strong": 9,
+        "moderate": 0,
+        "weak": 1,
+        "minimal": 0,
+        "no-trades": 0
+      }
+    },
+    "pairs": [
+      {
+        "symbol": "BINANCE:ETHUSDT.P",
+        "timeframe": "15",
+        "hardProbes": 1009,
+        "corpusProbes": 309,
+        "closedProbes": 700,
+        "graded": 1008,
+        "excellent": 998,
+        "strong": 9,
+        "belowStrong": 1,
+        "engineErrors": 1,
+        "tiers": {
+          "excellent": 998,
+          "strong": 9,
+          "moderate": 0,
+          "weak": 1,
+          "minimal": 0,
+          "no-trades": 0
+        }
+      },
+      {
+        "symbol": "BINANCE:BTCUSDT",
+        "timeframe": "15",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 673,
+        "graded": 673,
+        "excellent": 668,
+        "strong": 5,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 668,
+          "strong": 5,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        }
+      },
+      {
+        "symbol": "BINANCE:BTCUSDT",
+        "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 516,
+        "graded": 516,
+        "excellent": 516,
+        "strong": 0,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 516,
+          "strong": 0,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        }
+      },
+      {
+        "symbol": "BINANCE:ETHUSDT.P",
+        "timeframe": "1D",
+        "hardProbes": 0,
+        "corpusProbes": 0,
+        "closedProbes": 540,
+        "graded": 540,
+        "excellent": 540,
+        "strong": 0,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 540,
+          "strong": 0,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        }
+      }
+    ],
+    "otherMarkets": {
+      "lanes": 14,
+      "markets": 7,
+      "additionalTimeframes": 0,
+      "hardProbes": 0,
+      "corpusProbes": 0,
+      "closedProbes": 5256,
+      "graded": 5256,
+      "excellent": 5229,
+      "strong": 26,
+      "belowStrong": 1,
+      "engineErrors": 0,
+      "tiers": {
+        "excellent": 5229,
+        "strong": 26,
+        "moderate": 1,
+        "weak": 0,
+        "minimal": 0,
+        "no-trades": 0
+      },
+      "timeframes": [
+        {
+          "timeframe": "15",
+          "lanes": 7,
+          "graded": 3081,
+          "excellent": 3057,
+          "strong": 23,
+          "belowStrong": 1,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 3057,
+            "strong": 23,
+            "moderate": 1,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        {
+          "timeframe": "1D",
+          "lanes": 7,
+          "graded": 2175,
+          "excellent": 2172,
+          "strong": 3,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 2172,
+            "strong": 3,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        }
+      ]
+    },
+    "tvTradesCompared": 4695544,
+    "tvTradesComparedSource": "Sum over the graded probes of this baseline of the trades compared with TradingView, each probe counted once; a position closed in several parts counts once; trades still open at the end of TradingView's list are excluded."
+  },
+  "releases": {
+    "1.0.1": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.0.1/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261001-codegen-67892cda; digest-verified snapshot a61bef614d50edd2795cb28852ce0946aa5036267e935d9866f15876c046fa1e; private evidence sha256:b380a4807d52d286d8becc01a5d1ba4f0f2966cf2320321368848b2f0f39e9e4.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261001-codegen-67892cda",
+          "snapshotSha256": "a61bef614d50edd2795cb28852ce0946aa5036267e935d9866f15876c046fa1e",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "b2a578ce776b75b85c24f46ccdcbb3dcbe227a64",
+          "codegenCommit": "67892cdab13c892b05539cbb7aae104ee01f8022",
+          "promotionDate": "2026-10-01T16:56:07.000Z",
+          "privateEvidenceSha256": "b380a4807d52d286d8becc01a5d1ba4f0f2966cf2320321368848b2f0f39e9e4"
+        },
+        "id": "pineforge-parity-baseline-20261001-codegen-67892cda",
+        "date": "2026-10-01",
+        "engineCommit": "b2a578ce776b75b85c24f46ccdcbb3dcbe227a64",
+        "codegenCommit": "67892cdab13c892b05539cbb7aae104ee01f8022",
+        "snapshotSha256": "a61bef614d50edd2795cb28852ce0946aa5036267e935d9866f15876c046fa1e",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7905,
+        "strong": 84,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7905,
+          "strong": 84,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7596,
+            "strong": 84,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7596,
+              "strong": 84,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 98.95,
+        "strongPct": 1.05,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 995,
+          "strong": 14,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 995,
+            "strong": 14,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 995,
+            "strong": 14,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 995,
+              "strong": 14,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 660,
+            "strong": 8,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 660,
+              "strong": 8,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 515,
+            "strong": 1,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 515,
+              "strong": 1,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 538,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 538,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5197,
+          "strong": 59,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5197,
+            "strong": 59,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3032,
+              "strong": 49,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3032,
+                "strong": 49,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2165,
+              "strong": 10,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2165,
+                "strong": 10,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.1.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.1.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261004-engine-7b596622; digest-verified snapshot af86f13e31308927d7694b2ea1c713188ce661db8937cf8b6667905485f3475e; private evidence sha256:b53ab83abad04525ab3bb1be8d1992be616dcf6f8b38a27087f71d74c98c1a6c.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261004-engine-7b596622",
+          "snapshotSha256": "af86f13e31308927d7694b2ea1c713188ce661db8937cf8b6667905485f3475e",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "7b596622a95a8ca63a53247e9528c8051bb626f0",
+          "codegenCommit": "c5d97ee5884fbe62946ca1dd5deedb9e518dc533",
+          "promotionDate": "2026-10-04T04:49:31.000Z",
+          "privateEvidenceSha256": "b53ab83abad04525ab3bb1be8d1992be616dcf6f8b38a27087f71d74c98c1a6c"
+        },
+        "id": "pineforge-parity-baseline-20261004-engine-7b596622",
+        "date": "2026-10-04",
+        "engineCommit": "7b596622a95a8ca63a53247e9528c8051bb626f0",
+        "codegenCommit": "c5d97ee5884fbe62946ca1dd5deedb9e518dc533",
+        "snapshotSha256": "af86f13e31308927d7694b2ea1c713188ce661db8937cf8b6667905485f3475e",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7951,
+        "strong": 38,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7951,
+          "strong": 38,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7642,
+            "strong": 38,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7642,
+              "strong": 38,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.52,
+        "strongPct": 0.48,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1000,
+          "strong": 9,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1000,
+            "strong": 9,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1000,
+            "strong": 9,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1000,
+              "strong": 9,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 664,
+            "strong": 4,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 664,
+              "strong": 4,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 539,
+            "strong": 1,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 539,
+              "strong": 1,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5232,
+          "strong": 24,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5232,
+            "strong": 24,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3060,
+              "strong": 21,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3060,
+                "strong": 21,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2172,
+              "strong": 3,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2172,
+                "strong": 3,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.2.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.2.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261005-engine-52292db9; digest-verified snapshot 7161ebdc2444e2a68c607473c60732fe3057ca8f60c90ae0491a05039475b2ee; private evidence sha256:951b78ecf1ccfa6386a1c2dd3a961dcabc6927ffac8835fee1ab2158e88652a8.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261005-engine-52292db9",
+          "snapshotSha256": "7161ebdc2444e2a68c607473c60732fe3057ca8f60c90ae0491a05039475b2ee",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "52292db9df5675dd3c357ebc2e25fc51b2a24398",
+          "codegenCommit": "48e7a13bacc64709595c398e166a5b0c4232354e",
+          "promotionDate": "2026-10-05T03:51:12.000Z",
+          "privateEvidenceSha256": "951b78ecf1ccfa6386a1c2dd3a961dcabc6927ffac8835fee1ab2158e88652a8"
+        },
+        "id": "pineforge-parity-baseline-20261005-engine-52292db9",
+        "date": "2026-10-05",
+        "engineCommit": "52292db9df5675dd3c357ebc2e25fc51b2a24398",
+        "codegenCommit": "48e7a13bacc64709595c398e166a5b0c4232354e",
+        "snapshotSha256": "7161ebdc2444e2a68c607473c60732fe3057ca8f60c90ae0491a05039475b2ee",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7970,
+        "strong": 19,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7970,
+          "strong": 19,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7661,
+            "strong": 19,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7661,
+              "strong": 19,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.76,
+        "strongPct": 0.24,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1005,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1005,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1005,
+            "strong": 4,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1005,
+              "strong": 4,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5243,
+          "strong": 13,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5243,
+            "strong": 13,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3069,
+              "strong": 12,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3069,
+                "strong": 12,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2174,
+              "strong": 1,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2174,
+                "strong": 1,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.3.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.3.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261006-engine-7a1f01c0; digest-verified snapshot e7921e2433a449d1b0859d2bac0536e5663a06820030b091e451529a37487b68; private evidence sha256:07a7ddae499aca8897b59eeb70fdb2da31eaa815c08bda249ebad5437b1ff996.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261006-engine-7a1f01c0",
+          "snapshotSha256": "e7921e2433a449d1b0859d2bac0536e5663a06820030b091e451529a37487b68",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "7a1f01c0fc7c32d3a233cdc38f54d5b959d5e66a",
+          "codegenCommit": "3e50082feabaa7176f74bff440fa658f7960ed92",
+          "promotionDate": "2026-10-06T01:23:09.000Z",
+          "privateEvidenceSha256": "07a7ddae499aca8897b59eeb70fdb2da31eaa815c08bda249ebad5437b1ff996"
+        },
+        "id": "pineforge-parity-baseline-20261006-engine-7a1f01c0",
+        "date": "2026-10-06",
+        "engineCommit": "7a1f01c0fc7c32d3a233cdc38f54d5b959d5e66a",
+        "codegenCommit": "3e50082feabaa7176f74bff440fa658f7960ed92",
+        "snapshotSha256": "e7921e2433a449d1b0859d2bac0536e5663a06820030b091e451529a37487b68",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7982,
+        "strong": 7,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7982,
+          "strong": 7,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7673,
+            "strong": 7,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7673,
+              "strong": 7,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.91,
+        "strongPct": 0.09,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5251,
+          "strong": 5,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5251,
+            "strong": 5,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3076,
+              "strong": 5,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3076,
+                "strong": 5,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.4.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.4.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261007-engine-b3192bfc; digest-verified snapshot 28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2; private evidence sha256:8a9598552b9c54e375a27c6494b75fea1a2a7d74331f166e67908ba2e0160684.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261007-engine-b3192bfc",
+          "snapshotSha256": "28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "b3192bfc2f5a24bf4efd6d1d01e01e8fe619dfed",
+          "codegenCommit": "bfc4ddce453db1ba810692af9b9ba3310d87f0ac",
+          "promotionDate": "2026-10-07T22:32:23.000Z",
+          "privateEvidenceSha256": "8a9598552b9c54e375a27c6494b75fea1a2a7d74331f166e67908ba2e0160684"
+        },
+        "id": "pineforge-parity-baseline-20261007-engine-b3192bfc",
+        "date": "2026-10-07",
+        "engineCommit": "b3192bfc2f5a24bf4efd6d1d01e01e8fe619dfed",
+        "codegenCommit": "bfc4ddce453db1ba810692af9b9ba3310d87f0ac",
+        "snapshotSha256": "28ba8dbd6f66c80085a80364d6114f8f971ac6ea3156d596a65995d2aec2fbb2",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.6.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.6.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261017-release-tag-a0fc3a9f; digest-verified snapshot a0fc3a9f8317e68e3c58c372c24e39fa41ca0b298257a52c46ab600760741570; private evidence sha256:1b0d14a12c34fd9e0b4e275c3428e833fcf8a57a43c017e1e1f3372bd7a5e43c.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261017-release-tag-a0fc3a9f",
+          "snapshotSha256": "a0fc3a9f8317e68e3c58c372c24e39fa41ca0b298257a52c46ab600760741570",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "1e48cfd6b029666542114d21d2cd98f1cf312f60",
+          "codegenCommit": "7300166636936d967d576693b3d92b249a02d805",
+          "promotionDate": "2026-10-17T05:11:05.303Z",
+          "privateEvidenceSha256": "1b0d14a12c34fd9e0b4e275c3428e833fcf8a57a43c017e1e1f3372bd7a5e43c"
+        },
+        "id": "pineforge-parity-baseline-20261017-release-tag-a0fc3a9f",
+        "date": "2026-10-17",
+        "engineCommit": "1e48cfd6b029666542114d21d2cd98f1cf312f60",
+        "codegenCommit": "7300166636936d967d576693b3d92b249a02d805",
+        "snapshotSha256": "a0fc3a9f8317e68e3c58c372c24e39fa41ca0b298257a52c46ab600760741570",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.6.1": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.6.1/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261018-release-tag-7a569d15; digest-verified snapshot 7a569d15b3fa1c5e91f4ecc1e37e5fbd641ff42fc3bba6891fa66b2625be4d7f; private evidence sha256:6a64aee3fbf8e21c8790ba41908abf5615c3a4875dc59db5519a5fd1f1893ff9.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261018-release-tag-7a569d15",
+          "snapshotSha256": "7a569d15b3fa1c5e91f4ecc1e37e5fbd641ff42fc3bba6891fa66b2625be4d7f",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "f37c8b5e4104808f8b1f9c161bfd14d0ee621675",
+          "codegenCommit": "52d74d60b94038ae55be6babf39e34dbd2e33317",
+          "promotionDate": "2026-10-18T01:45:23.333Z",
+          "privateEvidenceSha256": "6a64aee3fbf8e21c8790ba41908abf5615c3a4875dc59db5519a5fd1f1893ff9"
+        },
+        "id": "pineforge-parity-baseline-20261018-release-tag-7a569d15",
+        "date": "2026-10-18",
+        "engineCommit": "f37c8b5e4104808f8b1f9c161bfd14d0ee621675",
+        "codegenCommit": "52d74d60b94038ae55be6babf39e34dbd2e33317",
+        "snapshotSha256": "7a569d15b3fa1c5e91f4ecc1e37e5fbd641ff42fc3bba6891fa66b2625be4d7f",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.6.2": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.6.2/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261021-release-tag-653c94df; digest-verified snapshot 653c94dfdbb2f1d904692c2a4f1319823a6981a6018f78a39a1cd4af26248b76; private evidence sha256:35e014dcf11e15ddc68f628a74f2c6c74b6b53c4cd6b1c83b1fe466dc454a39b.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261021-release-tag-653c94df",
+          "snapshotSha256": "653c94dfdbb2f1d904692c2a4f1319823a6981a6018f78a39a1cd4af26248b76",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "dfe5f367e8935ef549ee7a8a38c1d437d1e8e42e",
+          "codegenCommit": "f0786eab355b4c1811a03d2644fef0c8cda544dd",
+          "promotionDate": "2026-10-21T15:39:15.147Z",
+          "privateEvidenceSha256": "35e014dcf11e15ddc68f628a74f2c6c74b6b53c4cd6b1c83b1fe466dc454a39b"
+        },
+        "id": "pineforge-parity-baseline-20261021-release-tag-653c94df",
+        "date": "2026-10-21",
+        "engineCommit": "dfe5f367e8935ef549ee7a8a38c1d437d1e8e42e",
+        "codegenCommit": "f0786eab355b4c1811a03d2644fef0c8cda544dd",
+        "snapshotSha256": "653c94dfdbb2f1d904692c2a4f1319823a6981a6018f78a39a1cd4af26248b76",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.6.3": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.6.3/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261023-release-tag-2268cbc1; digest-verified snapshot 2268cbc1585735f3d617cd8ac74aa718ea570eb6fd4b7c0894faac1c2dd6dd7c; private evidence sha256:eeb3ef25d0e16c8baaf697c997736870625ad66c8a74c2a765635d6347a6c5d2.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261023-release-tag-2268cbc1",
+          "snapshotSha256": "2268cbc1585735f3d617cd8ac74aa718ea570eb6fd4b7c0894faac1c2dd6dd7c",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "e799ac8ea911b4a83d4ec730fbcb742019ab086a",
+          "codegenCommit": "3ac65032bb23b59bfc9b6fe5ba91b791adc73ee2",
+          "promotionDate": "2026-10-23T01:36:31.174Z",
+          "privateEvidenceSha256": "eeb3ef25d0e16c8baaf697c997736870625ad66c8a74c2a765635d6347a6c5d2"
+        },
+        "id": "pineforge-parity-baseline-20261023-release-tag-2268cbc1",
+        "date": "2026-10-23",
+        "engineCommit": "e799ac8ea911b4a83d4ec730fbcb742019ab086a",
+        "codegenCommit": "3ac65032bb23b59bfc9b6fe5ba91b791adc73ee2",
+        "snapshotSha256": "2268cbc1585735f3d617cd8ac74aa718ea570eb6fd4b7c0894faac1c2dd6dd7c",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.7.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.7.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261025-release-tag-3d8afebe; digest-verified snapshot 3d8afebecb9145078a796d6f60918687477061a9096fda6f54165fb276491a2b; private evidence sha256:b96e85a04065dcd28242fa06d596be54561cec3b583e2f18beaa7dba3085fcbf.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261025-release-tag-3d8afebe",
+          "snapshotSha256": "3d8afebecb9145078a796d6f60918687477061a9096fda6f54165fb276491a2b",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "ed9e08ec051b0568b3eba189addeb5ae929670c5",
+          "codegenCommit": "3218bb99a67a46c0d226c44871e3c90e379262d8",
+          "promotionDate": "2026-10-25T04:15:27.508Z",
+          "privateEvidenceSha256": "b96e85a04065dcd28242fa06d596be54561cec3b583e2f18beaa7dba3085fcbf"
+        },
+        "id": "pineforge-parity-baseline-20261025-release-tag-3d8afebe",
+        "date": "2026-10-25",
+        "engineCommit": "ed9e08ec051b0568b3eba189addeb5ae929670c5",
+        "codegenCommit": "3218bb99a67a46c0d226c44871e3c90e379262d8",
+        "snapshotSha256": "3d8afebecb9145078a796d6f60918687477061a9096fda6f54165fb276491a2b",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.8.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.8.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261029-release-tag-05b5c178; digest-verified snapshot 05b5c178a811351cfc69de2b67518a10ba6c526f947b37a7d7a700b960e84a97; private evidence sha256:aa15c32049438380c87f34c05d2adc7c1f34d24e170df33d0229b939d0934776.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261029-release-tag-05b5c178",
+          "snapshotSha256": "05b5c178a811351cfc69de2b67518a10ba6c526f947b37a7d7a700b960e84a97",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "9836309e35c69046f18eda4d8c4e7f4edf21728c",
+          "codegenCommit": "3a02eb3a683b365a56bc93b613bfed7aa348c2b7",
+          "promotionDate": "2026-10-29T19:04:29.548Z",
+          "privateEvidenceSha256": "aa15c32049438380c87f34c05d2adc7c1f34d24e170df33d0229b939d0934776"
+        },
+        "id": "pineforge-parity-baseline-20261029-release-tag-05b5c178",
+        "date": "2026-10-29",
+        "engineCommit": "9836309e35c69046f18eda4d8c4e7f4edf21728c",
+        "codegenCommit": "3a02eb3a683b365a56bc93b613bfed7aa348c2b7",
+        "snapshotSha256": "05b5c178a811351cfc69de2b67518a10ba6c526f947b37a7d7a700b960e84a97",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.9.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.9.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261029-release-tag-cfe0a186; digest-verified snapshot cfe0a186457181085651dbcd272687875870ed4d6a6b3f23286c414c74bb111f; private evidence sha256:91e5692da30d554dd7fd91674fc5da503fd7ff47cb5ad85bb2e1a49434e888c5.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261029-release-tag-cfe0a186",
+          "snapshotSha256": "cfe0a186457181085651dbcd272687875870ed4d6a6b3f23286c414c74bb111f",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "ec4496878518da7c2b5ef9152c1e9c6b46dc4314",
+          "codegenCommit": "7c1b3dec9916195638995e4bd3c627b39ff82e26",
+          "promotionDate": "2026-10-29T21:05:15.154Z",
+          "privateEvidenceSha256": "91e5692da30d554dd7fd91674fc5da503fd7ff47cb5ad85bb2e1a49434e888c5"
+        },
+        "id": "pineforge-parity-baseline-20261029-release-tag-cfe0a186",
+        "date": "2026-10-29",
+        "engineCommit": "ec4496878518da7c2b5ef9152c1e9c6b46dc4314",
+        "codegenCommit": "7c1b3dec9916195638995e4bd3c627b39ff82e26",
+        "snapshotSha256": "cfe0a186457181085651dbcd272687875870ed4d6a6b3f23286c414c74bb111f",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.9.1": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.9.1/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261031-release-tag-ae1d82e6; digest-verified snapshot ae1d82e68d0a5b44ef25ccb2ed6551dc3372fe3335e0bdd87f182cdb620beb47; private evidence sha256:71fb08e7d4548378b5c56a19bc8db66ab2fd2441c3d44d5530ce4a51d30cf7cf.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261031-release-tag-ae1d82e6",
+          "snapshotSha256": "ae1d82e68d0a5b44ef25ccb2ed6551dc3372fe3335e0bdd87f182cdb620beb47",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "fc0a2df5deca07f8a7e59995a17e71203fb19f34",
+          "codegenCommit": "6ad071832ba6234557f9832f6da05c5b5a062853",
+          "promotionDate": "2026-10-31T00:58:51.329Z",
+          "privateEvidenceSha256": "71fb08e7d4548378b5c56a19bc8db66ab2fd2441c3d44d5530ce4a51d30cf7cf"
+        },
+        "id": "pineforge-parity-baseline-20261031-release-tag-ae1d82e6",
+        "date": "2026-10-31",
+        "engineCommit": "fc0a2df5deca07f8a7e59995a17e71203fb19f34",
+        "codegenCommit": "6ad071832ba6234557f9832f6da05c5b5a062853",
+        "snapshotSha256": "ae1d82e68d0a5b44ef25ccb2ed6551dc3372fe3335e0bdd87f182cdb620beb47",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.10.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.10.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261103-release-tag-3d8717c4; digest-verified snapshot 3d8717c4c1cb415a9ad64f96cf2bd1e21cdc9fe1575ac99501a3a167071373ad; private evidence sha256:855637ce1154e8d45dd8a5135ef9446187c637fdf2764963159032f7c33e4e74.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261103-release-tag-3d8717c4",
+          "snapshotSha256": "3d8717c4c1cb415a9ad64f96cf2bd1e21cdc9fe1575ac99501a3a167071373ad",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "59f98ba80e69a624f97ada11935e1bc973fd0e19",
+          "codegenCommit": "47f0e8a59696a8ba9d09166bbf428730f1bee723",
+          "promotionDate": "2026-11-03T21:13:02.973Z",
+          "privateEvidenceSha256": "855637ce1154e8d45dd8a5135ef9446187c637fdf2764963159032f7c33e4e74"
+        },
+        "id": "pineforge-parity-baseline-20261103-release-tag-3d8717c4",
+        "date": "2026-11-03",
+        "engineCommit": "59f98ba80e69a624f97ada11935e1bc973fd0e19",
+        "codegenCommit": "47f0e8a59696a8ba9d09166bbf428730f1bee723",
+        "snapshotSha256": "3d8717c4c1cb415a9ad64f96cf2bd1e21cdc9fe1575ac99501a3a167071373ad",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.11.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.11.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261109-release-tag-4b14e6d5; digest-verified snapshot 4b14e6d5f5a5f69180ad3161327278c9ff20594bdf00bcacbb986a74be4b7733; private evidence sha256:e4fd473468bc9f28716a76ec2fce033fbb5488a8cb04d64794732b51cf1c3e4f.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261109-release-tag-4b14e6d5",
+          "snapshotSha256": "4b14e6d5f5a5f69180ad3161327278c9ff20594bdf00bcacbb986a74be4b7733",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "a44723242ea34c8b2b00cb82f4a18e23a26280d5",
+          "codegenCommit": "702fac4e653219401b7a5d272d158fb9b89650a7",
+          "promotionDate": "2026-11-09T23:29:27.985Z",
+          "privateEvidenceSha256": "e4fd473468bc9f28716a76ec2fce033fbb5488a8cb04d64794732b51cf1c3e4f"
+        },
+        "id": "pineforge-parity-baseline-20261109-release-tag-4b14e6d5",
+        "date": "2026-11-09",
+        "engineCommit": "a44723242ea34c8b2b00cb82f4a18e23a26280d5",
+        "codegenCommit": "702fac4e653219401b7a5d272d158fb9b89650a7",
+        "snapshotSha256": "4b14e6d5f5a5f69180ad3161327278c9ff20594bdf00bcacbb986a74be4b7733",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.12.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.12.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261112-release-tag-cd9c85a6; digest-verified snapshot cd9c85a61312e6ad9becd1ffa904f64edbbae6c60f9927f455dd69185a138dce; private evidence sha256:d134c287143804b0fc04963901bf2c8747dc276621afa66e8fe0e9f27b3657c4.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261112-release-tag-cd9c85a6",
+          "snapshotSha256": "cd9c85a61312e6ad9becd1ffa904f64edbbae6c60f9927f455dd69185a138dce",
+          "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+          "engineCommit": "6e27d0f29460e44270d1e497c09062fbdc8470bc",
+          "codegenCommit": "126e055f07b316a2b4a1a56451f98beaf52ac927",
+          "promotionDate": "2026-11-12T17:08:15.469Z",
+          "privateEvidenceSha256": "d134c287143804b0fc04963901bf2c8747dc276621afa66e8fe0e9f27b3657c4"
+        },
+        "id": "pineforge-parity-baseline-20261112-release-tag-cd9c85a6",
+        "date": "2026-11-12",
+        "engineCommit": "6e27d0f29460e44270d1e497c09062fbdc8470bc",
+        "codegenCommit": "126e055f07b316a2b4a1a56451f98beaf52ac927",
+        "snapshotSha256": "cd9c85a61312e6ad9becd1ffa904f64edbbae6c60f9927f455dd69185a138dce",
+        "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+        "population": 8006,
+        "anomaliesExcluded": 17,
+        "graded": 7989,
+        "excellent": 7983,
+        "strong": 6,
+        "belowStrong": 0,
+        "engineErrors": 0,
+        "tiers": {
+          "excellent": 7983,
+          "strong": 6,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 309,
+            "excellent": 309,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 309,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7680,
+            "excellent": 7674,
+            "strong": 6,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7674,
+              "strong": 6,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.92,
+        "strongPct": 0.08,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7680,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1009,
+          "excellent": 1009,
+          "strong": 0,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 1009,
+            "strong": 0,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1009,
+            "excellent": 1009,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 1009,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 668,
+            "graded": 668,
+            "excellent": 666,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 666,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5252,
+          "strong": 4,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5252,
+            "strong": 4,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3077,
+              "strong": 4,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3077,
+                "strong": 4,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.13.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.13.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261118-release-tag-d6190c1f; digest-verified snapshot d6190c1f9a57ca912fce7f149c708d34a95bebdc2709075627757054d8d5bb20; private evidence sha256:bb4778ea20e5cf5c23cd0a8c494c9e0d9770df560e4e355e9d61878f5f269a26.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261118-release-tag-d6190c1f",
+          "snapshotSha256": "d6190c1f9a57ca912fce7f149c708d34a95bebdc2709075627757054d8d5bb20",
+          "populationSha256": "55019fcf95ce9d74e1d74d89918a1f0b6a6f814f17cd59905c6e857632859a0b",
+          "engineCommit": "438924f9b799f19eaee943ec68c2fd2879e899b7",
+          "codegenCommit": "9880b5138b7fcfac0ce634d5243e72baf64f747f",
+          "promotionDate": "2026-11-18T21:13:43.888Z",
+          "privateEvidenceSha256": "bb4778ea20e5cf5c23cd0a8c494c9e0d9770df560e4e355e9d61878f5f269a26"
+        },
+        "id": "pineforge-parity-baseline-20261118-release-tag-d6190c1f",
+        "date": "2026-11-18",
+        "engineCommit": "438924f9b799f19eaee943ec68c2fd2879e899b7",
+        "codegenCommit": "9880b5138b7fcfac0ce634d5243e72baf64f747f",
+        "snapshotSha256": "d6190c1f9a57ca912fce7f149c708d34a95bebdc2709075627757054d8d5bb20",
+        "populationSha256": "55019fcf95ce9d74e1d74d89918a1f0b6a6f814f17cd59905c6e857632859a0b",
+        "population": 8011,
+        "anomaliesExcluded": 17,
+        "graded": 7993,
+        "excellent": 7979,
+        "strong": 14,
+        "belowStrong": 0,
+        "engineErrors": 1,
+        "tiers": {
+          "excellent": 7979,
+          "strong": 14,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 308,
+            "excellent": 308,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 1,
+            "tiers": {
+              "excellent": 308,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7685,
+            "excellent": 7671,
+            "strong": 14,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7671,
+              "strong": 14,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.82,
+        "strongPct": 0.18,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7685,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1008,
+          "excellent": 1007,
+          "strong": 1,
+          "belowStrong": 0,
+          "engineErrors": 1,
+          "tiers": {
+            "excellent": 1007,
+            "strong": 1,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1008,
+            "excellent": 1007,
+            "strong": 1,
+            "belowStrong": 0,
+            "engineErrors": 1,
+            "tiers": {
+              "excellent": 1007,
+              "strong": 1,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 673,
+            "graded": 673,
+            "excellent": 671,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 671,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5245,
+          "strong": 11,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5245,
+            "strong": 11,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3070,
+              "strong": 11,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3070,
+                "strong": 11,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "1.14.0": {
+      "source": "https://github.com/pineforge-4pass/pineforge-engine/blob/v1.14.0/README.md#validation-scoreboard",
+      "scoreboard": {
+        "source": "Registry baseline pineforge-parity-baseline-20261120-release-tag-db7ecec1; digest-verified snapshot db7ecec1af3296a228dec667898f30fcf6eee87ef30068a0aede8fcbffb74132; private evidence sha256:17f87d89fcb6dfeba9ccc19b46f29fd5856b5431ad31c6d4244e656bbaf180d3.",
+        "provenance": {
+          "baselineId": "pineforge-parity-baseline-20261120-release-tag-db7ecec1",
+          "snapshotSha256": "db7ecec1af3296a228dec667898f30fcf6eee87ef30068a0aede8fcbffb74132",
+          "populationSha256": "77fc77ba0e14c5c1b35984a97c50cb000fc38394e776b9af826bef8d14346eb7",
+          "engineCommit": "665fc4ddc024951dd1c911ad5de9839a5c91e2e4",
+          "codegenCommit": "de63a1b29215939466a32e07c3cca110b946fb87",
+          "promotionDate": "2026-11-20T10:46:13.626Z",
+          "privateEvidenceSha256": "17f87d89fcb6dfeba9ccc19b46f29fd5856b5431ad31c6d4244e656bbaf180d3"
+        },
+        "id": "pineforge-parity-baseline-20261120-release-tag-db7ecec1",
+        "date": "2026-11-20",
+        "engineCommit": "665fc4ddc024951dd1c911ad5de9839a5c91e2e4",
+        "codegenCommit": "de63a1b29215939466a32e07c3cca110b946fb87",
+        "snapshotSha256": "db7ecec1af3296a228dec667898f30fcf6eee87ef30068a0aede8fcbffb74132",
+        "populationSha256": "77fc77ba0e14c5c1b35984a97c50cb000fc38394e776b9af826bef8d14346eb7",
+        "population": 8011,
+        "anomaliesExcluded": 17,
+        "graded": 7993,
+        "excellent": 7979,
+        "strong": 14,
+        "belowStrong": 0,
+        "engineErrors": 1,
+        "tiers": {
+          "excellent": 7979,
+          "strong": 14,
+          "moderate": 0,
+          "weak": 0,
+          "minimal": 0,
+          "no-trades": 0
+        },
+        "scopes": {
+          "corpus": {
+            "graded": 308,
+            "excellent": 308,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 1,
+            "tiers": {
+              "excellent": 308,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          "closed": {
+            "graded": 7685,
+            "excellent": 7671,
+            "strong": 14,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 7671,
+              "strong": 14,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        },
+        "excellentPct": 99.82,
+        "strongPct": 0.18,
+        "excellentOrStrongPct": 100,
+        "markets": 9,
+        "timeframes": 2,
+        "lanes": 18,
+        "corpusProbes": 309,
+        "closedProbes": 7685,
+        "hardLane": {
+          "symbol": "BINANCE:ETHUSDT.P",
+          "timeframe": "15",
+          "hardProbes": 1009,
+          "corpusProbes": 309,
+          "closedProbes": 700,
+          "graded": 1008,
+          "excellent": 1007,
+          "strong": 1,
+          "belowStrong": 0,
+          "engineErrors": 1,
+          "tiers": {
+            "excellent": 1007,
+            "strong": 1,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          }
+        },
+        "pairs": [
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "15",
+            "hardProbes": 1009,
+            "corpusProbes": 309,
+            "closedProbes": 700,
+            "graded": 1008,
+            "excellent": 1007,
+            "strong": 1,
+            "belowStrong": 0,
+            "engineErrors": 1,
+            "tiers": {
+              "excellent": 1007,
+              "strong": 1,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "15",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 673,
+            "graded": 673,
+            "excellent": 671,
+            "strong": 2,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 671,
+              "strong": 2,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 516,
+            "graded": 516,
+            "excellent": 516,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 516,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          },
+          {
+            "symbol": "BINANCE:ETHUSDT.P",
+            "timeframe": "1D",
+            "hardProbes": 0,
+            "corpusProbes": 0,
+            "closedProbes": 540,
+            "graded": 540,
+            "excellent": 540,
+            "strong": 0,
+            "belowStrong": 0,
+            "engineErrors": 0,
+            "tiers": {
+              "excellent": 540,
+              "strong": 0,
+              "moderate": 0,
+              "weak": 0,
+              "minimal": 0,
+              "no-trades": 0
+            }
+          }
+        ],
+        "otherMarkets": {
+          "lanes": 14,
+          "markets": 7,
+          "additionalTimeframes": 0,
+          "hardProbes": 0,
+          "corpusProbes": 0,
+          "closedProbes": 5256,
+          "graded": 5256,
+          "excellent": 5245,
+          "strong": 11,
+          "belowStrong": 0,
+          "engineErrors": 0,
+          "tiers": {
+            "excellent": 5245,
+            "strong": 11,
+            "moderate": 0,
+            "weak": 0,
+            "minimal": 0,
+            "no-trades": 0
+          },
+          "timeframes": [
+            {
+              "timeframe": "15",
+              "lanes": 7,
+              "graded": 3081,
+              "excellent": 3070,
+              "strong": 11,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 3070,
+                "strong": 11,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            },
+            {
+              "timeframe": "1D",
+              "lanes": 7,
+              "graded": 2175,
+              "excellent": 2175,
+              "strong": 0,
+              "belowStrong": 0,
+              "engineErrors": 0,
+              "tiers": {
+                "excellent": 2175,
+                "strong": 0,
+                "moderate": 0,
+                "weak": 0,
+                "minimal": 0,
+                "no-trades": 0
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "inventory": {
+    "source": "https://raw.githubusercontent.com/pineforge-4pass/pineforge-engine/d1d188673c526a5a1751e51f4f1aa0c0cdcd7471/README.md#validation-scoreboard; historical release 1.0.1 authored-script and closed-trade inventory, independent of the active population; not registry row or slug totals.",
+    "sourceRelease": "1.0.1",
+    "sourceCommit": "d1d188673c526a5a1751e51f4f1aa0c0cdcd7471",
+    "populationSha256": "cf857209574e03b760a308393d67c0eec114fb996749221f32de84c387f1b062",
+    "corpusScripts": 309,
+    "communityScripts": 680,
+    "probeScripts": 61,
+    "closedProbes": 7680,
+    "closedScripts": 741,
+    "communityProbes": 7179,
+    "probeScriptProbes": 501,
+    "tvTrades": 4776328
+  }
+}

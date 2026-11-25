@@ -20,6 +20,7 @@ from facts_other_markets import description_facts, tiers
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "repo_descriptions.py"
 FROZEN_FACTS = REPO / "tests" / "fixtures" / "repo-descriptions-facts.json"
+OWNER_ACCEPTED = FROZEN_FACTS.with_name("facts-owner-accepted.json")
 FACTS = FROZEN_FACTS
 POLICY = REPO / "facts" / "repo-descriptions.json"
 
@@ -89,6 +90,23 @@ class DescriptionCLI(unittest.TestCase):
         result = self.invoke("render", **kwargs)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
+
+    def test_render_with_owner_accepted_provenance(self):
+        facts = json.loads(FROZEN_FACTS.read_bytes())
+        exported = json.loads(OWNER_ACCEPTED.read_bytes())["scoreboard"]
+        for field in ("id", "date", "source", "provenance", "snapshotSha256", "populationSha256",
+                      "engineCommit", "codegenCommit"):
+            facts["scoreboard"][field] = exported[field]
+        path = self.document("cited.json", facts)
+        rendered = self.render(facts=path)
+        self.assertEqual(rendered["facts_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(rendered["repositories"], self.render()["repositories"])
+
+    def test_owner_accepted_export_cannot_make_the_all_graded_claim(self):
+        result = self.invoke("render", facts=OWNER_ACCEPTED)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("engine all-graded claim requires belowStrong == 0", result.stderr)
 
     def test_real_canonical_snapshot_and_complete_manifest(self):
         facts = json.loads(FACTS.read_text(encoding="utf-8"))
