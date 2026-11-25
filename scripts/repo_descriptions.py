@@ -125,10 +125,6 @@ def render(facts_path, policy_path):
 
 def render_document(facts, policy, facts_hash, policy_hash):
     validate_facts(facts)
-    scoreboard = facts["scoreboard"]
-    if (scoreboard["belowStrong"] != 0
-            or scoreboard["excellent"] + scoreboard["strong"] != scoreboard["graded"]):
-        raise InputError("engine all-graded claim requires belowStrong == 0 and excellent + strong == graded")
     fields(policy, {"schema", "version", "labels", "licenses", "wording", "repositories"})
     if policy["schema"] != "pineforge/repo-descriptions/v1" or type(policy["version"]) is not int or policy["version"] < 1:
         raise InputError("invalid description policy version")

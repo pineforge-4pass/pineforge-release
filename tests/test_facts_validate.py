@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FACTS = ROOT / "tests/fixtures/repo-descriptions-facts.json"
+OWNER_ACCEPTED = FACTS.with_name("facts-owner-accepted.json")
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from facts_validate import InputError, validate_facts
@@ -43,6 +44,22 @@ class FactsValidationCLI(unittest.TestCase):
         result = self.invoke(self.facts)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["sha256"], hashlib.sha256(self.facts.read_bytes()).hexdigest())
+
+    def test_owner_accepted_export_validates(self):
+        result = self.invoke(OWNER_ACCEPTED)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["sha256"], hashlib.sha256(OWNER_ACCEPTED.read_bytes()).hexdigest())
+
+    def test_owner_accepted_id_without_citations_names_the_missing_clause(self):
+        facts = json.loads(OWNER_ACCEPTED.read_bytes())
+        score = facts["scoreboard"]
+        baseline, _, snapshot, evidence = score["source"].split("; ")
+        score["source"] = "; ".join((baseline, snapshot, evidence))
+        self.facts.write_text(json.dumps(facts))
+        result = self.invoke(self.facts)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "facts-validate: missing or malformed owner-accepted clause\n")
 
     def test_compared_trade_count_is_one_paired_active_integer_and_optional(self):
         canonical = json.loads(self.facts.read_text())
@@ -124,6 +141,69 @@ class FactsValidationCLI(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stdout)
                     self.assertEqual(result.stdout, "")
                     self.assertTrue(result.stderr)
+
+
+class ScoreboardSourceValidation(unittest.TestCase):
+    def setUp(self):
+        self.facts = json.loads(FACTS.read_bytes())
+        self.score = self.facts["scoreboard"]
+        self.legacy = self.score["source"]
+        self.baseline, self.snapshot, self.evidence = self.legacy.split("; ")
+        self.record = "sha256:" + "ab" * 32
+        self.clause = f"owner-accepted (cited acceptance records {self.record})"
+        self.cited = "; ".join((self.baseline, self.clause, self.snapshot, self.evidence))
+
+    def test_one_or_many_cited_records_validate_verbatim(self):
+        records = [self.record, "sha256:" + "0" * 64, "sha256:" + "f" * 64]
+        for count in (1, 3):
+            with self.subTest(count=count):
+                source = self.cited.replace(self.record, ", ".join(records[:count]))
+                self.score["source"] = source
+                self.assertIs(validate_facts(self.facts), self.facts)
+                self.assertEqual(self.score["source"], source)
+
+    def test_malformed_owner_accepted_clause_is_named(self):
+        source, clause, record = self.cited, self.clause, self.record
+        cases = {
+            "missing list": source.replace(clause, "owner-accepted ()"),
+            "empty list": source.replace(record, ""),
+            "other text": source.replace(clause, "owner-accepted (approved)"),
+            "non-hex digit": source.replace(record, record[:-1] + "g"),
+            "uppercase second digest": source.replace(record, record + ", sha256:" + "A" * 64),
+            "short digest": source.replace(record, record[:-1]),
+            "long digest": source.replace(record, record + "0"),
+            "bare digest": source.replace(record, record.removeprefix("sha256:")),
+            "no space after comma": source.replace(record, record + "," + record),
+            "trailing comma": source.replace(record, record + ", "),
+            "missing parentheses": source.replace("(", "").replace(")", ""),
+            "after snapshot": "; ".join((self.baseline, self.snapshot, clause, self.evidence)),
+            "two clauses": source.replace(clause, f"{clause}; {clause}"),
+        }
+        for case, malformed in cases.items():
+            with self.subTest(case=case):
+                self.score["source"] = malformed
+                with self.assertRaisesRegex(InputError, "owner-accepted clause"):
+                    validate_facts(self.facts)
+
+    def test_both_source_forms_bind_all_three_provenance_values(self):
+        provenance = self.score["provenance"]
+        for source in (self.legacy, self.cited):
+            for field, different in (("baselineId", provenance["baselineId"] + "-other"),
+                                     ("snapshotSha256", "0" * 64), ("privateEvidenceSha256", "f" * 64)):
+                with self.subTest(cited=source == self.cited, field=field):
+                    self.score["source"] = source.replace(provenance[field], different)
+                    with self.assertRaisesRegex(InputError, "^scoreboard source does not bind its provenance$"):
+                        validate_facts(self.facts)
+
+    def test_legacy_source_is_still_exact(self):
+        self.assertIs(validate_facts(self.facts), self.facts)
+        self.assertEqual(self.score["source"], self.legacy)
+        for source in (self.legacy[:-1], self.legacy.replace("; ", ";  ", 1),
+                       self.legacy.replace("; ", "; additional basis; ", 1)):
+            with self.subTest(source=source):
+                self.score["source"] = source
+                with self.assertRaisesRegex(InputError, "^scoreboard source does not bind its provenance$"):
+                    validate_facts(self.facts)
 
 
 class OtherMarketsValidation(unittest.TestCase):

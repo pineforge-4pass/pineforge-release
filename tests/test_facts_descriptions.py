@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from facts_other_markets import description_facts
+from facts_other_markets import aggregate_facts, description_facts
 
 ROOT = Path(__file__).resolve().parents[1]
 HUB = "pineforge-4pass/pineforge-release"
@@ -318,7 +318,7 @@ class DescriptionsCLI(unittest.TestCase):
         self.assertEqual(self.patch_count, 0)
 
     def test_aggregate_source_prepares_and_reconciles_with_complete_totals(self):
-        raw = json.dumps(description_facts()).encode()
+        raw = json.dumps(aggregate_facts()).encode()
         self.files["facts/facts.json"] = raw
         source = self.prepare()
         self.assertEqual(source["facts_sha256"], hashlib.sha256(raw).hexdigest())
@@ -326,9 +326,8 @@ class DescriptionsCLI(unittest.TestCase):
         result = self.reconcile(dry_run="true")
         self.assertEqual(result.returncode, 1, result.stderr)
         rows = {row["role"]: row for row in json.loads(result.stdout)["repositories"]}
-        self.assertIn("all 10 graded probes", rows["engine"]["expected"])
-        self.assertIn("6 excellent, 4 strong", rows["engine"]["expected"])
-        self.assertIn("2/3 excellent probes", rows["corpus"]["expected"])
+        self.assertIn("10 graded probes: 3 excellent, 3 strong, 4 below strong", rows["engine"]["expected"])
+        self.assertIn("1/3 excellent probes", rows["corpus"]["expected"])
         self.assertEqual(self.patch_count, 0)
 
     def test_aggregate_identity_payload_fails_before_snapshot_or_consumer_reads(self):

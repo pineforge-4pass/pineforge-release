@@ -351,7 +351,7 @@
           "properties": {
             "baselineId": {
               "type": "string",
-              "pattern": "^pineforge-parity-baseline-[a-z0-9-]+$"
+              "pattern": "^pineforge-parity-(?:baseline|owner-accepted)-[a-z0-9-]+$"
             },
             "snapshotSha256": {
               "$ref": "#/$defs/digest"

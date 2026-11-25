@@ -20,6 +20,7 @@ from facts_other_markets import description_facts, tiers
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "repo_descriptions.py"
 FROZEN_FACTS = REPO / "tests" / "fixtures" / "repo-descriptions-facts.json"
+OWNER_ACCEPTED = FROZEN_FACTS.with_name("facts-owner-accepted.json")
 FACTS = FROZEN_FACTS
 POLICY = REPO / "facts" / "repo-descriptions.json"
 
@@ -30,6 +31,11 @@ def percentages(score):
                          ("excellentOrStrongPct", score["excellent"] + score["strong"])):
         score[field] = float((Decimal(count) * 100 / score["graded"]).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP)) if score["graded"] else 0
+
+
+def grade_summary(score):
+    return (f'{score["graded"]:,} graded probes: {score["excellent"]:,} excellent, '
+            f'{score["strong"]:,} strong, {score["belowStrong"]:,} below strong')
 
 
 def advance_current(facts, delta):
@@ -90,6 +96,32 @@ class DescriptionCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def assert_engine_description(self, text, corpus, closed, grades):
+        self.assertEqual(text,
+                         "Open-source C++17 engine for backtesting and forward execution, with a versioned C ABI; "
+                         "Pine Script v6 runs through code generation. Against TradingView's own trade lists "
+                         f"({corpus:,} open-corpus strategies, {closed:,} closed-test scripts), "
+                         f"{grades}. Apache-2.0.")
+        self.assertNotRegex(text, r"(?i)\ball\b.*\bgraded\b")
+        self.assertLessEqual(len(text), 350)
+
+    def test_render_with_owner_accepted_provenance(self):
+        facts = json.loads(FROZEN_FACTS.read_bytes())
+        exported = json.loads(OWNER_ACCEPTED.read_bytes())["scoreboard"]
+        for field in ("id", "date", "source", "provenance", "snapshotSha256", "populationSha256",
+                      "engineCommit", "codegenCommit"):
+            facts["scoreboard"][field] = exported[field]
+        path = self.document("cited.json", facts)
+        rendered = self.render(facts=path)
+        self.assertEqual(rendered["facts_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(rendered["repositories"], self.render()["repositories"])
+
+    def test_engine_description_reports_the_exported_grades(self):
+        rows = self.render(facts=OWNER_ACCEPTED)["repositories"]
+        engine = next(row for row in rows if row["role"] == "engine")
+        self.assert_engine_description(engine["expected"], 309, 741,
+                                      "7,993 graded probes: 7,951 excellent, 40 strong, 2 below strong")
+
     def test_real_canonical_snapshot_and_complete_manifest(self):
         facts = json.loads(FACTS.read_text(encoding="utf-8"))
         score, inventory = facts["scoreboard"], facts["inventory"]
@@ -98,19 +130,17 @@ class DescriptionCLI(unittest.TestCase):
         rows = {row["role"]: row for row in document["repositories"]}
         self.assertEqual(set(rows), {"engine", "codegen-oss", "corpus", "hpo", "release", "backtest-mcp"})
         self.assertEqual(rows["hpo"]["disposition"], "managed")
-        self.assertIn(f'all {score["graded"]:,} graded probes', rows["engine"]["expected"])
-        self.assertIn(f'{score["excellent"]:,} excellent, {score["strong"]} strong', rows["engine"]["expected"])
-        self.assertIn(f'{inventory["corpusScripts"]} open-corpus strategies, '
-                      f'{inventory["closedScripts"]} closed-test scripts',
-                      rows["engine"]["expected"])
+        self.assert_engine_description(rows["engine"]["expected"], inventory["corpusScripts"],
+                                      inventory["closedScripts"], grade_summary(score))
         self.assertIn(f'Historical script inventory ({inventory["sourceRelease"]}): '
                       f'{inventory["corpusScripts"]:,} scripts', rows["corpus"]["expected"])
         corpus = score["scopes"]["corpus"]
         self.assertIn(f'{corpus["excellent"]:,}/{corpus["graded"]:,} excellent probes',
                       rows["corpus"]["expected"])
         self.assertIn("PineForge Source License 1.2", rows["codegen-oss"]["expected"])
-        self.assertIn("scoreboard.graded", rows["engine"]["tokens"])
-        self.assertIn("inventory.closedScripts", rows["engine"]["tokens"])
+        self.assertEqual(set(rows["engine"]["tokens"]),
+                         {"inventory.corpusScripts", "inventory.closedScripts", "scoreboard.graded",
+                          "scoreboard.excellent", "scoreboard.strong", "scoreboard.belowStrong"})
         for row in rows.values():
             for source in row["license_sources"]:
                 self.assertIn("/" + source["commit"] + "/LICENSE", source["url"])
@@ -119,11 +149,8 @@ class DescriptionCLI(unittest.TestCase):
     def test_frozen_snapshot_has_exact_golden_prose(self):
         # This file is deliberately frozen; canonical promotions must not refresh it.
         rows = {row["role"]: row for row in self.render(facts=FROZEN_FACTS)["repositories"]}
-        self.assertEqual(rows["engine"]["expected"],
-                         "Open-source C++17 engine for backtesting and forward execution, with a versioned C ABI; "
-                         "Pine Script v6 runs through code generation. Against TradingView's own trade lists, "
-                         "all 7,989 graded probes (309 open-corpus strategies, 741 closed-test scripts) grade "
-                         "excellent or strong: 7,983 excellent, 6 strong. Apache-2.0.")
+        self.assert_engine_description(rows["engine"]["expected"], 309, 741,
+                                      "7,989 graded probes: 7,983 excellent, 6 strong, 0 below strong")
         self.assertEqual(rows["corpus"]["expected"],
                          "Open Pine Script reference corpus and TradingView trade traces. Current graded corpus: "
                          "309/309 excellent probes. Historical script inventory (1.0.1): 309 scripts. Apache-2.0.")
@@ -149,8 +176,8 @@ class DescriptionCLI(unittest.TestCase):
             with self.subTest(named=named):
                 document = self.render(facts=self.document("aggregate.json", facts))
                 rows = {row["role"]: row for row in document["repositories"]}
-                self.assertIn("all 10 graded probes", rows["engine"]["expected"])
-                self.assertIn("6 excellent, 4 strong", rows["engine"]["expected"])
+                self.assert_engine_description(rows["engine"]["expected"], 4, 7,
+                                              "10 graded probes: 6 excellent, 4 strong, 0 below strong")
                 self.assertIn("2/3 excellent probes", rows["corpus"]["expected"])
 
     def test_future_main_does_not_relabel_inventory_or_released_metrics(self):
@@ -175,86 +202,69 @@ class DescriptionCLI(unittest.TestCase):
                     self.assertNotEqual(score[field], previous["scoreboard"][field])
                 future = self.document("future.json", facts)
                 rows = {row["role"]: row for row in self.render(facts=future)["repositories"]}
-                self.assertIn(f'all {score["graded"]:,} graded probes', rows["engine"]["expected"])
-                self.assertIn(f'{score["excellent"]:,} excellent, {score["strong"]} strong',
-                              rows["engine"]["expected"])
-                self.assertIn(f'{inventory["corpusScripts"]} open-corpus strategies, '
-                              f'{inventory["closedScripts"]} closed-test scripts', rows["engine"]["expected"])
+                self.assert_engine_description(rows["engine"]["expected"], inventory["corpusScripts"],
+                                              inventory["closedScripts"], grade_summary(score))
                 engine = self.render(facts=future, policy=policy)["repositories"][0]
                 self.assertEqual(engine["expected"],
                                  f'Release probes: {canonical["releases"][release]["scoreboard"]["graded"]}; '
                                  f'current: {score["graded"]}; date: {score["date"]}; engine: {score["engineCommit"]}.')
                 self.assertNotEqual(self.render(facts=future)["facts_sha256"], self.render()["facts_sha256"])
 
-    def test_consistent_below_strong_snapshot_is_refused_before_output_or_live_reads(self):
-        canonical = json.loads(FROZEN_FACTS.read_text(encoding="utf-8"))
-        facts = copy.deepcopy(canonical)
-        scoreboard = facts["scoreboard"]
-        pair = next(value for value in scoreboard["pairs"]
-                    if value["hardProbes"] == 0 and value["corpusProbes"] == 0
-                    and value["closedProbes"] > 0)
-        for group in (scoreboard, scoreboard["scopes"]["closed"], pair):
-            group["excellent"] -= 1
-            group["belowStrong"] += 1
-            group["tiers"]["excellent"] -= 1
-            group["tiers"]["moderate"] += 1
-        percentages(scoreboard)
-        self.assertEqual(facts["inventory"], canonical["inventory"])
-        self.assertEqual(facts["releases"], canonical["releases"])
-        self.assertEqual(scoreboard["hardLane"], canonical["scoreboard"]["hardLane"])
-        self.assertEqual(scoreboard["population"] - scoreboard["anomaliesExcluded"],
-                         scoreboard["graded"])
-        lanes = [*scoreboard["pairs"]]
-        if "otherMarkets" in scoreboard:
-            lanes.append(scoreboard["otherMarkets"])
-        for group in [scoreboard, *scoreboard["scopes"].values(), *lanes]:
-            self.assertEqual(sum(group["tiers"].values()), group["graded"])
-            self.assertEqual(group["excellent"] + group["strong"] + group["belowStrong"],
-                             group["graded"])
-            self.assertEqual(group["belowStrong"], sum(value for tier, value in group["tiers"].items()
-                                                     if tier not in {"excellent", "strong"}))
-        for field in ("graded", "excellent", "strong", "belowStrong", "engineErrors"):
-            self.assertEqual(sum(value[field] for value in lanes), scoreboard[field])
-            self.assertEqual(sum(value[field] for value in scoreboard["scopes"].values()),
-                             scoreboard[field])
-        future = self.document("future-below-strong.json", facts)
-        executable, env, _ = self.fake_gh()
-        for arguments in [("render",), ("render", "--format", "commands"),
-                          ("check", "--live", "--gh", str(executable))]:
-            with self.subTest(arguments=arguments):
-                result = self.invoke(*arguments, facts=future, env=env)
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertEqual(result.stdout, "")
-                self.assertIn("all-graded", result.stderr)
-        self.assertFalse((self.root / "api-calls.jsonl").exists())
+    def test_engine_description_formats_zero_and_four_digit_grades(self):
+        def regrade(group, below):
+            strong = group["graded"] - below
+            group.update(excellent=0, strong=strong, belowStrong=below,
+                         tiers=tiers(strong=strong, moderate=below))
 
-    def test_all_graded_claim_requires_exact_excellent_and_strong_sum(self):
+        for below, expected in (
+            (0, "7,989 graded probes: 0 excellent, 7,989 strong, 0 below strong"),
+            (1800, "7,989 graded probes: 0 excellent, 6,189 strong, 1,800 below strong"),
+        ):
+            with self.subTest(below=below):
+                facts = json.loads(FROZEN_FACTS.read_bytes())
+                score = facts["scoreboard"]
+                # Only closed probes in the other markets receive the lower grade.
+                for group in (score, score["scopes"]["closed"], score["otherMarkets"]):
+                    regrade(group, below)
+                for group in (*score["pairs"], score["hardLane"], score["scopes"]["corpus"]):
+                    regrade(group, 0)
+                percentages(score)
+                rows = self.render(facts=self.document("grades.json", facts))["repositories"]
+                engine = next(row for row in rows if row["role"] == "engine")
+                self.assert_engine_description(engine["expected"], 309, 741, expected)
+
+    def test_inconsistent_grade_totals_fail_before_output_or_live_reads(self):
+        executable, env, _ = self.fake_gh()
         for difference in (-1, 1):
-            with self.subTest(difference=difference):
-                facts = json.loads(FROZEN_FACTS.read_text(encoding="utf-8"))
-                facts["scoreboard"]["excellent"] += difference
-                result = self.invoke("render", "--format", "commands",
-                                     facts=self.document("inconsistent-sum.json", facts))
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertEqual(result.stdout, "")
-                self.assertIn("all-graded", result.stderr)
+            facts = json.loads(OWNER_ACCEPTED.read_bytes())
+            facts["scoreboard"]["excellent"] += difference
+            path = self.document("inconsistent-sum.json", facts)
+            for args in [("render",), ("render", "--format", "commands"),
+                         ("check", "--live", "--gh", str(executable))]:
+                with self.subTest(difference=difference, args=args):
+                    result = self.invoke(*args, facts=path, env=env)
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("all-graded tier sum differs", result.stderr)
+        self.assertFalse((self.root / "api-calls.jsonl").exists())
 
     def test_changed_historical_tokens_are_read_not_hardcoded(self):
         facts = json.loads(FROZEN_FACTS.read_text(encoding="utf-8"))
-        facts["inventory"].update(corpusScripts=411, communityScripts=794, closedScripts=855)
+        facts["inventory"].update(corpusScripts=1309, communityScripts=1680, closedScripts=1741)
         historic = facts["releases"][facts["inventory"]["sourceRelease"]]["scoreboard"]
-        historic["population"] += 102
-        historic["corpusProbes"] += 102
+        added = facts["inventory"]["corpusScripts"] - historic["corpusProbes"]
+        historic["population"] += added
+        historic["corpusProbes"] += added
         for group in (historic, historic["scopes"]["corpus"], historic["pairs"][0], historic["hardLane"]):
-            group["graded"] += 102
-            group["excellent"] += 102
-            group["tiers"]["excellent"] += 102
+            group["graded"] += added
+            group["excellent"] += added
+            group["tiers"]["excellent"] += added
         for lane in (historic["pairs"][0], historic["hardLane"]):
-            lane["corpusProbes"] += 102
-            lane["hardProbes"] += 102
+            lane["corpusProbes"] += added
+            lane["hardProbes"] += added
         percentages(historic)
         engine = self.render(facts=self.document("inventory.json", facts))["repositories"][0]
-        self.assertIn("411 open-corpus strategies, 855 closed-test scripts", engine["expected"])
+        self.assertIn("1,309 open-corpus strategies, 1,741 closed-test scripts", engine["expected"])
 
     def test_missing_unknown_and_unresolved_tokens_fail_without_partial_commands(self):
         for template in ["{{facts:scoreboard.unknown|int}}", "{{facts:inventory|text}}",

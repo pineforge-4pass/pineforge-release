@@ -111,17 +111,15 @@ not current main. `{{license:id}}` inserts a centrally approved label and record
 its pinned source. `{{word:id}}` inserts approved static product wording, such as
 language/ABI standard names; it is not a quantity store.
 
-The engine preserves the approved published stopgap exactly. Its parenthesized
+The engine description reports the current graded total and its breakdown:
+excellent, strong, and below strong, including zero counts. Its parenthesized
 open-corpus strategy and closed-test script counts are **historical inventory**
-from `inventory`, not the current graded-probe denominator. The policy records
-that scope explicitly. Corpus copy names the historical source release separately
-from current graded probes. Advancing the scoreboard never refills inventory or
-changes a released scoreboard.
+from `inventory`, not the current graded-probe denominator. Corpus copy names
+the historical source release separately from current graded probes. Advancing
+the scoreboard never refills inventory or changes a released scoreboard.
 
-The approved engine all-graded claim fails closed unless `scoreboard.belowStrong`
-is zero and `scoreboard.excellent + scoreboard.strong == scoreboard.graded`.
-An unsupported snapshot is refused before output or live API calls, so it cannot
-produce partial command proposals. GitHub owner/repository identities compare
+The three grade counts must sum to `scoreboard.graded`. Inconsistent facts are
+refused before output or live API calls. GitHub owner/repository identities compare
 case-insensitively for source verification, duplicates, live reads, and holds;
 pinned commits and the `LICENSE` source path still match exactly.
 
@@ -148,8 +146,8 @@ checks on every current and released scoreboard: safe integer counts, tier/lane/
 scope sums, percentages, unique lane identities, hard-lane evidence, source
 identities and matching provenance. Historical inventory binds to its source
 release and its sums, independently of current main. Remote schema references
-are disabled. Descriptions additionally enforce the all-graded claim, public
-role identities, license source URLs, length, and fixed managed scope. Invalid inputs
+are disabled. Descriptions additionally enforce public role identities, license
+source URLs, length, and fixed managed scope. Invalid inputs
 produce no stdout and no consumer calls. All source and policy bytes validate
 before prepare emits files or minting becomes eligible.
 
@@ -164,8 +162,8 @@ Exact prose acceptance uses `tests/fixtures/repo-descriptions-facts.json`, a
 frozen snapshot that canonical promotions must not refresh. Current-facts
 checks derive their quantities and provenance from the supplied document;
 consistent synthetic advances change counts, date and engine together while
-preserving historical inventory and released scoreboards. Schema/semantic
-rejection and the unsupported below-strong-domain refusal remain required.
+preserving historical inventory and released scoreboards. The checks also cover
+nonzero below-strong counts and reject invalid facts.
 
 `facts-descriptions.yml` replaces the retired duplicate drift workflow. A main
 push touching its path filters wakes it even when the commit includes other
