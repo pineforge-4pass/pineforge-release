@@ -22,10 +22,18 @@ MAX_INPUT_BYTES = 2 * 1024 * 1024
 MAX_SAFE_INTEGER = 2**53 - 1
 COUNTS = ("graded", "excellent", "strong", "belowStrong", "engineErrors")
 TIERS = ("excellent", "strong", "moderate", "weak", "minimal", "no-trades")
+CITED_RECORD = r"sha256:[0-9a-f]{64}"
+OWNER_ACCEPTED_CLAUSE = re.compile(
+    rf" owner-accepted \(cited acceptance records {CITED_RECORD}(?:, {CITED_RECORD})*\)"
+)
 
 
 class InputError(ValueError):
     pass
+
+
+class OwnerAcceptedClauseError(InputError):
+    """A fixed public diagnostic; never include the supplied source text."""
 
 
 def require(condition, message):
@@ -121,6 +129,19 @@ def other_market_timeframe_invariants(other):
                 "other markets timeframe tier sum differs")
 
 
+def validate_scoreboard_source(source, provenance):
+    baseline_id = provenance["baselineId"]
+    baseline, _, details = source.partition(";")
+    if baseline_id.startswith("pineforge-parity-owner-accepted-") or "owner-accepted" in details:
+        clause, separator, details = details.partition(";")
+        if not separator or not OWNER_ACCEPTED_CLAUSE.fullmatch(clause) or "owner-accepted" in details:
+            raise OwnerAcceptedClauseError("missing or malformed owner-accepted clause")
+    require(baseline == f"Registry baseline {baseline_id}" and details == (
+        f' digest-verified snapshot {provenance["snapshotSha256"]}; '
+        f'private evidence sha256:{provenance["privateEvidenceSha256"]}.'),
+        "scoreboard source does not bind its provenance")
+
+
 def scoreboard_invariants(score):
     provenance = score["provenance"]
     for field in ("engineCommit", "codegenCommit", "snapshotSha256", "populationSha256"):
@@ -128,10 +149,7 @@ def scoreboard_invariants(score):
     require(score["id"] == provenance["baselineId"] and
             score["date"] == provenance["promotionDate"][:10], "baseline or promotion date differs")
     require(provenance["promotionDate"].endswith(("Z", "+00:00")), "promotion date must be UTC")
-    require(score["source"] == (
-        f'Registry baseline {provenance["baselineId"]}; digest-verified snapshot '
-        f'{provenance["snapshotSha256"]}; private evidence sha256:{provenance["privateEvidenceSha256"]}.'),
-        "scoreboard source does not bind its provenance")
+    validate_scoreboard_source(score["source"], provenance)
     tally(score)
     require(score["graded"] + score["engineErrors"] + score["anomaliesExcluded"] == score["population"],
             "population sum differs")
@@ -241,6 +259,9 @@ def main():
         facts, sha = load_facts(args.facts)
         print(json.dumps({"sha256": sha, "schema": facts["schema"], "status": "valid"}, sort_keys=True))
         return 0
+    except OwnerAcceptedClauseError as error:
+        print(f"facts-validate: {error}", file=sys.stderr)
+        return 2
     except (InputError, OSError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
         print("facts-validate: invalid facts or unavailable input", file=sys.stderr)
         return 2
