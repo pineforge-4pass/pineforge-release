@@ -73,7 +73,7 @@ jobs:
           steps.setup.outputs.state == 'ready'
         # Preserve the failed outcome for a report; reconcile must return failure for any mint failure.
         continue-on-error: true
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: ${{ secrets.DESCRIPTIONS_APP_ID }}
           private-key: ${{ secrets.DESCRIPTIONS_APP_PRIVATE_KEY }}
